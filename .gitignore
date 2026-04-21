@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+outputs/
+configs/outputs/*
+.DS_Store
+.ipynb_checkpoints/
+*.gpkg-shm
+*.gpkg-wal

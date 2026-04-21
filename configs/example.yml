@@ -1,0 +1,97 @@
+project:
+  output_dir: ../outputs
+
+logging:
+  level: INFO
+
+r:
+  executable: /Library/Frameworks/R.framework/Resources/bin/Rscript
+
+sword:
+  parquet_dir: /Volumes/PhD/SWORD/v17c/beta/parquet/
+  search_radius_m: 5000
+  max_candidates: 8
+  use_node_refinement: true
+  continent: null
+  bbox: null
+
+
+
+gauges:
+  countries: ["US"]
+  metadata_output: ../outputs/gauges_raw.parquet
+  metadata_path: null
+  country_function_map: {}
+
+grdc:
+  catalog_path: /Volumes/PhD/river_hierarchy/data/GRDC_Stations 2.xlsx
+  sheet_name: station_catalogue
+  daily_only: true
+  min_daily_years: 1
+  output_dir: ../outputs/grdc
+  station_metadata_path: ../outputs/grdc_station_metadata.parquet
+  timeseries_path: ../outputs/grdc_timeseries.parquet
+
+matching:
+  score_weights:
+    distance: 0.6
+    river_name: 0.2
+    drainage_area: 0.2
+  ambiguity_penalty_weight: 0.1
+  ambiguity_window: 0.05
+  high_confidence_score: 0.8
+  medium_confidence_score: 0.6
+  min_score_gap: 0.1
+  review_distance_m: 2500
+
+timeseries:
+  output: ../outputs/gauge_timeseries.parquet
+  scope: high_medium_matched_only
+  variable: discharge
+  start_date: 2000-01-01
+  end_date: 2025-12-31
+  max_retries: 3
+  retry_backoff_seconds: 2.0
+  station_pause_seconds: 0.1
+  country_pause_seconds: 2.0
+
+kinematic:
+  width_field: width_obs_p50
+  slope_field: slope_obs_p50
+  kb_values: [10, 20, 30, 40]
+  q0_methods:
+    - pre_event_median
+    - event_start_discharge
+  t0_methods:
+    - rise_t10_t90
+    - rise_start_to_peak
+  allowed_confidence_classes: ["high", "medium"]
+
+  event_detection:
+    smoothing_window: 3
+    min_rise_points: 6
+    min_peak_prominence_ratio: 0.25
+    min_event_separation_hours: 72
+    pre_event_window_hours: 72
+    start_search_hours: 240
+    end_search_hours: 240
+    min_monotonic_rise_fraction: 0.7
+    min_event_duration_hours: 12
+
+  event_runtime:
+    batch_station_count: 250
+    execution_mode: sequential
+    workers: 4
+
+  screen_runtime:
+    batch_station_count: 100
+    execution_mode: sequential
+    workers: 4
+
+  screening:
+    min_valid_slope: 1.0e-6
+    gravity_m_s2: 9.80665
+    regime_tplus_min: 80
+    regime_froude_t0: 0.9
+    regime_tplus_end: 1000
+    regime_froude_end: 0.9

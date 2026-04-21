@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gauge-sword-match"
+version = "0.1.0"
+description = "Flood-study workflow for matching RivRetrieve gauge stations to SWORD reaches and nodes."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "OpenAI Codex" }]
+dependencies = [
+  "click>=8.1",
+  "geopandas>=1.0",
+  "numpy>=1.26",
+  "openpyxl>=3.1",
+  "pandas>=2.1",
+  "pyarrow>=14",
+  "pyproj>=3.6",
+  "PyYAML>=6.0",
+  "rapidfuzz>=3.0",
+  "shapely>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+gauge-sword-match = "gauge_sword_match.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gauge_sword_match"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
