@@ -1,10 +1,10 @@
-.DS_Store
 __pycache__/
 .pytest_cache/
 .venv/
 *.pyc
-**/outputs/
-**/configs/outputs/
+outputs/
+configs/outputs/*
+.DS_Store
+.ipynb_checkpoints/
 *.gpkg-shm
 *.gpkg-wal
-.ipynb_checkpoints/
