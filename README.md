@@ -21,8 +21,10 @@ outputs.
 
 `rivgraph_centerline/` will contain the RivGraph-based centerline and network
 extraction workflow. RivGraph work will stay isolated in this subproject and
-may use a separate Python or conda environment, a local fork, or an editable
-install while compatibility with newer Python versions is evaluated.
+will use a separate conda environment. The RivGraph library itself should be
+referenced from a fork of `VeinsOfTheEarth/RivGraph`, expected at
+`niekcde/RivGraph`, so package-level fixes can be made without vendoring copied
+source into this repository.
 
 The two subprojects are currently separate stages. They can each keep their
 own README and implementation details for now, and will be merged into a
@@ -37,6 +39,11 @@ products.
 
 Input data and generated products should be documented in the relevant
 subproject README rather than committed directly to this repository.
+
+Local scratch copies of upstream packages, including
+`rivgraph_centerline/RivGraph-master/`, are ignored. Use a pinned fork,
+editable install, or deliberate submodule when the project needs to depend on
+external source code.
 
 ## Branch plan
 

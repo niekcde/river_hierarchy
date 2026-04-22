@@ -24,13 +24,34 @@ gauge matching, discharge, flood event, and kinematic screening pipeline later.
 ```text
 rivgraph_centerline/
   configs/
+    rivgraph_centerline.example.yml
+    sections.example.csv
   src/
+    rivgraph_centerline/
   notebooks/
   outputs/
+  environment.yml
   README.md
 ```
 
 `outputs/` is for generated products and should stay ignored by Git.
+
+## RivGraph dependency
+
+RivGraph should be maintained as a separate library dependency, not copied into
+this project as normal source files. The intended setup is:
+
+```text
+VeinsOfTheEarth/RivGraph  ->  niekcde/RivGraph
+```
+
+Use the `river-hierarchy` branch of `niekcde/RivGraph` for package-level fixes
+if we encounter RivGraph bugs or need compatibility changes. Keep this
+repository focused on the river hierarchy workflow: mask inventories, mask
+preparation, QA, batch execution, and handoff products.
+
+The local `RivGraph-master/` folder, if present, is treated as scratch/reference
+source and is ignored by Git.
 
 ## Input notes
 
@@ -46,12 +67,19 @@ Example source data for early testing:
 
 ## Environment notes
 
-Use a separate Python or conda environment for RivGraph work. RivGraph may need
-compatibility fixes because older versions were written and tested against
-older Python and dependency versions. The first target is Python 3.11, using a
-local fork or editable install if needed.
+Use the separate conda environment defined in `environment.yml`. It targets
+Python 3.12 and installs RivGraph from the expected fork:
+
+```bash
+conda env create -f environment.yml
+conda activate river-hierarchy-rivgraph
+```
+
+Before creating the environment, fork `VeinsOfTheEarth/RivGraph` to
+`niekcde/RivGraph` and create/push the `river-hierarchy` branch. Once the
+workflow is reproducible, replace the floating branch reference in
+`environment.yml` with a specific commit hash.
 
 ## Status
 
-Initial skeleton only. Add setup notes, configuration examples, notebooks, and
-implementation code as the RivGraph workflow is developed.
+Initial framework only. No processing code has been added yet.
