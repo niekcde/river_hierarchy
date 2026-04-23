@@ -1,0 +1,1027 @@
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import networkx as nx
+import pandas as pd
+import csv
+import shapely
+import shapely.wkt
+from shapely import wkt
+import numpy as np
+import netCDF4
+import os
+import shutil
+from datetime import datetime, UTC, timedelta
+import io
+import subprocess
+from glob import glob
+from pathlib import Path 
+from rapid_run import run_rapid
+from synthetic_admissable_networkx_part_save import load_network_by_id
+import pyarrow as pa
+import pyarrow.parquet as pq
+try:
+    from tqdm import tqdm
+except ImportError:  # Fallback: no progress bar if tqdm isn't available.
+    def tqdm(iterable, **_kwargs):
+        return iterable
+
+import duckdb
+directory = '/Users/6256481/Desktop/PhD_icloud/USA_UNC/work/river_hierarchy/synthetic/'
+def run_synthetic_generator(dl, dw, bif, tw, directory,seed=10,max_att = 30, runType = 'random',
+                             bif_frac_up = 0.25, bif_frac_down = 0.25, rpb = 1):
+    if runType == 'random':
+        synthetic_script = '/Users/6256481/Documents/GitHub/river_hierarchy/synthetic.py'
+        cmd = [
+            "python",
+            synthetic_script,
+            "--domain-length", str(dl),
+            "--domain-width", str(dw),
+            "--n-bifurcations", str(bif),
+            "--x-points", "500",
+            "--gpkg", directory + f"my_river_{runType}.gpkg",
+            "--geojson", directory + f"my_river_{runType}.geojson",
+            "--crs", "EPSG:3857",
+            "--min-length-ratio", "5",
+            "--total-width", str(tw),
+            "--seed", f"{seed}",
+            "--html-plot", directory + f"plot_{runType}.html",
+            "--gap-min", "5",
+            "--no-plot",
+            "--width-split-mode", "equal",  # or "random"
+            "--width-split-min-pct", "0.2",
+            "--length-mode", "domain",  # or "total"
+            "--target-total-length", "10000",
+            "--max-attempts", f"{max_att}"
+        ]
+    elif runType == 'determined':
+        synthetic_script = '/Users/6256481/Documents/GitHub/river_hierarchy/synthetic_det.py'
+        cmd = [
+            "python",
+            synthetic_script,
+            "--domain-length", str(dl),
+            # "--domain-width", str(dw),
+            "--n-bifurcations", str(bif),
+            "--bifurcation-frac_up", f"{bif_frac_up}",
+            "--bifurcation-frac_down", f"{bif_frac_down}",
+            "--gpkg", directory + f"my_river_{runType}.gpkg",
+            "--geojson", directory + f"my_river_{runType}.geojson",
+            "--crs", "EPSG:3857",
+            "--min-length-ratio", "5",
+            "--root-width", str(tw),
+            "--seed", f"{seed}",
+            "--html-plot", directory + f"plot_{runType}.html",
+            "--no-plot",
+        ]
+    elif runType == 'determined_reach':
+        synthetic_script = '/Users/6256481/Documents/GitHub/river_hierarchy/synthetic_det_reach.py'
+        cmd = [
+            "python",
+            synthetic_script,
+            "--domain-length", str(dl),
+            "--n-bifurcations", str(bif),
+            "--reaches-per-break", f"{rpb}",
+            "--gpkg", directory + f"my_river_{runType}.gpkg",
+            "--geojson", directory + f"my_river_{runType}.geojson",
+            "--crs", "EPSG:3857",
+            "--min-length-ratio", "5",
+            "--root-width", str(tw),
+            "--seed", f"{seed}",
+            "--html-plot", directory + f"plot_{runType}.html",
+            "--no-plot",
+        ]
+    elif runType == 'determined_reach_rw':
+        synthetic_script = '/Users/6256481/Documents/GitHub/river_hierarchy/synthetic_reach_width.py'
+        cmd = [
+            "python",
+            synthetic_script,
+            "--domain-length", str(dl),
+            "--n-bifurcations", str(bif),
+            "--reaches-per-break", f"{rpb}",
+            "--gpkg", directory + f"my_river_{runType}.gpkg",
+            "--geojson", directory + f"my_river_{runType}.geojson",
+            "--crs", "EPSG:3857",
+            "--min-length-ratio", "5",
+            "--root-width", str(tw),
+            "--seed", f"{seed}",
+            "--html-plot", directory + f"plot_{runType}.html",
+            "--no-plot",
+        ]
+    subprocess.run(cmd, check=True)
+def create_graph(df, dfN):
+    # --- Create a Directed Graph ---
+    G = nx.MultiDiGraph()
+    # --- Add nodes with attributes ---
+    # Ignore geometry; keep node_id, x, y, and all other columns
+    node_attr_cols = [c for c in dfN.columns if c not in ["node_id"]]
+    for _, row in dfN.iterrows():
+        node_id = row["node_id"]
+        row['geometry'] = shapely.to_wkt(row['geometry'])
+        attrs = row[node_attr_cols].to_dict()
+        G.add_node(node_id, **attrs)
+    # --- Add edges with attributes ---
+    # Keep geometry + everything except the upstream/downstream identifiers
+    edge_attr_cols = [c for c in df.columns if c not in ["upstream", "downstream"]]
+    for _, row in df.iterrows():
+        u = row["upstream"]
+        v = row["downstream"]
+        r = row['reach_id']
+        row['geometry'] = shapely.to_wkt(row['geometry'])
+        # Edge attributes including geometry
+        attrs = row[edge_attr_cols].to_dict()
+        G.add_edge(u, v,key=r, **attrs)
+    return G
+def create_conn_file(G, directory):
+    # List of all edges in the river graph
+    edge_list = list(G.edges(data=True))
+    # Map node → outgoing edges (downstream edges)
+    node_to_edges_dn = {}
+    # Map node → incoming edges (upstream edges)
+    node_to_edges_up = {}
+    for u, v, data in edge_list:
+        eid = data["reach_id"]
+        # downstream edges from u → v
+        node_to_edges_dn.setdefault(u, []).append(eid)
+        # upstream edges into v
+        node_to_edges_up.setdefault(v, []).append(eid)
+    records = []
+
+    for u, v, data in edge_list:
+        eid = data["reach_id"]
+
+        # Downstream edges start at the downstream node (v)
+        downstream_edges = node_to_edges_dn.get(v, [])
+
+        # Upstream edges flow into the upstream node (u)
+        upstream_edges = node_to_edges_up.get(u, [])
+
+        # Build row dictionary
+        row = {
+            "reach_id": eid,
+            "n_rch_dn": len(downstream_edges),
+            "n_rch_up": len(upstream_edges),
+        }
+
+        # Expand downstream edge list
+        for i, e_dn in enumerate(downstream_edges, start=1):
+            row[f"rch_id_dn_{i}"] = e_dn
+
+        # Expand upstream edge list
+        for i, e_up in enumerate(upstream_edges, start=1):
+            row[f"rch_id_up_{i}"] = e_up
+
+        records.append(row)
+
+    df_connections = pd.DataFrame(records)
+
+    # Identify all dynamically created downstream and upstream columns
+    dn_cols = sorted([c for c in df_connections.columns if c.startswith("rch_id_dn_")],
+                    key=lambda x: int(x.split("_")[3]))  # sort by number after 'edge'
+
+    up_cols = sorted([c for c in df_connections.columns if c.startswith("rch_id_up_")],
+                    key=lambda x: int(x.split("_")[3]))
+
+    # Reorder columns exactly as requested
+    df_connections = df_connections[
+        ["reach_id", "n_rch_dn"] + dn_cols + ["n_rch_up"] + up_cols
+    ]
+    df_connections = df_connections.fillna(0)
+    df_connections.to_csv(directory + 'conn.csv', header=False, index=False)
+
+def create_riv_file(G, directory):
+    # Topological sort
+    sorted_reaches = list(nx.topological_sort(G))
+
+    # Build equivalent dataframe
+    df_sort = pd.DataFrame({"reach_id": sorted_reaches})
+
+    # Topological order of nodes
+    node_order = list(nx.topological_sort(G))
+
+    sorted_reach_ids = []
+
+    for u in node_order:
+        for v in G.successors(u):            # downstream neighbors
+            for k in G[u][v]:
+                reach_id = G[u][v][k]["reach_id"]   # reach_id is stored on EDGE
+                sorted_reach_ids.append(reach_id)
+
+    df_sort = pd.DataFrame({"reach_id": sorted_reach_ids})
+    df_sort.to_csv(directory + 'riv.csv', header=False, index=False)
+    return sorted_reach_ids
+def write_reach_ratios_csv(ratio_dict, output_csv):
+    """
+    Writes the reach ratios in the exact original CSV format:
+
+        reach_id, [downID, ratio], [downID, ratio], ...
+    ratio_dict : output from compute_reach_ratios()
+                 {reach_id: [[down1, r1], [down2, r2], ...]}
+    """
+
+    # Determine maximum number of downstream pairs for consistent column count
+    rat_path = output_csv + 'rat.csv'
+    max_cols = max((len(v) for v in ratio_dict.values()), default=0)
+    with open(rat_path, 'w', newline='') as f:
+        w = csv.writer(f)
+
+        if max_cols == 0:
+            return
+
+        for rid, pairs in ratio_dict.items():
+            row = [rid]
+
+            # Add each downstream pair in the form: [downID, ratio]
+            for down_id, ratio in pairs:
+                row.append([down_id, float(ratio)])
+
+            # If needed: pad with [0,0] exactly as the script did
+            while len(row) < max_cols + 1:
+                row.append([0,0])
+
+            w.writerow(row)
+
+
+def compute_reach_ratios(G, use_widths=True, directory = ''):
+    """
+    Compute downstream ratios for river reaches represented as edges.
+    Each edge must have: reach_id, width (if use_widths=True)
+
+    Returns
+    -------
+    dict: reach_id -> list of [downstream_reach_id, ratio]
+    """
+
+    # ------------------------------------------------------------------
+    # STEP 1 — Extract all reach_ids and their u→v mapping
+    # ------------------------------------------------------------------
+    reach_to_uv = {}
+    width_of = {}
+    for u, v, data in G.edges(data=True):
+        rid = data.get("reach_id")
+        if rid is None:
+            raise ValueError("All edges must have reach_id")
+        reach_to_uv[rid] = (u, v)
+        width_of[rid] = data.get("width", 1.0)
+    # ------------------------------------------------------------------
+    # STEP 2 — Build reach connectivity graph (RG)
+    # ------------------------------------------------------------------
+    RG = nx.DiGraph()
+    RG.add_nodes_from(reach_to_uv.keys())
+    for rid, (u, v) in reach_to_uv.items():
+        # All reaches starting at v are downstream of rid
+        for _, v2, data2 in G.out_edges(v, data=True):
+            rid2 = data2["reach_id"]
+            RG.add_edge(rid, rid2)
+        # If nothing flows out → outlet
+        if RG.out_degree(rid) == 0:
+            RG.add_edge(rid, 0)
+    if 0 in RG.nodes:
+        RG.nodes[0]["outlet"] = True
+    # ------------------------------------------------------------------
+    # STEP 3 — Topological order of reaches
+    # ------------------------------------------------------------------
+    # For trivial/small graphs, avoid strict topo requirements that can fail
+    # when a self-loop or single edge is present. Fall back to raw key order.
+    if len(reach_to_uv) <= 1:
+        order = list(reach_to_uv.keys()) + ([0] if 0 in RG.nodes else [])
+    else:
+        try:
+            order = list(nx.topological_sort(RG))
+        except nx.NetworkXUnfeasible:
+            raise ValueError("Graph contains cycles; reach connectivity invalid")
+    # Move outlet 0 to end
+    order = [r for r in order if r != 0] + ([0] if 0 in RG.nodes else [])
+    # Maximum number of downstreams for padding (same as script), allow empty
+    max_down = max(
+        (len(list(RG.successors(r))) for r in order if r != 0),
+        default=1
+    )
+    results = {}
+    # ------------------------------------------------------------------
+    # STEP 4 — Compute ratios
+    # ------------------------------------------------------------------
+    for rid in order:
+        if rid == 0:
+            continue
+        downstream = list(RG.successors(rid))
+        # If reach has outlet + real downstreams, ignore outlet
+        if 0 in downstream and len(downstream) > 1:
+            downstream.remove(0)
+        # ---- No widths: fallback rules ----
+        if not use_widths:
+            if downstream == [0]:
+                pairs = [[0, 0]]
+            elif len(downstream) == 1:
+                pairs = [[downstream[0], 1]]
+            else:
+                pairs = [[d, 1] for d in downstream]
+        # ---- Width-based ratios (corrected) ----
+        else:
+            if downstream == [0]:
+                pairs = [[0, 0]]
+            elif len(downstream) == 1:
+                pairs = [[downstream[0], 1]]
+
+            else:
+                # Use the widths of the downstream *reaches*, not nodes
+                ds_widths = [width_of[d] for d in downstream]
+                total = sum(ds_widths)
+                if total <= 0:
+                    ratios = [1.0 / len(downstream)] * len(downstream)
+                else:
+                    ratios = [w / total for w in ds_widths]
+                # normalize to sum exactly 1 (within rounding)
+                sum_rat = sum(ratios)
+                if sum_rat > 0:
+                    ratios = [r / sum_rat for r in ratios]
+                pairs = [[d, round(r, 6)] for d, r in zip(downstream, ratios)]
+        # ---- Pad like original script ----
+        while len(pairs) < max_down:
+            pairs.append([0, 0])
+        results[rid] = pairs
+    if not results:
+        open(directory + 'rat.csv', 'w').close()
+        open(directory + 'rat_srt.csv', 'w').close()
+        return results
+    write_reach_ratios_csv(results, directory)
+    def save_sorted_ratios(directory):
+        rat_path = directory + 'rat.csv'
+        rat_srt_path = directory + 'rat_srt.csv'
+        if not os.path.exists(rat_path):
+            open(rat_srt_path, 'w').close()
+            return
+        try:
+            con = pd.read_csv(directory + 'conn.csv', header=None)
+            rat = pd.read_csv(rat_path, header=None)
+        except pd.errors.EmptyDataError:
+            open(rat_srt_path, 'w').close()
+            return
+        if con.empty or rat.empty:
+            open(rat_srt_path, 'w').close()
+            return
+        order = con[0].drop_duplicates()
+        rat_srt = rat.set_index(0).loc[order].reset_index()
+        rat_srt.to_csv(rat_srt_path, header=None, index=None)
+    save_sorted_ratios(directory)
+    return results
+def compute_area_csv(
+    G,
+    a_width_area: float = 3.0,   # default coefficient
+    b_width_area: float = 0.40,   # default exponent
+    directory = ''
+):
+    """
+    Compute drainage area (km²) from width for each edge in the graph
+    and return a CSV string with:
+    reach_id, area_km2, x_centroid, y_centroid
+    """
+    def get_area(data):
+        reach_id = data.get("reach_id")
+        width_m  = data.get("width")
+        geom_wkt = data.get("geometry")
+        # Parse geometry and compute centroid
+        geom = wkt.loads(geom_wkt)
+        centroid = geom.centroid
+        x, y = centroid.x, centroid.y
+        # Convert width (m) → drainage area (km²)
+        # A = (w / a)^(1/b)
+        area_km2 = (width_m / a_width_area) ** (1.0 / b_width_area)
+        return reach_id, area_km2, x, y
+    file = directory + 'rapid_catchment.csv'
+    with open(file, 'w', newline='') as f:  
+        writer = csv.writer(f, delimiter="\t")
+        if isinstance(G, nx.MultiDiGraph):
+            for u, v, k, data in G.edges(data=True, keys = True):
+                reach_id, area_km2, x, y = get_area(data)
+                G[u][v][k]['area_km2'] = area_km2
+                writer.writerow([reach_id, area_km2, x, y])
+        elif isinstance(G, nx.DiGraph):
+            for u, v, data in G.edges(data=True):
+                reach_id, area_km2, x, y = get_area(data)
+                G[u][v]['area_km2'] = area_km2
+                writer.writerow([reach_id, area_km2, x, y])
+    return G
+def create_runoff(G, directory, dt_seconds = 10800, runOffC = [0.2], return_times = False):    # --------------------------------------------------------------------
+    # USER INPUTS
+    # --------------------------------------------------------------------
+    output_netcdf = directory + "inflow.nc"
+    if os.path.exists(output_netcdf):
+        os.remove(output_netcdf)
+    # runoff constant for each timestep (mm per meter reach length)
+    runoff_constants = runOffC
+    # timestep in seconds
+    # dt_seconds = 10800   # 3 hours
+    # field names in the graph edges
+    FIELD_REACH_ID = "reach_id"
+    FIELD_LENGTH   = "length"
+    FIELD_AREA     = "area_km2"
+    FIELD_GEOM     = "geometry"
+    # --------------------------------------------------------------------
+    # EXTRACT EDGE DATA
+    # --------------------------------------------------------------------
+    reach_ids = []
+    lengths_m = []
+    areas_m2  = []
+    lons = []
+    lats = []
+    # Handle Multi(Di)Graph via G.edges(data=True, keys=True)
+    use_keys = G.is_multigraph()
+    if use_keys:
+        edge_iter = G.edges(keys=True, data=True)
+    else:
+        edge_iter = G.edges(data=True)
+    source_mask = []
+    for edge in edge_iter:
+        if use_keys:
+            u, v, k, data = edge
+        else:
+            u, v, data = edge
+        # if G.nodes[u]['node_type'] != 'source':
+        #     data[FIELD_AREA] = 0
+        # A reach has inflow only if its upstream node is a source
+        source_mask.append(G.nodes[u]['node_type'] == 'source')
+        # Each edge **must** have reach_id, length, area, geom
+        rid = int(data[FIELD_REACH_ID])
+        L   = float(data[FIELD_LENGTH])        # meters
+        A   = float(data[FIELD_AREA])          # sqkm
+        geom = shapely.wkt.loads(data[FIELD_GEOM])
+        centroid = geom.centroid
+        reach_ids.append(rid)
+        lengths_m.append(L)
+        areas_m2.append(A * 1_000_000)         # convert sqkm → m²
+        lons.append(centroid.x)
+        lats.append(centroid.y)
+    source_mask = np.array(source_mask)
+    reach_ids = np.array(reach_ids)
+    lengths_m = np.array(lengths_m)
+    areas_m2  = np.array(areas_m2)
+    n_reaches = len(reach_ids)
+    n_timesteps = len(runoff_constants)
+    # --------------------------------------------------------------------
+    # COMPUTE INFLOW VOLUMES
+    # --------------------------------------------------------------------
+    # runoff(mm) = constant[t] * length
+    # volume(m3) = runoff(mm) * 0.001 * area(m2)
+    m3_riv = np.zeros((n_timesteps, n_reaches), dtype=np.float32)
+    for t in range(n_timesteps):
+        runoff_mm = runoff_constants[t]*dt_seconds * lengths_m
+        volume_m3 = runoff_mm * 0.001 * areas_m2
+        # Zero all inflow for NON-source reaches
+        volume_m3[~source_mask] = 0.0
+        m3_riv[t, :]            = volume_m3
+    # --------------------------------------------------------------------
+    # CREATE NETCDF OUTPUT
+    # --------------------------------------------------------------------
+    ds = netCDF4.Dataset(output_netcdf, "w", format="NETCDF4")
+    # dimensions
+    ds.title = "Synthetic runoff for RAPID routing"
+    ds.institution = "River Hierarchy Synthetic runs"
+    # ds.source = "synthetic generator v1"  # optional, but nice
+    ds.createDimension("time", n_timesteps)
+    ds.createDimension("rivid", n_reaches)
+    ds.createDimension("nv", 2)
+    # variables
+    m3_var = ds.createVariable("m3_riv", "f4", ("time", "rivid"))
+    rivid_var = ds.createVariable("rivid", "i8", ("rivid",))
+    time_var = ds.createVariable("time", "i8", ("time",))
+    time_bnds_var = ds.createVariable("time_bnds", "i8", ("time", "nv"))
+    lon_var = ds.createVariable("lon", "f8", ("rivid",))
+    lat_var = ds.createVariable("lat", "f8", ("rivid",))
+    crs_var = ds.createVariable("crs", "i4")
+    # metadata
+    ds.Conventions = "CF-1.6"
+    ds.featureType = "timeSeries"
+    ds.history = f"Created on {datetime.now(UTC).isoformat()}"
+    # coordinate fields
+    rivid_var[:] = reach_ids
+    lon_var[:] = lons
+    lat_var[:] = lats
+    # inflow data
+    m3_var[:, :] = m3_riv
+    # time axis setup
+    base_time = datetime(2015, 1, 1)
+    times = [
+        int((base_time + timedelta(seconds=dt_seconds*t)
+            - base_time).total_seconds())
+        for t in range(n_timesteps)
+    ]
+    time_var[:] = times
+    time_var.units = "seconds since 2015-01-01 00:00:00 +00:00"
+    time_var.calendar = "gregorian"
+    time_var.bounds = "time_bnds"
+    # time bounds
+    for t in range(n_timesteps):
+        time_bnds_var[t, 0] = times[t]
+        time_bnds_var[t, 1] = times[t] + dt_seconds
+    # close
+    ds.close()
+    if return_times:        return np.array(times, dtype=np.int64)
+def create_routing_parameters(
+    G,
+    directory,
+    field_reach_id="reach_id",
+    field_length="length",
+    field_geom="geometry",
+    xfc_value=0.1
+):
+    """
+    Create routing parameter files:
+        - kfc.csv
+        - xfc.csv
+        - coords.csv
+    from a NetworkX Graph, DiGraph, MultiGraph or MultiDiGraph.
+    Parameters
+    ----------
+    G : networkx graph
+        Graph containing edge attributes.
+    directory : str
+        Output directory (must exist).
+    """
+
+    # Correct edge iterator for multi vs non-multi graph
+    use_keys = G.is_multigraph()
+    if use_keys:
+        edge_iter = G.edges(keys=True, data=True)
+    else:
+        edge_iter = G.edges(data=True)
+    reach_ids = []
+    lengths_km = []
+    coords_x = []
+    coords_y = []
+    kfac = []
+    xfac = []
+    widths = []
+    # -----------------------------------------------------------
+    # Extract all reach information
+    # -----------------------------------------------------------        
+    for edge in edge_iter:
+        if use_keys:
+            u, v, k, data = edge
+        else:
+            u, v, data = edge
+        rid = int(data[field_reach_id])
+        L_m = float(data[field_length])
+        geom = shapely.wkt.loads(data[field_geom])
+        # Representative coordinate (centroid)
+        centroid = geom.centroid
+        # Convert meters → km
+        L_km = L_m / 1000.0
+        # Compute k-factor exactly like original script:
+        #   k = length(m) * 3.6 * 0.35
+        # k_value1 = L_m * 3.6 * 0.35
+        kb = 20
+        S = 1e-3
+        n = 0.35
+        k_value = (3/5)*n* ((L_m / (S**0.5)) * ((kb**(2/3))/(data['width']**(2/3))))
+        reach_ids.append(rid)
+        lengths_km.append(L_km)
+        coords_x.append(centroid.x)
+        coords_y.append(centroid.y)
+        kfac.append(round(k_value, 4))   # RRR formatting
+        xfac.append(xfc_value)
+        widths.append(data['width'])
+    mx, mn = np.argmax(kfac), np.argmin(kfac)
+    # -----------------------------------------------------------
+    # Write kfc.csv
+    # -----------------------------------------------------------
+    with open(directory + "kfc.csv", "w") as f:
+        writer = csv.writer(f)
+        for k in kfac:
+            writer.writerow([k])
+    # -----------------------------------------------------------
+    # Write xfc.csv
+    # -----------------------------------------------------------
+    with open(directory + "xfc.csv", "w") as f:
+        writer = csv.writer(f)
+        for x in xfac:
+            writer.writerow([x])
+    # -----------------------------------------------------------
+    # Write coords.csv
+    # -----------------------------------------------------------
+    with open(directory + "coords.csv", "w") as f:
+        writer = csv.writer(f)
+        for rid, x, y in zip(reach_ids, coords_x, coords_y):
+            writer.writerow([rid, x, y])
+def compute_dt_from_K(Kdir, x, return_midpoint=True):
+    """
+    Computes admissible dt range for Muskingum routing based on K values and x.
+    Automatically checks the theoretical admissibility condition:
+        Kmax/Kmin <= (1-x)/x
+    """
+    K = np.loadtxt(Kdir+"kfc.csv", dtype = float)  # or however you read it
+
+    Kmin = K.min()
+    Kmax = K.max()
+    ratio = Kmax / Kmin
+
+    allowed_ratio = (1 - x) / x
+
+    # ---------------------------------------------------------
+    # Check theoretical admissibility
+    # ---------------------------------------------------------
+    assert ratio <= allowed_ratio, (
+        f"No stable dt exists! "
+        f"Kmax/Kmin = {ratio:.3f} but allowed max = {(allowed_ratio):.3f} "
+        f"for x={x}.\n"
+        f"Increase x or reduce K variability."
+    )
+
+    # ---------------------------------------------------------
+    # Compute dt range
+    # ---------------------------------------------------------
+    dt_min = np.max(2 * K * x)
+    dt_max = np.min(2 * K * (1 - x))
+
+    assert dt_min <= dt_max, (
+        f"Stability range collapsed: dt_min={dt_min}, dt_max={dt_max}"
+    )
+
+    if return_midpoint:
+        return np.round(0.5 * (dt_min + dt_max),-1)
+    return dt_min, dt_max
+
+
+def _tag_to_y(tag: str) -> float:
+    if tag == "A":
+        return 1.0
+    if tag == "B":
+        return -1.0
+    return 0.0
+
+
+def _linestring_wkt(x1, y1, x2, y2) -> str:
+    return f"LINESTRING ({x1:.6f} {y1:.6f}, {x2:.6f} {y2:.6f})"
+
+
+def rivernetwork_to_rapid_graph(net) -> nx.MultiDiGraph:
+    """
+    Convert RiverNetworkNX graph to a RAPID-ready MultiDiGraph with:
+      - edge attrs: reach_id, width, length, geometry (WKT)
+      - node attrs: x, y, node_type
+    """
+    G_src = net.G
+    G = nx.MultiDiGraph()
+    # Build nodes first with x/y
+    for n, data in G_src.nodes(data=True):
+        x = float(data.get("x", 0.0))
+        tag = data.get("tag", "main")
+        y = _tag_to_y(tag)
+        G.add_node(n, x=x, y=y, node_type="internal")
+    # Deterministic edge ordering for stable reach_id assignment
+    edges = []
+    for u, v, k, data in G_src.edges(keys=True, data=True):
+        xu = float(G_src.nodes[u]["x"])
+        xv = float(G_src.nodes[v]["x"])
+        if xv <= xu:
+            continue
+        kind = data.get("kind", "")
+        branch = data.get("branch", "")
+        edges.append((xu, xv, branch, kind, str(k), u, v, data))
+    edges.sort()
+    for idx, (_, _, _, _, _, u, v, data) in enumerate(edges, start=1):
+        xu = float(G_src.nodes[u]["x"])
+        xv = float(G_src.nodes[v]["x"])
+        yu = float(G.nodes[u]["y"])
+        yv = float(G.nodes[v]["y"])
+        L = float(xv - xu)
+        w = float(data.get("w", 0.0))
+        geom = _linestring_wkt(xu, yu, xv, yv)
+        G.add_edge(
+            u, v, key=str(idx),
+            reach_id=int(idx),
+            width=w,
+            length=L,
+            geometry=geom,
+        )
+    # Mark source nodes
+    for n in G.nodes:
+        if G.in_degree(n) == 0:
+            G.nodes[n]["node_type"] = "source"
+    return G
+
+
+def _find_outlet_reach_id(G: nx.MultiDiGraph) -> int | None:
+    candidates = []
+    for u, v, k, data in G.edges(keys=True, data=True):
+        if G.out_degree(v) == 0:
+            candidates.append((float(G.nodes[v]["x"]), int(data["reach_id"])))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[-1][1]
+
+
+def _load_summary_table(sampled_dir: str | Path) -> pd.DataFrame:
+    sampled_dir = Path(sampled_dir)
+    parquet = sampled_dir / "summary.parquet"
+    print("print parquet: ", parquet)
+    csv_path = sampled_dir / "summary.csv"
+    if parquet.exists():
+        con = duckdb.connect()
+
+        dfS = con.execute(f"""
+            SELECT *
+            FROM read_parquet('{parquet}')
+        """).df()
+        print(dfS.shape[0])
+        return dfS
+        # return pd.read_parquet(parquet)
+    if csv_path.exists():
+        return pd.read_csv(csv_path)
+    raise FileNotFoundError("summary.parquet or summary.csv not found in sampled_dir")
+
+def _pick_recipes_path(sampled_dir: str | Path) -> Path:
+    sampled_dir = Path(sampled_dir)
+    for name in ["networks.jsonl.gz", "networks.json.gz"]:
+        p = sampled_dir / name
+        if p.exists():
+            return p
+    raise FileNotFoundError("networks.jsonl.gz or networks.json.gz not found in sampled_dir")
+
+
+def stratified_sample_ids(
+    summary_df: pd.DataFrame,
+    n_total: int,
+    k_bins: int = 4,
+    ebi_bins: int = 4,
+    seed: int = 123,
+) -> list:
+    if n_total <= 0:
+        return []
+    df = summary_df.copy()
+    df = df.dropna(subset=["k_mean", "ebi_mean", "network_id"])
+    if df.empty:
+        return []
+    # quantile binning with duplicate handling
+    df["k_bin"] = pd.qcut(df["k_mean"], q=k_bins, duplicates="drop")
+    df["ebi_bin"] = pd.qcut(df["ebi_mean"], q=ebi_bins, duplicates="drop")
+    # combine bins
+    df["bin"] = df["k_bin"].astype(str) + "|" + df["ebi_bin"].astype(str)
+    rng = np.random.default_rng(seed)
+    # target per bin
+    bins = df["bin"].unique().tolist()
+    if not bins:
+        return []
+    per_bin = max(1, n_total // len(bins))
+    sampled_ids = []
+    for b in bins:
+        group = df[df["bin"] == b]
+        take = min(per_bin, len(group))
+        if take == 0:
+            continue
+        sampled = group.sample(n=take, random_state=seed)
+        sampled_ids.extend(sampled["network_id"].astype(int).tolist())
+    # fill remainder from remaining pool
+    remaining = n_total - len(sampled_ids)
+    if remaining > 0:
+        remaining_pool = df[~df["network_id"].isin(sampled_ids)]
+        if not remaining_pool.empty:
+            extra = remaining_pool.sample(n=min(remaining, len(remaining_pool)), random_state=seed)
+            sampled_ids.extend(extra["network_id"].astype(int).tolist())
+    return sampled_ids[:n_total]
+
+
+def run_sampled_realizations(
+    sampled_dir: str | Path,
+    out_dir: str | Path,
+    n_benchmarks: int,
+    n_random_per_benchmark: int,
+    seed: int = 123,
+    k_bins: int = 4,
+    ebi_bins: int = 4,
+    use_admissible: bool = True,
+    output_mode: str = "parquet_outlet",
+    keep_intermediate: bool = False,
+    write_netcdf: bool = False,
+    x=0.1,
+):
+    """
+    Sample admissible networks from summary, load recipes by network_id,
+    run RAPID, and store outputs efficiently.
+    """
+    sampled_dir = Path(sampled_dir)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print('print sampled dir:', sampled_dir, '\n\n')
+    summary = _load_summary_table(sampled_dir)
+    summary["admissible"] = summary["k_ratio"] <= ((1 - x) / x)
+    # print(summary.shape[0])
+    if use_admissible and "admissible" in summary.columns:
+        summary = summary[summary["admissible"] == True]
+    if "is_benchmark" not in summary.columns or "geometry_id" not in summary.columns:
+        raise ValueError("summary must include is_benchmark and geometry_id columns")
+    # print(summary.shape[0], sampled_dir)
+    benches = summary[summary["is_benchmark"] == True]
+    # print(benches.shape[0])
+    bench_ids = stratified_sample_ids(benches, n_benchmarks, k_bins, ebi_bins, seed)
+    if not bench_ids:
+        raise ValueError("No benchmark network_ids selected; check summary filters/binning.")
+    network_ids = []
+    sample_types = {}
+    geom_for = summary.set_index("network_id")["geometry_id"].to_dict()
+    for bid in bench_ids:
+        network_ids.append(int(bid))
+        sample_types[int(bid)] = "benchmark"
+        gid = geom_for.get(int(bid))
+        if gid is None:
+            continue
+        candidates = summary[(summary["geometry_id"] == gid) & (summary["is_benchmark"] == False)]
+        candidates = candidates[~candidates["network_id"].isin(network_ids)]
+        if candidates.empty:
+            continue
+        take = min(n_random_per_benchmark, len(candidates))
+        picks = candidates.sample(n=take, random_state=seed)["network_id"].astype(int).tolist()
+        for pid in picks:
+            network_ids.append(int(pid))
+            sample_types[int(pid)] = "random_from_benchmark"
+    # print(len(bench_ids), len(candidates))
+    if not network_ids:
+        raise ValueError("No network_ids selected after benchmark/random expansion.")
+    recipes_path = _pick_recipes_path(sampled_dir)
+    parquet_writer = None
+    if output_mode == "parquet_outlet":
+        schema = pa.schema([
+            ("network_id", pa.int64()),
+            ("geometry_id", pa.int64()),
+            ("sample_type", pa.string()),
+            ("time", pa.int64()),
+            ("Q", pa.float64()),
+        ])
+        parquet_path = out_dir / "q_outlet.parquet"
+        parquet_writer = pq.ParquetWriter(parquet_path, schema)
+    results = []
+    for network_id in tqdm(network_ids, total=len(network_ids), desc="Running networks"):
+        net = load_network_by_id(recipes_path, int(network_id))
+        G = rivernetwork_to_rapid_graph(net)
+        work_dir = out_dir / f"network_{int(network_id):06d}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        create_conn_file(G, directory=str(work_dir) + "/")
+        riv_order = create_riv_file(G, directory=str(work_dir) + "/")
+        compute_reach_ratios(G, use_widths=True, directory=str(work_dir) + "/")
+        compute_area_csv(G, directory=str(work_dir) + "/")
+        X = 0.1
+        create_routing_parameters(G, directory=str(work_dir) + "/", xfc_value=X)
+        dt = compute_dt_from_K(str(work_dir) + "/", X, True)
+        steps, step_duration = build_first_part(dt)
+        runOffC = steps + [0] * 2000
+        times = create_runoff(G, directory=str(work_dir) + "/", dt_seconds=dt, runOffC=runOffC, return_times=True)
+        outlet_reach_id = _find_outlet_reach_id(G)
+        outlet_idx = None
+        if outlet_reach_id is not None and outlet_reach_id in riv_order:
+            outlet_idx = riv_order.index(outlet_reach_id)
+        out_path = work_dir / f"Qout_{int(network_id):06d}.nc"
+        if out_path.exists():
+            out_path.unlink()
+        if not os.access(work_dir, os.W_OK):
+            raise PermissionError(f"Output directory not writable: {work_dir}")
+        qout_path, qout = run_rapid(
+            str(work_dir),
+            ROUTING_TIMESTEP_SECONDS=dt,
+            runType="sampled",
+            seed=int(network_id),
+            output_path=str(out_path),
+            return_qout=True,
+        )
+        if output_mode == "parquet_outlet":
+            if outlet_idx is None:
+                raise ValueError(f"Outlet reach not found for network_id={network_id}")
+            q = qout[:, outlet_idx].astype(float)
+            table = pa.table({
+                "network_id": pa.array([int(network_id)] * len(times)),
+                "geometry_id": pa.array([int(geom_for.get(int(network_id), -1))] * len(times)),
+                "sample_type": pa.array([sample_types.get(int(network_id), "unknown")] * len(times)),
+                "time": pa.array(times),
+                "Q": pa.array(q),
+            })
+            parquet_writer.write_table(table)
+        results.append({
+            "network_id": int(network_id),
+            "dt": float(dt),
+            "qout_path": str(qout_path),
+        })
+        if not write_netcdf and out_path.exists():
+            out_path.unlink()
+        if not keep_intermediate:
+            if write_netcdf and out_path.exists():
+                shutil.move(str(out_path), str(out_dir / out_path.name))
+            shutil.rmtree(work_dir)
+    if parquet_writer is not None:
+        parquet_writer.close()
+    return results
+
+
+def resample(curve, N):
+    x_old = np.linspace(0,1,len(curve))
+    x_new = np.linspace(0,1,N)
+    return np.interp(x_new, x_old, curve)
+# def build_first_part(dt):
+#     # Canonical shapes
+#     A_shape = [0]*10
+#     B_shape = list(np.linspace(0,1,90))
+#     C_shape = [1]*100
+#     D_shape = list(np.linspace(1,50,350))
+#     E_shape = list(np.linspace(50,0,200))
+#     # Durations YOU choose
+#     T_A = 24*10*60*60
+#     T_B = 24*10*60*60
+#     T_C = 24*10*60*60
+#     T_D = 24*100*60*60
+#     T_E = 24*1*60*60
+#     # Convert to step counts
+#     N_A = max(1, int(T_A / dt))
+#     N_B = max(1, int(T_B / dt))
+#     N_C = max(1, int(T_C / dt))
+#     N_D = max(1, int(T_D / dt))
+#     N_E = max(1, int(T_E / dt))
+#     # Interpolate each segment
+#     A = resample(A_shape, N_A)
+#     B = resample(B_shape, N_B)
+#     C = resample(C_shape, N_C)
+#     D = resample(D_shape, N_D)
+#     E = resample(E_shape, N_E)
+#     # Combine
+#     return [list(A) + list(B) + list(C) + list(D) + list(E)], [T_A, T_B, T_C, T_D, T_E]
+def build_first_part(dt):
+    """
+    Returns a dt-invariant runoff curve.
+    Output:
+        runOffC - runoff intensity values sampled at routing dt
+        durations - list of segment durations in seconds
+    """
+
+    # ------------------------------------------------------------
+    # 1. Fixed physical durations (seconds)
+    # ------------------------------------------------------------
+    T_A = 24*10*60*60   # 10 days
+    T_B = 24*10*60*60
+    T_C = 24*10*60*60
+    T_D = 24*10*60*60
+    T_E = 24*1*60*60
+    durations = [T_A, T_B, T_C, T_D, T_E]
+    T_total = sum(durations)
+    # ------------------------------------------------------------
+    # 2. Build a *continuous* normalized time axis
+    #    (independent of dt)
+    # ------------------------------------------------------------
+    N_base = 3000   # high resolution to make curve smooth
+    t_base = np.linspace(0, T_total, N_base)
+    # helper to define each phase in continuous time
+    def segment_mask(t, t0, t1):
+        return (t >= t0) & (t < t1)
+    # ------------------------------------------------------------
+    # 3. Create continuous runoff intensity r(t)
+    # ------------------------------------------------------------
+    r = np.zeros_like(t_base)
+    # A: 0
+    t0 = 0
+    t1 = T_A
+    # r already 0
+    # B: ramp 0 → 1
+    t2      = t1 + T_B
+    mask    = segment_mask(t_base, t1, t2)
+    r[mask] = np.linspace(0, 1, mask.sum())
+    # C: plateau 1
+    t3      = t2 + T_C
+    mask    = segment_mask(t_base, t2, t3)
+    r[mask] = 1.0
+    # D: ramp 1 → 50
+    t4 = t3 + T_D
+    mask = segment_mask(t_base, t3, t4)
+    r[mask] = np.linspace(1, 10, mask.sum())
+    # E: ramp 50 → 0
+    t5 = t4 + T_E
+    mask = segment_mask(t_base, t4, t5)
+    r[mask] = np.linspace(10, 0, mask.sum())
+    # ------------------------------------------------------------
+    # 4. Sample r(t) at the routing dt
+    # ------------------------------------------------------------
+    t       = np.arange(0, T_total, dt)
+    runOffC = np.interp(t, t_base, r)
+    return runOffC.tolist(), durations
+def run_main(valList, 
+    singleValList, 
+    seed = 1, 
+    bif = 1,             
+    bif_frac_up = 0.2, 
+    bif_frac_down = 0.2, 
+    reach_break = 1,             
+    network_setting = 'random'):    
+    raise RuntimeError(        "Legacy synthetic generator workflow disabled. Use run_sampled_realizations() "        "with recipe outputs from synthetic_width_perc_splits."    )
+
+# "/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_5_geom/sampled_realizations"
+
+if __name__ == "__main__":    
+    breaks = 5
+    out_dir     = f"/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_{breaks}_geom/"
+    sampled_dir = out_dir + "sampled_realizations/"  
+    run_sampled_realizations(        sampled_dir=sampled_dir,        out_dir=out_dir, 
+                                    n_benchmarks=100,        
+                                    n_random_per_benchmark=10, 
+                                    seed=123,        
+                                    k_bins=4,        
+                                    ebi_bins=4,        
+                                    use_admissible=True,        
+                                    output_mode="parquet_outlet",        
+                                    keep_intermediate=False,        
+                                    write_netcdf=False,        
+                                    x = 0.1
+    )
