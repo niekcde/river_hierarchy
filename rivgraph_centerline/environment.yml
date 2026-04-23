@@ -32,4 +32,4 @@ dependencies:
       # Create the fork on GitHub first:
       # https://github.com/VeinsOfTheEarth/RivGraph -> https://github.com/niekcde/RivGraph
       # Pin this to a commit hash once the workflow is reproducible.
-      - git+ssh://git@github.com/niekcde/RivGraph.git@river-hierarchy#egg=rivgraph
+      - git+https://github.com/niekcde/RivGraph.git@river-hierarchy#egg=rivgraph

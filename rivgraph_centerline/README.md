@@ -65,6 +65,88 @@ Example source data for early testing:
 /Users/6256481/Desktop/PhD_icloud/projecten/river_hierarchy/niek_review_package/water_masks_sarl/sarl_river_07.tif
 ```
 
+## Manual edits
+
+Manual cleaning is handled as vector corrections rather than direct raster
+painting. Create a polygon GeoPackage with an `action` field:
+
+- `add`: burn those pixels to water/channel value `1`
+- `remove`: burn those pixels to background value `0`
+
+Apply the edits to a prepared binary mask with:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python \
+  rivgraph_centerline/src/rivgraph_centerline/manual_edits.py \
+  --base-mask rivgraph_centerline/outputs/smoke_tests/sarl_river_07/masks_prepared/sarl_river_07_binary_projected.tif \
+  --edits rivgraph_centerline/outputs/smoke_tests/sarl_river_07/manual_edits/sarl_river_07_manual_edits.gpkg \
+  --output rivgraph_centerline/outputs/smoke_tests/sarl_river_07/masks_cleaned/sarl_river_07_cleaned.tif
+```
+
+The cleaned mask remains a strict uint8 binary GeoTIFF with the prepared mask's
+CRS, transform, and dimensions.
+
+## Recommended workflow
+
+Use the staged runner:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  rivgraph_centerline/smoke_tests/run_smoke_workflow.py --help
+```
+
+For a new mask named `my_test_01`, the normal steps are:
+
+1. Prepare the binary/projected mask once:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  rivgraph_centerline/smoke_tests/run_smoke_workflow.py prepare-mask \
+  --name my_test_01 \
+  --source-mask /path/to/my_mask.tif
+```
+
+This creates:
+
+```text
+rivgraph_centerline/outputs/smoke_tests/my_test_01/
+  masks_prepared/my_test_01_binary_projected.tif
+  manual_edits/my_test_01_manual_edits.gpkg   # expected QGIS edit path
+  prepare_summary.json
+```
+
+2. Optionally create `manual_edits/my_test_01_manual_edits.gpkg` in QGIS and apply it:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  rivgraph_centerline/smoke_tests/run_smoke_workflow.py apply-edits \
+  --name my_test_01
+```
+
+3. Run RivGraph. This automatically prefers the cleaned mask if it exists; otherwise it uses the prepared mask:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-rivgraph \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  rivgraph_centerline/smoke_tests/run_smoke_workflow.py run-rivgraph \
+  --name my_test_01 \
+  --exit-sides NS
+```
+
+For a single command workflow without manual editing:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-rivgraph \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  rivgraph_centerline/smoke_tests/run_smoke_workflow.py run-all \
+  --name my_test_01 \
+  --source-mask /path/to/my_mask.tif \
+  --exit-sides NS
+```
+
+`run-all` reuses the existing prepared mask unless you pass `--force-prepare`,
+so you do not need to rebuild the binary mask after making manual edits.
+
 ## Environment notes
 
 Use the separate conda environment defined in `environment.yml`. It targets
@@ -80,6 +162,55 @@ Before creating the environment, fork `VeinsOfTheEarth/RivGraph` to
 workflow is reproducible, replace the floating branch reference in
 `environment.yml` with a specific commit hash.
 
+The environment installs the fork over HTTPS so setup does not require GitHub
+SSH keys. Use SSH only if your local GitHub authentication is configured.
+
+## A/B comparison
+
+To compare your current fork branch against the smaller `jameshgrn/update`
+patch set, create the second environment:
+
+```bash
+conda env create -f rivgraph_centerline/environment.update.yml
+conda activate river-hierarchy-rivgraph-update
+```
+
+Run the same cleaned mask through both installs into separate output folders.
+The current smoke-test script already accepts a custom mask and output folder:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-rivgraph \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  rivgraph_centerline/smoke_tests/smoke_test_sarl07.py \
+  --mask rivgraph_centerline/outputs/smoke_tests/sarl_river_07/masks_cleaned/sarl_river_07_cleaned.tif \
+  --output-dir rivgraph_centerline/outputs/smoke_tests/sarl_river_07_baseline \
+  --exit-sides NS
+
+MPLCONFIGDIR=/tmp/matplotlib-rivgraph \
+/opt/anaconda3/envs/river-hierarchy-rivgraph-update/bin/python -B \
+  rivgraph_centerline/smoke_tests/smoke_test_sarl07.py \
+  --mask rivgraph_centerline/outputs/smoke_tests/sarl_river_07/masks_cleaned/sarl_river_07_cleaned.tif \
+  --output-dir rivgraph_centerline/outputs/smoke_tests/sarl_river_07_update \
+  --exit-sides NS
+```
+
+Then compare the two runs:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  rivgraph_centerline/smoke_tests/compare_smoke_runs.py \
+  --baseline rivgraph_centerline/outputs/smoke_tests/sarl_river_07_baseline \
+  --candidate rivgraph_centerline/outputs/smoke_tests/sarl_river_07_update \
+  --output rivgraph_centerline/outputs/comparisons/sarl_river_07_ab_compare.json
+```
+
+The comparison report focuses on the parts most likely to move for river masks:
+summary counts, link counts, node counts, and centerline/link lengths.
+
 ## Status
 
-Initial framework only. No processing code has been added yet.
+Framework plus first manual smoke-test tooling:
+
+- binary-mask preparation and smoke-test runner
+- vector-based manual edit application
+- narrow A/B comparison helper for baseline vs update-branch runs

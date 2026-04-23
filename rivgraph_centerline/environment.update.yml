@@ -1,0 +1,30 @@
+name: river-hierarchy-rivgraph-update
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+
+  # Geospatial/scientific stack for comparing against jameshgrn/update.
+  - numpy>=2,<3
+  - scipy>=1.11,<1.16
+  - pandas>=2.2,<2.3
+  - matplotlib>=3.8,<3.11
+  - networkx>=2.8,<3.3
+  - scikit-image>=0.22,<0.25
+  - shapely>=2.1,<2.2
+  - geopandas>=1.1,<1.2
+  - pyproj>=3.6,<3.8
+  - rasterio>=1.4,<1.5
+  - pyogrio>=0.11.1,<0.13
+  - contextily>=1.6,<2
+  - pillow
+  - pyyaml
+  - loguru
+  - fastdtw
+
+  - pip:
+      # Narrow comparison target for the smaller modernization patch set.
+      # If this branch proves useful, mirror it into niekcde/RivGraph and pin
+      # to that fork instead of the third-party branch.
+      - git+https://github.com/jameshgrn/RivGraph.git@update#egg=rivgraph
