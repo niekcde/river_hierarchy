@@ -7,8 +7,10 @@ subproject folders for related river-network workflows.
 
 ```text
 river-hierarchy/
+  RAPID/
   SWORD_gauge_match/
   rivgraph_centerline/
+  synthetic_runs/
 ```
 
 ## Subprojects
@@ -26,9 +28,17 @@ referenced from a fork of `VeinsOfTheEarth/RivGraph`, expected at
 `niekcde/RivGraph`, so package-level fixes can be made without vendoring copied
 source into this repository.
 
-The two subprojects are currently separate stages. They can each keep their
-own README and implementation details for now, and will be merged into a
-single pipeline once the RivGraph centerline/network extraction stage is ready.
+`synthetic_runs/` now serves as the synthetic-network subproject. The copied
+legacy synthetic code is preserved there while the workflow is being extracted
+into a cleaner `src/` layout with explicit provenance tracking.
+
+`RAPID/` is the shared routing subproject. It will hold the reusable RAPID
+engine and RAPID input-preparation code used by synthetic runs first and by
+RivGraph-derived networks later.
+
+These subprojects are currently separate stages. They can each keep their own
+README and implementation details for now, and will be merged into a single
+pipeline once the shared interfaces are stable.
 
 ## Data and outputs
 
@@ -51,4 +61,7 @@ external source code.
   screening pipeline.
 - `rivgraph_centerline`: RivGraph-based centerline and network extraction
   work.
+- `synthetic_runs`: synthetic-network generation, routing experiments, and
+  sensitivity workflows.
+- `RAPID`: shared routing engine and RAPID input-preparation layer.
 - `main`: eventual merged project once both stages are ready to be integrated.

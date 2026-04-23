@@ -1,0 +1,125 @@
+# Synthetic Migration Map
+
+This file records where the copied legacy synthetic code came from and where it
+is intended to land during the refactor.
+
+## Provenance Rule
+
+Until extraction is complete, the authoritative preserved legacy copies are the
+files currently stored directly under `synthetic_runs/`.
+
+Their historical source was:
+
+```text
+/Users/6256481/Documents/GitHub/river_hierarchy/
+```
+
+Each legacy file should only be removed after:
+
+1. the replacement module exists in the new structure,
+2. imports or runners have been updated,
+3. the behavior has been checked against the preserved legacy file,
+4. this map has been updated if the target changed.
+
+## Frozen External Outputs To Keep Available
+
+These are not repository source files, but they are required to reproduce and
+validate the first refactor pass:
+
+- `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_5_geom/sampled_realizations/networks.jsonl.gz`
+- `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_5_geom/sampled_realizations/summary.parquet`
+- `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_5_geom/sampled_realizations/edges.parquet`
+- `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_5_geom/sampled_realizations/run_meta_sampling.json`
+- `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/networks_sensitivity.jsonl.gz`
+- `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/grid_manifest.csv`
+- `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/q_outlet.parquet`
+- `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/edge_velocity_tc.parquet`
+- `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/k_q_metrics.csv`
+- `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/peak_q_metrics.csv`
+- `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/run_errors.csv`
+- `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/run_regime.csv`
+- `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/edge_full2.csv`
+
+## Sensitivity Provenance
+
+The first sensitivity recipe set is notebook-derived.
+
+- Recipe construction notebook source:
+  `synthetic_runs/synthetic_admissable_networkx.ipynb`
+- Output recipe file:
+  `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/networks_sensitivity.jsonl.gz`
+- Current preserved count:
+  `7` recipes
+- Execution script:
+  `synthetic_runs/synthetic_runs_sensitivity`
+- Post-analysis notebook:
+  `synthetic_runs/synthetic_sensitivty.ipynb`
+
+Important: the notebook contains stale cell outputs, so provenance should be
+checked against the generated files above, not notebook output displays.
+
+## File-To-Target Map
+
+### Active Extraction Targets
+
+| Preserved legacy file | Intended target | Notes |
+| --- | --- | --- |
+| `synthetic_admissable_networkx_part_save.py` | `src/synthetic_runs/core/network.py`, `src/synthetic_runs/core/recipes.py`, `src/synthetic_runs/core/metrics.py` | Main keeper for `Params`, `RiverNetworkNX`, streamed summaries, recipe IO |
+| `synthetic_geometric_enumeration.py` | `src/synthetic_runs/enumerate/geometry.py` | Geometry-first enumeration; currently depends on private helpers from the core file |
+| `synthetic_width_perc_splits.py` | `src/synthetic_runs/enumerate/sample_widths.py` | Width realization and sampled-network generation |
+| `synthetic_runs` | `src/synthetic_runs/runners/sampled.py` | Keep only runner logic here; extract RAPID prep/helpers out |
+| `synthetic_runs_sensitivity` | `src/synthetic_runs/runners/sensitivity.py` | Keep only sensitivity runner logic here; extract shared code out |
+| `synthetic_network_k_metrics.py` | `src/synthetic_runs/analysis/k_metrics.py` | Post-run K-path analysis |
+| `synthetic_run_level_rf.py` | `src/synthetic_runs/analysis/run_level_rf.py` | Run-level Random Forest analysis |
+
+### Shared RAPID Extraction Targets
+
+| Preserved legacy file | Intended target | Notes |
+| --- | --- | --- |
+| `rapid_run.py` | `../RAPID/src/rapid_tools/engine.py` | Core RAPID routing engine |
+| RAPID prep helpers inside `synthetic_runs` and `synthetic_runs_sensitivity` | `../RAPID/src/rapid_tools/prep.py`, `../RAPID/src/rapid_tools/io.py` | `create_conn_file`, `create_riv_file`, `compute_reach_ratios`, `compute_area_csv`, `create_runoff`, `create_routing_parameters`, `compute_dt_from_K` |
+| `rivernetwork_to_rapid_graph` inside runner files | `../RAPID/src/rapid_tools/adapters/synthetic.py` | Synthetic-specific adapter; keep separate from generic RAPID prep |
+
+### Legacy Archive Only
+
+These should be retained for provenance during the refactor, but they are not
+the intended long-term implementation.
+
+| Preserved legacy file | Planned status | Notes |
+| --- | --- | --- |
+| `synthetic_admissable_networkx.py` | Archive only | Older non-streaming predecessor of `part_save` version |
+| `synthetic.py` | Archive only | Early random generator prototype |
+| `synthetic_det.py` | Archive only | Deterministic prototype |
+| `synthetic_det_reach.py` | Archive only | Reach-based deterministic prototype |
+| `synthetic_reach_width.py` | Archive only | Later reach-width prototype |
+| `admissable_k_one_bif.py` | Archive only | Exploratory predecessor |
+| `admissable_k_1_2_bif.py` | Archive only | Exploratory predecessor |
+| `admissable_multi_bif.py` | Archive only | Exploratory predecessor |
+| `admissable_multi_bif_2.py` | Archive only | Exploratory predecessor |
+| `synthetic_runs_backup` | Archive only | Backup copy |
+| `synthetic_runs.backup_20260206_113807` | Archive only | Backup copy |
+| `synthetic_runs.bak` | Archive only | Broken backup copy |
+| `synthetic_network_k_metrics_backup.py` | Archive only | Backup copy |
+| `rapid_run_back_up.py` | Archive only | Backup copy |
+| `backups/synthetic_runs_20260210_092628.py` | Archive only | Backup snapshot |
+| `backups/synthetic_network_k_metrics_20260210_085741.py` | Archive only | Backup snapshot |
+
+### Legacy Notebook Targets
+
+| Preserved legacy file | Planned status | Notes |
+| --- | --- | --- |
+| `synthetic_admissable_networkx.ipynb` | Keep under `notebooks/legacy/` later | Contains sensitivity recipe provenance |
+| `synthetic_sensitivty.ipynb` | Keep under `notebooks/legacy/` later | Sensitivity post-analysis |
+| `synthetic_data.ipynb` | Keep under `notebooks/legacy/` later | Legacy exploration |
+| `distribution_synth_network.ipynb` | Keep under `notebooks/legacy/` later | Legacy exploration |
+
+## Extraction Order
+
+1. Extract `Params`, `RiverNetworkNX`, recipe IO, and shared metrics from
+   `synthetic_admissable_networkx_part_save.py`.
+2. Extract geometry and width-enumeration modules.
+3. Extract RAPID engine and RAPID prep into `../RAPID/`.
+4. Rebuild the sampled and sensitivity runners on top of those shared modules.
+5. Move analysis utilities.
+6. Only then reorganize the preserved legacy files into an explicit `legacy/`
+   area.
