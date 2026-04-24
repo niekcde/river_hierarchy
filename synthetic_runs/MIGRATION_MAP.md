@@ -113,6 +113,24 @@ Phase 3 note:
   - a tiny sensitivity run using the preserved
     `synthetic_run_sensitivity/networks_sensitivity.jsonl.gz`
 
+Phase 4 note:
+
+- `src/synthetic_runs/core/network.py` now contains the extracted
+  `Params`, `RiverNetworkNX`, and `canonical_signature` implementation
+  instead of importing them from the preserved legacy file
+- the extracted core now directly supports:
+  - corridor instantiation
+  - loop/cross break insertion
+  - width recomputation
+  - recipe round-trips via `to_recipe()` / `from_recipe()`
+  - A/B-invariant canonical signatures
+- Phase 4 smoke checks succeeded for:
+  - a direct `RiverNetworkNX` recipe round-trip with matching signatures
+  - a tiny geometry-realization check through
+    `synthetic_geometric_enumeration.iter_realized_networks_from_geom_recipe`
+  - a tiny width-plan realization through
+    `synthetic_width_perc_splits.realize_geom_with_plan`
+
 ## File-To-Target Map
 
 ### Active Extraction Targets
