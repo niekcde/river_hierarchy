@@ -83,6 +83,18 @@ Phase 1 note:
   artifact for both sampled runs and sensitivity runs, not as an extra hidden
   recipe or a hidden runner-only special case
 
+Phase 2 note:
+
+- shared RAPID engine extracted to `../RAPID/src/rapid_tools/engine.py`
+- shared RAPID prep helpers extracted to `../RAPID/src/rapid_tools/prep.py`
+- synthetic RAPID adapters extracted to
+  `../RAPID/src/rapid_tools/adapters/synthetic.py`
+- the active runner paths in `synthetic_runs` and `synthetic_runs_sensitivity`
+  now call the shared RAPID layer
+- sampled routing outputs now write `run_meta_routing.json`
+- sensitivity outputs now write `run_meta_sensitivity.json` and include
+  `single_edge_control_path` in `grid_manifest.csv`
+
 ## File-To-Target Map
 
 ### Active Extraction Targets

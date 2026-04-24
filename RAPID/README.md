@@ -18,11 +18,19 @@ preparation code used by multiple workflows in this repository.
 
 ## Current Refactor Rule
 
-No legacy RAPID code has been moved here yet. The preserved source of truth is
-still:
+The first shared RAPID extraction pass is now in place:
+
+- `src/rapid_tools/engine.py`
+- `src/rapid_tools/prep.py`
+- `src/rapid_tools/adapters/synthetic.py`
+
+The preserved legacy copies still remain authoritative for backtracking during
+the migration:
 
 - `synthetic_runs/rapid_run.py`
 - the RAPID prep helpers embedded in `synthetic_runs/synthetic_runs`
 - the RAPID prep helpers embedded in `synthetic_runs/synthetic_runs_sensitivity`
 
-Those preserved files will be extracted into this subproject incrementally.
+The current runner paths in `synthetic_runs/` now call the shared modules in
+this subproject, while the embedded legacy helper definitions remain in place as
+reference during the transition.

@@ -17,7 +17,6 @@ import json
 import subprocess
 from glob import glob
 from pathlib import Path 
-from rapid_run import run_rapid
 from synthetic_admissable_networkx_part_save import load_network_by_id
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -30,8 +29,25 @@ except ImportError:  # Fallback: no progress bar if tqdm isn't available.
 _SRC_DIR = Path(__file__).resolve().parent / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
+_RAPID_SRC_DIR = Path(__file__).resolve().parents[1] / "RAPID" / "src"
+if str(_RAPID_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_RAPID_SRC_DIR))
 
 from synthetic_runs.runners import load_single_edge_control, resolve_single_edge_control
+from rapid_tools.engine import run_rapid as rapid_run_engine
+from rapid_tools.prep import (
+    compute_area_csv as rapid_compute_area_csv,
+    compute_dt_from_K as rapid_compute_dt_from_K,
+    compute_reach_ratios as rapid_compute_reach_ratios,
+    create_conn_file as rapid_create_conn_file,
+    create_riv_file as rapid_create_riv_file,
+    create_routing_parameters as rapid_create_routing_parameters,
+    create_runoff as rapid_create_runoff,
+)
+from rapid_tools.adapters.synthetic import (
+    build_single_edge_graph as rapid_build_single_edge_graph,
+    rivernetwork_to_rapid_graph as rapid_rivernetwork_to_rapid_graph,
+)
 
 import duckdb
 directory = '/Users/6256481/Desktop/PhD_icloud/USA_UNC/work/river_hierarchy/synthetic/'
@@ -1078,7 +1094,7 @@ def run_sampled_realizations(
     print('print sampled dir:', sampled_dir, '\n\n')
     run_meta = _load_run_meta(sampled_dir)
     params = run_meta.get("params", {})
-    single_edge_spec, _single_edge_control_used = load_single_edge_control(single_edge_control_path)
+    single_edge_spec, single_edge_control_used = load_single_edge_control(single_edge_control_path)
     single_edge_control = resolve_single_edge_control(single_edge_spec, params)
     summary = _load_summary_table(sampled_dir)
     summary["admissible"] = summary["k_ratio"] <= ((1 - x) / x)
@@ -1131,7 +1147,23 @@ def run_sampled_realizations(
     geom_for[single_edge_id] = int(single_edge_control["geometry_id"])
     if not network_ids:
         raise ValueError("No network_ids selected after maximin sampling.")
-    recipes_path = _pick_recipes_path(sampled_dir)
+    routing_meta = {
+        "sampled_dir": str(sampled_dir),
+        "recipes_path": str(_pick_recipes_path(sampled_dir)),
+        "seed": int(seed),
+        "use_admissible": bool(use_admissible),
+        "output_mode": output_mode,
+        "x": float(x),
+        "max_paths": int(max_paths),
+        "selected_benchmark_ids": [int(i) for i in bench_ids],
+        "selected_non_benchmark_ids": [int(i) for i in non_bench_ids],
+        "selected_network_ids": [int(i) for i in network_ids],
+        "single_edge_control_path": str(single_edge_control_used),
+        "single_edge_control": single_edge_control,
+    }
+    with open(out_dir / "run_meta_routing.json", "w", encoding="utf-8") as f:
+        json.dump(routing_meta, f, indent=2)
+    recipes_path = Path(routing_meta["recipes_path"])
     parquet_writer = None
     if output_mode == "parquet_outlet":
         schema = pa.schema([
@@ -1148,24 +1180,30 @@ def run_sampled_realizations(
     peak_q_rows = []
     for network_id in tqdm(network_ids, total=len(network_ids), desc="Running networks"):
         if int(network_id) == single_edge_id:
-            G = _build_single_edge_graph(
+            G = rapid_build_single_edge_graph(
                 single_edge_control["length_m"],
                 single_edge_control["width_m"],
             )
         else:
             net = load_network_by_id(recipes_path, int(network_id))
-            G = rivernetwork_to_rapid_graph(net)
+            G = rapid_rivernetwork_to_rapid_graph(net)
         work_dir = out_dir / f"network_{int(network_id):06d}"
         work_dir.mkdir(parents=True, exist_ok=True)
-        create_conn_file(G, directory=str(work_dir) + "/")
-        riv_order = create_riv_file(G, directory=str(work_dir) + "/")
-        compute_reach_ratios(G, use_widths=True, directory=str(work_dir) + "/")
-        compute_area_csv(G, directory=str(work_dir) + "/")
+        rapid_create_conn_file(G, directory=str(work_dir) + "/")
+        riv_order = rapid_create_riv_file(G, directory=str(work_dir) + "/")
+        rapid_compute_reach_ratios(G, use_widths=True, directory=str(work_dir) + "/")
+        rapid_compute_area_csv(G, directory=str(work_dir) + "/")
         X = 0.1
-        create_routing_parameters(G, directory=str(work_dir) + "/", xfc_value=X)
-        dt = compute_dt_from_K(str(work_dir) + "/", X, True)
+        rapid_create_routing_parameters(G, directory=str(work_dir) + "/", xfc_value=X)
+        dt = rapid_compute_dt_from_K(str(work_dir) + "/", X, True)
         runOffC, step_duration = build_first_part(dt)
-        times = create_runoff(G, directory=str(work_dir) + "/", dt_seconds=dt, runOffC=runOffC, return_times=True)
+        times = rapid_create_runoff(
+            G,
+            directory=str(work_dir) + "/",
+            dt_seconds=dt,
+            runOffC=runOffC,
+            return_times=True,
+        )
         outlet_reach_id = _find_outlet_reach_id(G)
         outlet_idx = None
         if outlet_reach_id is not None and outlet_reach_id in riv_order:
@@ -1175,7 +1213,7 @@ def run_sampled_realizations(
             out_path.unlink()
         if not os.access(work_dir, os.W_OK):
             raise PermissionError(f"Output directory not writable: {work_dir}")
-        qout_path, qout = run_rapid(
+        qout_path, qout = rapid_run_engine(
             str(work_dir),
             ROUTING_TIMESTEP_SECONDS=dt,
             runType="sampled",
