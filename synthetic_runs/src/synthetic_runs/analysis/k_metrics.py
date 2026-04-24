@@ -1,37 +1,36 @@
+"""K-path metrics for realized synthetic networks."""
+
+from __future__ import annotations
+
 import argparse
 import gzip
 import json
 from pathlib import Path
-import sys
 
+import networkx as nx
 import numpy as np
 import pandas as pd
-import networkx as nx
-
-_SRC_DIR = Path(__file__).resolve().parent / "src"
-if str(_SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(_SRC_DIR))
 
 from synthetic_runs.core import RiverNetworkNX
-from synthetic_runs.analysis.k_metrics import (
-    compute_k_metrics_for_network as _phase5_compute_k_metrics_for_network,
-    compute_metrics as _phase5_compute_metrics,
-    main as _phase5_main,
-)
+
 try:
     from tqdm import tqdm
 except ImportError:  # Fallback: no progress bar if tqdm isn't available.
     class _TqdmFallback:
         def __init__(self, iterable=None, **_kwargs):
             self.iterable = iterable
+
         def __iter__(self):
             if self.iterable is None:
                 return iter(())
             return iter(self.iterable)
+
         def update(self, _n=1):
             return None
+
         def close(self):
             return None
+
     def tqdm(iterable=None, **_kwargs):
         return _TqdmFallback(iterable, **_kwargs)
 
@@ -49,9 +48,11 @@ def compute_k_value(length_m: float, width_m: float) -> float:
     if length_m <= 0 or width_m <= 0:
         return np.nan
     kb = 20
-    S = 1e-3
-    n = 0.35
-    k_value = (3 / 5) * n * ((length_m / (S**0.5)) * ((kb ** (2 / 3)) / (width_m ** (2 / 3))))
+    slope = 1e-3
+    n_manning = 0.35
+    k_value = (3 / 5) * n_manning * (
+        (length_m / (slope**0.5)) * ((kb ** (2 / 3)) / (width_m ** (2 / 3)))
+    )
     return round(float(k_value), 4)
 
 
@@ -61,7 +62,7 @@ def build_k_graph(net) -> tuple[nx.DiGraph, dict, dict]:
     parallel edges. Returns (reach_graph, node_to_out, node_to_in).
     """
     G_src = net.G
-    RG = nx.DiGraph()
+    reach_graph = nx.DiGraph()
     node_to_out = {}
     node_to_in = {}
     for u, v, k, data in G_src.edges(keys=True, data=True):
@@ -73,14 +74,14 @@ def build_k_graph(net) -> tuple[nx.DiGraph, dict, dict]:
         length = float(xv - xu)
         k_val = compute_k_value(length, width)
         edge_id = (u, v, k)
-        RG.add_node(edge_id, K=k_val, u=u, v=v, length=length, width=width)
+        reach_graph.add_node(edge_id, K=k_val, u=u, v=v, length=length, width=width)
         node_to_out.setdefault(u, []).append(edge_id)
         node_to_in.setdefault(v, []).append(edge_id)
-    for edge_id, attrs in RG.nodes(data=True):
+    for edge_id, attrs in reach_graph.nodes(data=True):
         v = attrs["v"]
         for dn in node_to_out.get(v, []):
-            RG.add_edge(edge_id, dn)
-    return RG, node_to_out, node_to_in
+            reach_graph.add_edge(edge_id, dn)
+    return reach_graph, node_to_out, node_to_in
 
 
 def _pick_source(G: nx.DiGraph | nx.MultiDiGraph):
@@ -127,10 +128,7 @@ def _path_length(G: nx.DiGraph, path) -> float:
     return sum(float(G.nodes[r]["K"]) for r in path)
 
 
-def compute_k_metrics_for_network(
-    net,
-    max_paths: int = 100,
-):
+def compute_k_metrics_for_network(net, max_paths: int = 100):
     G_nodes = net.G
     source, source_msg = _pick_source(G_nodes)
     if source is None:
@@ -157,7 +155,6 @@ def compute_k_metrics_for_network(
     if not B_reaches or not C_reaches:
         return None, {"error": "B->C reach set empty"}
 
-    # Subgraph of paths from B to C
     desc = set()
     for r in B_reaches:
         desc |= nx.descendants(RG, r)
@@ -171,12 +168,10 @@ def compute_k_metrics_for_network(
         return None, {"error": "no B->C subgraph nodes"}
     SG = RG.subgraph(sub_nodes).copy()
 
-    # Check for NaN K values in relevant edges
-    for r, data in SG.nodes(data=True):
+    for _r, data in SG.nodes(data=True):
         if np.isnan(data.get("K", np.nan)):
             return None, {"error": "NaN K value encountered"}
 
-    # Min/Max path sums over reach-nodes (node-weighted DAG DP)
     topo = list(nx.topological_sort(SG))
     dist_min = {n: np.inf for n in SG.nodes}
     dist_max = {n: -np.inf for n in SG.nodes}
@@ -199,7 +194,6 @@ def compute_k_metrics_for_network(
     K_min = min(K_min_candidates)
     K_max = max(K_max_candidates)
 
-    # Enumerate paths up to max_paths
     total = 0.0
     n_paths = 0
     exceeded = False
@@ -244,11 +238,7 @@ def compute_k_metrics_for_network(
     return metrics, info
 
 
-def compute_metrics(
-    recipes_path: Path,
-    network_ids: list[int],
-    max_paths: int,
-):
+def compute_metrics(recipes_path: Path, network_ids: list[int], max_paths: int):
     rows = []
     target_ids = set(int(n) for n in network_ids)
     found_ids = set()
@@ -314,13 +304,13 @@ def compute_metrics(
     return pd.DataFrame(rows)
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description="Compute K-path metrics for selected networks.")
     parser.add_argument("--sampled-dir", required=True, help="Directory containing networks.jsonl.gz")
     parser.add_argument("--q-outlet", required=True, help="Path to q_outlet.parquet")
     parser.add_argument("--out", default="k_metrics.csv", help="Output CSV path")
     parser.add_argument("--max-paths", type=int, default=100, help="Max paths before skipping K_avg_path")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     q_outlet_path = Path(args.q_outlet)
     if not q_outlet_path.exists():
@@ -332,21 +322,20 @@ def main():
 
     if not network_ids:
         print("No network_ids found in q_outlet.parquet")
-        sys.exit(1)
+        return 1
 
     print(f"Found {len(network_ids)} unique network_ids from {q_outlet_path}")
     df_out = compute_metrics(recipes_path, network_ids, max_paths=args.max_paths)
     out_path = Path(args.out)
     df_out.to_csv(out_path, index=False)
     print(f"Wrote {len(df_out)} rows to {out_path}")
+    return 0
 
 
-# Keep the legacy implementation above as provenance, but route active use
-# through the extracted Phase 5 package module.
-compute_k_metrics_for_network = _phase5_compute_k_metrics_for_network
-compute_metrics = _phase5_compute_metrics
-main = _phase5_main
-
-
-if __name__ == "__main__":
-    main()
+__all__ = [
+    "build_k_graph",
+    "compute_k_metrics_for_network",
+    "compute_k_value",
+    "compute_metrics",
+    "main",
+]

@@ -9,18 +9,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from synthetic_runs.analysis.run_level_rf import (
-    RunLevelRFResult as _Phase5RunLevelRFResult,
-    canonicalize_run_columns as _phase5_canonicalize_run_columns,
-    merge_edge_summary_features as _phase5_merge_edge_summary_features,
-    prepare_run_level_dataset as _phase5_prepare_run_level_dataset,
-    run_random_forest_from_files as _phase5_run_random_forest_from_files,
-    run_random_forest_regression as _phase5_run_random_forest_regression,
-    save_run_level_result as _phase5_save_run_level_result,
-    summarize_edge_geometry as _phase5_summarize_edge_geometry,
-    main as _phase5_main,
-)
-
 
 MERGE_KEY = ["grid_id", "network_id"]
 OUTPUT_KEY = ["grid_id", "network_id"]
@@ -76,6 +64,7 @@ EDGE_SUMMARY_AGGREGATIONS: dict[str, list[str]] = {
     "length": ["sum", "mean", "max"],
 }
 
+
 @dataclass
 class RunLevelRFResult:
     target: str
@@ -90,6 +79,7 @@ class RunLevelRFResult:
     shap_importance: pd.DataFrame | None = None
     shap_values: pd.DataFrame | None = None
     model: Any | None = None
+
 
 def _read_table(path: str | Path) -> pd.DataFrame:
     path = Path(path)
@@ -173,10 +163,7 @@ def summarize_edge_geometry(edge_df: pd.DataFrame) -> pd.DataFrame:
     grouped = edge_df.groupby(MERGE_KEY, as_index=False)
     summary = grouped.size().rename(columns={"size": "edge_count"})
 
-    agg_summary = (
-        grouped.agg(available_aggs)
-        .reset_index()
-    )
+    agg_summary = grouped.agg(available_aggs).reset_index()
     agg_summary.columns = [
         "_".join(str(part) for part in col if part).rstrip("_")
         if isinstance(col, tuple) else col
@@ -956,18 +943,21 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-# Keep the legacy implementation above as provenance, but route active use
-# through the extracted Phase 5 package module.
-RunLevelRFResult = _Phase5RunLevelRFResult
-canonicalize_run_columns = _phase5_canonicalize_run_columns
-summarize_edge_geometry = _phase5_summarize_edge_geometry
-merge_edge_summary_features = _phase5_merge_edge_summary_features
-prepare_run_level_dataset = _phase5_prepare_run_level_dataset
-run_random_forest_regression = _phase5_run_random_forest_regression
-save_run_level_result = _phase5_save_run_level_result
-run_random_forest_from_files = _phase5_run_random_forest_from_files
-main = _phase5_main
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+__all__ = [
+    "CANONICAL_COLUMN_ALIASES",
+    "DEFAULT_TARGETS",
+    "DESIGNED_CATEGORICAL_FEATURES",
+    "DESIGNED_NUMERIC_FEATURES",
+    "EDGE_SUMMARY_AGGREGATIONS",
+    "MERGE_KEY",
+    "OUTPUT_KEY",
+    "RunLevelRFResult",
+    "canonicalize_run_columns",
+    "main",
+    "merge_edge_summary_features",
+    "prepare_run_level_dataset",
+    "run_random_forest_from_files",
+    "run_random_forest_regression",
+    "save_run_level_result",
+    "summarize_edge_geometry",
+]

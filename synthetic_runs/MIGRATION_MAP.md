@@ -131,6 +131,24 @@ Phase 4 note:
   - a tiny width-plan realization through
     `synthetic_width_perc_splits.realize_geom_with_plan`
 
+Phase 5 note:
+
+- K-path analysis is now extracted to
+  `src/synthetic_runs/analysis/k_metrics.py`
+- run-level Random Forest analysis is now extracted to
+  `src/synthetic_runs/analysis/run_level_rf.py`
+- `src/synthetic_runs/analysis/__init__.py` now exposes the extracted
+  analysis entry points alongside the plotting helpers
+- the preserved legacy top-level analysis files
+  `synthetic_network_k_metrics.py` and `synthetic_run_level_rf.py` still
+  contain the old implementations for provenance, but their active entry
+  points are now aliased to the extracted package modules
+- Phase 5 smoke checks succeeded for:
+  - `compute_metrics(...)` on the tiny sampled fixture in
+    `synthetic_runs/outputs/test_phase_1/sampled_small`
+  - `run_random_forest_regression(...)` on a small synthetic run-level
+    dataset with realized edge summaries in the `UNC` environment
+
 ## File-To-Target Map
 
 ### Active Extraction Targets
