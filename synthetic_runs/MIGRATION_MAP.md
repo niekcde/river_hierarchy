@@ -95,6 +95,24 @@ Phase 2 note:
 - sensitivity outputs now write `run_meta_sensitivity.json` and include
   `single_edge_control_path` in `grid_manifest.csv`
 
+Phase 3 note:
+
+- sampled runner logic is now extracted to
+  `src/synthetic_runs/runners/sampled.py`
+- sensitivity runner logic is now extracted to
+  `src/synthetic_runs/runners/sensitivity.py`
+- shared runner helpers live in `src/synthetic_runs/runners/shared.py`
+- `src/synthetic_runs/runners/__init__.py` now exposes lazy package entry
+  points for `run_sampled_realizations` and `run_sensitivity_grid`
+- the preserved legacy top-level files `synthetic_runs` and
+  `synthetic_runs_sensitivity` still contain the old implementations for
+  provenance, but their active entry points are now aliased to the extracted
+  package modules
+- Phase 3 smoke checks succeeded through the extracted modules for:
+  - a tiny sampled run using `synthetic_runs/outputs/test_phase_1/sampled_small`
+  - a tiny sensitivity run using the preserved
+    `synthetic_run_sensitivity/networks_sensitivity.jsonl.gz`
+
 ## File-To-Target Map
 
 ### Active Extraction Targets

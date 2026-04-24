@@ -35,6 +35,8 @@ if str(_RAPID_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_RAPID_SRC_DIR))
 
 from synthetic_runs.runners import load_single_edge_control, resolve_single_edge_control
+from synthetic_runs.runners.sampled import run_sampled_realizations as _phase3_run_sampled_realizations
+from synthetic_runs.runners.sensitivity import run_sensitivity_grid as _phase3_run_sensitivity_grid
 from rapid_tools.engine import run_rapid as rapid_run_engine
 from rapid_tools.prep import (
     compute_area_csv as rapid_compute_area_csv,
@@ -2126,6 +2128,12 @@ def run_main(valList,
     reach_break = 1,             
     network_setting = 'random'):    
     raise RuntimeError(        "Legacy synthetic generator workflow disabled. Use run_sampled_realizations() "        "with recipe outputs from synthetic_width_perc_splits."    )
+
+
+# Keep the legacy implementations above as provenance, but route active use
+# through the extracted Phase 3 package modules.
+run_sampled_realizations = _phase3_run_sampled_realizations
+run_sensitivity_grid = _phase3_run_sensitivity_grid
 
 # "/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_5_geom/sampled_realizations"
 
