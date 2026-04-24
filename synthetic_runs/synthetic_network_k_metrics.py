@@ -8,7 +8,11 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 
-from synthetic_admissable_networkx_part_save import RiverNetworkNX
+_SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from synthetic_runs.core import RiverNetworkNX
 try:
     from tqdm import tqdm
 except ImportError:  # Fallback: no progress bar if tqdm isn't available.

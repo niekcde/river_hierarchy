@@ -10,6 +10,7 @@ import numpy as np
 import netCDF4
 import os
 import shutil
+import sys
 from datetime import datetime, UTC, timedelta
 import io
 import json
@@ -25,6 +26,12 @@ try:
 except ImportError:  # Fallback: no progress bar if tqdm isn't available.
     def tqdm(iterable, **_kwargs):
         return iterable
+
+_SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from synthetic_runs.runners import load_single_edge_control, resolve_single_edge_control
 
 import duckdb
 directory = '/Users/6256481/Desktop/PhD_icloud/USA_UNC/work/river_hierarchy/synthetic/'
@@ -1058,11 +1065,12 @@ def run_sampled_realizations(
     maximin_log_cols: tuple = ("k_mean",),
     maximin_start: str = "extreme",
     max_paths: int = 100,
+    single_edge_control_path: str | Path | None = None,
     ):
     """
     Sample admissible networks from summary using maximin selection on
     (k_mean, ebi_mean). Benchmarks and non-benchmarks are sampled
-    independently, then combined.
+    independently, then combined with the explicit single-edge control artifact.
     """
     sampled_dir = Path(sampled_dir)
     out_dir     = Path(out_dir)
@@ -1070,12 +1078,8 @@ def run_sampled_realizations(
     print('print sampled dir:', sampled_dir, '\n\n')
     run_meta = _load_run_meta(sampled_dir)
     params = run_meta.get("params", {})
-    single_length = float(params.get("L", np.nan))
-    single_width = float(params.get("W_total", np.nan))
-    if not np.isfinite(single_length) or not np.isfinite(single_width):
-        raise ValueError("run_meta_sampling.json missing params L and/or W_total")
-    if single_length <= 0 or single_width <= 0:
-        raise ValueError("run_meta_sampling.json params L and W_total must be > 0")
+    single_edge_spec, _single_edge_control_used = load_single_edge_control(single_edge_control_path)
+    single_edge_control = resolve_single_edge_control(single_edge_spec, params)
     summary = _load_summary_table(sampled_dir)
     summary["admissible"] = summary["k_ratio"] <= ((1 - x) / x)
     # print(summary.shape[0])
@@ -1116,11 +1120,15 @@ def run_sampled_realizations(
     for nid in non_bench_ids:
         network_ids.append(int(nid))
         sample_types[int(nid)] = "non_benchmark"
-    single_edge_id = -1
+    single_edge_id = int(single_edge_control["network_id"])
+    if single_edge_id in network_ids:
+        raise ValueError(
+            f"Single-edge control network_id={single_edge_id} collides with sampled selection."
+        )
     if single_edge_id not in network_ids:
         network_ids.append(single_edge_id)
-    sample_types[single_edge_id] = "single_edge"
-    geom_for[single_edge_id] = -1
+    sample_types[single_edge_id] = str(single_edge_control["sample_type"])
+    geom_for[single_edge_id] = int(single_edge_control["geometry_id"])
     if not network_ids:
         raise ValueError("No network_ids selected after maximin sampling.")
     recipes_path = _pick_recipes_path(sampled_dir)
@@ -1140,7 +1148,10 @@ def run_sampled_realizations(
     peak_q_rows = []
     for network_id in tqdm(network_ids, total=len(network_ids), desc="Running networks"):
         if int(network_id) == single_edge_id:
-            G = _build_single_edge_graph(single_length, single_width)
+            G = _build_single_edge_graph(
+                single_edge_control["length_m"],
+                single_edge_control["width_m"],
+            )
         else:
             net = load_network_by_id(recipes_path, int(network_id))
             G = rivernetwork_to_rapid_graph(net)

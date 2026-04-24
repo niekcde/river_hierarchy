@@ -9,13 +9,29 @@ import math
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from synthetic_admissable_networkx_part_save import Params, _json_default, _grid_values, _crosses_intersect, _cross_loop_intersect,\
-    _disjoint, RiverNetworkNX, k_stats_from_graph, _iter_width_splits_two, _merge_summary_parts, admissable
+_SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from synthetic_runs.core import (
+    Params,
+    RiverNetworkNX,
+    _cross_loop_intersect,
+    _crosses_intersect,
+    _disjoint,
+    _grid_values,
+    _iter_width_splits_two,
+    _json_default,
+    _merge_summary_parts,
+    admissable,
+    k_stats_from_graph,
+)
 
 # ------------------------------------------------------------------
 # 1) Standalone legality (extracts your method logic to work on lists)

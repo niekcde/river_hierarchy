@@ -1,0 +1,16 @@
+{
+  "control_type": "single_edge",
+  "network_id": -1,
+  "geometry_id": -1,
+  "sample_type": "single_edge",
+  "network_type": "single_edge",
+  "length_source": {
+    "kind": "meta_field",
+    "field": "L"
+  },
+  "width_source": {
+    "kind": "meta_field",
+    "field": "W_total"
+  },
+  "notes": "Explicit baseline control for sampled and sensitivity workflows. This control is not part of the 7 structural sensitivity recipes."
+}

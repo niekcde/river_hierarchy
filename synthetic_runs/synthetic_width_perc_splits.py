@@ -6,13 +6,28 @@ import random
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from synthetic_admissable_networkx_part_save import Params, x_midpoints, edges_spanning_x, ebi, compute_k, _edge_uid,\
-    k_stats_from_graph, RiverNetworkNX, canonical_signature, _json_default
+_SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from synthetic_runs.core import (
+    Params,
+    RiverNetworkNX,
+    _edge_uid,
+    _json_default,
+    canonical_signature,
+    compute_k,
+    ebi,
+    edges_spanning_x,
+    k_stats_from_graph,
+    x_midpoints,
+)
 # ------------------------------------------------------------
 # EBI min/mean/max (uses your existing helpers x_midpoints, edges_spanning_x, ebi)
 # ------------------------------------------------------------

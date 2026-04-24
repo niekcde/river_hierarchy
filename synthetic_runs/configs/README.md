@@ -8,3 +8,5 @@ Examples to add during extraction:
 - width sampling settings
 - sampled-run settings
 - sensitivity grid settings
+- `single_edge_control.json`: explicit baseline control shared by sampled and
+  sensitivity workflows

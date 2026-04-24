@@ -40,6 +40,15 @@ validate the first refactor pass:
 - `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/run_regime.csv`
 - `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/edge_full2.csv`
 
+Recipe fixture anchors:
+
+- `synthetic_run_sensitivity/networks_sensitivity.jsonl.gz`
+  rows: `7`
+  sha256: `45a0dc374916ee92809c79645afbf2d4cdbd3394d92a8f4f6858726fd13e15b2`
+- `synthetic_run_5_geom/sampled_realizations/networks.jsonl.gz`
+  rows: `4399771`
+  sha256: `6c5edd9c7bddda0f7845a32736872d098cc0026f963de2baad02e64c267caf18`
+
 ## Sensitivity Provenance
 
 The first sensitivity recipe set is notebook-derived.
@@ -50,13 +59,29 @@ The first sensitivity recipe set is notebook-derived.
   `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/networks_sensitivity.jsonl.gz`
 - Current preserved count:
   `7` recipes
+- Those `7` recipes are the structural sensitivity set only:
+  `2` loop, `3` cross, `2` no-break
 - Execution script:
   `synthetic_runs/synthetic_runs_sensitivity`
 - Post-analysis notebook:
   `synthetic_runs/synthetic_sensitivty.ipynb`
+- Explicit baseline control artifact:
+  `synthetic_runs/configs/single_edge_control.json`
 
 Important: the notebook contains stale cell outputs, so provenance should be
 checked against the generated files above, not notebook output displays.
+
+Phase 1 note:
+
+- helper, metric, and recipe IO functions are being extracted into
+  `src/synthetic_runs/core/`
+- `RiverNetworkNX`, `Params`, and `canonical_signature` remain compatibility
+  exports backed by the preserved legacy implementation during the first pass
+- `src/synthetic_runs/runners/sensitivity_recipes.py` reproduces the preserved
+  `networks_sensitivity.jsonl.gz` fixture exactly
+- the separate single-edge baseline is now treated as a shared explicit control
+  artifact for both sampled runs and sensitivity runs, not as an extra hidden
+  recipe or a hidden runner-only special case
 
 ## File-To-Target Map
 
@@ -69,6 +94,7 @@ checked against the generated files above, not notebook output displays.
 | `synthetic_width_perc_splits.py` | `src/synthetic_runs/enumerate/sample_widths.py` | Width realization and sampled-network generation |
 | `synthetic_runs` | `src/synthetic_runs/runners/sampled.py` | Keep only runner logic here; extract RAPID prep/helpers out |
 | `synthetic_runs_sensitivity` | `src/synthetic_runs/runners/sensitivity.py` | Keep only sensitivity runner logic here; extract shared code out |
+| shared single-edge control in sampled/sensitivity runners | `configs/single_edge_control.json`, `src/synthetic_runs/runners/controls.py` | Explicit baseline control artifact; remains distinct from the 7 structural sensitivity recipes |
 | `synthetic_network_k_metrics.py` | `src/synthetic_runs/analysis/k_metrics.py` | Post-run K-path analysis |
 | `synthetic_run_level_rf.py` | `src/synthetic_runs/analysis/run_level_rf.py` | Run-level Random Forest analysis |
 

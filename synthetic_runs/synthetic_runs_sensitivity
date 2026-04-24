@@ -10,6 +10,7 @@ import numpy as np
 import netCDF4
 import os
 import shutil
+import sys
 from datetime import datetime, UTC, timedelta
 import io
 import json
@@ -26,6 +27,12 @@ try:
 except ImportError:  # Fallback: no progress bar if tqdm isn't available.
     def tqdm(iterable, **_kwargs):
         return iterable
+
+_SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from synthetic_runs.runners import load_single_edge_control, resolve_single_edge_control
 
 import duckdb
 directory = '/Users/6256481/Desktop/PhD_icloud/USA_UNC/work/river_hierarchy/synthetic/'
@@ -1178,11 +1185,12 @@ def run_sampled_realizations(
     maximin_log_cols: tuple = ("k_mean",),
     maximin_start: str = "extreme",
     max_paths: int = 100,
+    single_edge_control_path: str | Path | None = None,
     ):
     """
     Sample admissible networks from summary using maximin selection on
     (k_mean, ebi_mean). Benchmarks and non-benchmarks are sampled
-    independently, then combined.
+    independently, then combined with the explicit single-edge control artifact.
     """
     sampled_dir = Path(sampled_dir)
     out_dir     = Path(out_dir)
@@ -1190,12 +1198,8 @@ def run_sampled_realizations(
     print('print sampled dir:', sampled_dir, '\n\n')
     run_meta = _load_run_meta(sampled_dir)
     params = run_meta.get("params", {})
-    single_length = float(params.get("L", np.nan))
-    single_width = float(params.get("W_total", np.nan))
-    if not np.isfinite(single_length) or not np.isfinite(single_width):
-        raise ValueError("run_meta_sampling.json missing params L and/or W_total")
-    if single_length <= 0 or single_width <= 0:
-        raise ValueError("run_meta_sampling.json params L and W_total must be > 0")
+    single_edge_spec, _single_edge_control_used = load_single_edge_control(single_edge_control_path)
+    single_edge_control = resolve_single_edge_control(single_edge_spec, params)
     summary = _load_summary_table(sampled_dir)
     summary["admissible"] = summary["k_ratio"] <= ((1 - x) / x)
     # print(summary.shape[0])
@@ -1236,11 +1240,15 @@ def run_sampled_realizations(
     for nid in non_bench_ids:
         network_ids.append(int(nid))
         sample_types[int(nid)] = "non_benchmark"
-    single_edge_id = -1
+    single_edge_id = int(single_edge_control["network_id"])
+    if single_edge_id in network_ids:
+        raise ValueError(
+            f"Single-edge control network_id={single_edge_id} collides with sampled selection."
+        )
     if single_edge_id not in network_ids:
         network_ids.append(single_edge_id)
-    sample_types[single_edge_id] = "single_edge"
-    geom_for[single_edge_id] = -1
+    sample_types[single_edge_id] = str(single_edge_control["sample_type"])
+    geom_for[single_edge_id] = int(single_edge_control["geometry_id"])
     if not network_ids:
         raise ValueError("No network_ids selected after maximin sampling.")
     recipes_path = _pick_recipes_path(sampled_dir)
@@ -1260,7 +1268,10 @@ def run_sampled_realizations(
     peak_q_rows = []
     for network_id in tqdm(network_ids, total=len(network_ids), desc="Running networks"):
         if int(network_id) == single_edge_id:
-            G = _build_single_edge_graph(single_length, single_width)
+            G = _build_single_edge_graph(
+                single_edge_control["length_m"],
+                single_edge_control["width_m"],
+            )
         else:
             net = load_network_by_id(recipes_path, int(network_id))
             G = rivernetwork_to_rapid_graph(net)
@@ -1388,13 +1399,14 @@ def run_sensitivity_grid(
     peak_values: list[float],
     baseflow_values: list[float],
     x: float = 0.1,
-    include_single_edge: bool = True,
+    single_edge_control_path: str | Path | None = None,
     keep_intermediate: bool = False,
     write_netcdf: bool = False,
     max_paths: int = 100,
     ):
     """
-    Sensitivity grid runner with per-network targeting logic and automatic dedup.
+    Sensitivity grid runner with per-network targeting logic, automatic dedup,
+    and an explicit single-edge control artifact.
     """
     recipes_path = Path(recipes_path)
     out_dir = Path(out_dir)
@@ -1409,14 +1421,13 @@ def run_sensitivity_grid(
             continue
         recipe_for[nid] = load_recipe_by_id(recipes_path, nid)
 
-    # derive single-edge length/width from first recipe
+    # resolve the explicit single-edge control against recipe metadata
     if recipe_for:
         meta0 = next(iter(recipe_for.values())).get("meta", {})
-        single_length = float(meta0.get("L", 0.0))
-        single_width = float(meta0.get("W_total", 0.0))
+        single_edge_spec, _single_edge_control_used = load_single_edge_control(single_edge_control_path)
+        single_edge_control = resolve_single_edge_control(single_edge_spec, meta0)
     else:
-        single_length = 0.0
-        single_width = 0.0
+        raise ValueError("At least one structural recipe is required to resolve the single-edge control.")
 
     # grid configs with dedup
     all_configs = []
@@ -1529,29 +1540,33 @@ def run_sensitivity_grid(
                                     )
                                     add_cfg(cfg, sym_branch=sym_branch, sym_loop=sym_loop)
 
-    if include_single_edge:
-        nid = -1
-        for kb in kb_values:
-            for S_global in slope_values:
-                for forcing_hours in forcing_hours_values:
-                    for fall_hours in fall_hours_values:
-                        for peak in peak_values:
-                            for baseflow in baseflow_values:
-                                cfg = dict(
-                                    network_id=nid,
-                                    network_type="single_edge",
-                                    kb=float(kb),
-                                    S_global=float(S_global),
-                                    S_local=float(S_global),
-                                    sinuosity=1.0,
-                                    forcing_hours=float(forcing_hours),
-                                    fall_hours=float(fall_hours),
-                                    peak=float(peak),
-                                    baseflow=float(baseflow),
-                                    slope_target=None,
-                                    sinuosity_target=None,
-                                )
-                                add_cfg(cfg, sym_branch=False, sym_loop=False)
+    single_edge_id = int(single_edge_control["network_id"])
+    if any(int(nid) == single_edge_id for nid in network_ids):
+        raise ValueError(
+            f"Single-edge control network_id={single_edge_id} collides with structural sensitivity network_ids."
+        )
+    nid = single_edge_id
+    for kb in kb_values:
+        for S_global in slope_values:
+            for forcing_hours in forcing_hours_values:
+                for fall_hours in fall_hours_values:
+                    for peak in peak_values:
+                        for baseflow in baseflow_values:
+                            cfg = dict(
+                                network_id=nid,
+                                network_type=str(single_edge_control["network_type"]),
+                                kb=float(kb),
+                                S_global=float(S_global),
+                                S_local=float(S_global),
+                                sinuosity=1.0,
+                                forcing_hours=float(forcing_hours),
+                                fall_hours=float(fall_hours),
+                                peak=float(peak),
+                                baseflow=float(baseflow),
+                                slope_target=None,
+                                sinuosity_target=None,
+                            )
+                            add_cfg(cfg, sym_branch=False, sym_loop=False)
 
     # assign grid_id
     for grid_id, cfg in enumerate(all_configs, start=1):
@@ -1635,12 +1650,13 @@ def run_sensitivity_grid(
         peak_val = float(cfg["peak"])
         baseflow_val = float(cfg["baseflow"])
 
-        if nid < 0:
-            if single_length <= 0 or single_width <= 0:
-                raise ValueError("Single-edge length/width not available.")
-            G = _build_single_edge_graph(single_length, single_width)
-            geometry_id = -1
-            sample_type = "single_edge"
+        if nid == single_edge_id:
+            G = _build_single_edge_graph(
+                single_edge_control["length_m"],
+                single_edge_control["width_m"],
+            )
+            geometry_id = int(single_edge_control["geometry_id"])
+            sample_type = str(single_edge_control["sample_type"])
         else:
             recipe = recipe_for[nid]
             net = load_network_by_id(recipes_path, nid)
@@ -2073,7 +2089,7 @@ if __name__ == "__main__":
         fall_hours_values=[16],
         peak_values=[1e-5],
         baseflow_values=[3e-8,4e-8, 5e-8, 6e-8],
-        include_single_edge=True,
+        single_edge_control_path=Path(__file__).resolve().parent / "configs" / "single_edge_control.json",
         x = 0.1
     )
     # run_sensitivity_grid(
@@ -2085,6 +2101,6 @@ if __name__ == "__main__":
     #     sinuosity_values=[1.0, 1.2, 1.4],
     #     forcing_hours_values=[8, 10, 12],
     #     peak_values=[5e-10],
-    #     include_single_edge=True,
+    #     single_edge_control_path=Path(__file__).resolve().parent / "configs" / "single_edge_control.json",
     # )
     # )
