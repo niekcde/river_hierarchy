@@ -3,16 +3,19 @@
 This subproject is being reorganized from the legacy synthetic-network code
 copied from the old `river_hierarchy` repository.
 
-For the first refactor pass, the legacy source files remain preserved at the
-top level of this folder. No legacy file has been moved yet. New code should be
-placed under `src/` and extracted incrementally from those preserved files.
+The active package extraction is now in place. Archive-only legacy material has
+been moved into `legacy/`, while active wrapper/provenance files that still
+anchor the working pipeline remain at the top level of this folder.
 
 ## Current Refactor Rule
 
-- Treat the top-level legacy files in this folder as the provenance source.
+- Treat `legacy/` as the archive area for retired prototype and backup code.
+- Treat the remaining top-level wrapper/provenance files as the active bridge
+  layer until they are retired.
 - Extract code into `src/` in small steps.
-- Do not delete or rename legacy files until the extracted module has been
-  validated and the provenance is recorded in `MIGRATION_MAP.md`.
+- Do not delete preserved legacy material; move it into `legacy/` once it is no
+  longer needed as an active top-level bridge and record the move in
+  `MIGRATION_MAP.md`.
 
 ## Target Structure
 
@@ -21,6 +24,7 @@ synthetic_runs/
   README.md
   MIGRATION_MAP.md
   configs/
+  legacy/
   notebooks/
   sensitivity/
     configs/
@@ -39,6 +43,8 @@ synthetic_runs/
 - `runners/`: regular sampled runs and sensitivity runs
 - `analysis/`: post-run metrics and modeling
 - `sensitivity/`: configs and run-specific docs for the sensitivity workflow
+- `legacy/`: archive-only notebooks, prototypes, backups, and preserved RAPID
+  snapshots
 
 The shared RAPID engine and RAPID file-prep code are being split into the
 top-level `../RAPID/` subproject so they can be reused by both synthetic runs

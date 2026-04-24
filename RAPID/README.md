@@ -27,7 +27,7 @@ The first shared RAPID extraction pass is now in place:
 The preserved legacy copies still remain authoritative for backtracking during
 the migration:
 
-- `synthetic_runs/rapid_run.py`
+- `synthetic_runs/legacy/rapid/rapid_run.py`
 - the RAPID prep helpers embedded in `synthetic_runs/synthetic_runs`
 - the RAPID prep helpers embedded in `synthetic_runs/synthetic_runs_sensitivity`
 

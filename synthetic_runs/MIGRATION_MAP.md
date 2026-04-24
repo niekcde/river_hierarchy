@@ -6,7 +6,8 @@ is intended to land during the refactor.
 ## Provenance Rule
 
 Until extraction is complete, the authoritative preserved legacy copies are the
-files currently stored directly under `synthetic_runs/`.
+archive material under `synthetic_runs/legacy/` plus the remaining top-level
+wrapper/provenance files that still bridge active workflows to extracted code.
 
 Their historical source was:
 
@@ -54,7 +55,7 @@ Recipe fixture anchors:
 The first sensitivity recipe set is notebook-derived.
 
 - Recipe construction notebook source:
-  `synthetic_runs/synthetic_admissable_networkx.ipynb`
+  `synthetic_runs/legacy/notebooks/synthetic_admissable_networkx.ipynb`
 - Output recipe file:
   `/Volumes/PhD/river_hierarchy/output/synthetic_network/synthetic_run_sensitivity/networks_sensitivity.jsonl.gz`
 - Current preserved count:
@@ -64,7 +65,7 @@ The first sensitivity recipe set is notebook-derived.
 - Execution script:
   `synthetic_runs/synthetic_runs_sensitivity`
 - Post-analysis notebook:
-  `synthetic_runs/synthetic_sensitivty.ipynb`
+  `synthetic_runs/legacy/notebooks/synthetic_sensitivty.ipynb`
 - Explicit baseline control artifact:
   `synthetic_runs/configs/single_edge_control.json`
 
@@ -149,6 +150,19 @@ Phase 5 note:
   - `run_random_forest_regression(...)` on a small synthetic run-level
     dataset with realized edge summaries in the `UNC` environment
 
+Phase 6 note:
+
+- archive-only prototype scripts have been moved under
+  `synthetic_runs/legacy/prototypes/`
+- legacy notebooks have been moved under
+  `synthetic_runs/legacy/notebooks/`
+- backup copies and snapshots have been moved under
+  `synthetic_runs/legacy/backups/`
+- preserved RAPID source snapshots have been moved under
+  `synthetic_runs/legacy/rapid/`
+- active wrapper/provenance files remain at the top level of
+  `synthetic_runs/` so the working pipeline and smoke tests are unchanged
+
 ## File-To-Target Map
 
 ### Active Extraction Targets
@@ -168,7 +182,7 @@ Phase 5 note:
 
 | Preserved legacy file | Intended target | Notes |
 | --- | --- | --- |
-| `rapid_run.py` | `../RAPID/src/rapid_tools/engine.py` | Core RAPID routing engine |
+| `legacy/rapid/rapid_run.py` | `../RAPID/src/rapid_tools/engine.py` | Core RAPID routing engine |
 | RAPID prep helpers inside `synthetic_runs` and `synthetic_runs_sensitivity` | `../RAPID/src/rapid_tools/prep.py`, `../RAPID/src/rapid_tools/io.py` | `create_conn_file`, `create_riv_file`, `compute_reach_ratios`, `compute_area_csv`, `create_runoff`, `create_routing_parameters`, `compute_dt_from_K` |
 | `rivernetwork_to_rapid_graph` inside runner files | `../RAPID/src/rapid_tools/adapters/synthetic.py` | Synthetic-specific adapter; keep separate from generic RAPID prep |
 
@@ -179,31 +193,31 @@ the intended long-term implementation.
 
 | Preserved legacy file | Planned status | Notes |
 | --- | --- | --- |
-| `synthetic_admissable_networkx.py` | Archive only | Older non-streaming predecessor of `part_save` version |
-| `synthetic.py` | Archive only | Early random generator prototype |
-| `synthetic_det.py` | Archive only | Deterministic prototype |
-| `synthetic_det_reach.py` | Archive only | Reach-based deterministic prototype |
-| `synthetic_reach_width.py` | Archive only | Later reach-width prototype |
-| `admissable_k_one_bif.py` | Archive only | Exploratory predecessor |
-| `admissable_k_1_2_bif.py` | Archive only | Exploratory predecessor |
-| `admissable_multi_bif.py` | Archive only | Exploratory predecessor |
-| `admissable_multi_bif_2.py` | Archive only | Exploratory predecessor |
-| `synthetic_runs_backup` | Archive only | Backup copy |
-| `synthetic_runs.backup_20260206_113807` | Archive only | Backup copy |
-| `synthetic_runs.bak` | Archive only | Broken backup copy |
-| `synthetic_network_k_metrics_backup.py` | Archive only | Backup copy |
-| `rapid_run_back_up.py` | Archive only | Backup copy |
-| `backups/synthetic_runs_20260210_092628.py` | Archive only | Backup snapshot |
-| `backups/synthetic_network_k_metrics_20260210_085741.py` | Archive only | Backup snapshot |
+| `legacy/prototypes/synthetic_admissable_networkx.py` | Archive only | Older non-streaming predecessor of `part_save` version |
+| `legacy/prototypes/synthetic.py` | Archive only | Early random generator prototype |
+| `legacy/prototypes/synthetic_det.py` | Archive only | Deterministic prototype |
+| `legacy/prototypes/synthetic_det_reach.py` | Archive only | Reach-based deterministic prototype |
+| `legacy/prototypes/synthetic_reach_width.py` | Archive only | Later reach-width prototype |
+| `legacy/prototypes/admissable_k_one_bif.py` | Archive only | Exploratory predecessor |
+| `legacy/prototypes/admissable_k_1_2_bif.py` | Archive only | Exploratory predecessor |
+| `legacy/prototypes/admissable_multi_bif.py` | Archive only | Exploratory predecessor |
+| `legacy/prototypes/admissable_multi_bif_2.py` | Archive only | Exploratory predecessor |
+| `legacy/backups/synthetic_runs_backup` | Archive only | Backup copy |
+| `legacy/backups/synthetic_runs.backup_20260206_113807` | Archive only | Backup copy |
+| `legacy/backups/synthetic_runs.bak` | Archive only | Broken backup copy |
+| `legacy/backups/synthetic_network_k_metrics_backup.py` | Archive only | Backup copy |
+| `legacy/rapid/rapid_run_back_up.py` | Archive only | Backup copy |
+| `legacy/backups/synthetic_runs_20260210_092628.py` | Archive only | Backup snapshot |
+| `legacy/backups/synthetic_network_k_metrics_20260210_085741.py` | Archive only | Backup snapshot |
 
 ### Legacy Notebook Targets
 
 | Preserved legacy file | Planned status | Notes |
 | --- | --- | --- |
-| `synthetic_admissable_networkx.ipynb` | Keep under `notebooks/legacy/` later | Contains sensitivity recipe provenance |
-| `synthetic_sensitivty.ipynb` | Keep under `notebooks/legacy/` later | Sensitivity post-analysis |
-| `synthetic_data.ipynb` | Keep under `notebooks/legacy/` later | Legacy exploration |
-| `distribution_synth_network.ipynb` | Keep under `notebooks/legacy/` later | Legacy exploration |
+| `legacy/notebooks/synthetic_admissable_networkx.ipynb` | Archive only | Contains sensitivity recipe provenance |
+| `legacy/notebooks/synthetic_sensitivty.ipynb` | Archive only | Sensitivity post-analysis |
+| `legacy/notebooks/synthetic_data.ipynb` | Archive only | Legacy exploration |
+| `legacy/notebooks/distribution_synth_network.ipynb` | Archive only | Legacy exploration |
 
 ## Extraction Order
 
@@ -213,5 +227,5 @@ the intended long-term implementation.
 3. Extract RAPID engine and RAPID prep into `../RAPID/`.
 4. Rebuild the sampled and sensitivity runners on top of those shared modules.
 5. Move analysis utilities.
-6. Only then reorganize the preserved legacy files into an explicit `legacy/`
-   area.
+6. Reorganize archive-only files into an explicit `legacy/` area while keeping
+   the active wrapper/provenance layer stable.
