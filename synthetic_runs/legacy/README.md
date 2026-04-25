@@ -5,6 +5,8 @@ active synthetic pipeline, but is still kept for provenance and backtracking.
 
 Structure:
 
+- `reference/`
+  Preserved reference implementations that used to sit at the top level.
 - `prototypes/`
   Early synthetic generators and exploratory admissibility scripts.
 - `notebooks/`

@@ -23,8 +23,10 @@ anchor the working pipeline remain at the top level of this folder.
 synthetic_runs/
   README.md
   MIGRATION_MAP.md
+  RUNBOOK.md
   configs/
   legacy/
+    reference/
   notebooks/
   regular/
     configs/
@@ -48,8 +50,10 @@ synthetic_runs/
 - `pipelines/`: config-driven operational entry points for workflow steps
 - `regular/`: configs and shell wrappers for the regular synthetic workflow
 - `sensitivity/`: configs and run-specific docs for the sensitivity workflow
-- `legacy/`: archive-only notebooks, prototypes, backups, and preserved RAPID
-  snapshots
+- `legacy/`: archive-only notebooks, prototypes, backups, preserved reference
+  implementations, and preserved RAPID snapshots
+- `RUNBOOK.md`: current operational commands for the extracted regular and
+  sensitivity workflows
 
 The shared RAPID engine and RAPID file-prep code are being split into the
 top-level `../RAPID/` subproject so they can be reused by both synthetic runs

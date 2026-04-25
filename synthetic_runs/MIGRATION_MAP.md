@@ -193,6 +193,15 @@ Phase 8 note:
 - the downstream notebook-dependent analysis tail is still preserved separately
   and is not yet part of the config-driven shell wrappers
 
+Phase 9 note:
+
+- the preserved all-in-one reference file has been moved to
+  `synthetic_runs/legacy/reference/synthetic_admissable_networkx_part_save.py`
+- the top-level file `synthetic_admissable_networkx_part_save.py` is now a
+  compatibility wrapper over that preserved reference
+- `synthetic_runs/RUNBOOK.md` now records the current extracted regular and
+  sensitivity execution steps and commands
+
 ## Current Pipeline Steps
 
 These are the intended workflow steps after the refactor so the operational
@@ -229,7 +238,7 @@ eighth sensitivity recipe.
 
 | Preserved legacy file | Intended target | Notes |
 | --- | --- | --- |
-| `synthetic_admissable_networkx_part_save.py` | `src/synthetic_runs/core/network.py`, `src/synthetic_runs/core/recipes.py`, `src/synthetic_runs/core/metrics.py` | Main keeper for `Params`, `RiverNetworkNX`, streamed summaries, recipe IO |
+| `synthetic_admissable_networkx_part_save.py` | `src/synthetic_runs/core/network.py`, `src/synthetic_runs/core/recipes.py`, `src/synthetic_runs/core/metrics.py` | Preserved reference moved to `legacy/reference/`; top-level file is now a compatibility wrapper |
 | `synthetic_geometric_enumeration.py` | `src/synthetic_runs/enumerate/geometry.py` | Active implementation extracted; top-level file is now a compatibility wrapper |
 | `synthetic_width_perc_splits.py` | `src/synthetic_runs/enumerate/sample_widths.py` | Active implementation extracted; top-level file is now a compatibility wrapper |
 | `synthetic_runs` | `src/synthetic_runs/runners/sampled.py` | Keep only runner logic here; extract RAPID prep/helpers out |
