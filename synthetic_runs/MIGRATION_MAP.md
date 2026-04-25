@@ -163,6 +163,36 @@ Phase 6 note:
 - active wrapper/provenance files remain at the top level of
   `synthetic_runs/` so the working pipeline and smoke tests are unchanged
 
+## Current Pipeline Steps
+
+These are the intended workflow steps after the refactor so the operational
+pipeline is explicit, not notebook-only.
+
+### Regular Synthetic
+
+1. Build geometry recipes.
+2. Realize or sample widths on those geometries.
+3. Keep the explicit single-edge control separate.
+4. Select routing targets from the realized networks.
+5. Run RAPID on the selected set plus the explicit single-edge control.
+6. Run post-processing and metrics.
+7. Optionally inspect results in notebooks or plotting helpers.
+
+Important: the routing stage does not have to run every realized network. The
+selection step should remain explicit through runner arguments or config.
+
+### Sensitivity
+
+1. Build the `7` structural sensitivity recipes.
+2. Keep the explicit single-edge control separate.
+3. Run the sensitivity grid.
+4. Build post-processed analysis tables.
+5. Optionally inspect results in notebooks or plotting helpers.
+
+Important: the `7` structural recipes remain distinct from the single-edge
+control artifact. The single-edge case is a separate baseline control, not an
+eighth sensitivity recipe.
+
 ## File-To-Target Map
 
 ### Active Extraction Targets
