@@ -1,6 +1,9 @@
 # Sensitivity Configs
 
-Planned home for sensitivity-grid configuration files and example manifests.
+Config-driven entry points now use these example manifests:
+
+- `recipes.example.json`
+- `grid.example.json`
 
 The structural sensitivity recipe set remains the 7-record
 `networks_sensitivity.jsonl.gz` fixture.

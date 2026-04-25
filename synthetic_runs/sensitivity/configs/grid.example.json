@@ -1,0 +1,39 @@
+{
+  "recipes_path": "../../outputs/sensitivity_pipeline/networks_sensitivity.jsonl.gz",
+  "out_dir": "../../outputs/sensitivity_pipeline/grid",
+  "network_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "kb_values": [
+    20.0
+  ],
+  "slope_values": [
+    0.003
+  ],
+  "sinuosity_values": [
+    1.0
+  ],
+  "forcing_hours_values": [
+    14.0
+  ],
+  "fall_hours_values": [
+    16.0
+  ],
+  "peak_values": [
+    1e-05
+  ],
+  "baseflow_values": [
+    4e-08
+  ],
+  "x": 0.1,
+  "single_edge_control_path": "../../configs/single_edge_control.json",
+  "keep_intermediate": false,
+  "write_netcdf": false,
+  "max_paths": 100
+}

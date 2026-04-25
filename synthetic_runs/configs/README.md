@@ -1,12 +1,11 @@
 # Synthetic Configs
 
-Planned home for structured run configurations.
+Shared configs and control artifacts used across synthetic workflows.
 
-Examples to add during extraction:
-
-- geometry enumeration settings
-- width sampling settings
-- sampled-run settings
-- sensitivity grid settings
 - `single_edge_control.json`: explicit baseline control shared by sampled and
   sensitivity workflows
+
+Workflow-specific example configs now live in:
+
+- `../regular/configs/`
+- `../sensitivity/configs/`

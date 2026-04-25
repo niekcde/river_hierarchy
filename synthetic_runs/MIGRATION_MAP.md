@@ -178,6 +178,21 @@ Phase 7 note:
   `load_network_by_id` from `synthetic_admissable_networkx_part_save.py`;
   they now import it from `src/synthetic_runs/core/`
 
+Phase 8 note:
+
+- config-driven workflow entry points now live under
+  `src/synthetic_runs/pipelines/`
+- the regular workflow now has an operational folder at
+  `synthetic_runs/regular/` with example configs and `run_all.sh`
+- the sensitivity workflow now has example configs and `run_all.sh` under
+  `synthetic_runs/sensitivity/`
+- current extracted operational steps are:
+  - regular: build geometry, sample widths, route selected networks, compute
+    K metrics
+  - sensitivity: build the 7 structural recipes, run the sensitivity grid
+- the downstream notebook-dependent analysis tail is still preserved separately
+  and is not yet part of the config-driven shell wrappers
+
 ## Current Pipeline Steps
 
 These are the intended workflow steps after the refactor so the operational

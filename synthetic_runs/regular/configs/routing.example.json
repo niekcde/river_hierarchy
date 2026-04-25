@@ -1,0 +1,18 @@
+{
+  "sampled_dir": "../../outputs/regular_pipeline/sampled",
+  "out_dir": "../../outputs/regular_pipeline/routed",
+  "n_benchmarks": 1,
+  "n_non_benchmarks": 1,
+  "seed": 123,
+  "use_admissible": true,
+  "output_mode": "parquet_outlet",
+  "keep_intermediate": false,
+  "write_netcdf": false,
+  "x": 0.1,
+  "maximin_log_cols": [
+    "k_mean"
+  ],
+  "maximin_start": "extreme",
+  "max_paths": 100,
+  "single_edge_control_path": "../../configs/single_edge_control.json"
+}

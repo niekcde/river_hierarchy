@@ -26,6 +26,8 @@ synthetic_runs/
   configs/
   legacy/
   notebooks/
+  regular/
+    configs/
   sensitivity/
     configs/
   src/
@@ -34,6 +36,7 @@ synthetic_runs/
       enumerate/
       runners/
       analysis/
+      pipelines/
 ```
 
 ## Main Intent
@@ -42,6 +45,8 @@ synthetic_runs/
 - `enumerate/`: geometry enumeration and width sampling
 - `runners/`: regular sampled runs and sensitivity runs
 - `analysis/`: post-run metrics and modeling
+- `pipelines/`: config-driven operational entry points for workflow steps
+- `regular/`: configs and shell wrappers for the regular synthetic workflow
 - `sensitivity/`: configs and run-specific docs for the sensitivity workflow
 - `legacy/`: archive-only notebooks, prototypes, backups, and preserved RAPID
   snapshots
