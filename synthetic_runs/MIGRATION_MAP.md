@@ -163,6 +163,21 @@ Phase 6 note:
 - active wrapper/provenance files remain at the top level of
   `synthetic_runs/` so the working pipeline and smoke tests are unchanged
 
+Phase 7 note:
+
+- geometry-first enumeration is now extracted to
+  `src/synthetic_runs/enumerate/geometry.py`
+- width-sampling is now extracted to
+  `src/synthetic_runs/enumerate/sample_widths.py`
+- `src/synthetic_runs/enumerate/__init__.py` now exposes the active
+  enumeration and width-sampling entry points
+- the preserved top-level files `synthetic_geometric_enumeration.py` and
+  `synthetic_width_perc_splits.py` are now thin compatibility wrappers over the
+  extracted package modules
+- the active sampled and sensitivity runner wrappers no longer import
+  `load_network_by_id` from `synthetic_admissable_networkx_part_save.py`;
+  they now import it from `src/synthetic_runs/core/`
+
 ## Current Pipeline Steps
 
 These are the intended workflow steps after the refactor so the operational
@@ -200,8 +215,8 @@ eighth sensitivity recipe.
 | Preserved legacy file | Intended target | Notes |
 | --- | --- | --- |
 | `synthetic_admissable_networkx_part_save.py` | `src/synthetic_runs/core/network.py`, `src/synthetic_runs/core/recipes.py`, `src/synthetic_runs/core/metrics.py` | Main keeper for `Params`, `RiverNetworkNX`, streamed summaries, recipe IO |
-| `synthetic_geometric_enumeration.py` | `src/synthetic_runs/enumerate/geometry.py` | Geometry-first enumeration; currently depends on private helpers from the core file |
-| `synthetic_width_perc_splits.py` | `src/synthetic_runs/enumerate/sample_widths.py` | Width realization and sampled-network generation |
+| `synthetic_geometric_enumeration.py` | `src/synthetic_runs/enumerate/geometry.py` | Active implementation extracted; top-level file is now a compatibility wrapper |
+| `synthetic_width_perc_splits.py` | `src/synthetic_runs/enumerate/sample_widths.py` | Active implementation extracted; top-level file is now a compatibility wrapper |
 | `synthetic_runs` | `src/synthetic_runs/runners/sampled.py` | Keep only runner logic here; extract RAPID prep/helpers out |
 | `synthetic_runs_sensitivity` | `src/synthetic_runs/runners/sensitivity.py` | Keep only sensitivity runner logic here; extract shared code out |
 | shared single-edge control in sampled/sensitivity runners | `configs/single_edge_control.json`, `src/synthetic_runs/runners/controls.py` | Explicit baseline control artifact; remains distinct from the 7 structural sensitivity recipes |
