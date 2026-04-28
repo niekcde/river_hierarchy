@@ -16,6 +16,7 @@ from .qa_exports import export_qgis_package, export_review_queue, export_summary
 from .resolver import refine_best_matches_with_nodes, resolve_best_matches
 from .rivretrieve_bridge import build_backend
 from .scoring import score_candidates
+from .subdaily_locator import locate_subdaily_from_hierarchy_examples
 from .sword_io import scan_sword_parquet_dir
 from .timeseries_io import filter_station_table_for_timeseries
 from .utils import configure_logging, ensure_directory, get_logger, write_json, write_table
@@ -221,6 +222,46 @@ def fetch_timeseries(config_path: Path) -> None:
     station_table = _prepare_timeseries_station_table(config)
     output_path = backend.fetch_timeseries(config, station_table=Path(station_table))
     LOGGER.info("Gauge timeseries written to %s", output_path)
+
+
+@main.command("locate-subdaily")
+@click.option("--input", "input_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--country", required=True, type=str, help="Two-letter country code. US, CA, and BR are currently supported.")
+@click.option("--output", "output_path", required=True, type=click.Path(path_type=Path))
+@click.option("--layer", default="hierarchy_examples_filtered", show_default=True, type=str)
+@click.option("--inventory", "inventory_path", default=None, type=click.Path(exists=True, path_type=Path))
+@click.option("--search-radius-m", default=5000.0, show_default=True, type=click.FloatRange(min=0.0))
+@click.option("--nearby-limit", default=25, show_default=True, type=click.IntRange(min=1))
+@click.option("--inventory-snap-distance-m", default=5000.0, show_default=True, type=click.FloatRange(min=0.0))
+@click.option("--max-resolution-distance-m", default=5000.0, show_default=True, type=click.FloatRange(min=0.0))
+def locate_subdaily_command(
+    input_path: Path,
+    country: str,
+    output_path: Path,
+    layer: str,
+    inventory_path: Path | None,
+    search_radius_m: float,
+    nearby_limit: int,
+    inventory_snap_distance_m: float,
+    max_resolution_distance_m: float,
+) -> None:
+    results = locate_subdaily_from_hierarchy_examples(
+        input_path,
+        country=country,
+        layer=layer,
+        search_radius_m=search_radius_m,
+        nearby_limit=nearby_limit,
+        inventory_path=inventory_path,
+        inventory_snap_distance_m=inventory_snap_distance_m,
+        max_resolution_distance_m=max_resolution_distance_m,
+    )
+    write_table(results, output_path)
+    LOGGER.info(
+        "Subdaily locator wrote %s station rows for %s to %s",
+        len(results),
+        str(country).strip().upper(),
+        output_path,
+    )
 
 
 @main.command("export-gpkg")

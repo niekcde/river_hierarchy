@@ -85,7 +85,25 @@ project_root/
    - Falls back to a direct USGS daily-values request for US stations when `RivRetrieve::usa()` fails deterministically.
    - Writes merged timeseries output to CSV or Parquet.
 
-4. `detect-events`
+4. `locate-subdaily`
+   - Reads a seed GeoPackage or SQLite layer of example stations such as `hierarchy_examples_filtered.gpkg`.
+   - Deduplicates repeated station keys into one locator row per distinct station.
+   - Uses country-specific logic to determine whether subdaily discharge is available.
+   - The current implementation supports:
+     - US via the USGS Water Data API
+     - CA via the Environment Canada Wateroffice web service
+     - BR via the ANA telemetric and historical web services
+   - Resolves US identifiers by trying the raw site number, then an 8-digit zero-padded variant, then a nearby monitoring-location fallback.
+   - Resolves CA seeds through the locally extracted Canada inventory, including plausible nearby snaps and curated overrides where needed.
+   - Resolves BR seeds through the locally extracted Brazil inventory, then checks ANA telemetric discharge for subdaily values and `HidroSerieHistorica` for daily fallback coverage.
+   - Writes a locator table with:
+     - the original station key
+     - the resolved provider station ID
+     - whether a discharge series was found
+     - whether subdaily discharge was found
+     - the detected resolution method and notes
+
+5. `detect-events`
    - Standardizes RivRetrieve timeseries columns such as `Date` and `Q`.
    - Optionally merges in locally prepared GRDC daily timeseries when `grdc.timeseries_path` exists.
    - Applies the configured `timeseries.scope` to GRDC stations before reading the GRDC event input when `outputs/grdc/crosswalk_best.parquet` is available.
@@ -100,7 +118,7 @@ project_root/
      - event quality diagnostics
    - Keeps only high-quality events in `events_selected.parquet`.
 
-5. `screen-kinematic`
+6. `screen-kinematic`
    - Joins selected events to matched SWORD reaches.
    - Automatically combines the main crosswalk and the supplementary GRDC crosswalk when both are present.
    - Pulls configured reach attributes such as `width_obs_p50` and `slope_obs_p50`.
@@ -170,6 +188,24 @@ Core Python dependencies:
 - `rapidfuzz`
 - `openpyxl`
 - `click`
+
+## US-First Subdaily Locator
+
+Use the locator against the hierarchy example seed package like this:
+
+```bash
+PYTHONPATH=src /opt/anaconda3/envs/UNC/bin/python -m gauge_sword_match.cli locate-subdaily \
+  --input outputs/hierarchy_examples_filtered.gpkg \
+  --country US \
+  --output outputs/subdaily_locator_us.csv
+```
+
+Notes:
+
+- `--country US` and `--country CA` are currently supported.
+- The locator checks for USGS discharge parameter `00060` in the time-series metadata service.
+- For Canada, the locator checks Wateroffice discharge unit values (`47`) and discharge daily values (`flow` / `6`) from the official web service.
+- The output table is meant to answer "can I get subdaily discharge for this seed station?" before building a full fetch pipeline.
 
 ### R
 
