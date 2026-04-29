@@ -29,8 +29,28 @@ def load_gauge_inventory(path: str | Path) -> pd.DataFrame:
         raise ValueError(f"Gauge inventory at {path} is missing required columns: {', '.join(missing)}")
 
     working = frame.copy()
-    working["station_id"] = working["station_id"].astype("string").str.strip()
-    working["country"] = working["country"].astype("string").str.upper().fillna(pd.NA)
+    station_key_from_file = None
+    if "station_key" in working.columns:
+        station_key_from_file = working["station_key"].astype("string").str.strip()
+        station_key_parts = station_key_from_file.str.split(":", n=1, expand=True)
+        if station_key_parts.shape[1] == 2:
+            country_from_key = station_key_parts[0].astype("string").str.upper()
+            station_id_from_key = station_key_parts[1].astype("string").str.strip()
+            working["country"] = working["country"].astype("string").str.upper().fillna(pd.NA)
+            working["country"] = working["country"].where(
+                working["country"].notna() & working["country"].str.len().gt(0),
+                country_from_key,
+            )
+            working["station_id"] = station_id_from_key.where(
+                station_id_from_key.notna() & station_id_from_key.str.len().gt(0),
+                working["station_id"].astype("string").str.strip(),
+            )
+        else:
+            working["station_id"] = working["station_id"].astype("string").str.strip()
+            working["country"] = working["country"].astype("string").str.upper().fillna(pd.NA)
+    else:
+        working["station_id"] = working["station_id"].astype("string").str.strip()
+        working["country"] = working["country"].astype("string").str.upper().fillna(pd.NA)
     working["lat"] = pd.to_numeric(working["lat"], errors="coerce")
     working["lon"] = pd.to_numeric(working["lon"], errors="coerce")
     if "station_name" not in working.columns:

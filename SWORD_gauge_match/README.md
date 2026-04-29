@@ -93,9 +93,23 @@ project_root/
      - US via the USGS Water Data API
      - CA via the Environment Canada Wateroffice web service
      - BR via the ANA telemetric and historical web services
+     - CL via Chile DGA
+     - GF via France Hubeau hydrometry
+     - CO via Colombia IDEAM FEWS
+     - KH via the MRC time-series API
+     - LA via the MRC time-series API
+     - TH via the MRC time-series API
+     - BG via the Bulgaria APPD Danube hydrology page
+     - ML via the Niger Basin Authority ABN Water Status and GeoServer services
    - Resolves US identifiers by trying the raw site number, then an 8-digit zero-padded variant, then a nearby monitoring-location fallback.
    - Resolves CA seeds through the locally extracted Canada inventory, including plausible nearby snaps and curated overrides where needed.
    - Resolves BR seeds through the locally extracted Brazil inventory, then checks ANA telemetric discharge for subdaily values and `HidroSerieHistorica` for daily fallback coverage.
+   - Resolves GF seeds directly through the official France Hubeau Guyane hydrometry referential, then checks live `Q` observations plus daily `QmnJ` coverage.
+   - Resolves KH seeds through the official MRC time-series station inventory, then verifies discharge spacing from the live corrected-series endpoint because the MRC inventory labels can still say "daily" even when recent timestamps are subdaily.
+   - Resolves LA seeds through the same official MRC time-series station inventory and corrected-series endpoint used for the lower Mekong mainstream stations.
+   - Resolves TH seeds through the same official MRC time-series station inventory and corrected-series endpoint, while keeping ambiguous nearby-only matches unresolved unless there is a stronger station-code reconciliation.
+   - Resolves BG Danube seeds through the official Bulgaria APPD public Danube hydrology page, which exposes current daily discharge for `Svishtov`, `Ruse`, and `Silistra`, plus subdaily water-level graphs for some stations but no public subdaily discharge series.
+   - Resolves ML seeds through the official ABN `discharge` GeoServer layer, then checks the ABN `tabs-by-place` and `ts-by-placeId` endpoints. The public service labels the discharge series as `Instantaneous`, but the Mali stations currently return daily timestamps only.
    - Writes a locator table with:
      - the original station key
      - the resolved provider station ID
@@ -202,9 +216,17 @@ PYTHONPATH=src /opt/anaconda3/envs/UNC/bin/python -m gauge_sword_match.cli locat
 
 Notes:
 
-- `--country US` and `--country CA` are currently supported.
+- `--country US`, `--country CA`, `--country BR`, `--country CL`, `--country GF`, `--country CO`, `--country KH`, `--country LA`, `--country TH`, `--country BG`, and `--country ML` are currently supported.
 - The locator checks for USGS discharge parameter `00060` in the time-series metadata service.
 - For Canada, the locator checks Wateroffice discharge unit values (`47`) and discharge daily values (`flow` / `6`) from the official web service.
+- For Brazil, the locator checks ANA telemetric discharge plus ANA historical daily discharge from the official public web service.
+- For Chile, the locator confirms official DGA fluviometric stations in `Red_Hidrometrica` and checks the live `ALERTAS` layer for a timestamped subdaily record. The current Chile locator does not yet query a historical archive.
+- For French Guiana, the locator resolves against the official France Hubeau hydrometry referential for department `973`, checks live `observations_tr` discharge (`Q`), and paginates daily `obs_elab` discharge (`QmnJ`) to determine daily coverage bounds.
+- For Colombia, the locator resolves directly against the official IDEAM FEWS station CSV and checks the FEWS `jsonQ/<station_id>Qobs.json` discharge series. The current Colombia locator does not yet query a separate daily archive.
+- For Cambodia, the locator resolves through the official MRC time-series inventory and verifies discharge spacing from the corrected-series endpoint because some MRC discharge series are labeled daily in the inventory while still returning subdaily timestamps in the live series.
+- For Laos, the locator resolves through the same official MRC time-series inventory and verifies discharge spacing from the corrected-series endpoint instead of relying only on the inventory label.
+- For Thailand, the locator resolves through the same official MRC time-series inventory, prefers exact or curated station-code matches for mainstream discharge stations, and leaves weak nearby-only matches unresolved instead of forcing them.
+- For Bulgaria, the locator resolves the three Danube seeds through the official APPD Danube hydrology page and currently classifies them as daily-only because the public APPD page exposes daily discharge and subdaily water-level graphs, but not subdaily discharge.
 - The output table is meant to answer "can I get subdaily discharge for this seed station?" before building a full fetch pipeline.
 
 ### R

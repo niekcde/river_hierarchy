@@ -4,8 +4,19 @@ from pathlib import Path
 
 import pandas as pd
 
+from .bulgaria import BulgariaAppdClient, locate_bulgaria_subdaily_station
 from .brazil import BRAZIL_CURATED_INVENTORY_OVERRIDES, BrazilAnaHydroClient, locate_brazil_subdaily_station
 from .canada import CANADA_CURATED_INVENTORY_OVERRIDES, CanadaWaterofficeClient, locate_canada_subdaily_station
+from .chile import ChileDgaClient, locate_chile_subdaily_station
+from .colombia import ColombiaIdeamFewsClient, locate_colombia_subdaily_station
+from .french_guiana import FranceHubeauClient, locate_french_guiana_subdaily_station
+from .mekong_mrc import (
+    MekongMrcClient,
+    locate_cambodia_subdaily_station,
+    locate_laos_subdaily_station,
+    locate_thailand_subdaily_station,
+)
+from .niger_basin_abn import NigerBasinAbnClient, locate_mali_subdaily_station
 from .inventory import autodetect_inventory_path, enrich_seeds_with_inventory_matches, load_gauge_inventory
 from .seeds import load_hierarchy_example_station_seeds
 from .usgs import USGSWaterDataClient, locate_usgs_subdaily_station
@@ -21,12 +32,12 @@ def locate_subdaily_from_hierarchy_examples(
     inventory_path: str | Path | None = None,
     inventory_snap_distance_m: float = 5_000.0,
     max_resolution_distance_m: float = 5_000.0,
-    client: USGSWaterDataClient | CanadaWaterofficeClient | BrazilAnaHydroClient | None = None,
+    client: USGSWaterDataClient | CanadaWaterofficeClient | BrazilAnaHydroClient | ChileDgaClient | FranceHubeauClient | ColombiaIdeamFewsClient | MekongMrcClient | BulgariaAppdClient | NigerBasinAbnClient | None = None,
 ) -> pd.DataFrame:
     normalized_country = str(country).strip().upper()
-    if normalized_country not in {"US", "CA", "BR"}:
+    if normalized_country not in {"US", "CA", "BR", "CL", "GF", "CO", "KH", "LA", "TH", "BG", "ML"}:
         raise NotImplementedError(
-            f"Subdaily locator is currently implemented for US, CA, and BR only; received country '{normalized_country}'."
+            f"Subdaily locator is currently implemented for US, CA, BR, CL, GF, CO, KH, LA, TH, BG, and ML only; received country '{normalized_country}'."
         )
 
     seeds = load_hierarchy_example_station_seeds(input_path, layer=layer)
@@ -66,9 +77,63 @@ def locate_subdaily_from_hierarchy_examples(
                     row,
                     client=resolved_client,
                 )
-            else:
+            elif normalized_country == "BR":
                 resolved_client = client or BrazilAnaHydroClient()
                 result = locate_brazil_subdaily_station(
+                    row,
+                    client=resolved_client,
+                )
+            elif normalized_country == "GF":
+                resolved_client = client or FranceHubeauClient()
+                result = locate_french_guiana_subdaily_station(
+                    row,
+                    client=resolved_client,
+                    max_resolution_distance_m=max_resolution_distance_m,
+                )
+            elif normalized_country == "CO":
+                resolved_client = client or ColombiaIdeamFewsClient()
+                result = locate_colombia_subdaily_station(
+                    row,
+                    client=resolved_client,
+                    max_resolution_distance_m=max_resolution_distance_m,
+                )
+            elif normalized_country == "KH":
+                resolved_client = client or MekongMrcClient()
+                result = locate_cambodia_subdaily_station(
+                    row,
+                    client=resolved_client,
+                    max_resolution_distance_m=max_resolution_distance_m,
+                )
+            elif normalized_country == "LA":
+                resolved_client = client or MekongMrcClient()
+                result = locate_laos_subdaily_station(
+                    row,
+                    client=resolved_client,
+                    max_resolution_distance_m=max_resolution_distance_m,
+                )
+            elif normalized_country == "TH":
+                resolved_client = client or MekongMrcClient()
+                result = locate_thailand_subdaily_station(
+                    row,
+                    client=resolved_client,
+                    max_resolution_distance_m=max_resolution_distance_m,
+                )
+            elif normalized_country == "BG":
+                resolved_client = client or BulgariaAppdClient()
+                result = locate_bulgaria_subdaily_station(
+                    row,
+                    client=resolved_client,
+                )
+            elif normalized_country == "ML":
+                resolved_client = client or NigerBasinAbnClient()
+                result = locate_mali_subdaily_station(
+                    row,
+                    client=resolved_client,
+                    max_resolution_distance_m=max_resolution_distance_m,
+                )
+            else:
+                resolved_client = client or ChileDgaClient()
+                result = locate_chile_subdaily_station(
                     row,
                     client=resolved_client,
                 )
@@ -85,7 +150,27 @@ def locate_subdaily_from_hierarchy_examples(
                 "provider": (
                     "usgs"
                     if normalized_country == "US"
-                    else ("canada_wateroffice" if normalized_country == "CA" else "brazil_ana")
+                    else (
+                        "canada_wateroffice"
+                        if normalized_country == "CA"
+                        else (
+                            "brazil_ana"
+                            if normalized_country == "BR"
+                            else (
+                                "france_hubeau"
+                                if normalized_country == "GF"
+                                else (
+                                    "colombia_ideam_fews"
+                                    if normalized_country == "CO"
+                                    else (
+                                        "mrc_timeseries"
+                                        if normalized_country in {"KH", "LA", "TH"}
+                                        else ("bulgaria_appd" if normalized_country == "BG" else ("niger_basin_abn" if normalized_country == "ML" else "chile_dga"))
+                                    )
+                                )
+                            )
+                        )
+                    )
                 ),
                 "status": "api_error",
                 "resolution_method": "api_error",
