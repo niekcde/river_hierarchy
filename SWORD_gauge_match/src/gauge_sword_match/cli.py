@@ -226,7 +226,7 @@ def fetch_timeseries(config_path: Path) -> None:
 
 @main.command("locate-subdaily")
 @click.option("--input", "input_path", required=True, type=click.Path(exists=True, path_type=Path))
-@click.option("--country", required=True, type=str, help="Two-letter country code. US, CA, BR, CL, GF, CO, KH, LA, TH, BG, and ML are currently supported.")
+@click.option("--country", required=True, type=str, help="Two-letter country code. US, CA, BR, CL, GF, CO, KH, LA, TH, BG, ML, NG, and RU are currently supported.")
 @click.option("--output", "output_path", required=True, type=click.Path(path_type=Path))
 @click.option("--layer", default="hierarchy_examples_filtered", show_default=True, type=str)
 @click.option("--inventory", "inventory_path", default=None, type=click.Path(exists=True, path_type=Path))

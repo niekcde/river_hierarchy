@@ -17,6 +17,8 @@ from .mekong_mrc import (
     locate_thailand_subdaily_station,
 )
 from .niger_basin_abn import NigerBasinAbnClient, locate_mali_subdaily_station
+from .nigeria import NigeriaNihsaClient, locate_nigeria_subdaily_station
+from .russia import RussiaGmvoClient, locate_russia_subdaily_station
 from .inventory import autodetect_inventory_path, enrich_seeds_with_inventory_matches, load_gauge_inventory
 from .seeds import load_hierarchy_example_station_seeds
 from .usgs import USGSWaterDataClient, locate_usgs_subdaily_station
@@ -32,12 +34,12 @@ def locate_subdaily_from_hierarchy_examples(
     inventory_path: str | Path | None = None,
     inventory_snap_distance_m: float = 5_000.0,
     max_resolution_distance_m: float = 5_000.0,
-    client: USGSWaterDataClient | CanadaWaterofficeClient | BrazilAnaHydroClient | ChileDgaClient | FranceHubeauClient | ColombiaIdeamFewsClient | MekongMrcClient | BulgariaAppdClient | NigerBasinAbnClient | None = None,
+    client: USGSWaterDataClient | CanadaWaterofficeClient | BrazilAnaHydroClient | ChileDgaClient | FranceHubeauClient | ColombiaIdeamFewsClient | MekongMrcClient | BulgariaAppdClient | NigerBasinAbnClient | NigeriaNihsaClient | RussiaGmvoClient | None = None,
 ) -> pd.DataFrame:
     normalized_country = str(country).strip().upper()
-    if normalized_country not in {"US", "CA", "BR", "CL", "GF", "CO", "KH", "LA", "TH", "BG", "ML"}:
+    if normalized_country not in {"US", "CA", "BR", "CL", "GF", "CO", "KH", "LA", "TH", "BG", "ML", "NG", "RU"}:
         raise NotImplementedError(
-            f"Subdaily locator is currently implemented for US, CA, BR, CL, GF, CO, KH, LA, TH, BG, and ML only; received country '{normalized_country}'."
+            f"Subdaily locator is currently implemented for US, CA, BR, CL, GF, CO, KH, LA, TH, BG, ML, NG, and RU only; received country '{normalized_country}'."
         )
 
     seeds = load_hierarchy_example_station_seeds(input_path, layer=layer)
@@ -131,6 +133,18 @@ def locate_subdaily_from_hierarchy_examples(
                     client=resolved_client,
                     max_resolution_distance_m=max_resolution_distance_m,
                 )
+            elif normalized_country == "NG":
+                resolved_client = client or NigeriaNihsaClient()
+                result = locate_nigeria_subdaily_station(
+                    row,
+                    client=resolved_client,
+                )
+            elif normalized_country == "RU":
+                resolved_client = client or RussiaGmvoClient()
+                result = locate_russia_subdaily_station(
+                    row,
+                    client=resolved_client,
+                )
             else:
                 resolved_client = client or ChileDgaClient()
                 result = locate_chile_subdaily_station(
@@ -165,7 +179,15 @@ def locate_subdaily_from_hierarchy_examples(
                                     else (
                                         "mrc_timeseries"
                                         if normalized_country in {"KH", "LA", "TH"}
-                                        else ("bulgaria_appd" if normalized_country == "BG" else ("niger_basin_abn" if normalized_country == "ML" else "chile_dga"))
+                                        else (
+                                            "bulgaria_appd"
+                                            if normalized_country == "BG"
+                                            else (
+                                                "niger_basin_abn"
+                                                if normalized_country == "ML"
+                                                else ("nigeria_nihsa" if normalized_country == "NG" else ("russia_gmvo" if normalized_country == "RU" else "chile_dga"))
+                                            )
+                                        )
                                     )
                                 )
                             )

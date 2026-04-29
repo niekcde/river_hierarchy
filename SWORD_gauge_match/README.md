@@ -101,6 +101,8 @@ project_root/
      - TH via the MRC time-series API
      - BG via the Bulgaria APPD Danube hydrology page
      - ML via the Niger Basin Authority ABN Water Status and GeoServer services
+     - NG via the Nigeria Hydrological Services Agency NIHSA public dashboard and data-request portal
+     - RU via the legacy AIS GMVO / successor GIS CP Water access path
    - Resolves US identifiers by trying the raw site number, then an 8-digit zero-padded variant, then a nearby monitoring-location fallback.
    - Resolves CA seeds through the locally extracted Canada inventory, including plausible nearby snaps and curated overrides where needed.
    - Resolves BR seeds through the locally extracted Brazil inventory, then checks ANA telemetric discharge for subdaily values and `HidroSerieHistorica` for daily fallback coverage.
@@ -110,6 +112,8 @@ project_root/
    - Resolves TH seeds through the same official MRC time-series station inventory and corrected-series endpoint, while keeping ambiguous nearby-only matches unresolved unless there is a stronger station-code reconciliation.
    - Resolves BG Danube seeds through the official Bulgaria APPD public Danube hydrology page, which exposes current daily discharge for `Svishtov`, `Ruse`, and `Silistra`, plus subdaily water-level graphs for some stations but no public subdaily discharge series.
    - Resolves ML seeds through the official ABN `discharge` GeoServer layer, then checks the ABN `tabs-by-place` and `ts-by-placeId` endpoints. The public service labels the discharge series as `Instantaneous`, but the Mali stations currently return daily timestamps only.
+   - Resolves NG seeds conservatively through NIHSA metadata only: the public NIHSA flood dashboard exposes flood-risk layers, but no station-resolved public discharge API for the hierarchy seeds, so the locator reports those gauges as manual-request-only instead of forcing implausible matches.
+   - Resolves RU seeds conservatively through official access metadata only: the legacy AIS GMVO portal is now decommissioned, and the successor GIS CP Water hydrology segment is in a closed-access contour, so the locator reports the seeds as unresolved for public subdaily work instead of pretending there is an open API.
    - Writes a locator table with:
      - the original station key
      - the resolved provider station ID
@@ -216,7 +220,7 @@ PYTHONPATH=src /opt/anaconda3/envs/UNC/bin/python -m gauge_sword_match.cli locat
 
 Notes:
 
-- `--country US`, `--country CA`, `--country BR`, `--country CL`, `--country GF`, `--country CO`, `--country KH`, `--country LA`, `--country TH`, `--country BG`, and `--country ML` are currently supported.
+- `--country US`, `--country CA`, `--country BR`, `--country CL`, `--country GF`, `--country CO`, `--country KH`, `--country LA`, `--country TH`, `--country BG`, `--country ML`, `--country NG`, and `--country RU` are currently supported.
 - The locator checks for USGS discharge parameter `00060` in the time-series metadata service.
 - For Canada, the locator checks Wateroffice discharge unit values (`47`) and discharge daily values (`flow` / `6`) from the official web service.
 - For Brazil, the locator checks ANA telemetric discharge plus ANA historical daily discharge from the official public web service.
@@ -227,6 +231,8 @@ Notes:
 - For Laos, the locator resolves through the same official MRC time-series inventory and verifies discharge spacing from the corrected-series endpoint instead of relying only on the inventory label.
 - For Thailand, the locator resolves through the same official MRC time-series inventory, prefers exact or curated station-code matches for mainstream discharge stations, and leaves weak nearby-only matches unresolved instead of forcing them.
 - For Bulgaria, the locator resolves the three Danube seeds through the official APPD Danube hydrology page and currently classifies them as daily-only because the public APPD page exposes daily discharge and subdaily water-level graphs, but not subdaily discharge.
+- For Nigeria, the locator currently reports the Jama'are seeds as unresolved for public subdaily work because the official NIHSA public surface exposes a flood dashboard and a manual data-request workflow, but not a station-level public discharge API that can be reconciled to these seeds.
+- For Russia, the locator currently reports the selected seeds as unresolved for public subdaily work because the legacy AIS GMVO portal is decommissioned and the successor GIS CP Water hydrology segment is accessed through a closed contour rather than an open public station API.
 - The output table is meant to answer "can I get subdaily discharge for this seed station?" before building a full fetch pipeline.
 
 ### R

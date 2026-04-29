@@ -17,6 +17,8 @@ from gauge_sword_match.subdaily_locator.mekong_mrc import (
     locate_thailand_subdaily_station,
 )
 from gauge_sword_match.subdaily_locator.niger_basin_abn import locate_mali_subdaily_station
+from gauge_sword_match.subdaily_locator.nigeria import locate_nigeria_subdaily_station
+from gauge_sword_match.subdaily_locator.russia import locate_russia_subdaily_station
 from gauge_sword_match.subdaily_locator.runner import locate_subdaily_from_hierarchy_examples
 from gauge_sword_match.subdaily_locator.seeds import load_hierarchy_example_station_seeds
 from gauge_sword_match.subdaily_locator.usgs import MonitoringLocation, locate_usgs_subdaily_station
@@ -2351,3 +2353,160 @@ def test_locate_subdaily_from_hierarchy_examples_supports_mali_abn_resolution(tm
     assert by_key["ML:1134400"]["status"] == "resolved_historical_daily_only"
     assert by_key["ML:1134400"]["resolved_site_number"] == "Ke Macina"
     assert by_key["ML:1134400"]["daily_coverage_type"] == "historical_only"
+
+
+def test_locate_nigeria_subdaily_station_reports_public_request_only():
+    row = pd.Series(
+        {
+            "station_key": "NG:1837253",
+            "country": "NG",
+            "source_station_id": "1837253",
+            "lat": 11.424033,
+            "lon": 9.950833,
+            "occurrence_count": 1,
+            "example_ids": "18",
+            "down_values": "True",
+        }
+    )
+
+    class FakeClient:
+        dashboard_url = "https://nihsa.gov.ng/flood-forecast-dashboard/"
+        public_api_url = "https://nihsa.gov.ng/flood-forecast-dashboard/api/data"
+        data_request_url = "https://nihsa.gov.ng/data-request/"
+
+    result = locate_nigeria_subdaily_station(row, client=FakeClient())
+
+    assert result["provider"] == "nigeria_nihsa"
+    assert result["status"] == "unresolved"
+    assert result["resolution_method"] == "provider_station_api_not_public"
+    assert result["monitoring_location_found"] is False
+    assert result["discharge_series_found"] is False
+    assert result["subdaily_discharge_found"] is False
+    assert result["daily_coverage_type"] == "none"
+    assert result["candidate_site_numbers"] == "1837253,FOGGO"
+    assert "manual hydrological data-request workflow" in str(result["notes"])
+
+
+def test_locate_subdaily_from_hierarchy_examples_supports_nigeria_metadata_only(tmp_path: Path):
+    gpkg_path = tmp_path / "hierarchy_examples_filtered.gpkg"
+    with sqlite3.connect(gpkg_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE hierarchy_examples_filtered (
+                station_key TEXT,
+                lat REAL,
+                lon REAL,
+                down TEXT,
+                example_id REAL
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO hierarchy_examples_filtered VALUES (?, ?, ?, ?, ?)",
+            [
+                ("NG:1837253", 11.424033, 9.950833, "True", 18.0),
+                ("NG:1837255", 10.930033, 9.60565, "", 18.0),
+            ],
+        )
+
+    class FakeClient:
+        dashboard_url = "https://nihsa.gov.ng/flood-forecast-dashboard/"
+        public_api_url = "https://nihsa.gov.ng/flood-forecast-dashboard/api/data"
+        data_request_url = "https://nihsa.gov.ng/data-request/"
+
+    results = locate_subdaily_from_hierarchy_examples(
+        gpkg_path,
+        country="NG",
+        client=FakeClient(),
+        inventory_path=None,
+    )
+
+    assert len(results) == 2
+    by_key = {row["station_key"]: row for row in results.to_dict(orient="records")}
+
+    assert by_key["NG:1837253"]["status"] == "unresolved"
+    assert by_key["NG:1837253"]["provider"] == "nigeria_nihsa"
+    assert by_key["NG:1837253"]["candidate_site_numbers"] == "1837253,FOGGO"
+
+    assert by_key["NG:1837255"]["status"] == "unresolved"
+    assert by_key["NG:1837255"]["provider"] == "nigeria_nihsa"
+    assert by_key["NG:1837255"]["candidate_site_numbers"] == "1837255,BUNGA"
+
+
+def test_locate_russia_subdaily_station_reports_closed_access_portal():
+    row = pd.Series(
+        {
+            "station_key": "RU:2909150",
+            "country": "RU",
+            "source_station_id": "2909150",
+            "lat": 67.43,
+            "lon": 86.48,
+            "occurrence_count": 1,
+            "example_ids": "27",
+            "down_values": "True",
+        }
+    )
+
+    class FakeClient:
+        legacy_portal_url = "https://gmvo.skniivh.ru/"
+        closed_contour_url = "https://sslgis.favr.ru/"
+        access_instruction_url = "https://rwec.ru/dl/gis/instruction.pdf"
+
+    result = locate_russia_subdaily_station(row, client=FakeClient())
+
+    assert result["provider"] == "russia_gmvo"
+    assert result["status"] == "unresolved"
+    assert result["resolution_method"] == "provider_portal_closed_access"
+    assert result["monitoring_location_found"] is False
+    assert result["discharge_series_found"] is False
+    assert result["subdaily_discharge_found"] is False
+    assert result["daily_coverage_type"] == "none"
+    assert result["candidate_site_numbers"] == "2909150,IGARKA"
+    assert "decommissioned" in str(result["notes"]).lower()
+    assert "closed contour" in str(result["notes"]).lower()
+
+
+def test_locate_subdaily_from_hierarchy_examples_supports_russia_metadata_only(tmp_path: Path):
+    gpkg_path = tmp_path / "hierarchy_examples_filtered.gpkg"
+    with sqlite3.connect(gpkg_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE hierarchy_examples_filtered (
+                station_key TEXT,
+                lat REAL,
+                lon REAL,
+                down TEXT,
+                example_id REAL
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO hierarchy_examples_filtered VALUES (?, ?, ?, ?, ?)",
+            [
+                ("RU:2909150", 67.43, 86.48, "True", 27.0),
+                ("RU:2909152", 61.6, 90.08, "", 27.0),
+            ],
+        )
+
+    class FakeClient:
+        legacy_portal_url = "https://gmvo.skniivh.ru/"
+        closed_contour_url = "https://sslgis.favr.ru/"
+        access_instruction_url = "https://rwec.ru/dl/gis/instruction.pdf"
+
+    results = locate_subdaily_from_hierarchy_examples(
+        gpkg_path,
+        country="RU",
+        client=FakeClient(),
+        inventory_path=None,
+    )
+
+    assert len(results) == 2
+    by_key = {row["station_key"]: row for row in results.to_dict(orient="records")}
+
+    assert by_key["RU:2909150"]["status"] == "unresolved"
+    assert by_key["RU:2909150"]["provider"] == "russia_gmvo"
+    assert by_key["RU:2909150"]["candidate_site_numbers"] == "2909150,IGARKA"
+
+    assert by_key["RU:2909152"]["status"] == "unresolved"
+    assert by_key["RU:2909152"]["provider"] == "russia_gmvo"
+    assert by_key["RU:2909152"]["candidate_site_numbers"] == "2909152,POD. TUNGUSKA"
