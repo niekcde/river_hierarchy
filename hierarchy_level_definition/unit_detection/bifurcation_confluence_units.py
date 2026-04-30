@@ -116,7 +116,7 @@ def load_network(
 def build_graph(
     links: gpd.GeoDataFrame,
     nodes: gpd.GeoDataFrame,
-) -> tuple[nx.MultiDiGraph, nx.DiGraph]:
+) -> nx.MultiDiGraph:
     graph = nx.MultiDiGraph()
 
     for row in nodes.itertuples(index=False):
@@ -135,57 +135,43 @@ def build_graph(
         if v not in graph:
             graph.add_node(v, id_node=v)
 
-    simple_graph = nx.DiGraph()
-    simple_graph.add_nodes_from(graph.nodes(data=True))
-    for u, v, key, attrs in graph.edges(keys=True, data=True):
-        if not simple_graph.has_edge(u, v):
-            simple_graph.add_edge(
-                u,
-                v,
-                edge_keys=[key],
-                id_links=[int(attrs["id_link"])],
-                min_length=edge_length_from_attrs(attrs),
-            )
-        else:
-            simple_graph[u][v]["edge_keys"].append(key)
-            simple_graph[u][v]["id_links"].append(int(attrs["id_link"]))
-            simple_graph[u][v]["min_length"] = min(
-                simple_graph[u][v]["min_length"],
-                edge_length_from_attrs(attrs),
-            )
-
-    return graph, simple_graph
+    return graph
 
 
-def unique_successors(graph: nx.DiGraph | nx.MultiDiGraph, node: int) -> list[int]:
+def unique_successors(graph: nx.MultiDiGraph, node: int) -> list[int]:
     return sorted(set(graph.successors(node)))
 
 
-def unique_predecessors(graph: nx.DiGraph | nx.MultiDiGraph, node: int) -> list[int]:
+def unique_predecessors(graph: nx.MultiDiGraph, node: int) -> list[int]:
     return sorted(set(graph.predecessors(node)))
 
 
-def find_bifurcations(simple_graph: nx.DiGraph) -> list[int]:
-    return sorted(node for node in simple_graph.nodes if len(unique_successors(simple_graph, node)) > 1)
+def find_bifurcations(graph: nx.MultiDiGraph) -> list[int]:
+    return sorted(node for node in graph.nodes if graph.out_degree(node) > 1)
 
 
-def find_confluences(simple_graph: nx.DiGraph) -> list[int]:
-    return sorted(node for node in simple_graph.nodes if len(unique_predecessors(simple_graph, node)) > 1)
+def find_confluences(graph: nx.MultiDiGraph) -> list[int]:
+    return sorted(node for node in graph.nodes if graph.in_degree(node) > 1)
+
+
+def outgoing_branch_edges(graph: nx.MultiDiGraph, node: int) -> list[tuple[int, int, int]]:
+    return sorted((int(u), int(v), int(key)) for u, v, key in graph.out_edges(node, keys=True))
 
 
 def downstream_distances_without_bifurcation(
-    simple_graph: nx.DiGraph,
+    graph: nx.MultiDiGraph,
     bifurcation: int,
-    branch_start: int,
+    branch_edge: tuple[int, int, int],
 ) -> dict[int, int]:
-    branch_graph = simple_graph.copy()
+    _, branch_start, _ = branch_edge
+    branch_graph = graph.copy()
     if bifurcation in branch_graph:
         branch_graph.remove_node(bifurcation)
     return nx.single_source_shortest_path_length(branch_graph, branch_start)
 
 
 def _candidate_confluence_score(
-    branch_distances: dict[int, dict[int, int]],
+    branch_distances: dict[tuple[int, int, int], dict[int, int]],
     candidate: int,
 ) -> tuple[int, int, int]:
     distances = [distances_by_branch[candidate] for distances_by_branch in branch_distances.values()]
@@ -193,7 +179,7 @@ def _candidate_confluence_score(
 
 
 def first_rejoin_confluence(
-    simple_graph: nx.DiGraph,
+    graph: nx.MultiDiGraph,
     bifurcation: int,
     confluences: set[int] | list[int],
 ) -> int | None:
@@ -205,14 +191,14 @@ def first_rejoin_confluence(
     copy of the graph with the bifurcation removed. "First" is then approximated
     as the common confluence that minimizes the branch-wise shortest-hop score.
     """
-    branch_starts = unique_successors(simple_graph, bifurcation)
-    if len(branch_starts) < 2:
+    branch_edges = outgoing_branch_edges(graph, bifurcation)
+    if len(branch_edges) < 2:
         return None
 
     confluence_set = set(confluences)
     branch_distances = {
-        branch_start: downstream_distances_without_bifurcation(simple_graph, bifurcation, branch_start)
-        for branch_start in branch_starts
+        branch_edge: downstream_distances_without_bifurcation(graph, bifurcation, branch_edge)
+        for branch_edge in branch_edges
     }
 
     common_reachable = set.intersection(*(set(distances) for distances in branch_distances.values()))
@@ -249,31 +235,26 @@ def _resolve_edge_key(
 
 def unit_candidate_subgraph(
     graph: nx.MultiDiGraph,
-    simple_graph: nx.DiGraph,
     bifurcation: int,
     confluence: int,
 ) -> nx.MultiDiGraph:
-    downstream_nodes = nx.descendants(simple_graph, bifurcation) | {bifurcation}
-    upstream_nodes = nx.ancestors(simple_graph, confluence) | {confluence}
+    downstream_nodes = nx.descendants(graph, bifurcation) | {bifurcation}
+    upstream_nodes = nx.ancestors(graph, confluence) | {confluence}
     candidate_nodes = downstream_nodes & upstream_nodes
     return graph.subgraph(candidate_nodes).copy()
 
 
 def extract_simple_paths(
     graph: nx.MultiDiGraph,
-    simple_graph: nx.DiGraph,
     bifurcation: int,
     confluence: int,
     *,
     max_path_cutoff: int = 100,
     max_paths: int = 5000,
 ) -> tuple[list[UnitPath], int, bool]:
-    subgraph = unit_candidate_subgraph(graph, simple_graph, bifurcation, confluence)
-    simple_subgraph = nx.DiGraph()
-    simple_subgraph.add_nodes_from(subgraph.nodes(data=True))
-    simple_subgraph.add_edges_from((u, v) for u, v in subgraph.edges())
+    subgraph = unit_candidate_subgraph(graph, bifurcation, confluence)
 
-    shortest_hops = nx.shortest_path_length(simple_subgraph, bifurcation, confluence)
+    shortest_hops = nx.shortest_path_length(subgraph, bifurcation, confluence)
     max_simple_cutoff = max(1, subgraph.number_of_nodes() - 1)
     cutoff = min(max_simple_cutoff, max(max_path_cutoff, shortest_hops))
 
@@ -330,20 +311,19 @@ def classify_unit(
 
 def build_structural_units(
     graph: nx.MultiDiGraph,
-    simple_graph: nx.DiGraph,
     *,
     max_path_cutoff: int = 100,
     max_paths: int = 5000,
     debug: bool = False,
 ) -> list[StructuralUnit]:
-    bifurcations = find_bifurcations(simple_graph)
-    confluences = set(find_confluences(simple_graph))
+    bifurcations = find_bifurcations(graph)
+    confluences = set(find_confluences(graph))
 
     units_by_pair: dict[tuple[int, int], StructuralUnit] = {}
     next_unit_id = 1
 
     for bifurcation in bifurcations:
-        confluence = first_rejoin_confluence(simple_graph, bifurcation, confluences)
+        confluence = first_rejoin_confluence(graph, bifurcation, confluences)
         if confluence is None:
             if debug:
                 print(f"[debug] bifurcation {bifurcation}: no common downstream confluence found")
@@ -356,7 +336,6 @@ def build_structural_units(
         try:
             paths, cutoff_used, truncated = extract_simple_paths(
                 graph,
-                simple_graph,
                 bifurcation,
                 confluence,
                 max_path_cutoff=max_path_cutoff,
@@ -382,8 +361,8 @@ def build_structural_units(
             edge_set.update(path.edge_path)
 
         internal_nodes = sorted(node for node in node_set if node not in {bifurcation, confluence})
-        internal_bifurcations = [node for node in internal_nodes if len(unique_successors(simple_graph, node)) > 1]
-        internal_confluences = [node for node in internal_nodes if len(unique_predecessors(simple_graph, node)) > 1]
+        internal_bifurcations = [node for node in internal_nodes if graph.out_degree(node) > 1]
+        internal_confluences = [node for node in internal_nodes if graph.in_degree(node) > 1]
         path_lengths = [path.total_length for path in paths]
 
         unit = StructuralUnit(
@@ -544,10 +523,9 @@ def analyze_network(
     debug: bool = False,
 ) -> tuple[pd.DataFrame, list[StructuralUnit], list[dict[str, Any]]]:
     links, nodes = load_network(links_path, nodes_path)
-    graph, simple_graph = build_graph(links, nodes)
+    graph = build_graph(links, nodes)
     units = build_structural_units(
         graph,
-        simple_graph,
         max_path_cutoff=max_path_cutoff,
         max_paths=max_paths,
         debug=debug,
