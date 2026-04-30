@@ -917,6 +917,87 @@ def test_locate_subdaily_from_hierarchy_examples_supports_brazil_curated_overrid
     assert record["resolved_site_number"] == "54950000"
 
 
+def test_locate_subdaily_from_hierarchy_examples_supports_additional_brazil_manual_overrides(tmp_path: Path):
+    gpkg_path = tmp_path / "hierarchy_examples_filtered.gpkg"
+    inventory_path = tmp_path / "gauges_cleaned.csv"
+    with sqlite3.connect(gpkg_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE hierarchy_examples_filtered (
+                station_key TEXT,
+                lat REAL,
+                lon REAL,
+                down TEXT,
+                example_id REAL
+            )
+            """
+        )
+        connection.executemany(
+            "INSERT INTO hierarchy_examples_filtered VALUES (?, ?, ?, ?, ?)",
+            [
+                ("BR:3636201", -1.0650, -57.0614, "True", 11.0),
+                ("BR:3637150", -6.0453, -57.6428, "True", 9.0),
+                ("BR:3637152", -5.1525, -56.8539, "True", 9.0),
+            ],
+        )
+
+    pd.DataFrame(
+        [
+            {
+                "station_id": "16661000",
+                "country": "BR",
+                "lat": -1.3706,
+                "lon": -56.8519,
+                "station_name": pd.NA,
+            },
+            {
+                "station_id": "17710000",
+                "country": "BR",
+                "lat": -4.6156,
+                "lon": -56.3250,
+                "station_name": pd.NA,
+            },
+        ]
+    ).to_csv(inventory_path, index=False)
+
+    class FakeClient:
+        def fetch_subdaily_discharge_values(self, station_id: str, *, start_date, end_date):
+            if station_id == "16661000":
+                return pd.DataFrame({"DateTime": ["2026-04-01 03:00:00"], "Vazao": [12.0]})
+            if station_id == "17710000":
+                return pd.DataFrame({"DateTime": ["2026-04-02 06:00:00"], "Vazao": [8.5]})
+            raise AssertionError(f"Unexpected station {station_id}")
+
+        def fetch_daily_discharge_values(self, station_id: str, *, start_date, end_date):
+            if station_id == "16661000":
+                return pd.DataFrame({"Date": ["2026-04-01"], "Vazao": [11.8], "NivelConsistencia": [1]})
+            if station_id == "17710000":
+                return pd.DataFrame({"Date": ["2026-04-02"], "Vazao": [8.2], "NivelConsistencia": [1]})
+            raise AssertionError(f"Unexpected station {station_id}")
+
+    results = locate_subdaily_from_hierarchy_examples(
+        gpkg_path,
+        country="BR",
+        client=FakeClient(),
+        inventory_path=inventory_path,
+    )
+
+    assert len(results) == 3
+    by_key = {row["station_key"]: row for row in results.to_dict(orient="records")}
+
+    assert by_key["BR:3636201"]["inventory_station_id"] == "16661000"
+    assert by_key["BR:3636201"]["inventory_resolution_method"] == "inventory_curated_override"
+    assert by_key["BR:3636201"]["status"] == "subdaily_found"
+
+    assert by_key["BR:3637150"]["inventory_station_id"] == "17710000"
+    assert by_key["BR:3637150"]["inventory_resolution_method"] == "inventory_curated_override"
+    assert by_key["BR:3637150"]["status"] == "subdaily_found"
+
+    assert by_key["BR:3637152"]["inventory_station_id"] == "17710000"
+    assert by_key["BR:3637152"]["inventory_resolution_method"] == "inventory_curated_override"
+    assert by_key["BR:3637152"]["status"] == "subdaily_found"
+
+
 def test_locate_chile_subdaily_station_for_inventory_match():
     row = pd.Series(
         {

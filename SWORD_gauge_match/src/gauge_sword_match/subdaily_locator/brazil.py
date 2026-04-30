@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -16,13 +17,30 @@ BRAZIL_CURATED_INVENTORY_OVERRIDES = {
     # municipality, but the coordinate offset is larger than the generic snap
     # threshold used for automatic reconciliation.
     "BR:3652455": "BR:54950000",
+    # Manual review accepted ANA 16661000 as a usable downstream substitute for
+    # GRDC 3636201 in the hierarchy example set.
+    "BR:3636201": "BR:16661000",
+    # Manual review accepted ANA 17710000 as the single plausible hydrometric
+    # station representing both GRDC 3637150 and 3637152 in the hierarchy
+    # example set.
+    "BR:3637150": "BR:17710000",
+    "BR:3637152": "BR:17710000",
 }
 
 
 class BrazilAnaHydroClient:
-    def __init__(self, *, timeout_seconds: float = 30.0, user_agent: str = "gauge-sword-match/0.1.0") -> None:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = 30.0,
+        user_agent: str = "gauge-sword-match/0.1.0",
+        max_retries: int = 2,
+        retry_pause_seconds: float = 1.0,
+    ) -> None:
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.user_agent = user_agent
+        self.max_retries = max(0, int(max_retries))
+        self.retry_pause_seconds = max(0.0, float(retry_pause_seconds))
 
     def fetch_subdaily_discharge_values(
         self,
@@ -125,14 +143,29 @@ class BrazilAnaHydroClient:
                 "User-Agent": self.user_agent,
             },
         )
-        try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                payload = response.read()
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Brazil ANA HTTP {exc.code} for {request.full_url}: {detail or exc.reason}") from exc
-        except URLError as exc:
-            raise RuntimeError(f"Brazil ANA request failed for {request.full_url}: {exc.reason}") from exc
+        payload = b""
+        attempt = 0
+        while True:
+            try:
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    payload = response.read()
+                break
+            except HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace").strip()
+                if exc.code in {429, 500, 502, 503, 504} and attempt < self.max_retries:
+                    attempt += 1
+                    if self.retry_pause_seconds > 0:
+                        time.sleep(self.retry_pause_seconds)
+                    continue
+                raise RuntimeError(f"Brazil ANA HTTP {exc.code} for {request.full_url}: {detail or exc.reason}") from exc
+            except (TimeoutError, URLError) as exc:
+                if attempt < self.max_retries:
+                    attempt += 1
+                    if self.retry_pause_seconds > 0:
+                        time.sleep(self.retry_pause_seconds)
+                    continue
+                reason = exc.reason if isinstance(exc, URLError) else str(exc)
+                raise RuntimeError(f"Brazil ANA request failed for {request.full_url}: {reason}") from exc
 
         try:
             return ET.fromstring(payload)

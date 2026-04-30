@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import socket
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -26,9 +29,20 @@ class MonitoringLocation:
 
 
 class USGSWaterDataClient:
-    def __init__(self, *, timeout_seconds: float = 30.0, user_agent: str = "gauge-sword-match/0.1.0") -> None:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = 60.0,
+        user_agent: str = "gauge-sword-match/0.1.0",
+        api_key: str | None = None,
+        request_pause_seconds: float = 0.0,
+        max_retries: int = 4,
+    ) -> None:
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.user_agent = user_agent
+        self.api_key = _nullable_str(api_key) or _nullable_str(os.environ.get("USGS_WATER_API_KEY")) or _nullable_str(os.environ.get("USGS_API_KEY"))
+        self.request_pause_seconds = max(0.0, float(request_pause_seconds))
+        self.max_retries = max(0, int(max_retries))
 
     def fetch_discharge_metadata(self, monitoring_location_id: str) -> list[dict[str, Any]]:
         payload = self._get_json(
@@ -73,23 +87,94 @@ class USGSWaterDataClient:
         )
         return [_parse_monitoring_location(feature) for feature in _get_feature_list(payload)]
 
+    def fetch_continuous_values(
+        self,
+        *,
+        time_series_id: str,
+        start_datetime_utc: str,
+        end_datetime_utc: str,
+        limit: int = 10_000,
+    ) -> pd.DataFrame:
+        features: list[dict[str, Any]] = []
+        offset = 0
+        normalized_limit = max(1, int(limit))
+        while True:
+            payload = self._get_json(
+                "continuous",
+                {
+                    "f": "json",
+                    "time_series_id": time_series_id,
+                    "datetime": f"{start_datetime_utc}/{end_datetime_utc}",
+                    "limit": normalized_limit,
+                    "offset": offset,
+                },
+            )
+            page_features = _get_feature_list(payload)
+            if not page_features:
+                break
+            features.extend(page_features)
+            if len(page_features) < normalized_limit:
+                break
+            offset += normalized_limit
+
+        records: list[dict[str, Any]] = []
+        for feature in features:
+            properties = feature.get("properties") or {}
+            timestamp_text = _nullable_str(properties.get("time"))
+            value_text = _nullable_str(properties.get("value"))
+            value = _to_float(value_text)
+            if timestamp_text is None or value is None:
+                continue
+            records.append(
+                {
+                    "time": timestamp_text,
+                    "value": value,
+                    "unit_of_measure": _nullable_str(properties.get("unit_of_measure")),
+                    "qualifier": _nullable_str(properties.get("qualifier")),
+                    "approval_status": _nullable_str(properties.get("approval_status")),
+                    "time_series_id": _nullable_str(properties.get("time_series_id")) or time_series_id,
+                    "monitoring_location_id": _nullable_str(properties.get("monitoring_location_id")),
+                }
+            )
+        return pd.DataFrame.from_records(records)
+
     def _get_json(self, collection: str, params: dict[str, Any]) -> dict[str, Any]:
-        encoded_params = urlencode({key: value for key, value in params.items() if value is not None}, doseq=True)
+        query_params = {key: value for key, value in params.items() if value is not None}
+        if self.api_key is not None and "api_key" not in query_params:
+            query_params["api_key"] = self.api_key
+        encoded_params = urlencode(query_params, doseq=True)
         request = Request(
             f"{USGS_WATER_API_BASE_URL}/{collection}/items?{encoded_params}",
             headers={
                 "Accept": "application/geo+json, application/json",
                 "User-Agent": self.user_agent,
+                **({"X-Api-Key": self.api_key} if self.api_key is not None else {}),
             },
         )
-        try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                return json.load(response)
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"USGS API HTTP {exc.code} for {request.full_url}: {detail or exc.reason}") from exc
-        except URLError as exc:
-            raise RuntimeError(f"USGS API request failed for {request.full_url}: {exc.reason}") from exc
+        if self.request_pause_seconds > 0:
+            time.sleep(self.request_pause_seconds)
+
+        attempt = 0
+        while True:
+            try:
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    return json.load(response)
+            except HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace").strip()
+                if attempt < self.max_retries and exc.code in {429, 500, 502, 503, 504}:
+                    retry_after = _to_float(exc.headers.get("Retry-After"))
+                    sleep_seconds = retry_after if retry_after is not None else min(60.0, 2.0 * (attempt + 1))
+                    time.sleep(max(0.0, sleep_seconds))
+                    attempt += 1
+                    continue
+                raise RuntimeError(f"USGS API HTTP {exc.code} for {request.full_url}: {detail or exc.reason}") from exc
+            except (TimeoutError, socket.timeout, URLError) as exc:
+                if attempt < self.max_retries:
+                    time.sleep(min(10.0, 1.0 * (attempt + 1)))
+                    attempt += 1
+                    continue
+                reason = exc.reason if isinstance(exc, URLError) else str(exc)
+                raise RuntimeError(f"USGS API request failed for {request.full_url}: {reason}") from exc
 
 
 def locate_usgs_subdaily_station(

@@ -106,6 +106,28 @@ class FranceHubeauClient:
 
         return first_date, last_date, count
 
+    def fetch_realtime_discharge_values(self, station_id: str, *, page_size: int = 20_000) -> pd.DataFrame:
+        payload = self._get_json(
+            f"{FRANCE_HUBEAU_BASE_URL}/observations_tr",
+            {
+                "code_entite": station_id,
+                "grandeur_hydro": "Q",
+                "size": int(page_size),
+                "sort": "asc",
+                "format": "json",
+            },
+        )
+        records = _extract_realtime_records(payload)
+        next_url = _nullable_str(payload.get("next"))
+        while next_url:
+            payload = self._get_json_url(next_url)
+            records.extend(_extract_realtime_records(payload))
+            next_url = _nullable_str(payload.get("next"))
+
+        if not records:
+            return pd.DataFrame()
+        return pd.DataFrame.from_records(records)
+
     def _get_json(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
         encoded = urlencode({key: value for key, value in params.items() if value is not None}, doseq=True)
         return self._get_json_url(f"{url}?{encoded}")
@@ -344,6 +366,33 @@ def _extract_last_date_field(records: Any, field_name: str) -> str | None:
         if value is not None:
             return value
     return None
+
+
+def _extract_realtime_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        return []
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        timestamp_text = _nullable_str(row.get("date_obs"))
+        raw_value = _to_float(row.get("resultat_obs"))
+        if timestamp_text is None or raw_value is None:
+            continue
+        records.append(
+            {
+                "time": timestamp_text,
+                # Hubeau realtime discharge observations are exposed in l/s.
+                "value_m3s": raw_value / 1000.0,
+                "raw_value": raw_value,
+                "raw_unit_of_measure": "l/s",
+                "unit_of_measure": "m3/s",
+                "continuite_obs_hydro": row.get("continuite_obs_hydro"),
+            }
+        )
+    return records
 
 
 def _subtract_months(moment: datetime, months: int) -> datetime:

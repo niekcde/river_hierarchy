@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -12,10 +13,16 @@ from .gauge_io import clean_gauges, gauges_to_geodataframe, load_gauges
 from .grdc_io import build_grdc_request_table, load_grdc_catalog, prepare_grdc_catalog, write_grdc_request_station_names
 from .kinematic_runner import run_kinematic_screen_batched
 from .kinematic_qa import export_kinematic_review_queue
-from .qa_exports import export_qgis_package, export_review_queue, export_summary_metrics
+from .qa_exports import (
+    export_qgis_package,
+    export_review_queue,
+    export_subdaily_hierarchy_package,
+    export_summary_metrics,
+)
 from .resolver import refine_best_matches_with_nodes, resolve_best_matches
 from .rivretrieve_bridge import build_backend
 from .scoring import score_candidates
+from .subdaily_download import download_subdaily_from_audit, download_subdaily_to_country_outputs
 from .subdaily_locator import locate_subdaily_from_hierarchy_examples
 from .sword_io import scan_sword_parquet_dir
 from .timeseries_io import filter_station_table_for_timeseries
@@ -284,6 +291,82 @@ def export_gpkg(config_path: Path) -> None:
     gauges_gdf = gauges_to_geodataframe(gauges)
     export_qgis_package(best_matches, gauges_gdf, catalog, config.qgis_export_path)
     LOGGER.info("QGIS GeoPackage written to %s", config.qgis_export_path)
+
+
+@main.command("export-subdaily-gpkg")
+@click.option("--input-gpkg", "input_gpkg_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--audit", "audit_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--output", "output_path", required=True, type=click.Path(path_type=Path))
+@click.option("--layer", default="hierarchy_examples_filtered", show_default=True, type=str)
+def export_subdaily_gpkg_command(
+    input_gpkg_path: Path,
+    audit_path: Path,
+    output_path: Path,
+    layer: str,
+) -> None:
+    export_subdaily_hierarchy_package(
+        input_gpkg_path,
+        audit_path,
+        output_path,
+        layer=layer,
+    )
+    LOGGER.info("Subdaily hierarchy GeoPackage written to %s", output_path)
+
+
+@main.command("download-subdaily")
+@click.option("--audit", "audit_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--output", "output_path", default=None, type=click.Path(path_type=Path), help="Combined subdaily timeseries output path. Use together with --manifest.")
+@click.option("--manifest", "manifest_path", default=None, type=click.Path(path_type=Path), help="Combined download manifest path. Use together with --output.")
+@click.option("--output-dir", "output_dir", default=None, type=click.Path(path_type=Path), help="Optional root directory for per-country outputs. Writes <dir>/<COUNTRY>/subdaily_timeseries.parquet and <dir>/<COUNTRY>/subdaily_download_manifest.csv.")
+@click.option("--country", "countries", multiple=True, type=str, help="Optional two-letter country filter. Repeat to restrict the download set.")
+@click.option("--start-date", default="2010-01-01", show_default=True, type=click.DateTime(formats=["%Y-%m-%d"]))
+@click.option("--minimum-completeness", default=0.70, show_default=True, type=click.FloatRange(min=0.0, max=1.0))
+@click.option("--max-gap-days", default=183.0, show_default=True, type=click.FloatRange(min=0.0))
+@click.option("--progress/--no-progress", default=True, show_default=True, help="Show a per-station progress bar during the download run.")
+def download_subdaily_command(
+    audit_path: Path,
+    output_path: Path | None,
+    manifest_path: Path | None,
+    output_dir: Path | None,
+    countries: tuple[str, ...],
+    start_date: datetime,
+    minimum_completeness: float,
+    max_gap_days: float,
+    progress: bool,
+) -> None:
+    if output_dir is not None and (output_path is not None or manifest_path is not None):
+        raise click.ClickException("Use either --output-dir for per-country files or the combined --output/--manifest pair, not both.")
+    if output_dir is None and (output_path is None or manifest_path is None):
+        raise click.ClickException("Provide either --output-dir or both --output and --manifest.")
+
+    if output_dir is not None:
+        summary = download_subdaily_to_country_outputs(
+            audit_path,
+            output_dir=output_dir,
+            countries=list(countries),
+            target_start_date=start_date.date(),
+            minimum_completeness=minimum_completeness,
+            max_gap_days=max_gap_days,
+            show_progress=progress,
+        )
+        LOGGER.info(
+            "Per-country subdaily downloader wrote %s country summaries to %s",
+            len(summary),
+            output_dir,
+        )
+        return
+
+    timeseries, manifest = download_subdaily_from_audit(
+        audit_path,
+        output_path=output_path,
+        manifest_path=manifest_path,
+        countries=list(countries),
+        target_start_date=start_date.date(),
+        minimum_completeness=minimum_completeness,
+        max_gap_days=max_gap_days,
+        show_progress=progress,
+    )
+    LOGGER.info("Subdaily downloader wrote %s rows across %s stations", len(timeseries), len(manifest))
 
 
 @main.command("detect-events")
