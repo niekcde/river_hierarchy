@@ -9,6 +9,7 @@ from typing import Any, Mapping, Sequence
 import click
 import pandas as pd
 
+from .canada_manual_download import load_canada_manual_archive
 from .chile_manual_excel import load_chile_manual_archive
 from .subdaily_locator.brazil import BrazilAnaHydroClient
 from .subdaily_locator.canada import CanadaWaterofficeClient
@@ -40,6 +41,10 @@ BRAZIL_TELEMETRIC_MIN_CHUNK_DAYS = 30
 DEFAULT_COUNTRY_TIMESERIES_FILENAME = "subdaily_timeseries.parquet"
 DEFAULT_COUNTRY_MANIFEST_FILENAME = "subdaily_download_manifest.csv"
 DEFAULT_COUNTRY_SUMMARY_FILENAME = "subdaily_country_download_summary.csv"
+CANADA_DUPLICATE_STATION_KEYS_TO_SKIP = {
+    "CA:4208871",
+    "CA:4214590",
+}
 
 INTERNAL_SERIES_COLUMNS = [
     "time",
@@ -363,6 +368,12 @@ def _load_download_station_rows(
         working["country"] = working["country"].astype("string").str.upper()
 
     working["provider"] = working["provider"].astype("string").fillna(pd.NA)
+    canada_duplicate_mask = (
+        working["provider"].astype("string").eq("canada_wateroffice")
+        & working["station_key"].astype("string").isin(CANADA_DUPLICATE_STATION_KEYS_TO_SKIP)
+    )
+    if canada_duplicate_mask.any():
+        working = working[~canada_duplicate_mask].copy()
     working["resolved_site_number"] = working.apply(
         lambda row: _normalize_provider_station_id(
             row.get("resolved_site_number"),
@@ -398,9 +409,12 @@ def _build_default_clients(overrides: Mapping[str, Any] | None) -> dict[str, Any
 
 def _build_country_provider_contexts(country_dir: Path) -> dict[str, Any]:
     chile_excel_dir = country_dir / "excel_download"
+    canada_manual_dir = country_dir / "manual_download"
     contexts: dict[str, Any] = {}
     if chile_excel_dir.exists() and chile_excel_dir.is_dir():
         contexts["chile_dga"] = {"manual_excel_dir": chile_excel_dir}
+    if canada_manual_dir.exists() and canada_manual_dir.is_dir():
+        contexts["canada_wateroffice"] = {"manual_download_dir": canada_manual_dir}
     return contexts
 
 
@@ -424,6 +438,7 @@ def _fetch_provider_series(
         return _fetch_canada_subdaily_series(
             row,
             client=provider_clients["canada_wateroffice"],
+            provider_context=provider_context,
             runtime_now=runtime_now,
             target_start_date=target_start_date,
         )
@@ -509,10 +524,17 @@ def _fetch_canada_subdaily_series(
     row: pd.Series,
     *,
     client: CanadaWaterofficeClient,
+    provider_context: Mapping[str, Any] | None,
     runtime_now: datetime,
     target_start_date: date,
 ) -> ProviderSeriesResult:
     provider_station_id = str(row["resolved_site_number"]).strip()
+    manual_download_dir = None if provider_context is None else provider_context.get("manual_download_dir")
+    if manual_download_dir is not None:
+        manual_frame, manual_notes = load_canada_manual_archive(provider_station_id, manual_download_dir)
+        if not manual_frame.empty:
+            return ProviderSeriesResult(manual_frame, notes=manual_notes)
+
     frame = client.fetch_discharge_unit_values(
         provider_station_id,
         start_datetime_utc=datetime.combine(target_start_date, datetime.min.time(), tzinfo=timezone.utc),

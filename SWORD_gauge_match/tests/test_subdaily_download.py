@@ -1,3 +1,4 @@
+import lzma
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -5,6 +6,7 @@ import pandas as pd
 
 from gauge_sword_match.chile_manual_excel import parse_chile_manual_sheet
 from gauge_sword_match.subdaily_download import (
+    _load_download_station_rows,
     _select_download_window,
     download_subdaily_from_audit,
     download_subdaily_to_country_outputs,
@@ -280,6 +282,101 @@ def test_download_subdaily_from_audit_widens_window_when_latest_10y_has_large_ga
     assert manifest.loc[0, "download_status"] == "ok"
     assert manifest.loc[0, "window_strategy"] == "since_2010_gap_fallback"
     assert manifest.loc[0, "selected_row_count"] == 12
+
+
+def test_load_download_station_rows_skips_duplicate_canada_seed_station_keys(tmp_path: Path):
+    audit = pd.DataFrame(
+        [
+            {
+                "station_key": "CA:04HA002",
+                "country": "CA",
+                "provider": "canada_wateroffice",
+                "status": "subdaily_found",
+                "resolved_site_number": "04HA002",
+            },
+            {
+                "station_key": "CA:4214590",
+                "country": "CA",
+                "provider": "canada_wateroffice",
+                "status": "subdaily_found",
+                "resolved_site_number": "04HA002",
+            },
+            {
+                "station_key": "CA:07DD001",
+                "country": "CA",
+                "provider": "canada_wateroffice",
+                "status": "subdaily_found",
+                "resolved_site_number": "07DD001",
+            },
+            {
+                "station_key": "CA:4208871",
+                "country": "CA",
+                "provider": "canada_wateroffice",
+                "status": "subdaily_found",
+                "resolved_site_number": "07DD001",
+            },
+        ]
+    )
+    audit_path = tmp_path / "audit.csv"
+    audit.to_csv(audit_path, index=False)
+
+    rows = _load_download_station_rows(audit_path, countries=["CA"])
+
+    assert list(rows["station_key"]) == ["CA:04HA002", "CA:07DD001"]
+
+
+def test_download_subdaily_from_audit_prefers_manual_canada_archive(tmp_path: Path):
+    audit = pd.DataFrame(
+        [
+            {
+                "station_key": "CA:04HA002",
+                "country": "CA",
+                "provider": "canada_wateroffice",
+                "status": "subdaily_found",
+                "resolved_site_number": "04HA002",
+                "resolved_station_name": "Canada Manual Gauge",
+            }
+        ]
+    )
+    audit_path = tmp_path / "audit.csv"
+    audit.to_csv(audit_path, index=False)
+
+    manual_dir = tmp_path / "manual_download"
+    manual_dir.mkdir(parents=True, exist_ok=True)
+    payload = "\n".join(
+        [
+            "# Time-series identifier: Discharge.Working@04HA002",
+            "# Location: ALBANY RIVER ABOVE FISHING CREEK ISLAND",
+            "# Value units: m^3/s",
+            "# CSV data starts at line 5.",
+            "ISO 8601 UTC,Timestamp (UTC-05:00),Value,Approval Level,Grade,Qualifiers",
+            "2011-01-01T05:00:00Z,2011-01-01 00:00:00,611.2,Approved,10,",
+            "2011-01-01T11:00:00Z,2011-01-01 06:00:00,612.2,Approved,10,",
+        ]
+    )
+    with lzma.open(manual_dir / "Discharge.Working@04HA002.20110101_corrected.csv.xz", "wt", encoding="utf-8") as handle:
+        handle.write(payload)
+    with lzma.open(manual_dir / "Discharge.Working@04HA002.20110101_corrected (1).csv.xz", "wt", encoding="utf-8") as handle:
+        handle.write(payload)
+
+    class FakeCanadaClient:
+        def fetch_discharge_unit_values(self, station_id: str, *, start_datetime_utc, end_datetime_utc):
+            raise AssertionError("API client should not be called when manual Canada archive is available")
+
+    timeseries, manifest = download_subdaily_from_audit(
+        audit_path,
+        countries=["CA"],
+        clients={"canada_wateroffice": FakeCanadaClient()},
+        provider_contexts={"canada_wateroffice": {"manual_download_dir": manual_dir}},
+        now_utc=datetime(2025, 1, 10, tzinfo=timezone.utc),
+    )
+
+    assert len(timeseries) == 2
+    assert manifest.loc[0, "download_status"] == "ok"
+    assert manifest.loc[0, "window_strategy"] == "full_available_short_record"
+    assert "manual AQUARIUS archive parsed from 1 file(s)" in manifest.loc[0, "notes"]
+    assert timeseries["provider_station_id"].eq("04HA002").all()
+    assert timeseries["unit_of_measure"].eq("m3/s").all()
 
 
 def test_select_download_window_prefers_latest_10y_when_recent_archive_is_solid():
