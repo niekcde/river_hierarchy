@@ -361,8 +361,8 @@ def summarize_discharge_metadata(features: list[dict[str, Any]]) -> dict[str, An
 
     for feature in features:
         properties = feature.get("properties") or {}
-        computation_identifier = str(properties.get("computation_identifier") or "").strip().lower()
-        computation_period_identifier = str(properties.get("computation_period_identifier") or "").strip().lower()
+        computation_identifier = (_nullable_str(properties.get("computation_identifier")) or "").strip().lower()
+        computation_period_identifier = (_nullable_str(properties.get("computation_period_identifier")) or "").strip().lower()
         if computation_identifier == "instantaneous" or computation_period_identifier == "points":
             instantaneous_features.append(feature)
         if computation_period_identifier == "daily":
@@ -373,7 +373,7 @@ def summarize_discharge_metadata(features: list[dict[str, Any]]) -> dict[str, An
     primary_instantaneous_series_count = sum(
         1
         for feature in instantaneous_features
-        if str((feature.get("properties") or {}).get("primary") or "").strip().lower() == "primary"
+        if (_nullable_str((feature.get("properties") or {}).get("primary")) or "").strip().lower() == "primary"
     )
 
     return {
@@ -454,7 +454,7 @@ def _parse_monitoring_location(feature: dict[str, Any]) -> MonitoringLocation:
     lon = _to_float(coordinates[0] if len(coordinates) > 0 else None)
     lat = _to_float(coordinates[1] if len(coordinates) > 1 else None)
     return MonitoringLocation(
-        monitoring_location_id=str(feature.get("id") or properties.get("id") or "").strip(),
+        monitoring_location_id=_nullable_str(feature.get("id")) or _nullable_str(properties.get("id")) or "",
         monitoring_location_number=_nullable_str(properties.get("monitoring_location_number")),
         monitoring_location_name=_nullable_str(properties.get("monitoring_location_name")),
         lat=lat,
@@ -522,16 +522,73 @@ def _max_timestamp_iso(values: list[pd.Timestamp | pd.NaT]) -> str | None:
 
 
 def _nullable_str(value: Any) -> str | None:
-    if value is None or pd.isna(value):
+    scalar = _first_non_null(value)
+    if scalar is None or _is_missing_scalar(scalar):
         return None
-    text = str(value).strip()
+    text = str(scalar).strip()
     return text or None
 
 
 def _to_float(value: Any) -> float | None:
-    if value is None or pd.isna(value):
+    scalar = _first_non_null(value)
+    if scalar is None or _is_missing_scalar(scalar):
         return None
     try:
-        return float(value)
+        return float(scalar)
     except (TypeError, ValueError):
         return None
+
+
+def _first_non_null(value: Any) -> Any:
+    for item in _iter_scalar_candidates(value):
+        if not _is_missing_scalar(item):
+            return item
+    return None
+
+
+def _iter_scalar_candidates(value: Any):
+    if value is None:
+        return
+    if isinstance(value, pd.Series):
+        for item in value.tolist():
+            yield from _iter_scalar_candidates(item)
+        return
+    if isinstance(value, pd.Index):
+        for item in value.tolist():
+            yield from _iter_scalar_candidates(item)
+        return
+    if isinstance(value, dict):
+        yield value
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_scalar_candidates(item)
+        return
+    if not pd.api.types.is_scalar(value) and not isinstance(value, (str, bytes)):
+        try:
+            iterable = list(value)
+        except TypeError:
+            yield value
+            return
+        for item in iterable:
+            yield from _iter_scalar_candidates(item)
+        return
+    yield value
+
+
+def _is_missing_scalar(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (list, tuple, set, dict, pd.Series, pd.Index)):
+        return False
+    if not pd.api.types.is_scalar(value) and not isinstance(value, (str, bytes)):
+        return False
+    result = pd.isna(value)
+    if isinstance(result, (list, tuple, pd.Series, pd.Index)):
+        return False
+    if not pd.api.types.is_scalar(result) and not isinstance(result, (str, bytes)):
+        return False
+    try:
+        return bool(result)
+    except Exception:
+        return False

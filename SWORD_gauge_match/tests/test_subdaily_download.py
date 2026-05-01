@@ -561,6 +561,60 @@ def test_download_subdaily_from_audit_handles_non_scalar_usgs_unit_values(tmp_pa
     assert timeseries["unit_of_measure"].eq("m3/s").all()
 
 
+def test_download_subdaily_from_audit_handles_array_like_usgs_metadata_fields(tmp_path: Path):
+    audit = pd.DataFrame(
+        [
+            {
+                "station_key": "US:4116192",
+                "country": "US",
+                "provider": "usgs",
+                "status": "subdaily_found",
+                "resolved_site_number": "13013650",
+                "resolved_station_name": "USGS Metadata Edge Case",
+            }
+        ]
+    )
+    audit_path = tmp_path / "audit.csv"
+    audit.to_csv(audit_path, index=False)
+
+    class FakeUSGSClient:
+        def fetch_discharge_metadata(self, monitoring_location_id: str):
+            return [
+                {
+                    "properties": {
+                        "id": pd.Series(["ts-array"]),
+                        "monitoring_location_id": monitoring_location_id,
+                        "computation_identifier": pd.Series(["Instantaneous"]),
+                        "computation_period_identifier": pd.Index(["Points"]),
+                        "primary": pd.Series(["Primary"]),
+                    }
+                }
+            ]
+
+        def fetch_continuous_values(self, *, time_series_id: str, start_datetime_utc: str, end_datetime_utc: str, limit: int = 10_000):
+            assert time_series_id == "ts-array"
+            return pd.DataFrame(
+                {
+                    "time": ["2024-01-01T00:00:00Z", "2024-01-01T06:00:00Z"],
+                    "value": [20.0, 21.0],
+                    "unit_of_measure": ["ft3/s", "ft3/s"],
+                    "time_series_id": [time_series_id, time_series_id],
+                }
+            )
+
+    timeseries, manifest = download_subdaily_from_audit(
+        audit_path,
+        countries=["US"],
+        clients={"usgs": FakeUSGSClient()},
+        now_utc=datetime(2025, 1, 10, tzinfo=timezone.utc),
+    )
+
+    assert len(timeseries) == 2
+    assert manifest.loc[0, "download_status"] == "ok"
+    assert manifest.loc[0, "provider_station_id"] == "13013650"
+    assert timeseries["unit_of_measure"].eq("m3/s").all()
+
+
 def test_download_subdaily_from_audit_adaptively_splits_usgs_timeout_windows(tmp_path: Path):
     audit = pd.DataFrame(
         [

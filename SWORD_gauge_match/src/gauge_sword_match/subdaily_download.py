@@ -1280,8 +1280,8 @@ def _select_usgs_instantaneous_time_series_id(features: list[dict[str, Any]]) ->
     first_candidate: str | None = None
     for feature in features:
         properties = feature.get("properties") or {}
-        computation_identifier = str(properties.get("computation_identifier") or "").strip().lower()
-        computation_period_identifier = str(properties.get("computation_period_identifier") or "").strip().lower()
+        computation_identifier = (_nullable_str(properties.get("computation_identifier")) or "").strip().lower()
+        computation_period_identifier = (_nullable_str(properties.get("computation_period_identifier")) or "").strip().lower()
         is_instantaneous = computation_identifier == "instantaneous" or computation_period_identifier == "points"
         if not is_instantaneous:
             continue
@@ -1290,7 +1290,7 @@ def _select_usgs_instantaneous_time_series_id(features: list[dict[str, Any]]) ->
             continue
         if first_candidate is None:
             first_candidate = time_series_id
-        if str(properties.get("primary") or "").strip().lower() == "primary":
+        if (_nullable_str(properties.get("primary")) or "").strip().lower() == "primary":
             primary_candidate = time_series_id
             break
     return primary_candidate or first_candidate
@@ -1400,14 +1400,10 @@ def _timestamp_iso(value: pd.Timestamp | None) -> str | None:
 
 
 def _first_non_null(values: Any, *, default: Any = None) -> Any:
-    if values is None:
-        return default
-    if isinstance(values, pd.Series):
-        for value in values:
-            if not _is_missing_value(value):
-                return value
-        return default
-    return values if not _is_missing_value(values) else default
+    for value in _iter_scalar_candidates(values):
+        if not _is_missing_value(value):
+            return value
+    return default
 
 
 def _join_notes(*notes: str | None) -> str | None:
@@ -1416,15 +1412,15 @@ def _join_notes(*notes: str | None) -> str | None:
 
 
 def _normalize_text(value: Any) -> str:
-    if value is None or pd.isna(value):
-        return ""
-    return str(value).strip().lower()
+    text = _nullable_str(value)
+    return text.strip().lower() if text is not None else ""
 
 
 def _nullable_str(value: Any) -> str | None:
-    if _is_missing_value(value):
+    scalar = _first_non_null(value)
+    if _is_missing_value(scalar):
         return None
-    text = str(value).strip()
+    text = str(scalar).strip()
     return text or None
 
 
@@ -1465,26 +1461,15 @@ def _normalize_provider_station_id(
 
 
 def _normalize_unit_scalar(value: Any) -> str | None:
-    if isinstance(value, pd.Series):
-        for item in value:
-            normalized = _normalize_unit_scalar(item)
-            if normalized is not None:
-                return normalized
-        return None
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            normalized = _normalize_unit_scalar(item)
-            if normalized is not None:
-                return normalized
-        return None
     return _nullable_str(value)
 
 
 def _to_float(value: Any) -> float | None:
-    if _is_missing_value(value):
+    scalar = _first_non_null(value)
+    if _is_missing_value(scalar):
         return None
     try:
-        numeric = float(value)
+        numeric = float(scalar)
     except (TypeError, ValueError):
         return None
     if pd.isna(numeric):
@@ -1497,12 +1482,46 @@ def _is_missing_value(value: Any) -> bool:
         return True
     if isinstance(value, pd.Series):
         return value.empty or value.isna().all()
-    if isinstance(value, (list, tuple, set, dict)):
+    if isinstance(value, (list, tuple, set, dict, pd.Index)):
+        return False
+    if not pd.api.types.is_scalar(value) and not isinstance(value, (str, bytes)):
         return False
     result = pd.isna(value)
-    if isinstance(result, (list, tuple, pd.Series)):
+    if isinstance(result, (list, tuple, pd.Series, pd.Index)):
+        return False
+    if not pd.api.types.is_scalar(result) and not isinstance(result, (str, bytes)):
         return False
     try:
         return bool(result)
     except Exception:
         return False
+
+
+def _iter_scalar_candidates(value: Any):
+    if value is None:
+        return
+    if isinstance(value, pd.Series):
+        for item in value.tolist():
+            yield from _iter_scalar_candidates(item)
+        return
+    if isinstance(value, pd.Index):
+        for item in value.tolist():
+            yield from _iter_scalar_candidates(item)
+        return
+    if isinstance(value, dict):
+        yield value
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_scalar_candidates(item)
+        return
+    if not pd.api.types.is_scalar(value) and not isinstance(value, (str, bytes)):
+        try:
+            iterable = list(value)
+        except TypeError:
+            yield value
+            return
+        for item in iterable:
+            yield from _iter_scalar_candidates(item)
+        return
+    yield value
