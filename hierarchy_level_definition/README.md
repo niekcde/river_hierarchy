@@ -9,7 +9,7 @@ This area is split into the stages you described:
 - `unit_detection/`
   Detect bifurcation-confluence units and their nesting relationships from the validated directed network.
 - `metrics/`
-  Compute geometry-based unit metrics from the detected units so the same logic can be used from a notebook or batch scripts.
+  Compute direct, hierarchy-aware unit metrics from the detected units so the same logic can be used from a notebook or batch scripts. The current metrics are computed from each unit's detected paths in the present graph; recursive collapsed geometry is future work.
 - `notebooks/`
   Interactive notebooks for stepping through the workflow on smoke-test examples such as `sarl_03`.
 
@@ -24,7 +24,7 @@ Recommended order:
 Metrics entry points:
 
 - From the notebook or another Python module:
-  `from hierarchy_level_definition.metrics import compute_unit_metrics, compute_unit_metrics_from_units`
+  `from hierarchy_level_definition.metrics import compute_unit_metrics, compute_unit_metrics_from_units, summarize_by_hierarchy_level`
 - From the command line:
   `python hierarchy_level_definition/metrics/unit_metrics.py <links.gpkg> <nodes.gpkg> --output-dir <dir>`
 
@@ -33,4 +33,9 @@ The metrics module writes:
 - `unit_summary.csv`
 - `unit_metrics.csv`
 - `path_metrics.csv`
+- `hierarchy_level_metrics.csv`
 - `metrics_manifest.json`
+
+Metric definitions:
+
+- See `metrics/metrics_definition.md` for the full metric reference, including equations, width definitions, and a shorter "important metrics" overview.
