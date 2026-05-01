@@ -76,10 +76,12 @@ def export_subdaily_hierarchy_package(
     output_path,
     *,
     layer: str = "hierarchy_examples_filtered",
+    manifests_dir=None,
 ) -> None:
     hierarchy_examples_path = Path(hierarchy_examples_path)
     audit_path = Path(audit_path)
     output_path = Path(output_path)
+    manifests_dir = None if manifests_dir is None else Path(manifests_dir)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
         output_path.unlink()
@@ -87,6 +89,9 @@ def export_subdaily_hierarchy_package(
     examples = gpd.read_file(hierarchy_examples_path, layer=layer)
     audit = read_table(audit_path)
     audit_prepared = _prepare_subdaily_audit_for_export(audit)
+    manifest_prepared = _prepare_download_manifests_for_export(manifests_dir)
+    if manifest_prepared is not None:
+        audit_prepared = audit_prepared.merge(manifest_prepared, on="station_key", how="left")
 
     points_layer = examples.merge(audit_prepared, on="station_key", how="left")
     points_layer.to_file(output_path, layer=layer, driver="GPKG")
@@ -166,6 +171,79 @@ def _prepare_subdaily_audit_for_export(audit: pd.DataFrame) -> pd.DataFrame:
         if column in working.columns
     ]
     prepared = working[keep_columns].copy()
+    prepared = prepared.drop_duplicates(subset=["station_key"], keep="first").reset_index(drop=True)
+    return prepared
+
+
+def _prepare_download_manifests_for_export(manifests_dir: Path | None) -> pd.DataFrame | None:
+    if manifests_dir is None:
+        return None
+    if not manifests_dir.exists() or not manifests_dir.is_dir():
+        raise ValueError(f"Subdaily manifest directory does not exist: {manifests_dir}")
+
+    manifest_paths = sorted(manifests_dir.glob("*/subdaily_download_manifest.csv"))
+    if not manifest_paths:
+        return None
+
+    frames: list[pd.DataFrame] = []
+    for path in manifest_paths:
+        manifest = pd.read_csv(path)
+        if "station_key" not in manifest.columns:
+            continue
+        manifest["manifest_country"] = path.parent.name.upper()
+        frames.append(manifest)
+
+    if not frames:
+        return None
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    keep_columns = [
+        column
+        for column in [
+            "station_key",
+            "provider_station_id",
+            "download_status",
+            "window_strategy",
+            "requested_start",
+            "requested_end",
+            "raw_returned_start",
+            "raw_returned_end",
+            "raw_row_count",
+            "selected_start",
+            "selected_end",
+            "selected_row_count",
+            "median_timestep_hours",
+            "completeness_ratio",
+            "max_gap_days",
+            "provider_series_name",
+            "provider_series_id",
+            "notes",
+            "manifest_country",
+        ]
+        if column in combined.columns
+    ]
+    prepared = combined[keep_columns].copy()
+    rename_map = {
+        "provider_station_id": "download_provider_station_id",
+        "download_status": "download_status",
+        "window_strategy": "download_window_strategy",
+        "requested_start": "download_requested_start",
+        "requested_end": "download_requested_end",
+        "raw_returned_start": "download_raw_returned_start",
+        "raw_returned_end": "download_raw_returned_end",
+        "raw_row_count": "download_raw_row_count",
+        "selected_start": "download_selected_start",
+        "selected_end": "download_selected_end",
+        "selected_row_count": "download_selected_row_count",
+        "median_timestep_hours": "download_median_timestep_hours",
+        "completeness_ratio": "download_completeness_ratio",
+        "max_gap_days": "download_max_gap_days",
+        "provider_series_name": "download_provider_series_name",
+        "provider_series_id": "download_provider_series_id",
+        "notes": "download_notes",
+        "manifest_country": "download_manifest_country",
+    }
+    prepared = prepared.rename(columns=rename_map)
     prepared = prepared.drop_duplicates(subset=["station_key"], keep="first").reset_index(drop=True)
     return prepared
 

@@ -26,6 +26,7 @@ from .subdaily_download import download_subdaily_from_audit, download_subdaily_t
 from .subdaily_locator import locate_subdaily_from_hierarchy_examples
 from .sword_io import scan_sword_parquet_dir
 from .timeseries_io import filter_station_table_for_timeseries
+from .us_manual_import import import_manual_us_subdaily
 from .utils import configure_logging, ensure_directory, get_logger, write_json, write_table
 
 LOGGER = get_logger("cli")
@@ -298,17 +299,20 @@ def export_gpkg(config_path: Path) -> None:
 @click.option("--audit", "audit_path", required=True, type=click.Path(exists=True, path_type=Path))
 @click.option("--output", "output_path", required=True, type=click.Path(path_type=Path))
 @click.option("--layer", default="hierarchy_examples_filtered", show_default=True, type=str)
+@click.option("--manifests-dir", "manifests_dir", default=None, type=click.Path(exists=True, path_type=Path))
 def export_subdaily_gpkg_command(
     input_gpkg_path: Path,
     audit_path: Path,
     output_path: Path,
     layer: str,
+    manifests_dir: Path | None,
 ) -> None:
     export_subdaily_hierarchy_package(
         input_gpkg_path,
         audit_path,
         output_path,
         layer=layer,
+        manifests_dir=manifests_dir,
     )
     LOGGER.info("Subdaily hierarchy GeoPackage written to %s", output_path)
 
@@ -367,6 +371,45 @@ def download_subdaily_command(
         show_progress=progress,
     )
     LOGGER.info("Subdaily downloader wrote %s rows across %s stations", len(timeseries), len(manifest))
+
+
+@main.command("import-manual-us-subdaily")
+@click.option("--manual-dir", "manual_dir", default=Path("outputs/subdaily_values/US/manual_download"), show_default=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--audit", "audit_path", default=Path("outputs/subdaily_daily_audit_manual_updates_with_added_examples.csv"), show_default=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--examples-gpkg", "examples_gpkg_path", default=Path("outputs/hierarchy_examples_filtered_manual_updates.gpkg"), show_default=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--examples-csv", "examples_csv_path", default=Path("outputs/hierarchy_examples_manual_updates.csv"), show_default=True, type=click.Path(path_type=Path))
+@click.option("--subdaily-gpkg", "subdaily_gpkg_path", default=Path("outputs/hierarchy_examples_filtered_subdaily_manual_updates.gpkg"), show_default=True, type=click.Path(path_type=Path))
+@click.option("--output-dir", "output_dir", default=Path("outputs/subdaily_values"), show_default=True, type=click.Path(path_type=Path))
+@click.option("--gauges-cleaned", "gauges_cleaned_path", default=Path("outputs/gauges_cleaned.parquet"), show_default=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--start-date", default="2010-01-01", show_default=True, type=click.DateTime(formats=["%Y-%m-%d"]))
+@click.option("--max-gap-days", default=183.0, show_default=True, type=click.FloatRange(min=0.0))
+def import_manual_us_subdaily_command(
+    manual_dir: Path,
+    audit_path: Path,
+    examples_gpkg_path: Path,
+    examples_csv_path: Path,
+    subdaily_gpkg_path: Path,
+    output_dir: Path,
+    gauges_cleaned_path: Path,
+    start_date: datetime,
+    max_gap_days: float,
+) -> None:
+    result = import_manual_us_subdaily(
+        manual_download_dir=manual_dir,
+        audit_path=audit_path,
+        examples_gpkg_path=examples_gpkg_path,
+        examples_csv_path=examples_csv_path,
+        subdaily_gpkg_path=subdaily_gpkg_path,
+        output_dir=output_dir,
+        gauges_cleaned_path=gauges_cleaned_path,
+        target_start_date=start_date.date(),
+        max_gap_days=max_gap_days,
+    )
+    LOGGER.info(
+        "Manual US subdaily import added/updated %s stations and wrote %s US timeseries rows",
+        len(result["imported_station_keys"]),
+        result["us_timeseries_rows"],
+    )
 
 
 @main.command("detect-events")

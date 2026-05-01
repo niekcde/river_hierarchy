@@ -25,6 +25,7 @@ from .subdaily_locator.colombia import ColombiaIdeamFewsClient
 from .subdaily_locator.french_guiana import FranceHubeauClient
 from .subdaily_locator.mekong_mrc import MekongMrcClient
 from .subdaily_locator.usgs import USGSWaterDataClient
+from .us_manual_download import load_us_manual_archive
 from .utils import ensure_directory, get_logger, read_table, write_table
 
 LOGGER = get_logger("subdaily_download")
@@ -409,12 +410,13 @@ def _build_default_clients(overrides: Mapping[str, Any] | None) -> dict[str, Any
 
 def _build_country_provider_contexts(country_dir: Path) -> dict[str, Any]:
     chile_excel_dir = country_dir / "excel_download"
-    canada_manual_dir = country_dir / "manual_download"
+    manual_download_dir = country_dir / "manual_download"
     contexts: dict[str, Any] = {}
     if chile_excel_dir.exists() and chile_excel_dir.is_dir():
         contexts["chile_dga"] = {"manual_excel_dir": chile_excel_dir}
-    if canada_manual_dir.exists() and canada_manual_dir.is_dir():
-        contexts["canada_wateroffice"] = {"manual_download_dir": canada_manual_dir}
+    if manual_download_dir.exists() and manual_download_dir.is_dir():
+        contexts["canada_wateroffice"] = {"manual_download_dir": manual_download_dir}
+        contexts["usgs"] = {"manual_download_dir": manual_download_dir}
     return contexts
 
 
@@ -431,6 +433,7 @@ def _fetch_provider_series(
         return _fetch_usgs_subdaily_series(
             row,
             client=provider_clients["usgs"],
+            provider_context=provider_context,
             runtime_now=runtime_now,
             target_start_date=target_start_date,
         )
@@ -477,10 +480,17 @@ def _fetch_usgs_subdaily_series(
     row: pd.Series,
     *,
     client: USGSWaterDataClient,
+    provider_context: Mapping[str, Any] | None,
     runtime_now: datetime,
     target_start_date: date,
 ) -> ProviderSeriesResult:
     provider_station_id = str(row["resolved_site_number"]).strip()
+    manual_download_dir = None if provider_context is None else provider_context.get("manual_download_dir")
+    if manual_download_dir is not None:
+        manual_frame, manual_notes = load_us_manual_archive(provider_station_id, manual_download_dir)
+        if not manual_frame.empty:
+            return ProviderSeriesResult(manual_frame, notes=manual_notes)
+
     monitoring_location_id = f"USGS-{provider_station_id}"
     metadata = client.fetch_discharge_metadata(monitoring_location_id)
     time_series_id = _select_usgs_instantaneous_time_series_id(metadata)
