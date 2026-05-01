@@ -230,6 +230,8 @@ Each row in `unit_metrics.csv` is one structural unit.
 - `class`
 - `n_paths`
 - `n_valid_paths`
+- `unit_node_ids`
+- `unit_node_count`
 
 `n_valid_paths` counts paths with:
 
@@ -252,6 +254,20 @@ Output fields:
 - `equivalent_length`
 - `elongation`
 
+Interpretation:
+
+- `equivalent_width` is the effective parallel width of the unit, obtained by summing the representative importance of all valid paths.
+- `equivalent_length` is a width-weighted characteristic length of the unit, so wider paths influence it more strongly than narrow paths.
+- `elongation` is a compact shape-style metric:
+  - values near `1` suggest unit length and effective width are of similar magnitude
+  - larger values suggest long, slender units
+  - values less than `1` suggest relatively short and wide units
+
+Important note:
+
+- these are direct metrics of the currently detected unit paths
+- they are not recursive collapsed-geometry metrics of a parent rebuilt from child units
+
 ### Path-length spread metrics
 
 Computed on valid path lengths:
@@ -262,6 +278,21 @@ Computed on valid path lengths:
 - `path_length_range = path_length_max - path_length_min`
 - `path_length_range_norm = path_length_range / equivalent_length`
 - `path_length_cv = std(path_length) / mean(path_length)`
+
+Interpretation:
+
+- `path_length_min` and `path_length_max` give the shortest and longest valid pathways through the unit.
+- `path_length_range` measures absolute branch-length contrast.
+- `path_length_range_norm` rescales that contrast by the unit's characteristic length, which makes it easier to compare small and large units.
+- `path_length_cv` is the coefficient of variation of path lengths:
+  - near `0` means the path lengths are similar
+  - larger values mean greater spread in branch lengths
+
+What these metrics are good for:
+
+- distinguishing balanced versus asymmetric pathway lengths
+- identifying long detour paths relative to short direct paths
+- quantifying geometric asymmetry even when width balance is similar
 
 ### Path-width spread metrics
 
@@ -274,6 +305,27 @@ Computed on valid `path_width_eq` values:
 - `path_width_range_norm = path_width_range / equivalent_width`
 - `largest_path_width_fraction = max(W_p) / equivalent_width`
 - `dominant_width_fraction = largest_path_width_fraction`
+
+Interpretation:
+
+- these metrics use `path_width_eq`, so they describe differences in representative path importance, not raw local pixel extremes.
+- `path_width_range` is the absolute difference between the widest and narrowest valid path.
+- `path_width_range_norm` rescales that difference by the total effective unit width.
+- `largest_path_width_fraction` is often the most intuitive dominance metric:
+  - close to `0.5` in a two-path unit suggests a balanced split
+  - close to `1.0` suggests one path dominates the unit
+
+Use this section for:
+
+- representative branch dominance
+- balance of pathway importance
+- comparing how uneven the split is across different units
+
+Do not confuse these with:
+
+- `path_width_min`, `path_width_max`, `path_width_p05`, `path_width_p95`
+
+Those path-level metrics describe local narrow/wide conditions along a path, while the width-spread metrics here describe differences between whole-path representative widths.
 
 ### Entropy-based path diversity metrics
 
@@ -300,6 +352,26 @@ Interpretation:
 - `effective_n_paths_width` is the number of equally important paths that would produce the same entropy
 - `path_disparity_width` near `1` means path importance is evenly distributed
 - larger `path_disparity_width` means many mapped paths exist but only a few are effectively important
+
+Additional intuition:
+
+- `width_entropy` grows as path importance becomes more evenly distributed.
+- `width_evenness` is the normalized version and is usually easier to compare across units with different numbers of paths.
+- `effective_n_paths_width` is often more intuitive than raw entropy because it is on a path-count scale.
+
+Examples:
+
+- widths `[1, 1, 1, 1]`
+  - `width_evenness = 1`
+  - `effective_n_paths_width = 4`
+- widths `[0.9, 0.1]`
+  - lower entropy
+  - `effective_n_paths_width` much closer to `1` than to `2`
+
+So this section answers:
+
+- how many paths are effectively important?
+- are multiple paths genuinely sharing the unit, or is one path doing most of the work geometrically?
 
 ### Two-path metrics
 
@@ -329,6 +401,105 @@ Simple first-score:
 
 `topologic_complexity_score = ln(1 + n_valid_paths) + ln(1 + internal_bifurcation_count) + ln(1 + internal_confluence_count)`
 
+#### What counts as "internal" here
+
+Each unit has:
+
+- one boundary bifurcation
+- one boundary confluence
+
+The topologic complexity metrics ask:
+
+- what additional branching or merging happens inside the unit between those boundaries?
+
+So:
+
+- `internal_bifurcation_count`
+  counts bifurcation nodes inside the unit, excluding the boundary bifurcation
+- `internal_confluence_count`
+  counts confluence nodes inside the unit, excluding the boundary confluence
+
+These are local unit-structure metrics, not whole-network metrics.
+
+#### Meaning of each field
+
+- `internal_bifurcation_count`
+  Measures how many additional branch-splitting events occur inside the unit.
+- `internal_confluence_count`
+  Measures how many additional rejoining events occur inside the unit.
+- `total_bifurcation_count`
+  Adds the boundary bifurcation back in, so it describes the full number of bifurcation nodes associated with the unit structure.
+- `total_confluence_count`
+  Adds the boundary confluence back in for the same reason.
+- `internal_branch_node_count`
+  Counts all internal topologic decision points, regardless of whether they are splits or rejoins.
+- `branching_density_by_length`
+  Normalizes internal branching complexity by unit scale:
+  more internal branch nodes per unit length means denser internal structure.
+- `path_redundancy`
+  Measures how many additional valid paths exist beyond a single-path baseline.
+  It is intentionally simple:
+  - `0` for one valid path
+  - `1` for two valid paths
+  - `2` for three valid paths
+  and so on.
+- `compound_indicator`
+  Marks whether the unit has child units in the nesting tree.
+  This is about hierarchy membership, not just internal branch-node counts.
+
+#### How to read `topologic_complexity_score`
+
+The score combines three things:
+
+1. number of valid paths
+2. number of internal bifurcations
+3. number of internal confluences
+
+The log transform does two useful things:
+
+- keeps the score from exploding for large values
+- makes the jump from `0` to `1` more meaningful than the jump from `5` to `6`
+
+So it is a compact "how structurally busy is this unit?" score.
+
+Examples:
+
+- simple two-path unit with no internal branching:
+  - `n_valid_paths = 2`
+  - `internal_bifurcation_count = 0`
+  - `internal_confluence_count = 0`
+  - `topologic_complexity_score = ln(3)`
+
+- nested three-path unit with one internal bifurcation and one internal confluence:
+  - `topologic_complexity_score = ln(4) + ln(2) + ln(2)`
+
+So a higher score can come from:
+
+- more valid paths
+- more internal splits
+- more internal rejoins
+- or a combination of all three
+
+#### What these metrics do and do not capture
+
+They do capture:
+
+- whether the unit is topologically simple or internally branched
+- whether internal complexity is sparse or dense relative to length
+- whether the unit contains nested structure
+
+They do not directly capture:
+
+- exact spatial placement of the internal nodes
+- width balance between paths
+- local bottlenecks
+- whether a unit belongs to a larger compound bubble
+
+Those are handled by other fields:
+
+- width and entropy metrics for pathway importance
+- `compound_bubble_id` and related fields for broader multi-channel context
+
 ### Dynamic-proxy complexity metrics
 
 These are width-based pathway-importance proxies, not hydrodynamic discharge metrics.
@@ -347,6 +518,25 @@ Output fields:
 - `effective_n_paths_dyn_width = exp(dynamic_proxy_entropy)`
 - `dominant_dyn_fraction_width = max(q_i)`
 - `dynamic_proxy_complexity_score = width_evenness`
+
+Interpretation:
+
+- these metrics deliberately reuse width fractions as a first-order proxy for pathway importance
+- they are useful when discharge is unavailable but you still want a "more than one important path?" style diagnostic
+
+In the current implementation:
+
+- `dynamic_proxy_entropy` is numerically the same as `width_entropy`
+- `effective_n_paths_dyn_width` is numerically the same as `effective_n_paths_width`
+- `dominant_dyn_fraction_width` is numerically the same as `dominant_width_fraction`
+- `dynamic_proxy_complexity_score` is numerically the same as `width_evenness`
+
+So at the moment this block is conceptually important rather than mathematically independent.
+
+Why keep it anyway:
+
+- it marks the intended place where later hydrodynamic or flux-based metrics can plug in
+- it cleanly separates "representative geometry metrics" from "pathway importance proxy metrics"
 
 ### Metric-derived classification
 
@@ -377,6 +567,18 @@ Current labels include:
 
 In this classification, "dynamic" means width-based dynamic proxy, not measured discharge.
 
+Interpretation:
+
+- this field is best treated as a compact label for exploratory grouping
+- it is not a replacement for the underlying metrics
+- when the label looks surprising, inspect:
+  - `n_valid_paths`
+  - `largest_path_width_fraction`
+  - `width_evenness`
+  - `internal_bifurcation_count`
+  - `internal_confluence_count`
+  - `topologic_complexity_score`
+
 ### Hierarchy metadata
 
 These fields describe position in the detected nesting structure:
@@ -389,11 +591,74 @@ These fields describe position in the detected nesting structure:
 - `n_descendants`
 - `is_compound`
 - `compound_unit_id`
+- `compound_bubble_id`
+- `in_compound_bubble`
+- `compound_bubble_role`
 
 Important note:
 
 - `collapse_level` is currently a hierarchy scale label
 - it does not mean that recursive geometric collapse has been performed
+
+How to read these together:
+
+- `primary_parent_id`
+  is the chosen parent in the unit nesting tree when multiple containment relationships are possible.
+- `root_unit_id`
+  is the top-most enclosing unit in that nesting tree.
+- `depth_from_root`
+  is top-down depth:
+  - `0` means tree root
+  - larger numbers mean more deeply nested units
+- `collapse_level`
+  is bottom-up scale:
+  - `0` means no children
+  - larger numbers mean the unit sits above smaller nested units
+- `n_children`
+  is the number of direct child units
+- `n_descendants`
+  is the total number of child, grandchild, and deeper nested units
+
+This means `depth_from_root` and `collapse_level` are not the same:
+
+- `depth_from_root` says how far down you are from the outer unit
+- `collapse_level` says how much smaller structure exists beneath the unit
+
+The current distinction is:
+
+- `is_compound`
+  means the unit is locally compound in the nesting tree, i.e. it has child units.
+- `compound_unit_id`
+  is the outer enclosing unit ID from the unit hierarchy. In the current implementation this is the top-most enclosing outer unit in that nested unit tree. Standalone units have `NA`.
+- `compound_bubble_id`
+  is a separate bubble ID, independent from `unit_id`. It is assigned to every unit and represents the maximal multi-channel bubble component based on overlapping unit footprints.
+- `in_compound_bubble`
+  is `True` when the bubble contains more than one unit, and `False` when the unit is the only member of its bubble.
+- `compound_bubble_role`
+  is one of:
+  - `standalone`
+  - `bubble_root`
+  - `bubble_member`
+
+This means a unit can be:
+
+- locally simple (`is_compound = False`)
+- but still part of a larger compound bubble (`in_compound_bubble = True`)
+
+or:
+
+- locally complex
+- but still not have an enclosing outer unit (`compound_unit_id = NA`)
+
+if it is a complex standalone unit rather than a nested child.
+
+This is the intended distinction for cases where a local bifurcation-confluence pair closes, but the broader river context is still multi-channel.
+
+Practical reading:
+
+- if `class` is complex but `compound_unit_id` is `NA`, the unit is locally complex but not nested inside an enclosing outer unit.
+- if `compound_bubble_id` matches across several units, those units belong to one broader multi-channel bubble even if some of them are locally simple.
+- `unit_node_ids` is the quickest link back to the GeoPackage for visual QA in QGIS.
 
 ## Hierarchy-Level Summary Metrics
 
@@ -474,6 +739,14 @@ If you want a reduced set for interpretation, these are the main ones to focus o
   Compact topologic complexity indicator.
 - `unit_topodynamic_class`
   Practical summary class combining path balance and structural complexity.
+- `compound_bubble_id`
+  The key field for grouping local units into one larger multi-channel bubble. This ID is separate from `unit_id`.
+- `compound_bubble_role`
+  Quick indicator of whether the unit is the bubble root or just a member.
+- `compound_unit_id`
+  The outer enclosing unit ID when the current unit is nested inside a larger unit hierarchy.
+- `unit_node_ids`
+  Direct link back to node IDs in the GeoPackage for QGIS cross-checking.
 
 ## Recommended Usage
 

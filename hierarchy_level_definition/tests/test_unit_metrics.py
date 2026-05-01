@@ -10,7 +10,11 @@ from hierarchy_level_definition.metrics.unit_metrics import (
     normalized_entropy,
     weighted_harmonic_mean_width,
 )
-from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import StructuralUnit, UnitPath
+from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import (
+    StructuralUnit,
+    UnitPath,
+    build_summary_frame,
+)
 
 
 def _make_links(rows: list[dict[str, object]]) -> pd.DataFrame:
@@ -179,3 +183,94 @@ def test_dominant_simple_split_classification() -> None:
 
     unit_metrics, _ = compute_unit_metrics_from_units(links, [unit])
     assert unit_metrics.iloc[0]["unit_topodynamic_class"] == "dominant_simple_split"
+
+
+def test_compound_bubble_membership_and_unit_node_ids() -> None:
+    links = _make_links(
+        [
+            {"id_link": 1, "len_adj": 100.0, "wid_adj": 60.0},
+            {"id_link": 2, "len_adj": 120.0, "wid_adj": 40.0},
+            {"id_link": 3, "len_adj": 70.0, "wid_adj": 30.0},
+            {"id_link": 4, "len_adj": 80.0, "wid_adj": 25.0},
+            {"id_link": 5, "len_adj": 90.0, "wid_adj": 50.0},
+            {"id_link": 6, "len_adj": 110.0, "wid_adj": 45.0},
+            {"id_link": 7, "len_adj": 100.0, "wid_adj": 55.0},
+            {"id_link": 8, "len_adj": 120.0, "wid_adj": 35.0},
+        ]
+    )
+
+    root_unit = StructuralUnit(
+        unit_id=10,
+        bifurcation=1,
+        confluence=4,
+        n_paths=2,
+        unit_class="compound_or_nested_complex",
+        min_path_length=100.0,
+        max_path_length=120.0,
+        paths=[
+            UnitPath(1, [1, 4], [(1, 4, 1)], [1], 100.0),
+            UnitPath(2, [1, 2, 4], [(1, 2, 2), (2, 4, 3)], [2, 3], 190.0),
+        ],
+        node_set={1, 2, 3, 4, 5},
+        edge_set={(1, 4, 1), (1, 2, 2), (2, 4, 3), (2, 3, 4), (2, 5, 5)},
+        internal_bifurcations=[2],
+        internal_confluences=[],
+        children=[20],
+        parents=[],
+    )
+    child_unit = StructuralUnit(
+        unit_id=20,
+        bifurcation=2,
+        confluence=3,
+        n_paths=2,
+        unit_class="simple_bifurcation_confluence_pair",
+        min_path_length=80.0,
+        max_path_length=90.0,
+        paths=[
+            UnitPath(1, [2, 3], [(2, 3, 4)], [4], 80.0),
+            UnitPath(2, [2, 5, 3], [(2, 5, 5), (5, 3, 6)], [5, 6], 200.0),
+        ],
+        node_set={2, 3, 5},
+        edge_set={(2, 3, 4), (2, 5, 5), (5, 3, 6)},
+        internal_bifurcations=[],
+        internal_confluences=[],
+        children=[],
+        parents=[10],
+    )
+    standalone_unit = _make_unit(
+        [
+            _make_parallel_path(1, 7, total_length=100.0),
+            _make_parallel_path(2, 8, total_length=120.0),
+        ],
+        unit_id=30,
+    )
+
+    unit_metrics, _ = compute_unit_metrics_from_units(links, [root_unit, child_unit, standalone_unit])
+    summary = build_summary_frame([root_unit, child_unit, standalone_unit])
+
+    metrics_by_id = unit_metrics.set_index("unit_id")
+    summary_by_id = summary.set_index("unit_id")
+
+    bubble_id_root = metrics_by_id.loc[10, "compound_bubble_id"]
+    bubble_id_child = metrics_by_id.loc[20, "compound_bubble_id"]
+    bubble_id_standalone = metrics_by_id.loc[30, "compound_bubble_id"]
+
+    assert pd.notna(bubble_id_root)
+    assert bubble_id_root == bubble_id_child
+    assert bubble_id_root != bubble_id_standalone
+
+    assert metrics_by_id.loc[10, "compound_bubble_role"] == "bubble_root"
+    assert bool(metrics_by_id.loc[10, "in_compound_bubble"]) is True
+    assert metrics_by_id.loc[10, "compound_unit_id"] == 10
+
+    assert metrics_by_id.loc[20, "compound_bubble_role"] == "bubble_member"
+    assert bool(metrics_by_id.loc[20, "in_compound_bubble"]) is True
+    assert metrics_by_id.loc[20, "compound_unit_id"] == 10
+
+    assert pd.notna(metrics_by_id.loc[30, "compound_bubble_id"])
+    assert metrics_by_id.loc[30, "compound_bubble_role"] == "standalone"
+    assert bool(metrics_by_id.loc[30, "in_compound_bubble"]) is False
+    assert pd.isna(metrics_by_id.loc[30, "compound_unit_id"])
+
+    assert metrics_by_id.loc[20, "unit_node_ids"] == "2,3,5"
+    assert summary_by_id.loc[20, "unit_node_ids"] == "2,3,5"

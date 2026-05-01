@@ -22,6 +22,7 @@ if __package__ is None or __package__ == "":
 from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import (
     StructuralUnit,
     analyze_network,
+    build_unit_context_frame,
     load_network,
 )
 
@@ -280,72 +281,8 @@ def _with_metrics_attrs(
     return frame
 
 
-def _count_descendants(children_map: dict[int, list[int]], unit_id: int) -> int:
-    children = children_map.get(unit_id, [])
-    return len(children) + sum(_count_descendants(children_map, child_id) for child_id in children)
-
-
-def _collapse_level(children_map: dict[int, list[int]], unit_id: int) -> int:
-    children = children_map.get(unit_id, [])
-    if not children:
-        return 0
-    return 1 + max(_collapse_level(children_map, child_id) for child_id in children)
-
-
 def _build_primary_tree_metadata(units: list[StructuralUnit]) -> pd.DataFrame:
-    units_by_id = {unit.unit_id: unit for unit in units}
-    primary_parent: dict[int, int | None] = {}
-    children_map: dict[int, list[int]] = {unit.unit_id: [] for unit in units}
-
-    for unit in units:
-        if not unit.parents:
-            primary_parent[unit.unit_id] = None
-            continue
-
-        chosen_parent = min(
-            unit.parents,
-            key=lambda parent_id: (
-                len(units_by_id[parent_id].edge_set),
-                len(units_by_id[parent_id].node_set),
-                parent_id,
-            ),
-        )
-        primary_parent[unit.unit_id] = chosen_parent
-        children_map[chosen_parent].append(unit.unit_id)
-
-    for child_ids in children_map.values():
-        child_ids.sort()
-
-    records: list[dict[str, Any]] = []
-
-    def walk(unit_id: int, *, root_unit_id: int, depth_from_root: int) -> None:
-        child_ids = children_map[unit_id]
-        records.append(
-            {
-                "unit_id": unit_id,
-                "primary_parent_id": primary_parent[unit_id],
-                "root_unit_id": root_unit_id,
-                "depth_from_root": depth_from_root,
-                # This is a hierarchy scale label only. It does not imply recursive geometric collapse.
-                "collapse_level": _collapse_level(children_map, unit_id),
-                "n_children": len(child_ids),
-                "n_descendants": _count_descendants(children_map, unit_id),
-                "is_compound": len(child_ids) > 0,
-                "compound_unit_id": unit_id if child_ids else pd.NA,
-            }
-        )
-        for child_id in child_ids:
-            walk(child_id, root_unit_id=root_unit_id, depth_from_root=depth_from_root + 1)
-
-    root_ids = sorted(unit.unit_id for unit in units if primary_parent[unit.unit_id] is None)
-    for root_id in root_ids:
-        walk(root_id, root_unit_id=root_id, depth_from_root=0)
-
-    metadata = pd.DataFrame.from_records(records).sort_values("unit_id").reset_index(drop=True)
-    for column in ("primary_parent_id", "root_unit_id", "depth_from_root", "collapse_level", "n_children", "n_descendants", "compound_unit_id"):
-        metadata[column] = metadata[column].astype("Int64")
-    metadata["is_compound"] = metadata["is_compound"].astype(bool)
-    return metadata
+    return build_unit_context_frame(units)
 
 
 def _valid_path_mask(frame: pd.DataFrame) -> pd.Series:

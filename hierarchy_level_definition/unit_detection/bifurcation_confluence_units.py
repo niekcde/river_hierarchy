@@ -38,6 +38,16 @@ class StructuralUnit:
     parents: list[int] = field(default_factory=list)
     path_cutoff_used: int | None = None
     path_enumeration_truncated: bool = False
+    primary_parent_id: int | None = None
+    root_unit_id: int | None = None
+    depth_from_root: int | None = None
+    collapse_level: int | None = None
+    n_descendants: int = 0
+    is_compound: bool = False
+    compound_unit_id: int | None = None
+    compound_bubble_id: int | None = None
+    in_compound_bubble: bool = False
+    compound_bubble_role: str = "standalone"
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -48,12 +58,25 @@ class StructuralUnit:
             "class": self.unit_class,
             "min_path_length": self.min_path_length,
             "max_path_length": self.max_path_length,
+            "unit_node_ids": ",".join(str(node_id) for node_id in sorted(self.node_set)),
+            "unit_node_count": len(self.node_set),
             "internal_bifurcations": self.internal_bifurcations,
             "internal_confluences": self.internal_confluences,
             "children": self.children,
             "parents": self.parents,
+            "primary_parent_id": self.primary_parent_id,
+            "root_unit_id": self.root_unit_id,
+            "depth_from_root": self.depth_from_root,
+            "collapse_level": self.collapse_level,
+            "n_children": len(self.children),
+            "n_descendants": self.n_descendants,
+            "is_compound": self.is_compound,
             "path_cutoff_used": self.path_cutoff_used,
             "path_enumeration_truncated": self.path_enumeration_truncated,
+            "compound_unit_id": self.compound_unit_id,
+            "compound_bubble_id": self.compound_bubble_id,
+            "in_compound_bubble": self.in_compound_bubble,
+            "compound_bubble_role": self.compound_bubble_role,
         }
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -65,12 +88,24 @@ class StructuralUnit:
             "class": self.unit_class,
             "min_path_length": self.min_path_length,
             "max_path_length": self.max_path_length,
+            "node_ids": sorted(self.node_set),
             "internal_bifurcations": self.internal_bifurcations,
             "internal_confluences": self.internal_confluences,
             "children": self.children,
             "parents": self.parents,
+            "primary_parent_id": self.primary_parent_id,
+            "root_unit_id": self.root_unit_id,
+            "depth_from_root": self.depth_from_root,
+            "collapse_level": self.collapse_level,
+            "n_children": len(self.children),
+            "n_descendants": self.n_descendants,
+            "is_compound": self.is_compound,
             "path_cutoff_used": self.path_cutoff_used,
             "path_enumeration_truncated": self.path_enumeration_truncated,
+            "compound_unit_id": self.compound_unit_id,
+            "compound_bubble_id": self.compound_bubble_id,
+            "in_compound_bubble": self.in_compound_bubble,
+            "compound_bubble_role": self.compound_bubble_role,
             "paths": [
                 {
                     "path_id": path.path_id,
@@ -392,6 +427,7 @@ def build_structural_units(
 
     units = list(units_by_pair.values())
     assign_hierarchy(units)
+    annotate_unit_context(units, graph=graph)
     return sorted(units, key=lambda unit: unit.unit_id)
 
 
@@ -441,45 +477,67 @@ def assign_hierarchy(units: list[StructuralUnit]) -> None:
         unit.parents.sort()
 
 
-def build_summary_frame(units: list[StructuralUnit]) -> pd.DataFrame:
-    records = [
-        {
-            "unit_id": unit.unit_id,
-            "bifurcation": unit.bifurcation,
-            "confluence": unit.confluence,
-            "n_paths": unit.n_paths,
-            "class": unit.unit_class,
-            "min_path_length": unit.min_path_length,
-            "max_path_length": unit.max_path_length,
-            "children": ",".join(str(child) for child in unit.children),
-            "parents": ",".join(str(parent) for parent in unit.parents),
-            "path_cutoff_used": unit.path_cutoff_used,
-            "path_enumeration_truncated": unit.path_enumeration_truncated,
-        }
-        for unit in units
-    ]
-    if not records:
-        return pd.DataFrame(
-            columns=[
-                "unit_id",
-                "bifurcation",
-                "confluence",
-                "n_paths",
-                "class",
-                "min_path_length",
-                "max_path_length",
-                "children",
-                "parents",
-                "path_cutoff_used",
-                "path_enumeration_truncated",
-            ]
-        )
-    return pd.DataFrame.from_records(records).sort_values(["bifurcation", "confluence"]).reset_index(drop=True)
+def _count_descendants(children_map: dict[int, list[int]], unit_id: int) -> int:
+    children = children_map.get(unit_id, [])
+    return len(children) + sum(_count_descendants(children_map, child_id) for child_id in children)
 
 
-def build_hierarchy_forest(units: list[StructuralUnit]) -> list[dict[str, Any]]:
+def _collapse_level(children_map: dict[int, list[int]], unit_id: int) -> int:
+    children = children_map.get(unit_id, [])
+    if not children:
+        return 0
+    return 1 + max(_collapse_level(children_map, child_id) for child_id in children)
+
+
+def _node_order_index(graph: nx.MultiDiGraph | None) -> dict[int, int]:
+    if graph is None or graph.number_of_nodes() == 0:
+        return {}
+    try:
+        ordered_nodes = list(nx.topological_sort(graph))
+    except nx.NetworkXUnfeasible:
+        source_nodes = sorted(node for node in graph.nodes if graph.in_degree(node) == 0 and graph.out_degree(node) > 0)
+        if source_nodes:
+            distances = nx.multi_source_dijkstra_path_length(graph, source_nodes, weight=None)
+            ordered_nodes = sorted(
+                graph.nodes,
+                key=lambda node: (
+                    distances.get(node, float("inf")),
+                    int(node),
+                ),
+            )
+        else:
+            ordered_nodes = sorted(int(node) for node in graph.nodes)
+    return {int(node): index for index, node in enumerate(ordered_nodes)}
+
+
+def _unit_context_available(units: list[StructuralUnit]) -> bool:
+    if not units:
+        return True
+    return all(unit.root_unit_id is not None and unit.compound_bubble_id is not None for unit in units)
+
+
+def annotate_unit_context(
+    units: list[StructuralUnit],
+    graph: nx.MultiDiGraph | None = None,
+) -> None:
+    if graph is None and _unit_context_available(units):
+        return
+
     units_by_id = {unit.unit_id: unit for unit in units}
     primary_parent_by_child: dict[int, int] = {}
+    node_order = _node_order_index(graph)
+
+    for unit in units:
+        unit.primary_parent_id = None
+        unit.root_unit_id = None
+        unit.depth_from_root = None
+        unit.collapse_level = None
+        unit.n_descendants = 0
+        unit.is_compound = False
+        unit.compound_unit_id = None
+        unit.compound_bubble_id = None
+        unit.in_compound_bubble = False
+        unit.compound_bubble_role = "standalone"
 
     for unit in units:
         if not unit.parents:
@@ -499,6 +557,201 @@ def build_hierarchy_forest(units: list[StructuralUnit]) -> list[dict[str, Any]]:
     for child_ids in primary_children.values():
         child_ids.sort()
 
+    def walk(unit_id: int, *, root_unit_id: int, depth_from_root: int) -> None:
+        unit = units_by_id[unit_id]
+        unit.primary_parent_id = primary_parent_by_child.get(unit_id)
+        unit.root_unit_id = root_unit_id
+        unit.depth_from_root = depth_from_root
+        unit.collapse_level = _collapse_level(primary_children, unit_id)
+        unit.n_descendants = _count_descendants(primary_children, unit_id)
+        unit.is_compound = len(unit.children) > 0
+        root_is_compound = len(primary_children[root_unit_id]) > 0
+        unit.compound_unit_id = root_unit_id if root_is_compound else None
+
+        for child_id in primary_children[unit_id]:
+            walk(
+                child_id,
+                root_unit_id=root_unit_id,
+                depth_from_root=depth_from_root + 1,
+            )
+
+    root_ids = sorted(unit.unit_id for unit in units if unit.unit_id not in primary_parent_by_child)
+    for root_id in root_ids:
+        walk(root_id, root_unit_id=root_id, depth_from_root=0)
+
+    bubble_graph = nx.Graph()
+    for unit in units:
+        bubble_graph.add_node(unit.unit_id)
+
+    sorted_units = sorted(units, key=lambda unit: unit.unit_id)
+    for index, left_unit in enumerate(sorted_units):
+        for right_unit in sorted_units[index + 1 :]:
+            if left_unit.edge_set & right_unit.edge_set:
+                bubble_graph.add_edge(left_unit.unit_id, right_unit.unit_id)
+
+    def bubble_root_key(unit_id: int) -> tuple[int, int, int, int, int]:
+        unit = units_by_id[unit_id]
+        return (
+            node_order.get(unit.bifurcation, int(unit.bifurcation)),
+            node_order.get(unit.confluence, int(unit.confluence)),
+            -len(unit.edge_set),
+            -len(unit.node_set),
+            unit.unit_id,
+        )
+
+    components = [sorted(component) for component in nx.connected_components(bubble_graph)]
+    bubble_specs = []
+    for component in components:
+        bubble_root_unit_id = min(component, key=bubble_root_key)
+        bubble_specs.append((component, bubble_root_unit_id))
+
+    bubble_specs.sort(key=lambda item: bubble_root_key(item[1]))
+
+    for bubble_id, (component, bubble_root_unit_id) in enumerate(bubble_specs, start=1):
+        component_units = [units_by_id[unit_id] for unit_id in component]
+        bubble_size = len(component_units)
+        for unit in component_units:
+            unit.compound_bubble_id = bubble_id
+            unit.in_compound_bubble = bubble_size > 1
+            if bubble_size == 1:
+                unit.compound_bubble_role = "standalone"
+            elif unit.unit_id == bubble_root_unit_id:
+                unit.compound_bubble_role = "bubble_root"
+            else:
+                unit.compound_bubble_role = "bubble_member"
+
+
+def build_unit_context_frame(
+    units: list[StructuralUnit],
+    graph: nx.MultiDiGraph | None = None,
+) -> pd.DataFrame:
+    annotate_unit_context(units, graph=graph)
+    records = [
+        {
+            "unit_id": unit.unit_id,
+            "primary_parent_id": unit.primary_parent_id,
+            "root_unit_id": unit.root_unit_id,
+            "depth_from_root": unit.depth_from_root,
+            # This is a hierarchy scale label only. It does not imply recursive geometric collapse.
+            "collapse_level": unit.collapse_level,
+            "n_children": len(unit.children),
+            "n_descendants": unit.n_descendants,
+            "is_compound": unit.is_compound,
+            "compound_unit_id": unit.compound_unit_id,
+            "compound_bubble_id": unit.compound_bubble_id,
+            "in_compound_bubble": unit.in_compound_bubble,
+            "compound_bubble_role": unit.compound_bubble_role,
+            "unit_node_ids": ",".join(str(node_id) for node_id in sorted(unit.node_set)),
+            "unit_node_count": len(unit.node_set),
+        }
+        for unit in units
+    ]
+    metadata = pd.DataFrame.from_records(records).sort_values("unit_id").reset_index(drop=True)
+    if metadata.empty:
+        return pd.DataFrame(
+            columns=[
+                "unit_id",
+                "primary_parent_id",
+                "root_unit_id",
+                "depth_from_root",
+                "collapse_level",
+                "n_children",
+                "n_descendants",
+                "is_compound",
+                "compound_unit_id",
+                "compound_bubble_id",
+                "in_compound_bubble",
+                "compound_bubble_role",
+                "unit_node_ids",
+                "unit_node_count",
+            ]
+        )
+    for column in (
+        "primary_parent_id",
+        "root_unit_id",
+        "depth_from_root",
+        "collapse_level",
+        "n_children",
+        "n_descendants",
+        "compound_unit_id",
+        "compound_bubble_id",
+        "unit_node_count",
+    ):
+        metadata[column] = metadata[column].astype("Int64")
+    metadata["is_compound"] = metadata["is_compound"].astype(bool)
+    metadata["in_compound_bubble"] = metadata["in_compound_bubble"].astype(bool)
+    return metadata
+
+
+def build_summary_frame(
+    units: list[StructuralUnit],
+    graph: nx.MultiDiGraph | None = None,
+) -> pd.DataFrame:
+    annotate_unit_context(units, graph=graph)
+    records = [unit.to_record() for unit in units]
+    if not records:
+        return pd.DataFrame(
+            columns=[
+                "unit_id",
+                "bifurcation",
+                "confluence",
+                "n_paths",
+                "class",
+                "min_path_length",
+                "max_path_length",
+                "unit_node_ids",
+                "unit_node_count",
+                "internal_bifurcations",
+                "internal_confluences",
+                "children",
+                "parents",
+                "primary_parent_id",
+                "root_unit_id",
+                "depth_from_root",
+                "collapse_level",
+                "n_children",
+                "n_descendants",
+                "is_compound",
+                "path_cutoff_used",
+                "path_enumeration_truncated",
+                "compound_unit_id",
+                "compound_bubble_id",
+                "in_compound_bubble",
+                "compound_bubble_role",
+            ]
+        )
+    summary = pd.DataFrame.from_records(records).sort_values(["bifurcation", "confluence", "unit_id"]).reset_index(drop=True)
+    for column in (
+        "primary_parent_id",
+        "root_unit_id",
+        "depth_from_root",
+        "collapse_level",
+        "n_children",
+        "n_descendants",
+        "compound_unit_id",
+        "compound_bubble_id",
+        "unit_node_count",
+    ):
+        summary[column] = summary[column].astype("Int64")
+    summary["is_compound"] = summary["is_compound"].astype(bool)
+    summary["in_compound_bubble"] = summary["in_compound_bubble"].astype(bool)
+    return summary
+
+
+def build_hierarchy_forest(
+    units: list[StructuralUnit],
+    graph: nx.MultiDiGraph | None = None,
+) -> list[dict[str, Any]]:
+    annotate_unit_context(units, graph=graph)
+    units_by_id = {unit.unit_id: unit for unit in units}
+    primary_children: dict[int, list[int]] = {unit.unit_id: [] for unit in units}
+    for unit in units:
+        if unit.primary_parent_id is None:
+            continue
+        primary_children[unit.primary_parent_id].append(unit.unit_id)
+    for child_ids in primary_children.values():
+        child_ids.sort()
+
     def recurse(unit_id: int) -> dict[str, Any]:
         unit = units_by_id[unit_id]
         return {
@@ -507,10 +760,13 @@ def build_hierarchy_forest(units: list[StructuralUnit]) -> list[dict[str, Any]]:
             "confluence": unit.confluence,
             "n_paths": unit.n_paths,
             "class": unit.unit_class,
+            "node_ids": sorted(unit.node_set),
+            "compound_bubble_id": unit.compound_bubble_id,
+            "compound_bubble_role": unit.compound_bubble_role,
             "children": [recurse(child_id) for child_id in primary_children[unit_id]],
         }
 
-    root_ids = sorted(unit.unit_id for unit in units if unit.unit_id not in primary_parent_by_child)
+    root_ids = sorted(unit.unit_id for unit in units if unit.primary_parent_id is None)
     return [recurse(unit_id) for unit_id in root_ids]
 
 
@@ -530,8 +786,8 @@ def analyze_network(
         max_paths=max_paths,
         debug=debug,
     )
-    summary = build_summary_frame(units)
-    hierarchy = build_hierarchy_forest(units)
+    summary = build_summary_frame(units, graph=graph)
+    hierarchy = build_hierarchy_forest(units, graph=graph)
     return summary, units, hierarchy
 
 
