@@ -775,3 +775,297 @@ For larger or compound units, the most informative summary metrics are usually:
 - `effective_n_paths_width`
 - `topologic_complexity_score`
 - `unit_topodynamic_class`
+
+## Recommended Score Set
+
+If the goal is to compare units rather than individual paths, the current recommended unit-based score set is:
+
+- `topologic_complexity_score`
+- `effective_n_paths_width`
+- `n_valid_paths`
+- `equivalent_length`
+- `elongation`
+
+This set is aimed at unit comparison and collapse ranking, not at reproducing every path-level detail.
+
+In this framing:
+
+- `topologic_complexity_score` captures structural richness
+- `effective_n_paths_width` captures effective redundancy / width-partition complexity
+- `n_valid_paths` preserves literal path multiplicity
+- `equivalent_length` is the preferred direct persistence metric
+- `elongation` is the preferred normalized persistence metric
+
+Optional substitutions:
+
+- replace `effective_n_paths_width` with `width_evenness` if a bounded `0-1` balance metric is preferred
+- replace `effective_n_paths_width` with `dominant_width_fraction` if a more direct dominance metric is preferred
+- add `equivalent_width` back into the score set when absolute breadth or total parallel conveyance scale is scientifically important
+
+### Proposed ranking schema
+
+For practical use, it helps to separate:
+
+- variables that should be used for all units
+- variables that become especially important for compound units
+- variables that are scientifically useful but not yet implemented as output columns
+
+#### Base ranking variables for all units
+
+The current base ranking set is:
+
+- `topologic_complexity_score`
+- `effective_n_paths_width`
+- `n_valid_paths`
+- `equivalent_length`
+- `elongation`
+
+These represent:
+
+1. structural richness inside the unit
+2. effective pathway redundancy
+3. literal multiplicity of valid paths
+4. persistence of the split in absolute length units
+5. persistence of the split relative to unit width
+
+#### Additional ranking variables for compound units
+
+For compound units, the current output fields that add useful context are:
+
+- `n_descendants`
+- `collapse_level`
+- `compound_unit_id`
+- `compound_bubble_id`
+
+These describe where the unit sits in the larger hierarchy:
+
+- `n_descendants` indicates how much nested substructure lies inside the unit
+- `collapse_level` indicates hierarchy scale
+- `compound_unit_id` identifies the enclosing outer unit in the nesting tree
+- `compound_bubble_id` identifies the broader maximal multi-channel zone
+
+#### Descendant-aware extensions that are not yet implemented
+
+One important limitation of the current topologic metrics is that they capture the presence of nested structure, but not the geometric size or importance of that nested structure.
+
+For future compound-unit ranking, useful descendant-aware additions would be:
+
+- `max_child_equivalent_length`
+- `sum_child_equivalent_length`
+- `max_child_effective_n_paths_width`
+- `sum_child_equivalent_width`
+
+These are not current output columns. They are proposed future additions for ranking and collapse studies where the geometric importance of nested subunits matters.
+
+### Why this reduced set is recommended
+
+#### 1. Keep the analysis unit-based, not path-based
+
+If the scientific question is:
+
+- how complex is this bifurcation-confluence unit?
+- how balanced is flow-path importance inside it?
+- how large and elongated is it?
+
+then the path table is mainly diagnostic support.
+
+The unit metrics already aggregate the path information into:
+
+- effective width partitioning
+- effective path counts
+- structural complexity
+- overall unit scale and shape
+
+So the path metrics are useful for QA and interpretation, but they do not need to be part of the main score set.
+
+#### 2. Skip the two-path-only metrics for the main score set
+
+The two-path metrics:
+
+- `width_ratio_2`
+- `smaller_width_fraction_2`
+- `dominant_width_fraction_2`
+- `length_ratio_2`
+
+are highly interpretable, but they only apply to units with exactly two valid paths.
+
+If the goal is one score family that works across:
+
+- simple two-path units
+- multi-thread units
+- nested compound units
+
+then the multipath metrics are preferable because they generalize the same ideas to any number of valid paths.
+
+This is why the recommended score set uses:
+
+- `effective_n_paths_width`
+- `n_valid_paths`
+
+instead of the 2-path-specific metrics.
+
+#### 3. Do not keep all entropy-family metrics at once
+
+These metrics are tightly related:
+
+- `width_entropy`
+- `width_evenness`
+- `effective_n_paths_width`
+- `path_disparity_width`
+
+They all derive from the same width-share distribution across valid paths.
+
+So they should usually be treated as alternative expressions of the same underlying concept:
+
+- how evenly the unit's effective width is distributed among its paths
+
+Recommended choice:
+
+- `effective_n_paths_width`
+
+because it is on an interpretable path-count scale and is the closest analog to entropic braiding logic.
+
+#### 4. Keep literal multiplicity alongside effective multiplicity
+
+`effective_n_paths_width` is intentionally not the same as `n_valid_paths`.
+
+Two units can have:
+
+- different `n_valid_paths`
+- similar `effective_n_paths_width`
+
+This happens when one unit has more mapped paths, but those extra paths contribute little representative width.
+
+So:
+
+- `n_valid_paths` captures literal path multiplicity
+- `effective_n_paths_width` captures effective path multiplicity
+
+Both are useful, and they should not be treated as interchangeable.
+
+#### 5. Prefer persistence-oriented geometry over breadth-oriented geometry for collapse ranking
+
+These three are not independent:
+
+- `equivalent_width`
+- `equivalent_length`
+- `elongation = equivalent_length / equivalent_width`
+
+But for collapse ranking, the main scientific question is usually not pure width or size. It is:
+
+- how long the flow remains partitioned
+- how strongly that partition persists relative to unit width
+
+That makes:
+
+- `equivalent_length` the preferred direct persistence metric
+- `elongation` the preferred normalized persistence metric
+
+while:
+
+- `equivalent_width` remains a useful secondary breadth / magnitude descriptor
+
+This is also why `elongation` should not be interpreted as pure size. It is better understood as:
+
+- a unit aspect ratio
+- a normalized split-persistence ratio
+
+rather than an area-like measure.
+
+#### 6. Keep one topologic metric, but recognize its limit
+
+`topologic_complexity_score` is recommended because it compresses:
+
+- number of valid paths
+- internal bifurcations
+- internal confluences
+
+into one structural complexity variable.
+
+That makes it a good companion to:
+
+- `effective_n_paths_width`
+
+which captures how that structure is effectively partitioned geometrically.
+
+However, `topologic_complexity_score` does not encode the size of nested children. It tells you that nested structure exists, but not whether that nested subunit is short and minor or long and dominant. That is why compound-unit ranking often needs both:
+
+- the topologic score
+- separate descendant-aware context such as `n_descendants`, `collapse_level`, and future child-size summaries
+
+#### 7. Do not force one scalar ranking too early
+
+The collapse problem mixes several distinct dimensions:
+
+- structural complexity
+- effective pathway redundancy
+- literal path multiplicity
+- split persistence
+- hierarchy context
+
+It is usually better to rank or cluster units using a small feature vector than to collapse everything immediately into one scalar.
+
+That is especially true for compound units, where a single scalar can hide the difference between:
+
+- a locally simple unit inside a large compound bubble
+- a genuinely nested outer unit with important child substructure
+
+## Defensibility and Literature Position
+
+This score choice is defensible if it is described precisely.
+
+### What is defensible to claim
+
+It is defensible to say that:
+
+- the current unit metrics are inspired by entropy-based channel-network complexity ideas associated with Alejandro Tejedor and related river/delta network work
+- `effective_n_paths_width` is the closest unit-scale analog in this framework to an entropic braiding-style metric
+- the current implementation adapts that logic from cross-section/channel-count style formulations to bifurcation-confluence units and representative path widths
+
+### What should not be claimed
+
+It would not be accurate to say that:
+
+- this framework is a direct implementation of Tejedor's eBI
+- the current unit metrics are numerically equivalent to cross-section-based eBI values
+
+The current implementation is:
+
+- unit-based, not cross-section-based
+- path-based, not direct channel-intercept based
+- driven by representative path widths, not observed discharge partitioning
+
+So the correct wording is:
+
+- analogous to
+- inspired by
+- aligned with
+
+rather than:
+
+- identical to
+- reproduces exactly
+
+### Why the Tejedor connection helps
+
+Alejandro Tejedor is a well-established researcher in entropy-based and graph-theoretic analysis of river and delta channel networks. That makes the use of entropy/effective-path style metrics scientifically legible and defensible, especially when your framework is presented as an adaptation rather than a copy.
+
+The logic that works in your favor is:
+
+1. the literature already supports entropy-based metrics as meaningful measures of network/channel complexity
+2. your framework preserves that conceptual backbone
+3. your adaptation is targeted to bifurcation-confluence units rather than cross-sections or entire delta graphs
+
+So the defensibility comes from:
+
+- conceptual continuity with published entropy-based river-network metrics
+- clear documentation of what is preserved
+- clear documentation of what is changed
+
+### Practical wording recommendation
+
+In methods text, the safest wording is something like:
+
+"We characterize unit-scale pathway complexity using an entropy-based effective-path metric derived from representative path-width fractions. This metric is conceptually aligned with entropic braiding formulations, in the sense that it measures the effective number of important pathways, but it is adapted here to bifurcation-confluence units rather than cross-sections."
+
+That wording is strong, accurate, and easy to defend.
