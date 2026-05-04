@@ -646,7 +646,7 @@ def build_unit_context_frame(
         }
         for unit in units
     ]
-    metadata = pd.DataFrame.from_records(records).sort_values("unit_id").reset_index(drop=True)
+    metadata = pd.DataFrame.from_records(records)
     if metadata.empty:
         return pd.DataFrame(
             columns=[
@@ -666,6 +666,7 @@ def build_unit_context_frame(
                 "unit_node_count",
             ]
         )
+    metadata = metadata.sort_values("unit_id").reset_index(drop=True)
     for column in (
         "primary_parent_id",
         "root_unit_id",

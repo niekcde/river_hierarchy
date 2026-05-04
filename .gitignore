@@ -4,6 +4,8 @@ __pycache__/
 .venv/
 *.pyc
 **/outputs/
+network_variants/output/
+network_variants/experiments/
 **/configs/outputs/
 *.gpkg-shm
 *.gpkg-wal

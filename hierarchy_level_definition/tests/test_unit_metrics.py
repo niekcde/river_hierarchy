@@ -13,6 +13,7 @@ from hierarchy_level_definition.metrics.unit_metrics import (
 from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import (
     StructuralUnit,
     UnitPath,
+    build_unit_context_frame,
     build_summary_frame,
 )
 
@@ -274,3 +275,36 @@ def test_compound_bubble_membership_and_unit_node_ids() -> None:
 
     assert metrics_by_id.loc[20, "unit_node_ids"] == "2,3,5"
     assert summary_by_id.loc[20, "unit_node_ids"] == "2,3,5"
+
+
+def test_build_unit_context_frame_handles_empty_units() -> None:
+    context = build_unit_context_frame([])
+
+    assert list(context.columns) == [
+        "unit_id",
+        "primary_parent_id",
+        "root_unit_id",
+        "depth_from_root",
+        "collapse_level",
+        "n_children",
+        "n_descendants",
+        "is_compound",
+        "compound_unit_id",
+        "compound_bubble_id",
+        "in_compound_bubble",
+        "compound_bubble_role",
+        "unit_node_ids",
+        "unit_node_count",
+    ]
+    assert context.empty
+
+
+def test_compute_unit_metrics_from_units_handles_empty_units() -> None:
+    links = _make_links([])
+
+    unit_metrics, path_metrics = compute_unit_metrics_from_units(links, [])
+
+    assert unit_metrics.empty
+    assert path_metrics.empty
+    assert "unit_id" in unit_metrics.columns
+    assert "unit_topodynamic_class" in unit_metrics.columns

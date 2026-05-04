@@ -51,6 +51,7 @@ DEFAULT_MERGE_FEATURE_COLUMNS = (
 
 DEFAULT_LOG_FEATURE_COLUMNS = ("equivalent_length",)
 DEFAULT_MAX_GROUP_COUNT = 6
+DEFAULT_MIN_RELATIVE_COST_REDUCTION = 0.15
 
 
 def _ensure_columns(frame: pd.DataFrame, required: Sequence[str]) -> None:
@@ -417,7 +418,7 @@ def build_constrained_merge_tree(
     standardized_features = _zscore_frame(feature_frame.loc[:, list(feature_columns)])
     records: list[dict[str, Any]] = []
     n_units = len(ranking)
-    if n_units <= 1:
+    if n_units == 0:
         grouping = pd.DataFrame(
             columns=[
                 "n_groups",
@@ -448,14 +449,14 @@ def build_constrained_merge_tree(
                 "merge_feature_columns": list(feature_columns),
                 "merge_log_feature_columns": list(log_feature_columns),
                 "group_distance": "within-group sum of squared distances in globally standardized feature space",
-                "group_count_range": [2, min(max_group_count, n_units)],
+                "group_count_range": [0, 0],
             },
         )
 
     costs = _ordered_partition_costs(standardized_features, feature_columns)
-    max_group_count = max(2, min(int(max_group_count), n_units))
+    max_group_count = max(1, min(int(max_group_count), n_units))
 
-    for n_groups in range(2, max_group_count + 1):
+    for n_groups in range(1, max_group_count + 1):
         partition_total_cost, boundaries = _optimal_contiguous_partitions(costs, n_groups)
         for group_index, (start_index, end_index) in enumerate(boundaries, start=1):
             group_frame = ranking.iloc[start_index:end_index]
@@ -550,12 +551,16 @@ def build_constrained_merge_tree(
         "merge_feature_columns": list(feature_columns),
         "merge_log_feature_columns": list(log_feature_columns),
         "group_distance": "within-group sum of squared distances in globally standardized feature space",
-        "group_count_range": [2, max_group_count],
+        "group_count_range": [1, max_group_count],
     }
     return _with_collapse_attrs(merge_tree, collapse_config)
 
 
-def summarize_group_count_selection(group_partitions: pd.DataFrame) -> pd.DataFrame:
+def summarize_group_count_selection(
+    group_partitions: pd.DataFrame,
+    *,
+    min_relative_cost_reduction: float = DEFAULT_MIN_RELATIVE_COST_REDUCTION,
+) -> pd.DataFrame:
     _ensure_columns(group_partitions, ("n_groups", "partition_total_cost"))
 
     if group_partitions.empty:
@@ -567,11 +572,16 @@ def summarize_group_count_selection(group_partitions: pd.DataFrame) -> pd.DataFr
                 "relative_cost_reduction_from_prev",
                 "normalized_partition_total_cost",
                 "elbow_score",
+                "split_is_meaningful",
                 "is_optimal_n_groups",
             ]
         )
         collapse_config = dict(group_partitions.attrs.get("collapse_config", {}))
-        collapse_config.setdefault("group_count_selection_method", "global elbow on partition_total_cost")
+        collapse_config.setdefault(
+            "group_count_selection_method",
+            "conservative diminishing-returns rule on partition_total_cost",
+        )
+        collapse_config.setdefault("min_relative_cost_reduction", float(min_relative_cost_reduction))
         collapse_config.setdefault("optimal_n_groups", None)
         return _with_collapse_attrs(summary, collapse_config)
 
@@ -614,19 +624,31 @@ def summarize_group_count_selection(group_partitions: pd.DataFrame) -> pd.DataFr
         )
         summary.loc[summary.index[[0, len(summary) - 1]], "elbow_score"] = 0.0
 
-    optimal_row = summary.sort_values(
-        ["elbow_score", "n_groups"],
-        ascending=[False, True],
-        kind="mergesort",
-    ).iloc[0]
-    optimal_n_groups = int(optimal_row["n_groups"])
+    summary["split_is_meaningful"] = False
+    if len(summary) >= 2:
+        summary.loc[summary.index[1:], "split_is_meaningful"] = (
+            pd.to_numeric(summary.loc[summary.index[1:], "relative_cost_reduction_from_prev"], errors="coerce")
+            >= float(min_relative_cost_reduction)
+        ).fillna(False)
+
+    optimal_n_groups = int(summary["n_groups"].iloc[0])
+    for row in summary.iloc[1:].itertuples(index=False):
+        if bool(row.split_is_meaningful):
+            optimal_n_groups = int(row.n_groups)
+            continue
+        break
     summary["is_optimal_n_groups"] = summary["n_groups"].eq(optimal_n_groups)
 
     summary["n_groups"] = summary["n_groups"].astype("Int64")
+    summary["split_is_meaningful"] = summary["split_is_meaningful"].astype(bool)
     summary["is_optimal_n_groups"] = summary["is_optimal_n_groups"].astype(bool)
 
     collapse_config = dict(group_partitions.attrs.get("collapse_config", {}))
-    collapse_config.setdefault("group_count_selection_method", "global elbow on partition_total_cost")
+    collapse_config.setdefault(
+        "group_count_selection_method",
+        "conservative diminishing-returns rule on partition_total_cost",
+    )
+    collapse_config.setdefault("min_relative_cost_reduction", float(min_relative_cost_reduction))
     collapse_config.setdefault("optimal_n_groups", optimal_n_groups)
     return _with_collapse_attrs(summary, collapse_config)
 

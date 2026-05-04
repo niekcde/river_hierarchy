@@ -93,8 +93,14 @@ def test_build_constrained_merge_tree_merges_adjacent_units_in_global_ranking() 
 
     merge_tree = build_constrained_merge_tree(unit_metrics)
 
-    assert set(merge_tree["n_groups"].tolist()) == {2, 3, 4}
+    assert set(merge_tree["n_groups"].tolist()) == {1, 2, 3, 4}
     assert (merge_tree["grouping_rule"] == "optimal_contiguous_partition").all()
+
+    groups_for_one = merge_tree.loc[merge_tree["n_groups"] == 1].sort_values("group_index")
+    assert len(groups_for_one) == 1
+    assert groups_for_one.iloc[0]["group_size"] == 4
+    assert groups_for_one.iloc[0]["rank_start"] == 1
+    assert groups_for_one.iloc[0]["rank_end"] == 4
 
     groups_for_two = merge_tree.loc[merge_tree["n_groups"] == 2].sort_values("group_index")
     assert len(groups_for_two) == 2
@@ -115,7 +121,7 @@ def test_compute_collapse_decisions_from_unit_metrics_returns_all_outputs() -> N
     collapse_ranking, merge_tree, bubble_summary = compute_collapse_decisions_from_unit_metrics(unit_metrics)
 
     assert len(collapse_ranking) == 4
-    assert len(merge_tree) == 9
+    assert len(merge_tree) == 10
     assert len(bubble_summary) == 2
 
     bubble_summary_by_id = bubble_summary.set_index("compound_bubble_id")
@@ -133,7 +139,7 @@ def test_summarize_collapse_bubbles_uses_ranking_and_merge_tree() -> None:
 
     bubble1 = bubble_summary.set_index("compound_bubble_id").loc[1]
     assert bubble1["n_group_rows"] >= 1
-    assert bubble1["min_n_groups"] == 2
+    assert bubble1["min_n_groups"] == 1
     assert bubble1["mean_collapse_priority_score"] == pytest.approx(
         ranking.loc[ranking["compound_bubble_id"] == 1, "collapse_priority_score"].mean()
     )
@@ -145,10 +151,11 @@ def test_summarize_group_count_selection_returns_one_optimal_group_count() -> No
 
     summary = summarize_group_count_selection(partitions)
 
-    assert set(summary["n_groups"].tolist()) == {2, 3, 4}
+    assert set(summary["n_groups"].tolist()) == {1, 2, 3, 4}
     assert summary["is_optimal_n_groups"].sum() == 1
     assert "n_valid_paths" not in partitions.attrs["collapse_config"]["merge_feature_columns"]
-    assert summary.attrs["collapse_config"]["optimal_n_groups"] in {2, 3, 4}
+    assert summary.attrs["collapse_config"]["optimal_n_groups"] in {1, 2, 3, 4}
+    assert "min_relative_cost_reduction" in summary.attrs["collapse_config"]
 
 
 def test_select_optimal_groups_filters_to_selected_partition() -> None:
@@ -162,3 +169,34 @@ def test_select_optimal_groups_filters_to_selected_partition() -> None:
     optimal_n_groups = int(summary.loc[summary["is_optimal_n_groups"], "n_groups"].iloc[0])
     assert set(selected_groups["n_groups"].tolist()) == {optimal_n_groups}
     assert selected_groups["group_index"].tolist() == list(range(1, len(selected_groups) + 1))
+
+
+def test_select_optimal_groups_can_keep_single_group_for_homogeneous_state() -> None:
+    unit_metrics = pd.DataFrame.from_records(
+        [
+            {
+                "unit_id": unit_id,
+                "compound_bubble_id": pd.NA,
+                "primary_parent_id": pd.NA,
+                "compound_unit_id": pd.NA,
+                "compound_bubble_role": "standalone",
+                "unit_node_ids": f"{unit_id},{unit_id + 1}",
+                "n_valid_paths": 2,
+                "effective_n_paths_width": 1.8,
+                "path_disparity_width": 1.1,
+                "equivalent_length": 500.0,
+                "elongation": 2.0,
+                "topologic_complexity_score": 1.2,
+            }
+            for unit_id in (1, 2, 3, 4)
+        ]
+    )
+
+    partitions = build_constrained_merge_tree(unit_metrics)
+    summary = summarize_group_count_selection(partitions)
+    selected_groups = select_optimal_groups(partitions, summary)
+
+    assert int(summary.loc[summary["is_optimal_n_groups"], "n_groups"].iloc[0]) == 1
+    assert len(selected_groups) == 1
+    assert selected_groups.iloc[0]["group_label"] == "G1_1"
+    assert selected_groups.iloc[0]["group_size"] == 4
