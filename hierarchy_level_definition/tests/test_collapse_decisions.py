@@ -10,6 +10,7 @@ from hierarchy_level_definition.collapse_decisions.unit_collapse_decisions impor
     summarize_collapse_bubbles,
     summarize_group_count_selection,
 )
+from hierarchy_level_definition.run_unit_workflow import select_optimal_groups
 
 
 def _make_unit_metrics() -> pd.DataFrame:
@@ -148,3 +149,16 @@ def test_summarize_group_count_selection_returns_one_optimal_group_count() -> No
     assert summary["is_optimal_n_groups"].sum() == 1
     assert "n_valid_paths" not in partitions.attrs["collapse_config"]["merge_feature_columns"]
     assert summary.attrs["collapse_config"]["optimal_n_groups"] in {2, 3, 4}
+
+
+def test_select_optimal_groups_filters_to_selected_partition() -> None:
+    unit_metrics = _make_unit_metrics()
+    partitions = build_constrained_merge_tree(unit_metrics)
+    summary = summarize_group_count_selection(partitions)
+
+    selected_groups = select_optimal_groups(partitions, summary)
+
+    assert not selected_groups.empty
+    optimal_n_groups = int(summary.loc[summary["is_optimal_n_groups"], "n_groups"].iloc[0])
+    assert set(selected_groups["n_groups"].tolist()) == {optimal_n_groups}
+    assert selected_groups["group_index"].tolist() == list(range(1, len(selected_groups) + 1))
