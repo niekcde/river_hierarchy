@@ -1838,6 +1838,9 @@ def generate_network_variant(
     sword_node_source_path: str | Path | None = None,
     sword_wse_field: str | None = None,
     sword_match_tolerance: float | None = None,
+    sword_example_station_source_path: str | Path | None = None,
+    sword_station_match_source_path: str | Path | None = None,
+    sword_reach_buffer_steps: int = 2,
     max_path_cutoff: int = 100,
     max_paths: int = 5000,
     verbose_rivgraph: bool = False,
@@ -1958,13 +1961,17 @@ def generate_network_variant(
         node_match=node_match,
         link_match=link_match,
     )
-    directed_nodes, node_sword_match = match_variant_nodes_to_sword(
+    directed_nodes, node_sword_match, sword_match_summary = match_variant_nodes_to_sword(
         directed_nodes=directed_nodes,
         parent_nodes=reviewed_nodes,
         node_match=node_match,
         sword_node_source_path=sword_node_source_path,
         sword_wse_field=sword_wse_field,
         sword_match_tolerance=sword_match_tolerance,
+        example_id=example_id,
+        sword_example_station_source_path=sword_example_station_source_path,
+        sword_station_match_source_path=sword_station_match_source_path,
+        sword_reach_buffer_steps=sword_reach_buffer_steps,
     )
     link_lineage = _resolve_link_lineage(
         parent_graph=parent_graph,
@@ -2047,13 +2054,33 @@ def generate_network_variant(
             "reviewed_nodes": str(Path(reviewed_nodes_path).resolve()),
             "workflow_output_dir": str(Path(workflow_output_dir).resolve()) if workflow_output_dir is not None else None,
             "sword_node_source": str(Path(sword_node_source_path).resolve()) if sword_node_source_path is not None else None,
+            "sword_example_station_source": (
+                str(Path(sword_example_station_source_path).resolve())
+                if sword_example_station_source_path is not None
+                else sword_match_summary.get("example_station_source")
+            ),
+            "sword_station_match_source": (
+                str(Path(sword_station_match_source_path).resolve())
+                if sword_station_match_source_path is not None
+                else sword_match_summary.get("station_match_source")
+            ),
         },
         "mask_summary": mask_summary,
         "sword_matching": {
             "wse_field": sword_wse_field,
             "match_tolerance": sword_match_tolerance,
+            "reach_buffer_steps": int(sword_reach_buffer_steps),
             "n_matched_nodes": int(node_sword_match["sword_node_id"].notna().sum()) if not node_sword_match.empty else 0,
             "n_propagated_matches": int(node_sword_match["sword_match_from_parent"].fillna(False).sum()) if not node_sword_match.empty else 0,
+            "candidate_scope": sword_match_summary.get("scope"),
+            "candidate_region": sword_match_summary.get("candidate_region"),
+            "candidate_reach_count": sword_match_summary.get("candidate_reach_count"),
+            "candidate_reach_ids": sword_match_summary.get("candidate_reach_ids", []),
+            "upstream_station_key": sword_match_summary.get("upstream_station_key"),
+            "downstream_station_key": sword_match_summary.get("downstream_station_key"),
+            "upstream_reach_id": sword_match_summary.get("upstream_reach_id"),
+            "downstream_reach_id": sword_match_summary.get("downstream_reach_id"),
+            "filter_reason": sword_match_summary.get("reason"),
         },
         "output_paths": {
             "output_dir": str(output_path.resolve()),
@@ -2139,6 +2166,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sword-node-source", default=None, help="Optional SWORD node source file or parquet directory used for node matching.")
     parser.add_argument("--sword-wse-field", default=None, help="Optional WSE field name in the SWORD node source. Defaults to automatic detection.")
     parser.add_argument("--sword-match-tolerance", type=float, default=None, help="Optional maximum SWORD node-match distance in CRS units/meters after reprojection.")
+    parser.add_argument("--sword-example-stations-source", default=None, help="Optional example-station source used to derive example-specific SWORD reach corridors. Defaults to the repo hierarchy_examples_filtered_subdaily_manual_updates_final.gpkg when present.")
+    parser.add_argument("--sword-station-match-source", default=None, help="Optional station-to-SWORD match source used to derive example-specific SWORD reach corridors. Defaults to the repo selected_event_stations_same_main_path.gpkg when present.")
+    parser.add_argument("--sword-reach-buffer-steps", type=int, default=2, help="Number of reach steps to extend upstream and downstream beyond the example corridor endpoints when constraining SWORD node candidates.")
     parser.add_argument("--max-path-cutoff", type=int, default=100, help="Unit-detection max simple-path cutoff when rehydrating units.")
     parser.add_argument("--max-paths", type=int, default=5000, help="Unit-detection maximum number of simple paths when rehydrating units.")
     parser.add_argument("--verbose-rivgraph", action="store_true", help="Print RivGraph progress to stdout.")
@@ -2173,6 +2203,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         sword_node_source_path=args.sword_node_source,
         sword_wse_field=args.sword_wse_field,
         sword_match_tolerance=args.sword_match_tolerance,
+        sword_example_station_source_path=args.sword_example_stations_source,
+        sword_station_match_source_path=args.sword_station_match_source,
+        sword_reach_buffer_steps=args.sword_reach_buffer_steps,
         max_path_cutoff=args.max_path_cutoff,
         max_paths=args.max_paths,
         verbose_rivgraph=args.verbose_rivgraph,

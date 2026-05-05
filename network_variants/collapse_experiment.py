@@ -445,6 +445,9 @@ def run_collapse_experiment(
     sword_node_source_path: str | Path | None = None,
     sword_wse_field: str | None = None,
     sword_match_tolerance: float | None = None,
+    sword_example_station_source_path: str | Path | None = None,
+    sword_station_match_source_path: str | Path | None = None,
+    sword_reach_buffer_steps: int = 2,
     verbose_rivgraph: bool = False,
 ) -> CollapseExperimentOutputs:
     if mode not in EXPERIMENT_MODES:
@@ -478,6 +481,9 @@ def run_collapse_experiment(
         "sword_node_source_path": sword_node_source_path,
         "sword_wse_field": sword_wse_field,
         "sword_match_tolerance": sword_match_tolerance,
+        "sword_example_station_source_path": sword_example_station_source_path,
+        "sword_station_match_source_path": sword_station_match_source_path,
+        "sword_reach_buffer_steps": sword_reach_buffer_steps,
         "max_path_cutoff": max_path_cutoff,
         "max_paths": max_paths,
         "verbose_rivgraph": verbose_rivgraph,
@@ -543,6 +549,17 @@ def run_collapse_experiment(
                     "sword_node_source_path": str(Path(sword_node_source_path).resolve()) if sword_node_source_path is not None else None,
                     "sword_wse_field": sword_wse_field,
                     "sword_match_tolerance": sword_match_tolerance,
+                    "sword_example_station_source_path": (
+                        str(Path(sword_example_station_source_path).resolve())
+                        if sword_example_station_source_path is not None
+                        else None
+                    ),
+                    "sword_station_match_source_path": (
+                        str(Path(sword_station_match_source_path).resolve())
+                        if sword_station_match_source_path is not None
+                        else None
+                    ),
+                    "sword_reach_buffer_steps": int(sword_reach_buffer_steps),
                     "verbose_rivgraph": bool(verbose_rivgraph),
                 },
             },
@@ -708,6 +725,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sword-node-source", default=None, help="Optional SWORD node source file or parquet directory used for node matching.")
     parser.add_argument("--sword-wse-field", default=None, help="Optional WSE field name in the SWORD node source. Defaults to automatic detection.")
     parser.add_argument("--sword-match-tolerance", type=float, default=None, help="Optional maximum SWORD node-match distance in CRS units/meters after reprojection.")
+    parser.add_argument("--sword-example-stations-source", default=None, help="Optional example-station source used to derive example-specific SWORD reach corridors. Defaults to the repo hierarchy_examples_filtered_subdaily_manual_updates_final.gpkg when present.")
+    parser.add_argument("--sword-station-match-source", default=None, help="Optional station-to-SWORD match source used to derive example-specific SWORD reach corridors. Defaults to the repo selected_event_stations_same_main_path.gpkg when present.")
+    parser.add_argument("--sword-reach-buffer-steps", type=int, default=2, help="Number of reach steps to extend upstream and downstream beyond the example corridor endpoints when constraining SWORD node candidates.")
     parser.add_argument("--verbose-rivgraph", action="store_true", help="Print RivGraph progress to stdout.")
     return parser
 
@@ -743,6 +763,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         sword_node_source_path=args.sword_node_source,
         sword_wse_field=args.sword_wse_field,
         sword_match_tolerance=args.sword_match_tolerance,
+        sword_example_station_source_path=args.sword_example_stations_source,
+        sword_station_match_source_path=args.sword_station_match_source,
+        sword_reach_buffer_steps=args.sword_reach_buffer_steps,
         verbose_rivgraph=args.verbose_rivgraph,
     )
 

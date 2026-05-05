@@ -188,16 +188,45 @@ Optional:
 - `--sword-node-source`
   Optional external SWORD node source used for node matching. When omitted,
   node-to-SWORD matching is skipped unless the parent directed nodes already
-  carry propagated SWORD columns.
+  carry propagated SWORD columns. When this points at a SWORD parquet
+  directory, the workflow will also try to constrain candidate nodes to the
+  current example's buffered SWORD reach corridor before running nearest-node
+  matching.
 - `--sword-wse-field`
-  Optional WSE field name in the supplied SWORD node source.
+  Optional WSE field name in the supplied SWORD node source. If the requested
+  field is null for a matched node, the workflow first tries the nearest node
+  on the same SWORD reach using that same requested field when `node_order` is
+  available. If that still fails and the source also has `wse`, it falls back
+  to same-node `wse` and records the fallback in the node output.
 - `--sword-match-tolerance`
   Optional maximum distance for direct SWORD node matching.
+- `--sword-example-stations-source`
+  Optional example-station source used to derive example-specific SWORD reach
+  corridors. Defaults to the repo
+  `SWORD_gauge_match/outputs/hierarchy_examples_filtered_subdaily_manual_updates_final.gpkg`
+  when present.
+- `--sword-station-match-source`
+  Optional station-to-SWORD match source used to derive example-specific SWORD
+  reach corridors. Defaults to the repo
+  `SWORD_gauge_match/outputs/selected_event_stations_same_main_path.gpkg`
+  when present.
+- `--sword-reach-buffer-steps`
+  Number of reach steps to extend upstream and downstream beyond the matched
+  example corridor endpoints. Default: `2`.
 
 Additional node-matching outputs:
 
 - `matching/node_sword_match.csv`
 - SWORD columns written onto `directed/*_directed_nodes.gpkg`
+- the variant manifest now records whether node matching used:
+  - the full bbox candidate set
+  - or an example-specific buffered SWORD reach corridor
+- node outputs also carry:
+  - `sword_wse`
+  - `sword_wse_field`
+  - `sword_wse_fallback_used`
+  - `sword_wse_fill_method`
+  - `sword_wse_source_node_id`
 
 ## Collapse Experiments
 
