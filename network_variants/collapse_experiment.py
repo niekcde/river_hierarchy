@@ -442,6 +442,9 @@ def run_collapse_experiment(
     transect_scale: float = 1.5,
     min_transect_pixels: float = 5.0,
     match_tolerance: float | None = None,
+    sword_node_source_path: str | Path | None = None,
+    sword_wse_field: str | None = None,
+    sword_match_tolerance: float | None = None,
     verbose_rivgraph: bool = False,
 ) -> CollapseExperimentOutputs:
     if mode not in EXPERIMENT_MODES:
@@ -472,6 +475,9 @@ def run_collapse_experiment(
         "transect_scale": transect_scale,
         "min_transect_pixels": min_transect_pixels,
         "match_tolerance": match_tolerance,
+        "sword_node_source_path": sword_node_source_path,
+        "sword_wse_field": sword_wse_field,
+        "sword_match_tolerance": sword_match_tolerance,
         "max_path_cutoff": max_path_cutoff,
         "max_paths": max_paths,
         "verbose_rivgraph": verbose_rivgraph,
@@ -534,6 +540,9 @@ def run_collapse_experiment(
                     "transect_scale": float(transect_scale),
                     "min_transect_pixels": float(min_transect_pixels),
                     "match_tolerance": match_tolerance,
+                    "sword_node_source_path": str(Path(sword_node_source_path).resolve()) if sword_node_source_path is not None else None,
+                    "sword_wse_field": sword_wse_field,
+                    "sword_match_tolerance": sword_match_tolerance,
                     "verbose_rivgraph": bool(verbose_rivgraph),
                 },
             },
@@ -696,6 +705,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transect-scale", type=float, default=1.5, help="Multiplier for transect half-length relative to local total width.")
     parser.add_argument("--min-transect-pixels", type=float, default=5.0, help="Minimum transect half-length in raster pixels.")
     parser.add_argument("--match-tolerance", type=float, default=None, help="Optional spatial tolerance for parent-child graph matching.")
+    parser.add_argument("--sword-node-source", default=None, help="Optional SWORD node source file or parquet directory used for node matching.")
+    parser.add_argument("--sword-wse-field", default=None, help="Optional WSE field name in the SWORD node source. Defaults to automatic detection.")
+    parser.add_argument("--sword-match-tolerance", type=float, default=None, help="Optional maximum SWORD node-match distance in CRS units/meters after reprojection.")
     parser.add_argument("--verbose-rivgraph", action="store_true", help="Print RivGraph progress to stdout.")
     return parser
 
@@ -728,6 +740,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         transect_scale=args.transect_scale,
         min_transect_pixels=args.min_transect_pixels,
         match_tolerance=args.match_tolerance,
+        sword_node_source_path=args.sword_node_source,
+        sword_wse_field=args.sword_wse_field,
+        sword_match_tolerance=args.sword_match_tolerance,
         verbose_rivgraph=args.verbose_rivgraph,
     )
 

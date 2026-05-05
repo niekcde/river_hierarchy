@@ -44,6 +44,7 @@ from hierarchy_level_definition.unit_detection.bifurcation_confluence_units impo
     StructuralUnit,
     analyze_network,
 )
+from network_variants.sword_matching import match_variant_nodes_to_sword
 
 
 DEFAULT_FOOTPRINT_WIDTH_FIELD = "wid_adj"
@@ -62,6 +63,7 @@ class NetworkVariantOutputs:
     collapse_components: pd.DataFrame
     edit_geometries: gpd.GeoDataFrame
     node_match: pd.DataFrame
+    node_sword_match: pd.DataFrame
     link_match: pd.DataFrame
     link_lineage: pd.DataFrame
     link_width_families: pd.DataFrame
@@ -1833,6 +1835,9 @@ def generate_network_variant(
     transect_scale: float = DEFAULT_TRANSECT_SCALE,
     min_transect_pixels: float = DEFAULT_MIN_TRANSECT_PIXELS,
     match_tolerance: float | None = None,
+    sword_node_source_path: str | Path | None = None,
+    sword_wse_field: str | None = None,
+    sword_match_tolerance: float | None = None,
     max_path_cutoff: int = 100,
     max_paths: int = 5000,
     verbose_rivgraph: bool = False,
@@ -1953,6 +1958,14 @@ def generate_network_variant(
         node_match=node_match,
         link_match=link_match,
     )
+    directed_nodes, node_sword_match = match_variant_nodes_to_sword(
+        directed_nodes=directed_nodes,
+        parent_nodes=reviewed_nodes,
+        node_match=node_match,
+        sword_node_source_path=sword_node_source_path,
+        sword_wse_field=sword_wse_field,
+        sword_match_tolerance=sword_match_tolerance,
+    )
     link_lineage = _resolve_link_lineage(
         parent_graph=parent_graph,
         directed_child_links=directed_links,
@@ -1991,6 +2004,7 @@ def generate_network_variant(
     link_match.to_csv(matching_dir / "link_match.csv", index=False)
     link_lineage.to_csv(matching_dir / "link_lineage.csv", index=False)
     node_match.to_csv(matching_dir / "node_match.csv", index=False)
+    node_sword_match.to_csv(matching_dir / "node_sword_match.csv", index=False)
     directed_links.to_file(directed_dir / f"{rivgraph_name}_directed_links.gpkg", driver="GPKG")
     directed_nodes.to_file(directed_dir / f"{rivgraph_name}_directed_nodes.gpkg", driver="GPKG")
     with (directed_dir / "direction_validation_report.json").open("w", encoding="utf-8") as handle:
@@ -2021,6 +2035,7 @@ def generate_network_variant(
             "total/wet/dry width-family computation",
             "parent-child graph matching",
             "directed variant graph assignment",
+            "SWORD node matching/propagation",
         ],
         "not_yet_implemented": [
             "RAPID handoff package",
@@ -2031,8 +2046,15 @@ def generate_network_variant(
             "reviewed_links": str(Path(reviewed_links_path).resolve()),
             "reviewed_nodes": str(Path(reviewed_nodes_path).resolve()),
             "workflow_output_dir": str(Path(workflow_output_dir).resolve()) if workflow_output_dir is not None else None,
+            "sword_node_source": str(Path(sword_node_source_path).resolve()) if sword_node_source_path is not None else None,
         },
         "mask_summary": mask_summary,
+        "sword_matching": {
+            "wse_field": sword_wse_field,
+            "match_tolerance": sword_match_tolerance,
+            "n_matched_nodes": int(node_sword_match["sword_node_id"].notna().sum()) if not node_sword_match.empty else 0,
+            "n_propagated_matches": int(node_sword_match["sword_match_from_parent"].fillna(False).sum()) if not node_sword_match.empty else 0,
+        },
         "output_paths": {
             "output_dir": str(output_path.resolve()),
             "collapsed_mask": str(collapsed_mask_path.resolve()),
@@ -2042,6 +2064,7 @@ def generate_network_variant(
             "link_width_samples": str((width_dir / "link_width_samples.csv").resolve()),
             "links_with_width_families": str((width_dir / "links_with_width_families.gpkg").resolve()),
             "node_match": str((matching_dir / "node_match.csv").resolve()),
+            "node_sword_match": str((matching_dir / "node_sword_match.csv").resolve()),
             "link_match": str((matching_dir / "link_match.csv").resolve()),
             "link_lineage": str((matching_dir / "link_lineage.csv").resolve()),
             "directed_links": str((directed_dir / f"{rivgraph_name}_directed_links.gpkg").resolve()),
@@ -2064,6 +2087,7 @@ def generate_network_variant(
         collapse_components=collapse_components,
         edit_geometries=edit_geometries,
         node_match=node_match,
+        node_sword_match=node_sword_match,
         link_match=link_match,
         link_lineage=link_lineage,
         link_width_families=link_width_families,
@@ -2112,6 +2136,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--transect-scale", type=float, default=DEFAULT_TRANSECT_SCALE, help="Multiplier for transect half-length relative to local total width.")
     parser.add_argument("--min-transect-pixels", type=float, default=DEFAULT_MIN_TRANSECT_PIXELS, help="Minimum transect half-length in raster pixels.")
     parser.add_argument("--match-tolerance", type=float, default=None, help="Optional spatial tolerance for parent-child graph matching. Defaults to 1.25 raster pixels.")
+    parser.add_argument("--sword-node-source", default=None, help="Optional SWORD node source file or parquet directory used for node matching.")
+    parser.add_argument("--sword-wse-field", default=None, help="Optional WSE field name in the SWORD node source. Defaults to automatic detection.")
+    parser.add_argument("--sword-match-tolerance", type=float, default=None, help="Optional maximum SWORD node-match distance in CRS units/meters after reprojection.")
     parser.add_argument("--max-path-cutoff", type=int, default=100, help="Unit-detection max simple-path cutoff when rehydrating units.")
     parser.add_argument("--max-paths", type=int, default=5000, help="Unit-detection maximum number of simple paths when rehydrating units.")
     parser.add_argument("--verbose-rivgraph", action="store_true", help="Print RivGraph progress to stdout.")
@@ -2143,6 +2170,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         transect_scale=args.transect_scale,
         min_transect_pixels=args.min_transect_pixels,
         match_tolerance=args.match_tolerance,
+        sword_node_source_path=args.sword_node_source,
+        sword_wse_field=args.sword_wse_field,
+        sword_match_tolerance=args.sword_match_tolerance,
         max_path_cutoff=args.max_path_cutoff,
         max_paths=args.max_paths,
         verbose_rivgraph=args.verbose_rivgraph,

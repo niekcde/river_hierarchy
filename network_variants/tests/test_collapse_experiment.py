@@ -157,6 +157,7 @@ def _make_variant_runner():
             collapse_components=empty_frame,
             edit_geometries=empty_gdf,
             node_match=empty_frame,
+            node_sword_match=empty_frame,
             link_match=empty_frame,
             link_lineage=empty_frame,
             link_width_families=empty_frame,

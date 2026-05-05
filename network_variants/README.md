@@ -12,6 +12,8 @@ Current V1 scope:
 - rerun RivGraph on the collapsed mask
 - match regenerated nodes/links back to the reviewed parent graph
 - assign regenerated-link flow direction from parent matching plus topology rules
+- optionally match regenerated nodes to external SWORD nodes and propagate those
+  node matches through sequential states
 - compute regenerated-link width families:
   - `total` width on the collapsed mask
   - `wet` width on the reference wet mask
@@ -65,6 +67,20 @@ regenerated link layer. It now includes:
 - `matched_parent_node_path`
 - `direction_assignment_method`
 - `geometry_reversed_to_match_flow`
+
+The directed node layer can now also carry standardized SWORD node attributes:
+
+- `sword_node_id`
+- `sword_reach_id`
+- `sword_region`
+- `sword_dist_out`
+- `sword_wse`
+- `sword_wse_field`
+- `sword_match_distance`
+- `sword_match_method`
+- `sword_match_from_parent`
+- `sword_match_within_tolerance`
+- `sword_source_file`
 
 Important:
 
@@ -122,6 +138,10 @@ The main runner consumes:
 - reviewed/directed links GeoPackage
 - reviewed/directed nodes GeoPackage
 - RivGraph `exit_sides`
+- optional SWORD node source:
+  - one geospatial file such as `gpkg` / `geojson`
+  - one GeoParquet file
+  - or a directory of SWORD parquet node tiles
 - either:
   - explicit `unit_id`s
   - or one `group_label` from `selected_groups.csv` / `ordered_group_partitions.csv`
@@ -165,6 +185,19 @@ Optional:
   Override the spatial tolerance used for parent-child node/link matching.
   By default the workflow uses `1.25` raster pixels from the cleaned mask
   transform.
+- `--sword-node-source`
+  Optional external SWORD node source used for node matching. When omitted,
+  node-to-SWORD matching is skipped unless the parent directed nodes already
+  carry propagated SWORD columns.
+- `--sword-wse-field`
+  Optional WSE field name in the supplied SWORD node source.
+- `--sword-match-tolerance`
+  Optional maximum distance for direct SWORD node matching.
+
+Additional node-matching outputs:
+
+- `matching/node_sword_match.csv`
+- SWORD columns written onto `directed/*_directed_nodes.gpkg`
 
 ## Collapse Experiments
 
@@ -189,6 +222,8 @@ Important:
   regenerated directed graph
 - group labels such as `G3_1` are local to the current state, not globally
   stable across all variants
+- when SWORD node matching is enabled, propagated SWORD attributes are carried
+  forward through the directed node layers of successive states
 
 Example: independent base-unit variants
 
