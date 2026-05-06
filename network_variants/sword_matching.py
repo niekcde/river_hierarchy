@@ -67,6 +67,15 @@ def _first_existing(columns: Sequence[str], candidates: Sequence[str]) -> str | 
     return None
 
 
+def _coerce_optional_int_scalar(value: Any) -> int | None:
+    if value is None or value is pd.NA or pd.isna(value):
+        return None
+    numeric = pd.to_numeric([value], errors="coerce")[0]
+    if pd.isna(numeric):
+        return None
+    return int(numeric)
+
+
 def _empty_match_frame(directed_nodes: gpd.GeoDataFrame, *, matched_parent_lookup: Mapping[int, int | None]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for node_id in directed_nodes["id_node"].astype(int).tolist():
@@ -644,15 +653,18 @@ def match_variant_nodes_to_sword(
     parent_lookup: dict[int, dict[str, Any]] = {}
     if "id_node" in parent_nodes.columns and "sword_node_id" in parent_nodes.columns:
         for row in parent_nodes.itertuples(index=False):
-            sword_node_id = getattr(row, "sword_node_id", pd.NA)
-            if sword_node_id is pd.NA or pd.isna(sword_node_id):
+            sword_node_id = _coerce_optional_int_scalar(getattr(row, "sword_node_id", pd.NA))
+            if sword_node_id is None:
                 continue
             fallback_used = bool(getattr(row, "sword_wse_fallback_used", False))
             fill_method = getattr(row, "sword_wse_fill_method", None)
             if fill_method is None or pd.isna(fill_method) or fill_method == "":
                 fill_method = "same_node_wse" if fallback_used else "requested_field"
+            sword_wse_source_node_id = _coerce_optional_int_scalar(
+                getattr(row, "sword_wse_source_node_id", pd.NA)
+            )
             parent_lookup[int(row.id_node)] = {
-                "sword_node_id": int(sword_node_id),
+                "sword_node_id": sword_node_id,
                 "sword_reach_id": getattr(row, "sword_reach_id", pd.NA),
                 "sword_region": getattr(row, "sword_region", pd.NA),
                 "sword_dist_out": getattr(row, "sword_dist_out", float("nan")),
@@ -660,7 +672,9 @@ def match_variant_nodes_to_sword(
                 "sword_wse_field": getattr(row, "sword_wse_field", ""),
                 "sword_wse_fallback_used": fallback_used,
                 "sword_wse_fill_method": fill_method,
-                "sword_wse_source_node_id": getattr(row, "sword_wse_source_node_id", int(sword_node_id)),
+                "sword_wse_source_node_id": (
+                    sword_wse_source_node_id if sword_wse_source_node_id is not None else sword_node_id
+                ),
                 "sword_source_file": getattr(row, "sword_source_file", ""),
             }
 

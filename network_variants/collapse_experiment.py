@@ -405,6 +405,26 @@ def _build_identity_node_match(nodes: gpd.GeoDataFrame) -> pd.DataFrame:
     )
 
 
+def _normalize_numeric_id_columns(
+    frame: pd.DataFrame | gpd.GeoDataFrame,
+    *,
+    columns: Sequence[str] = ("id_node", "idx_node", "id_link", "id_us_node", "id_ds_node"),
+) -> pd.DataFrame | gpd.GeoDataFrame:
+    result = frame.copy()
+    for column in columns:
+        if column not in result.columns:
+            continue
+        numeric = pd.to_numeric(result[column], errors="coerce")
+        non_null_original = result[column].notna()
+        if numeric[non_null_original].isna().any():
+            continue
+        if numeric.isna().any():
+            result[column] = numeric.astype("Int64")
+        else:
+            result[column] = numeric.astype("int64")
+    return result
+
+
 def _build_identity_link_match(links: gpd.GeoDataFrame) -> pd.DataFrame:
     base_links = links.copy()
     base_links["id_link"] = base_links["id_link"].astype(int)
@@ -639,6 +659,8 @@ def _materialize_base_state_variant(
     reviewed_nodes = gpd.read_file(context.reviewed_nodes_path)
     directed_links = _apply_collapsed_selection_metadata(reviewed_links, unit_ids=[], group_label=None)
     directed_nodes = _apply_collapsed_selection_metadata(reviewed_nodes, unit_ids=[], group_label=None)
+    directed_links = _normalize_numeric_id_columns(directed_links)
+    directed_nodes = _normalize_numeric_id_columns(directed_nodes)
     directed_links["example_id"] = example_id
     directed_links["variant_id"] = base_variant_id
     directed_nodes["example_id"] = example_id
@@ -681,6 +703,7 @@ def _materialize_base_state_variant(
         if column not in directed_links.columns:
             directed_links[column] = default
     directed_links["n_units"] = pd.to_numeric(directed_links["n_units"], errors="coerce").fillna(0).astype(int)
+    directed_links = _normalize_numeric_id_columns(directed_links)
 
     enriched_links, link_width_samples = compute_width_families(
         directed_links,
@@ -690,9 +713,11 @@ def _materialize_base_state_variant(
         min_transect_pixels=min_transect_pixels,
     )
     enriched_links = _apply_collapsed_selection_metadata(enriched_links, unit_ids=[], group_label=None)
+    enriched_links = _normalize_numeric_id_columns(enriched_links)
     enriched_links["example_id"] = example_id
     enriched_links["variant_id"] = base_variant_id
     link_width_samples = _apply_collapsed_selection_metadata(link_width_samples, unit_ids=[], group_label=None)
+    link_width_samples = _normalize_numeric_id_columns(link_width_samples)
     link_width_samples["example_id"] = example_id
     link_width_samples["variant_id"] = base_variant_id
 
@@ -719,6 +744,7 @@ def _materialize_base_state_variant(
         sword_reach_buffer_steps=sword_reach_buffer_steps,
     )
     directed_nodes = _apply_collapsed_selection_metadata(directed_nodes, unit_ids=[], group_label=None)
+    directed_nodes = _normalize_numeric_id_columns(directed_nodes)
     directed_nodes["example_id"] = example_id
     directed_nodes["variant_id"] = base_variant_id
     node_sword_match = _apply_collapsed_selection_metadata(node_sword_match, unit_ids=[], group_label=None)

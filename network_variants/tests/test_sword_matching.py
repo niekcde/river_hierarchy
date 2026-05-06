@@ -180,6 +180,60 @@ def test_match_variant_nodes_to_sword_propagates_parent_match_with_missing_fill_
     assert match_row["sword_wse_fill_method"] == "requested_field"
 
 
+def test_match_variant_nodes_to_sword_skips_parent_rows_with_string_na_sword_node_id(tmp_path: Path) -> None:
+    directed_nodes = _node_frame(
+        [
+            {"id_node": 10, "geometry": Point(0.0, 0.0)},
+            {"id_node": 11, "geometry": Point(100.0, 0.0)},
+        ]
+    )
+    parent_nodes = _node_frame(
+        [
+            {
+                "id_node": 1,
+                "geometry": Point(-10.0, 0.0),
+                "sword_node_id": "<NA>",
+                "sword_wse_fill_method": "requested_field",
+            },
+            {
+                "id_node": 2,
+                "geometry": Point(110.0, 0.0),
+                "sword_node_id": 502,
+                "sword_reach_id": 9002,
+                "sword_region": "na",
+                "sword_dist_out": 5678.0,
+                "sword_wse": 3.9,
+                "sword_wse_field": "wse",
+                "sword_wse_fill_method": "requested_field",
+            },
+        ]
+    )
+    node_match = pd.DataFrame(
+        {
+            "child_id_node": [10, 11],
+            "matched_parent_node_id": [1, 2],
+            "parent_node_order": [0, 1],
+        }
+    )
+
+    enriched_nodes, match_frame, _ = match_variant_nodes_to_sword(
+        directed_nodes=directed_nodes,
+        parent_nodes=parent_nodes,
+        node_match=node_match,
+        sword_node_source_path=None,
+        sword_wse_field="wse",
+    )
+
+    row_10 = match_frame.loc[match_frame["id_node"] == 10].iloc[0]
+    row_11 = match_frame.loc[match_frame["id_node"] == 11].iloc[0]
+
+    assert pd.isna(row_10["sword_node_id"])
+    assert row_10["sword_match_method"] == "unmatched"
+    assert int(row_11["sword_node_id"]) == 502
+    assert row_11["sword_match_method"] == "propagated_parent"
+    assert pd.isna(enriched_nodes.loc[enriched_nodes["id_node"] == 10, "sword_node_id"]).iloc[0]
+
+
 def test_match_variant_nodes_to_sword_falls_back_from_requested_wse_field_to_wse(tmp_path: Path) -> None:
     directed_nodes = _node_frame(
         [

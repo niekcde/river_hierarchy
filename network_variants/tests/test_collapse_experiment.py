@@ -10,6 +10,7 @@ from hierarchy_level_definition.run_unit_workflow import UnitWorkflowOutputs, wr
 from network_variants.collapse_experiment import (
     BaseStateVariantOutputs,
     _build_unit_link_membership,
+    _normalize_numeric_id_columns,
     run_collapse_experiment,
 )
 from network_variants.variant_generation import NetworkVariantOutputs
@@ -368,3 +369,22 @@ def test_build_unit_link_membership_derives_link_to_unit_mapping() -> None:
     assert link_row["unit_ids"] == "1,2"
     assert int(link_row["n_units"]) == 2
     assert link_row["collapse_levels"] == "0,1"
+
+
+def test_normalize_numeric_id_columns_coerces_base_link_ids_from_object() -> None:
+    frame = pd.DataFrame(
+        {
+            "id_link": ["48", "52"],
+            "id_us_node": ["31", "34"],
+            "id_ds_node": ["34", "36"],
+            "label": ["a", "b"],
+        }
+    )
+
+    normalized = _normalize_numeric_id_columns(frame)
+
+    assert str(normalized["id_link"].dtype) == "int64"
+    assert str(normalized["id_us_node"].dtype) == "int64"
+    assert str(normalized["id_ds_node"].dtype) == "int64"
+    assert normalized.loc[0, "id_us_node"] == 31
+    assert normalized.loc[1, "id_ds_node"] == 36
