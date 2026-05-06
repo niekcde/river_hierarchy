@@ -7,7 +7,11 @@ import geopandas as gpd
 import pandas as pd
 
 from hierarchy_level_definition.run_unit_workflow import UnitWorkflowOutputs, write_unit_workflow_outputs
-from network_variants.collapse_experiment import BaseStateVariantOutputs, run_collapse_experiment
+from network_variants.collapse_experiment import (
+    BaseStateVariantOutputs,
+    _build_unit_link_membership,
+    run_collapse_experiment,
+)
 from network_variants.variant_generation import NetworkVariantOutputs
 
 
@@ -328,3 +332,39 @@ def test_base_state_is_materialized_as_local_variant_outputs(tmp_path: Path) -> 
     assert Path(base_row["directed_nodes_path"]).name == "S000_base_directed_nodes.gpkg"
     assert "states/S000_base/variant" in base_row["variant_output_dir"]
     assert base_state_materializer.calls
+
+
+def test_build_unit_link_membership_derives_link_to_unit_mapping() -> None:
+    path_metrics = pd.DataFrame(
+        {
+            "unit_id": [1, 1, 2],
+            "path_id": [1, 2, 1],
+            "id_links": ["2,6", "3,5,8", "1,3"],
+        }
+    )
+    unit_metrics = pd.DataFrame(
+        {
+            "unit_id": [1, 2],
+            "root_unit_id": [1, 2],
+            "collapse_level": [0, 1],
+            "compound_unit_id": [pd.NA, 20],
+            "compound_bubble_id": [10, 20],
+            "class": ["compound_or_nested_complex", "simple_bifurcation_confluence_pair"],
+            "unit_topodynamic_class": ["intermediate_unit", "balanced_simple_split"],
+        }
+    )
+
+    membership, link_summary = _build_unit_link_membership(
+        path_metrics=path_metrics,
+        unit_metrics=unit_metrics,
+    )
+
+    row = membership.loc[(membership["unit_id"] == 1) & (membership["id_link"] == 3)].iloc[0]
+    assert row["path_ids"] == "2"
+    assert int(row["n_paths_through_link"]) == 1
+    assert row["unit_topodynamic_class"] == "intermediate_unit"
+
+    link_row = link_summary.loc[link_summary["id_link"] == 3].iloc[0]
+    assert link_row["unit_ids"] == "1,2"
+    assert int(link_row["n_units"]) == 2
+    assert link_row["collapse_levels"] == "0,1"

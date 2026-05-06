@@ -473,6 +473,139 @@ def _build_identity_link_lineage(links: gpd.GeoDataFrame) -> pd.DataFrame:
     )
 
 
+def _serialize_unique_ints(values: pd.Series) -> str:
+    unique: list[int] = []
+    seen: set[int] = set()
+    for value in values.tolist():
+        if value is pd.NA or pd.isna(value):
+            continue
+        numeric = int(value)
+        if numeric in seen:
+            continue
+        seen.add(numeric)
+        unique.append(numeric)
+    return _serialize_int_list(unique)
+
+
+def _serialize_unique_strings(values: pd.Series) -> str:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for value in values.tolist():
+        if value is pd.NA or pd.isna(value):
+            continue
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        unique.append(text)
+    return ",".join(unique)
+
+
+def _build_unit_link_membership(
+    *,
+    path_metrics: pd.DataFrame,
+    unit_metrics: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    membership_columns = [
+        "unit_id",
+        "id_link",
+        "path_ids",
+        "n_paths_through_link",
+        "root_unit_id",
+        "collapse_level",
+        "compound_unit_id",
+        "compound_bubble_id",
+        "unit_class",
+        "unit_topodynamic_class",
+    ]
+    link_summary_columns = [
+        "id_link",
+        "unit_ids",
+        "n_units",
+        "root_unit_ids",
+        "collapse_levels",
+        "compound_unit_ids",
+        "compound_bubble_ids",
+        "unit_classes",
+        "unit_topodynamic_classes",
+    ]
+    if path_metrics.empty or unit_metrics.empty or "unit_id" not in path_metrics.columns or "id_links" not in path_metrics.columns:
+        return (
+            pd.DataFrame(columns=membership_columns),
+            pd.DataFrame(columns=link_summary_columns),
+        )
+
+    raw_records: list[dict[str, Any]] = []
+    for row in path_metrics.itertuples(index=False):
+        link_ids = _parse_int_list(getattr(row, "id_links", ""))
+        if not link_ids:
+            continue
+        for link_id in link_ids:
+            raw_records.append(
+                {
+                    "unit_id": int(row.unit_id),
+                    "id_link": int(link_id),
+                    "path_id": int(row.path_id),
+                }
+            )
+    if not raw_records:
+        return (
+            pd.DataFrame(columns=membership_columns),
+            pd.DataFrame(columns=link_summary_columns),
+        )
+
+    raw_membership = pd.DataFrame.from_records(raw_records)
+    membership = (
+        raw_membership.groupby(["unit_id", "id_link"], sort=True, as_index=False)
+        .agg(
+            path_ids=("path_id", lambda values: _serialize_int_list(sorted({int(value) for value in values}))),
+            n_paths_through_link=("path_id", "nunique"),
+        )
+    )
+
+    unit_metric_columns = [
+        column
+        for column in (
+            "unit_id",
+            "root_unit_id",
+            "collapse_level",
+            "compound_unit_id",
+            "compound_bubble_id",
+            "class",
+            "unit_topodynamic_class",
+        )
+        if column in unit_metrics.columns
+    ]
+    if unit_metric_columns:
+        membership = membership.merge(
+            unit_metrics[unit_metric_columns].rename(columns={"class": "unit_class"}),
+            on="unit_id",
+            how="left",
+            validate="many_to_one",
+        )
+    for column in membership_columns:
+        if column not in membership.columns:
+            membership[column] = pd.NA
+    membership = membership[membership_columns].sort_values(["id_link", "unit_id"], kind="mergesort").reset_index(drop=True)
+
+    link_summary = (
+        membership.groupby("id_link", sort=True, as_index=False)
+        .agg(
+            unit_ids=("unit_id", _serialize_unique_ints),
+            n_units=("unit_id", "nunique"),
+            root_unit_ids=("root_unit_id", _serialize_unique_ints),
+            collapse_levels=("collapse_level", _serialize_unique_ints),
+            compound_unit_ids=("compound_unit_id", _serialize_unique_ints),
+            compound_bubble_ids=("compound_bubble_id", _serialize_unique_ints),
+            unit_classes=("unit_class", _serialize_unique_strings),
+            unit_topodynamic_classes=("unit_topodynamic_class", _serialize_unique_strings),
+        )
+        .sort_values("id_link", kind="mergesort")
+        .reset_index(drop=True)
+    )
+    return membership, link_summary
+
+
 def _materialize_base_state_variant(
     *,
     context: ExperimentStateContext,
@@ -510,6 +643,44 @@ def _materialize_base_state_variant(
     directed_links["variant_id"] = base_variant_id
     directed_nodes["example_id"] = example_id
     directed_nodes["variant_id"] = base_variant_id
+
+    unit_link_membership, unit_link_summary = _build_unit_link_membership(
+        path_metrics=context.workflow.path_metrics,
+        unit_metrics=context.workflow.unit_metrics,
+    )
+    if not unit_link_membership.empty:
+        unit_link_membership.to_csv(summary_dir / "unit_link_membership.csv", index=False)
+    else:
+        pd.DataFrame(
+            columns=[
+                "unit_id",
+                "id_link",
+                "path_ids",
+                "n_paths_through_link",
+                "root_unit_id",
+                "collapse_level",
+                "compound_unit_id",
+                "compound_bubble_id",
+                "unit_class",
+                "unit_topodynamic_class",
+            ]
+        ).to_csv(summary_dir / "unit_link_membership.csv", index=False)
+
+    if not unit_link_summary.empty:
+        directed_links = directed_links.merge(unit_link_summary, on="id_link", how="left", validate="1:1")
+    for column, default in (
+        ("unit_ids", ""),
+        ("n_units", 0),
+        ("root_unit_ids", ""),
+        ("collapse_levels", ""),
+        ("compound_unit_ids", ""),
+        ("compound_bubble_ids", ""),
+        ("unit_classes", ""),
+        ("unit_topodynamic_classes", ""),
+    ):
+        if column not in directed_links.columns:
+            directed_links[column] = default
+    directed_links["n_units"] = pd.to_numeric(directed_links["n_units"], errors="coerce").fillna(0).astype(int)
 
     enriched_links, link_width_samples = compute_width_families(
         directed_links,
@@ -654,6 +825,7 @@ def _materialize_base_state_variant(
             "output_dir": str(variant_dir.resolve()),
             "collapsed_mask": str(collapsed_mask_path.resolve()),
             "collapse_components": str((summary_dir / "collapse_components.csv").resolve()),
+            "unit_link_membership": str((summary_dir / "unit_link_membership.csv").resolve()),
             "edit_geometries": str((mask_dir / "collapse_edit_geometries.gpkg").resolve()),
             "link_width_families": str((width_dir / "link_width_families.csv").resolve()),
             "link_width_samples": str((width_dir / "link_width_samples.csv").resolve()),
