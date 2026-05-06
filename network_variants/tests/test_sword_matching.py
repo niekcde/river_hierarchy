@@ -133,6 +133,53 @@ def test_match_variant_nodes_to_sword_propagates_parent_matches_and_falls_back_t
     assert match_metadata["scope"] == "bbox_only"
 
 
+def test_match_variant_nodes_to_sword_propagates_parent_match_with_missing_fill_method(tmp_path: Path) -> None:
+    directed_nodes = _node_frame(
+        [
+            {"id_node": 10, "geometry": Point(0.0, 0.0)},
+        ]
+    )
+    parent_nodes = _node_frame(
+        [
+            {
+                "id_node": 1,
+                "geometry": Point(-10.0, 0.0),
+                "sword_node_id": 501,
+                "sword_reach_id": 9001,
+                "sword_region": "na",
+                "sword_dist_out": 1234.0,
+                "sword_wse": 4.2,
+                "sword_wse_field": "wse_obs_p50",
+                "sword_wse_fallback_used": False,
+                "sword_wse_fill_method": pd.NA,
+                "sword_source_file": "/tmp/source.parquet",
+            },
+        ]
+    )
+    node_match = pd.DataFrame(
+        {
+            "child_id_node": [10],
+            "matched_parent_node_id": [1],
+            "parent_node_order": [0],
+        }
+    )
+
+    enriched_nodes, match_frame, _ = match_variant_nodes_to_sword(
+        directed_nodes=directed_nodes,
+        parent_nodes=parent_nodes,
+        node_match=node_match,
+        sword_node_source_path=None,
+        sword_wse_field="wse_obs_p50",
+    )
+
+    row = enriched_nodes.iloc[0]
+    match_row = match_frame.iloc[0]
+    assert int(row["sword_node_id"]) == 501
+    assert row["sword_match_method"] == "propagated_parent"
+    assert row["sword_wse_fill_method"] == "requested_field"
+    assert match_row["sword_wse_fill_method"] == "requested_field"
+
+
 def test_match_variant_nodes_to_sword_falls_back_from_requested_wse_field_to_wse(tmp_path: Path) -> None:
     directed_nodes = _node_frame(
         [

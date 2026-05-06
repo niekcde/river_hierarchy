@@ -11,6 +11,7 @@ from shapely.geometry import LineString, Point
 
 from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import StructuralUnit
 from network_variants.variant_generation import (
+    _apply_collapsed_selection_metadata,
     _apply_collapse_components_to_mask,
     _assign_variant_directions,
     _componentize_units,
@@ -72,6 +73,16 @@ def test_compute_family_stats_uses_trimmed_values() -> None:
     assert np.isclose(stats["adj"], 6.0)
     assert np.isclose(stats["med"], 6.0)
     assert np.isclose(stats["p50"], 6.0)
+
+
+def test_apply_collapsed_selection_metadata_adds_collapsed_unit_columns() -> None:
+    frame = pd.DataFrame({"id_link": [10, 11]})
+
+    result = _apply_collapsed_selection_metadata(frame, unit_ids=[5], group_label=None)
+
+    assert result["collapsed_selection_label"].tolist() == ["collapsed_unit_5", "collapsed_unit_5"]
+    assert result["collapsed_unit_ids"].tolist() == ["5", "5"]
+    assert result["collapsed_selection_type"].tolist() == ["unit", "unit"]
 
 
 def test_apply_collapse_components_to_mask_adds_pixels(tmp_path: Path) -> None:

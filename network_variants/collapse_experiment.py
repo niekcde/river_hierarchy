@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+import geopandas as gpd
 import pandas as pd
 
 if __package__ is None or __package__ == "":
@@ -21,7 +23,14 @@ from hierarchy_level_definition.run_unit_workflow import (
     run_unit_workflow,
     write_unit_workflow_outputs,
 )
-from network_variants.variant_generation import NetworkVariantOutputs, generate_network_variant
+from network_variants.sword_matching import match_variant_nodes_to_sword
+from network_variants.variant_generation import (
+    NetworkVariantOutputs,
+    _apply_collapsed_selection_metadata,
+    _collapsed_selection_metadata,
+    compute_width_families,
+    generate_network_variant,
+)
 
 
 EXPERIMENT_MODES = (
@@ -65,6 +74,14 @@ class CollapseExperimentOutputs:
     transition_registry: pd.DataFrame
     output_dir: Path
     manifest: dict[str, Any]
+
+
+@dataclass
+class BaseStateVariantOutputs:
+    output_dir: Path
+    collapsed_mask_path: Path
+    directed_links_path: Path
+    directed_nodes_path: Path
 
 
 def _git_revision() -> str | None:
@@ -129,6 +146,12 @@ def _parse_int_list(value: Any) -> list[int]:
 def _sanitize_label(value: str) -> str:
     cleaned = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in value.strip())
     return cleaned or "selection"
+
+
+def _selection_label(selection: ExperimentSelection | None) -> str:
+    if selection is None:
+        return "base_state"
+    return _collapsed_selection_metadata(selection.selected_unit_ids, selection.selected_group_label)["collapsed_selection_label"]
 
 
 def _optional_int(value: Any) -> int | None:
@@ -251,6 +274,7 @@ def _state_record(context: ExperimentStateContext, mode: str) -> dict[str, Any]:
         "mode": mode,
         "state_role": "base" if context.depth == 0 else "derived",
         "selection_type": selection.selection_type if selection is not None else "",
+        "collapsed_selection_label": _selection_label(selection),
         "selected_unit_ids": _serialize_int_list(selection.selected_unit_ids) if selection is not None else "",
         "selected_group_label": selection.selected_group_label or "" if selection is not None else "",
         "selected_group_size": int(selection.selected_group_size) if selection is not None else 0,
@@ -289,6 +313,7 @@ def _transition_record(
         "depth": int(child_context.depth),
         "mode": "",
         "selection_type": selection.selection_type,
+        "collapsed_selection_label": _selection_label(selection),
         "selected_unit_ids": _serialize_int_list(selection.selected_unit_ids),
         "selected_group_label": selection.selected_group_label or "",
         "selected_group_size": int(selection.selected_group_size),
@@ -361,6 +386,298 @@ def _run_state_hierarchy(
     )
 
 
+def _build_identity_node_match(nodes: gpd.GeoDataFrame) -> pd.DataFrame:
+    ordered_nodes = nodes.copy()
+    ordered_nodes["id_node"] = ordered_nodes["id_node"].astype(int)
+    ordered_nodes = ordered_nodes.reset_index(drop=True)
+    return pd.DataFrame(
+        {
+            "child_id_node": ordered_nodes["id_node"].astype(int),
+            "matched_parent_node_id": ordered_nodes["id_node"].astype(int),
+            "match_distance": 0.0,
+            "match_within_tolerance": True,
+            "parent_node_order": ordered_nodes.index.astype(int),
+            "child_is_inlet_raw": ordered_nodes["is_inlet"].fillna(False).astype(bool),
+            "child_is_outlet_raw": ordered_nodes["is_outlet"].fillna(False).astype(bool),
+            "parent_is_inlet": ordered_nodes["is_inlet"].fillna(False).astype(bool),
+            "parent_is_outlet": ordered_nodes["is_outlet"].fillna(False).astype(bool),
+        }
+    )
+
+
+def _build_identity_link_match(links: gpd.GeoDataFrame) -> pd.DataFrame:
+    base_links = links.copy()
+    base_links["id_link"] = base_links["id_link"].astype(int)
+    lengths = base_links.geometry.length.astype(float)
+    return pd.DataFrame(
+        {
+            "child_id_link": base_links["id_link"].astype(int),
+            "parent_id_link": base_links["id_link"].astype(int),
+            "parent_id_us_node": pd.to_numeric(base_links.get("id_us_node"), errors="coerce").astype("Int64"),
+            "parent_id_ds_node": pd.to_numeric(base_links.get("id_ds_node"), errors="coerce").astype("Int64"),
+            "child_length": lengths,
+            "parent_length": lengths,
+            "child_overlap_length": lengths,
+            "child_overlap_fraction": 1.0,
+            "parent_overlap_length": lengths,
+            "parent_overlap_fraction": 1.0,
+            "child_trim_distance": 0.0,
+            "parent_trim_distance": 0.0,
+            "child_core_length": lengths,
+            "parent_core_length": lengths,
+            "child_core_overlap_length": lengths,
+            "child_core_overlap_fraction": 1.0,
+            "parent_core_overlap_length": lengths,
+            "parent_core_overlap_fraction": 1.0,
+            "distance": 0.0,
+            "candidate_class": "core_overlap",
+            "candidate_rank": 1,
+            "is_dominant": True,
+        }
+    )
+
+
+def _build_identity_link_lineage(links: gpd.GeoDataFrame) -> pd.DataFrame:
+    base_links = links.copy()
+    base_links["id_link"] = base_links["id_link"].astype(int)
+    us_nodes = pd.to_numeric(base_links.get("id_us_node"), errors="coerce").astype("Int64")
+    ds_nodes = pd.to_numeric(base_links.get("id_ds_node"), errors="coerce").astype("Int64")
+    link_ids_text = base_links["id_link"].astype(str)
+    return pd.DataFrame(
+        {
+            "id_link": base_links["id_link"].astype(int),
+            "lineage_type": "base_identity_1to1",
+            "dominant_parent_link_id": base_links["id_link"].astype(int),
+            "matched_parent_link_ids": link_ids_text,
+            "primary_parent_link_ids": link_ids_text,
+            "secondary_parent_link_ids": "",
+            "touch_parent_link_ids": "",
+            "candidate_parent_link_ids": link_ids_text,
+            "matched_parent_link_count": 1,
+            "primary_parent_link_count": 1,
+            "secondary_parent_link_count": 0,
+            "touch_parent_link_count": 0,
+            "dominant_parent_overlap_fraction": 1.0,
+            "dominant_parent_overlap_length": base_links.geometry.length.astype(float),
+            "dominant_parent_core_overlap_fraction": 1.0,
+            "dominant_parent_core_overlap_length": base_links.geometry.length.astype(float),
+            "matched_parent_overlap_fraction": 1.0,
+            "matched_parent_overlap_length": base_links.geometry.length.astype(float),
+            "matched_parent_core_overlap_fraction": 1.0,
+            "matched_parent_core_overlap_length": base_links.geometry.length.astype(float),
+            "lineage_method": "base_state_identity",
+            "matched_parent_us_node": us_nodes,
+            "matched_parent_ds_node": ds_nodes,
+            "matched_parent_node_path": "",
+        }
+    )
+
+
+def _materialize_base_state_variant(
+    *,
+    context: ExperimentStateContext,
+    example_id: str,
+    preferred_width_field: str,
+    transect_scale: float,
+    min_transect_pixels: float,
+    sword_node_source_path: str | Path | None,
+    sword_wse_field: str | None,
+    sword_match_tolerance: float | None,
+    sword_example_station_source_path: str | Path | None,
+    sword_station_match_source_path: str | Path | None,
+    sword_reach_buffer_steps: int,
+) -> BaseStateVariantOutputs:
+    variant_dir = context.state_dir / "variant"
+    summary_dir = variant_dir / "summary"
+    mask_dir = variant_dir / "mask"
+    matching_dir = variant_dir / "matching"
+    directed_dir = variant_dir / "directed"
+    width_dir = variant_dir / "widths"
+    for directory in (summary_dir, mask_dir, matching_dir, directed_dir, width_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    selection_metadata = _collapsed_selection_metadata([], None)
+    base_variant_id = context.state_id
+    base_run_name = f"{example_id}__{base_variant_id}"
+    collapsed_mask_path = mask_dir / f"{base_run_name}_collapsed.tif"
+    shutil.copy2(context.cleaned_mask_path, collapsed_mask_path)
+
+    reviewed_links = gpd.read_file(context.reviewed_links_path)
+    reviewed_nodes = gpd.read_file(context.reviewed_nodes_path)
+    directed_links = _apply_collapsed_selection_metadata(reviewed_links, unit_ids=[], group_label=None)
+    directed_nodes = _apply_collapsed_selection_metadata(reviewed_nodes, unit_ids=[], group_label=None)
+    directed_links["example_id"] = example_id
+    directed_links["variant_id"] = base_variant_id
+    directed_nodes["example_id"] = example_id
+    directed_nodes["variant_id"] = base_variant_id
+
+    enriched_links, link_width_samples = compute_width_families(
+        directed_links,
+        collapsed_mask_path=collapsed_mask_path,
+        wet_reference_mask_path=collapsed_mask_path,
+        transect_scale=transect_scale,
+        min_transect_pixels=min_transect_pixels,
+    )
+    enriched_links = _apply_collapsed_selection_metadata(enriched_links, unit_ids=[], group_label=None)
+    enriched_links["example_id"] = example_id
+    enriched_links["variant_id"] = base_variant_id
+    link_width_samples = _apply_collapsed_selection_metadata(link_width_samples, unit_ids=[], group_label=None)
+    link_width_samples["example_id"] = example_id
+    link_width_samples["variant_id"] = base_variant_id
+
+    node_match = _apply_collapsed_selection_metadata(_build_identity_node_match(reviewed_nodes), unit_ids=[], group_label=None)
+    node_match["example_id"] = example_id
+    node_match["variant_id"] = base_variant_id
+    link_match = _apply_collapsed_selection_metadata(_build_identity_link_match(reviewed_links), unit_ids=[], group_label=None)
+    link_match["example_id"] = example_id
+    link_match["variant_id"] = base_variant_id
+    link_lineage = _apply_collapsed_selection_metadata(_build_identity_link_lineage(reviewed_links), unit_ids=[], group_label=None)
+    link_lineage["example_id"] = example_id
+    link_lineage["variant_id"] = base_variant_id
+
+    directed_nodes, node_sword_match, sword_match_summary = match_variant_nodes_to_sword(
+        directed_nodes=directed_nodes,
+        parent_nodes=reviewed_nodes,
+        node_match=node_match,
+        sword_node_source_path=sword_node_source_path,
+        sword_wse_field=sword_wse_field,
+        sword_match_tolerance=sword_match_tolerance,
+        example_id=example_id,
+        sword_example_station_source_path=sword_example_station_source_path,
+        sword_station_match_source_path=sword_station_match_source_path,
+        sword_reach_buffer_steps=sword_reach_buffer_steps,
+    )
+    directed_nodes = _apply_collapsed_selection_metadata(directed_nodes, unit_ids=[], group_label=None)
+    directed_nodes["example_id"] = example_id
+    directed_nodes["variant_id"] = base_variant_id
+    node_sword_match = _apply_collapsed_selection_metadata(node_sword_match, unit_ids=[], group_label=None)
+    node_sword_match["example_id"] = example_id
+    node_sword_match["variant_id"] = base_variant_id
+
+    link_width_families = pd.DataFrame(enriched_links.drop(columns=enriched_links.geometry.name))
+    directed_links_path = directed_dir / f"{base_run_name}_directed_links.gpkg"
+    directed_nodes_path = directed_dir / f"{base_run_name}_directed_nodes.gpkg"
+    links_with_widths_path = width_dir / "links_with_width_families.gpkg"
+
+    empty_components = _apply_collapsed_selection_metadata(
+        pd.DataFrame(
+            columns=[
+                "component_id",
+                "unit_ids",
+                "link_ids",
+                "node_ids",
+                "compound_bubble_ids",
+                "n_units",
+                "n_links",
+                "n_nodes",
+                "footprint_area",
+                "added_pixels",
+                "added_area",
+            ]
+        ),
+        unit_ids=[],
+        group_label=None,
+    )
+    empty_components["example_id"] = example_id
+    empty_components["variant_id"] = base_variant_id
+    empty_edit_geometries = gpd.GeoDataFrame(
+        {
+            "component_id": pd.Series(dtype="string"),
+            "geometry_role": pd.Series(dtype="string"),
+            "action": pd.Series(dtype="string"),
+            "unit_ids": pd.Series(dtype="string"),
+            "collapsed_selection_type": pd.Series(dtype="string"),
+            "collapsed_selection_label": pd.Series(dtype="string"),
+            "collapsed_unit_ids": pd.Series(dtype="string"),
+            "collapsed_group_label": pd.Series(dtype="string"),
+            "collapsed_unit_count": pd.Series(dtype="int64"),
+            "example_id": pd.Series(dtype="string"),
+            "variant_id": pd.Series(dtype="string"),
+        },
+        geometry=gpd.GeoSeries([], crs=reviewed_links.crs),
+        crs=reviewed_links.crs,
+    )
+
+    empty_components.to_csv(summary_dir / "collapse_components.csv", index=False)
+    empty_edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
+    link_width_families.to_csv(width_dir / "link_width_families.csv", index=False)
+    link_width_samples.to_csv(width_dir / "link_width_samples.csv", index=False)
+    enriched_links.to_file(links_with_widths_path, driver="GPKG")
+    node_match.to_csv(matching_dir / "node_match.csv", index=False)
+    node_sword_match.to_csv(matching_dir / "node_sword_match.csv", index=False)
+    link_match.to_csv(matching_dir / "link_match.csv", index=False)
+    link_lineage.to_csv(matching_dir / "link_lineage.csv", index=False)
+    directed_links.to_file(directed_links_path, driver="GPKG")
+    directed_nodes.to_file(directed_nodes_path, driver="GPKG")
+    with (directed_dir / "direction_validation_report.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "method": "base_state_reuse",
+                "is_valid": True,
+                "issues": [],
+                "source_nodes": reviewed_nodes.loc[reviewed_nodes["is_inlet"].fillna(False), "id_node"].astype(int).tolist(),
+                "sink_nodes": reviewed_nodes.loc[reviewed_nodes["is_outlet"].fillna(False), "id_node"].astype(int).tolist(),
+            },
+            handle,
+            indent=2,
+        )
+
+    manifest = {
+        "example_id": example_id,
+        "variant_id": base_variant_id,
+        "selection_source": "base_state",
+        "selected_unit_ids": [],
+        "group_label": None,
+        "collapsed_selection": selection_metadata,
+        "n_components": 0,
+        "component_ids": [],
+        "base_state_materialized": True,
+        "mask_summary": {
+            "base_water_pixels": None,
+            "collapsed_water_pixels": None,
+            "pixels_added": 0,
+            "pixels_removed": 0,
+            "changed_pixels": 0,
+        },
+        "sword_matching": {
+            "wse_field": sword_wse_field,
+            "match_tolerance": sword_match_tolerance,
+            "reach_buffer_steps": int(sword_reach_buffer_steps),
+            "n_matched_nodes": int(node_sword_match["sword_node_id"].notna().sum()) if not node_sword_match.empty else 0,
+            "n_propagated_matches": int(node_sword_match["sword_match_from_parent"].fillna(False).sum()) if not node_sword_match.empty else 0,
+            "candidate_scope": sword_match_summary.get("scope"),
+            "candidate_region": sword_match_summary.get("candidate_region"),
+            "candidate_reach_count": sword_match_summary.get("candidate_reach_count"),
+            "candidate_reach_ids": sword_match_summary.get("candidate_reach_ids", []),
+        },
+        "output_paths": {
+            "output_dir": str(variant_dir.resolve()),
+            "collapsed_mask": str(collapsed_mask_path.resolve()),
+            "collapse_components": str((summary_dir / "collapse_components.csv").resolve()),
+            "edit_geometries": str((mask_dir / "collapse_edit_geometries.gpkg").resolve()),
+            "link_width_families": str((width_dir / "link_width_families.csv").resolve()),
+            "link_width_samples": str((width_dir / "link_width_samples.csv").resolve()),
+            "links_with_width_families": str(links_with_widths_path.resolve()),
+            "node_match": str((matching_dir / "node_match.csv").resolve()),
+            "node_sword_match": str((matching_dir / "node_sword_match.csv").resolve()),
+            "link_match": str((matching_dir / "link_match.csv").resolve()),
+            "link_lineage": str((matching_dir / "link_lineage.csv").resolve()),
+            "directed_links": str(directed_links_path.resolve()),
+            "directed_nodes": str(directed_nodes_path.resolve()),
+            "direction_validation_report": str((directed_dir / "direction_validation_report.json").resolve()),
+        },
+    }
+    with (summary_dir / "variant_manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+
+    return BaseStateVariantOutputs(
+        output_dir=variant_dir,
+        collapsed_mask_path=collapsed_mask_path,
+        directed_links_path=directed_links_path,
+        directed_nodes_path=directed_nodes_path,
+    )
+
+
 def _build_child_state(
     *,
     parent_context: ExperimentStateContext,
@@ -427,6 +744,7 @@ def run_collapse_experiment(
     unit_workflow_runner: Callable[..., UnitWorkflowOutputs] = run_unit_workflow,
     unit_workflow_writer: Callable[..., None] = write_unit_workflow_outputs,
     variant_runner: Callable[..., NetworkVariantOutputs] = generate_network_variant,
+    base_state_variant_materializer: Callable[..., BaseStateVariantOutputs] = _materialize_base_state_variant,
     max_path_cutoff: int = 100,
     max_paths: int = 5000,
     pixel_width_fields: Sequence[str] | None = None,
@@ -503,6 +821,23 @@ def run_collapse_experiment(
         unit_workflow_writer=unit_workflow_writer,
         unit_workflow_kwargs=unit_workflow_kwargs,
     )
+    base_variant_outputs = base_state_variant_materializer(
+        context=base_context,
+        example_id=root_example_id,
+        preferred_width_field=preferred_width_field,
+        transect_scale=transect_scale,
+        min_transect_pixels=min_transect_pixels,
+        sword_node_source_path=sword_node_source_path,
+        sword_wse_field=sword_wse_field,
+        sword_match_tolerance=sword_match_tolerance,
+        sword_example_station_source_path=sword_example_station_source_path,
+        sword_station_match_source_path=sword_station_match_source_path,
+        sword_reach_buffer_steps=sword_reach_buffer_steps,
+    )
+    base_context.variant_output_dir = base_variant_outputs.output_dir
+    base_context.cleaned_mask_path = base_variant_outputs.collapsed_mask_path
+    base_context.reviewed_links_path = base_variant_outputs.directed_links_path
+    base_context.reviewed_nodes_path = base_variant_outputs.directed_nodes_path
 
     state_records: list[dict[str, Any]] = [_state_record(base_context, mode)]
     transition_records: list[dict[str, Any]] = []

@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -127,6 +128,42 @@ def _default_variant_id(group_label: str | None, unit_ids: Sequence[int] | None)
 def _default_output_dir(cleaned_mask_path: str | Path, variant_id: str, example_id: str | None = None) -> Path:
     example_id = str(example_id) if example_id is not None else _infer_example_id(cleaned_mask_path)
     return Path(__file__).resolve().parent / "outputs" / example_id / variant_id
+
+
+def _collapsed_selection_label(unit_ids: Sequence[int] | None, group_label: str | None) -> str:
+    unique_unit_ids = _ensure_unique_preserve_order(unit_ids or [])
+    if group_label:
+        safe_group_label = re.sub(r"[^0-9A-Za-z_-]+", "_", str(group_label)).strip("_") or "group"
+        return f"collapsed_group_{safe_group_label}"
+    if not unique_unit_ids:
+        return "base_state"
+    if len(unique_unit_ids) == 1:
+        return f"collapsed_unit_{unique_unit_ids[0]}"
+    return "collapsed_units_" + "_".join(str(unit_id) for unit_id in unique_unit_ids)
+
+
+def _collapsed_selection_metadata(unit_ids: Sequence[int] | None, group_label: str | None) -> dict[str, Any]:
+    unique_unit_ids = _ensure_unique_preserve_order(unit_ids or [])
+    return {
+        "collapsed_selection_type": "group" if group_label else ("unit" if unique_unit_ids else "base"),
+        "collapsed_selection_label": _collapsed_selection_label(unique_unit_ids, group_label),
+        "collapsed_unit_ids": _serialize_int_list(unique_unit_ids),
+        "collapsed_group_label": str(group_label) if group_label is not None else "",
+        "collapsed_unit_count": int(len(unique_unit_ids)),
+    }
+
+
+def _apply_collapsed_selection_metadata(
+    frame: pd.DataFrame | gpd.GeoDataFrame,
+    *,
+    unit_ids: Sequence[int] | None,
+    group_label: str | None,
+) -> pd.DataFrame | gpd.GeoDataFrame:
+    result = frame.copy()
+    metadata = _collapsed_selection_metadata(unit_ids, group_label)
+    for column, value in metadata.items():
+        result[column] = value
+    return result
 
 
 def _parse_int_list(value: Any) -> list[int]:
@@ -1901,10 +1938,23 @@ def generate_network_variant(
         all_touched=all_touched,
         allow_noop=allow_noop,
     )
+    selection_metadata = _collapsed_selection_metadata(resolved_unit_ids, group_label)
+    collapse_components = _apply_collapsed_selection_metadata(
+        collapse_components,
+        unit_ids=resolved_unit_ids,
+        group_label=group_label,
+    )
     collapse_components["example_id"] = example_id
     collapse_components["variant_id"] = variant_id
     if group_label is not None:
         collapse_components["group_label"] = str(group_label)
+    edit_geometries = _apply_collapsed_selection_metadata(
+        edit_geometries,
+        unit_ids=resolved_unit_ids,
+        group_label=group_label,
+    )
+    edit_geometries["example_id"] = example_id
+    edit_geometries["variant_id"] = variant_id
 
     collapsed_mask_path = _write_mask(mask_dir / f"{example_id}__{variant_id}_collapsed.tif", collapsed_mask, parent_profile)
     edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
@@ -1933,12 +1983,27 @@ def generate_network_variant(
 
     raw_links = gpd.read_file(rivgraph_paths["links"])
     raw_nodes = gpd.read_file(rivgraph_paths["nodes"])
+    raw_links = _apply_collapsed_selection_metadata(
+        raw_links,
+        unit_ids=resolved_unit_ids,
+        group_label=group_label,
+    )
+    raw_nodes = _apply_collapsed_selection_metadata(
+        raw_nodes,
+        unit_ids=resolved_unit_ids,
+        group_label=group_label,
+    )
     enriched_links, link_width_samples = compute_width_families(
         raw_links,
         collapsed_mask_path=collapsed_mask_path,
         wet_reference_mask_path=wet_reference_mask_path,
         transect_scale=transect_scale,
         min_transect_pixels=min_transect_pixels,
+    )
+    link_width_samples = _apply_collapsed_selection_metadata(
+        link_width_samples,
+        unit_ids=resolved_unit_ids,
+        group_label=group_label,
     )
     parent_node_order, _, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
     node_match = _match_child_nodes_to_parent_nodes(
@@ -1973,12 +2038,42 @@ def generate_network_variant(
         sword_station_match_source_path=sword_station_match_source_path,
         sword_reach_buffer_steps=sword_reach_buffer_steps,
     )
+    node_match = _apply_collapsed_selection_metadata(
+        node_match,
+        unit_ids=resolved_unit_ids,
+        group_label=group_label,
+    )
+    link_match = _apply_collapsed_selection_metadata(
+        link_match,
+        unit_ids=resolved_unit_ids,
+        group_label=group_label,
+    )
+    directed_links = _apply_collapsed_selection_metadata(
+        directed_links,
+        unit_ids=resolved_unit_ids,
+        group_label=group_label,
+    )
+    directed_nodes = _apply_collapsed_selection_metadata(
+        directed_nodes,
+        unit_ids=resolved_unit_ids,
+        group_label=group_label,
+    )
+    node_sword_match = _apply_collapsed_selection_metadata(
+        node_sword_match,
+        unit_ids=resolved_unit_ids,
+        group_label=group_label,
+    )
     link_lineage = _resolve_link_lineage(
         parent_graph=parent_graph,
         directed_child_links=directed_links,
         node_match=node_match,
         link_match=link_match,
         match_tolerance=float(match_tolerance),
+    )
+    link_lineage = _apply_collapsed_selection_metadata(
+        link_lineage,
+        unit_ids=resolved_unit_ids,
+        group_label=group_label,
     )
     directed_links = directed_links.drop(
         columns=[column for column in link_lineage.columns if column in directed_links.columns and column != "id_link"],
@@ -2023,6 +2118,7 @@ def generate_network_variant(
         "selection_source": "group_label" if group_label is not None else "unit_ids",
         "selected_unit_ids": resolved_unit_ids,
         "group_label": group_label,
+        "collapsed_selection": selection_metadata,
         "n_components": int(len(collapse_components)),
         "component_ids": collapse_components["component_id"].tolist(),
         "exit_sides": str(exit_sides),

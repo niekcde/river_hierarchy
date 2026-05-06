@@ -649,7 +649,7 @@ def match_variant_nodes_to_sword(
                 continue
             fallback_used = bool(getattr(row, "sword_wse_fallback_used", False))
             fill_method = getattr(row, "sword_wse_fill_method", None)
-            if fill_method in (None, "", pd.NA):
+            if fill_method is None or pd.isna(fill_method) or fill_method == "":
                 fill_method = "same_node_wse" if fallback_used else "requested_field"
             parent_lookup[int(row.id_node)] = {
                 "sword_node_id": int(sword_node_id),

@@ -6,6 +6,7 @@ __pycache__/
 **/outputs/
 network_variants/output/
 network_variants/experiments/
+network_variants/README.html
 **/configs/outputs/
 *.gpkg-shm
 *.gpkg-wal

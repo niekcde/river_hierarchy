@@ -7,7 +7,7 @@ import geopandas as gpd
 import pandas as pd
 
 from hierarchy_level_definition.run_unit_workflow import UnitWorkflowOutputs, write_unit_workflow_outputs
-from network_variants.collapse_experiment import run_collapse_experiment
+from network_variants.collapse_experiment import BaseStateVariantOutputs, run_collapse_experiment
 from network_variants.variant_generation import NetworkVariantOutputs
 
 
@@ -181,6 +181,33 @@ def _make_variant_runner():
     return runner
 
 
+def _make_base_state_materializer():
+    calls: list[dict[str, Any]] = []
+
+    def materializer(**kwargs: Any) -> BaseStateVariantOutputs:
+        calls.append(dict(kwargs))
+        context = kwargs["context"]
+        output_dir = context.state_dir / "variant"
+        directed_dir = output_dir / "directed"
+        mask_dir = output_dir / "mask"
+        for directory in (output_dir, directed_dir, mask_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+        collapsed_mask_path = mask_dir / "S000_base_collapsed.tif"
+        directed_links_path = directed_dir / "S000_base_directed_links.gpkg"
+        directed_nodes_path = directed_dir / "S000_base_directed_nodes.gpkg"
+        for path in (collapsed_mask_path, directed_links_path, directed_nodes_path):
+            path.touch()
+        return BaseStateVariantOutputs(
+            output_dir=output_dir,
+            collapsed_mask_path=collapsed_mask_path,
+            directed_links_path=directed_links_path,
+            directed_nodes_path=directed_nodes_path,
+        )
+
+    materializer.calls = calls
+    return materializer
+
+
 def test_sequential_units_recomputes_hierarchy_on_each_child_state(tmp_path: Path) -> None:
     workflow_runner = _make_workflow_runner(
         [
@@ -190,6 +217,7 @@ def test_sequential_units_recomputes_hierarchy_on_each_child_state(tmp_path: Pat
         ]
     )
     variant_runner = _make_variant_runner()
+    base_state_materializer = _make_base_state_materializer()
 
     results = run_collapse_experiment(
         "sequential-units",
@@ -201,6 +229,7 @@ def test_sequential_units_recomputes_hierarchy_on_each_child_state(tmp_path: Pat
         unit_workflow_runner=workflow_runner,
         unit_workflow_writer=write_unit_workflow_outputs,
         variant_runner=variant_runner,
+        base_state_variant_materializer=base_state_materializer,
     )
 
     assert [call["unit_ids"] for call in variant_runner.calls] == [[5], [2]]
@@ -219,6 +248,7 @@ def test_sequential_groups_uses_current_state_group_labels(tmp_path: Path) -> No
         ]
     )
     variant_runner = _make_variant_runner()
+    base_state_materializer = _make_base_state_materializer()
 
     results = run_collapse_experiment(
         "sequential-groups",
@@ -230,6 +260,7 @@ def test_sequential_groups_uses_current_state_group_labels(tmp_path: Path) -> No
         unit_workflow_runner=workflow_runner,
         unit_workflow_writer=write_unit_workflow_outputs,
         variant_runner=variant_runner,
+        base_state_variant_materializer=base_state_materializer,
     )
 
     assert [call["group_label"] for call in variant_runner.calls] == ["G3_1", "G2_1"]
@@ -251,6 +282,7 @@ def test_independent_units_creates_one_child_per_base_unit(tmp_path: Path) -> No
         ]
     )
     variant_runner = _make_variant_runner()
+    base_state_materializer = _make_base_state_materializer()
 
     results = run_collapse_experiment(
         "independent-units",
@@ -262,10 +294,37 @@ def test_independent_units_creates_one_child_per_base_unit(tmp_path: Path) -> No
         unit_workflow_runner=workflow_runner,
         unit_workflow_writer=write_unit_workflow_outputs,
         variant_runner=variant_runner,
+        base_state_variant_materializer=base_state_materializer,
     )
 
     assert [call["unit_ids"] for call in variant_runner.calls] == [[5], [7], [2]]
-    assert all(str(call["reviewed_links_path"]).endswith("base_links.gpkg") for call in variant_runner.calls)
+    assert all(str(call["reviewed_links_path"]).endswith("S000_base_directed_links.gpkg") for call in variant_runner.calls)
     assert list(results.state_registry["parent_state_id"]) == ["", "S000_base", "S000_base", "S000_base"]
     assert list(results.state_registry["depth"]) == [0, 1, 1, 1]
     assert results.manifest["stop_reason"] == "all_base_units_processed"
+
+
+def test_base_state_is_materialized_as_local_variant_outputs(tmp_path: Path) -> None:
+    workflow_runner = _make_workflow_runner([_workflow_outputs([5]), _workflow_outputs([])])
+    variant_runner = _make_variant_runner()
+    base_state_materializer = _make_base_state_materializer()
+
+    results = run_collapse_experiment(
+        "independent-units",
+        cleaned_mask_path=tmp_path / "base_cleaned.tif",
+        reviewed_links_path=tmp_path / "base_links.gpkg",
+        reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=tmp_path / "experiment",
+        unit_workflow_runner=workflow_runner,
+        unit_workflow_writer=write_unit_workflow_outputs,
+        variant_runner=variant_runner,
+        base_state_variant_materializer=base_state_materializer,
+    )
+
+    base_row = results.state_registry.loc[results.state_registry["state_id"] == "S000_base"].iloc[0]
+    assert Path(base_row["variant_output_dir"]).name == "variant"
+    assert Path(base_row["directed_links_path"]).name == "S000_base_directed_links.gpkg"
+    assert Path(base_row["directed_nodes_path"]).name == "S000_base_directed_nodes.gpkg"
+    assert "states/S000_base/variant" in base_row["variant_output_dir"]
+    assert base_state_materializer.calls
