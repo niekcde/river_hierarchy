@@ -11,6 +11,8 @@ from scipy.io import netcdf_file
 from scipy.sparse import csc_matrix, diags, identity
 from scipy.sparse.linalg import factorized, splu
 
+from .hydrograph import HydrographMetricConfig, write_hydrograph_outputs
+
 
 DEFAULT_QOUT_NAME = "Qout_rapid_framework.nc"
 
@@ -246,6 +248,7 @@ def run_prepared_experiment(
     experiment_dir: str | Path,
     *,
     only_prepared: bool = True,
+    hydrograph_config: HydrographMetricConfig | None = None,
 ) -> pd.DataFrame:
     experiment_path = Path(experiment_dir).expanduser().resolve()
     registry_path = experiment_path / "rapid_prep_registry.csv"
@@ -263,15 +266,32 @@ def run_prepared_experiment(
         qout_path = run_dir / DEFAULT_QOUT_NAME
         try:
             output = run_prepared_state(prep_dir, output_path=qout_path)
-            run_rows.append(
-                {
-                    "state_id": getattr(row, "state_id"),
-                    "rapid_prep_dir": str(prep_dir),
-                    "rapid_run_dir": str(run_dir),
-                    "qout_nc": str(output),
-                    "status": "ran",
-                }
-            )
+            run_row = {
+                "state_id": getattr(row, "state_id"),
+                "rapid_prep_dir": str(prep_dir),
+                "rapid_run_dir": str(run_dir),
+                "qout_nc": str(output),
+                "status": "ran",
+            }
+            try:
+                hydrograph_outputs = write_hydrograph_outputs(
+                    prep_dir,
+                    output,
+                    run_dir,
+                    config=hydrograph_config,
+                )
+                run_row.update(hydrograph_outputs)
+            except Exception as hydrograph_exc:  # pragma: no cover - exercised through registry rows
+                run_row.update(
+                    {
+                        "hydrograph_status": "failed",
+                        "hydrograph_error": str(hydrograph_exc),
+                        "outlet_hydrograph_csv": "",
+                        "hydrograph_metrics_csv": "",
+                        "hydrograph_metrics_json": "",
+                    }
+                )
+            run_rows.append(run_row)
         except Exception as exc:  # pragma: no cover - exercised through registry rows
             run_rows.append(
                 {
@@ -281,6 +301,11 @@ def run_prepared_experiment(
                     "qout_nc": "",
                     "status": "failed",
                     "error": str(exc),
+                    "hydrograph_status": "",
+                    "hydrograph_error": "",
+                    "outlet_hydrograph_csv": "",
+                    "hydrograph_metrics_csv": "",
+                    "hydrograph_metrics_json": "",
                 }
             )
     run_registry = pd.DataFrame(run_rows)
@@ -294,6 +319,19 @@ def run_prepared_experiment(
                 "states_total": int(len(run_registry)),
                 "states_ran": int(run_registry["status"].eq("ran").sum()) if not run_registry.empty else 0,
                 "states_failed": int(run_registry["status"].eq("failed").sum()) if not run_registry.empty else 0,
+                "hydrograph_metrics_computed": int(run_registry["hydrograph_status"].eq("computed").sum()) if "hydrograph_status" in run_registry.columns else 0,
+                "hydrograph_metrics_failed": int(run_registry["hydrograph_status"].eq("failed").sum()) if "hydrograph_status" in run_registry.columns else 0,
+                "hydrograph_metric_config": (
+                    {
+                        "event_start_time": hydrograph_config.event_start_time,
+                        "event_start_window_hours": hydrograph_config.event_start_window_hours,
+                        "event_start_buffer_hours": hydrograph_config.event_start_buffer_hours,
+                        "event_end_time": hydrograph_config.event_end_time,
+                        "event_end_buffer_hours": hydrograph_config.event_end_buffer_hours,
+                    }
+                    if hydrograph_config is not None
+                    else None
+                ),
             },
             indent=2,
         )

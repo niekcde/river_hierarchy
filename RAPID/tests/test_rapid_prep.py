@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from rapid_tools.engine import run_prepared_experiment
+from rapid_tools.hydrograph import HydrographMetricConfig
 from rapid_tools.k_values import KValueConfig, compute_k_values
 from rapid_tools.prep import RapidPrepConfig, prepare_experiment
 from rapid_tools.slope import SlopeConfig, compute_link_slopes
@@ -122,12 +123,19 @@ def test_run_prepared_experiment_writes_qout(tmp_path: Path) -> None:
     )
     run_registry = run_prepared_experiment(experiment_dir)
     assert run_registry.loc[0, "status"] == "ran"
+    assert run_registry.loc[0, "hydrograph_status"] == "computed"
 
     qout_path = Path(run_registry.loc[0, "qout_nc"])
     assert qout_path.exists()
     with netcdf_file(qout_path, "r", mmap=False) as ds:
         qout = ds.variables["Qout"].data.copy()
         assert qout.shape == (3, 1)
+    assert Path(run_registry.loc[0, "outlet_hydrograph_csv"]).exists()
+    assert Path(run_registry.loc[0, "hydrograph_metrics_csv"]).exists()
+    hydrograph_metrics = pd.read_csv(run_registry.loc[0, "hydrograph_metrics_csv"])
+    assert "peak_discharge_cms" in hydrograph_metrics.columns
+    assert "time_to_peak_seconds" in hydrograph_metrics.columns
+    assert hydrograph_metrics.loc[0, "event_start_source"] == "auto_input_min_prepeak"
 
 
 def test_prepare_experiment_accepts_real_link_id_zero(tmp_path: Path) -> None:
@@ -332,3 +340,69 @@ def test_prepare_experiment_exports_celerity_columns(tmp_path: Path) -> None:
         "rapid_celerity_cap_max_mps",
     ):
         assert column in rapid_links.columns
+    for column in (
+        "n_source_links",
+        "n_links",
+        "link_multiplier",
+        "pct_celerity_capped",
+        "rapid_k_min",
+        "rapid_k_max",
+    ):
+        assert column in registry.columns
+
+
+def test_run_prepared_experiment_allows_manual_event_start_time(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path)
+    prepare_experiment(
+        experiment_dir,
+        forcing_path=experiment_dir / "forcing.csv",
+        prep_config=RapidPrepConfig(),
+    )
+
+    run_registry = run_prepared_experiment(
+        experiment_dir,
+        hydrograph_config=HydrographMetricConfig(
+            event_start_time="2020-01-01T01:00:00Z",
+        ),
+    )
+
+    assert run_registry.loc[0, "hydrograph_status"] == "computed"
+    assert run_registry.loc[0, "event_start_source"] == "manual_input_time"
+
+
+def test_run_prepared_experiment_supports_start_and_end_window_search(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path)
+    forcing = pd.DataFrame(
+        {
+            "time": [
+                "2020-01-01T00:00:00Z",
+                "2020-01-01T01:00:00Z",
+                "2020-01-01T02:00:00Z",
+                "2020-01-01T03:00:00Z",
+                "2020-01-01T04:00:00Z",
+            ],
+            "discharge": [10.0, 5.0, 8.0, 4.0, 9.0],
+        }
+    )
+    forcing.to_csv(experiment_dir / "forcing.csv", index=False)
+    prepare_experiment(
+        experiment_dir,
+        forcing_path=experiment_dir / "forcing.csv",
+        prep_config=RapidPrepConfig(),
+    )
+
+    run_registry = run_prepared_experiment(
+        experiment_dir,
+        hydrograph_config=HydrographMetricConfig(
+            event_start_time="2020-01-01T01:30:00Z",
+            event_start_buffer_hours=1.0,
+            event_end_time="2020-01-01T03:30:00Z",
+            event_end_buffer_hours=1.0,
+        ),
+    )
+
+    assert run_registry.loc[0, "hydrograph_status"] == "computed"
+    assert run_registry.loc[0, "event_start_source"] == "manual_input_min_window"
+    assert run_registry.loc[0, "event_end_source"] == "manual_input_min_window"
+    assert run_registry.loc[0, "event_start_time_utc"] == "2020-01-01T01:00:00+00:00"
+    assert run_registry.loc[0, "event_end_time_utc"] == "2020-01-01T03:00:00+00:00"

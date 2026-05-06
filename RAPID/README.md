@@ -187,6 +187,21 @@ and experiment-level summaries:
 - `rapid_prep_registry.csv`
 - `rapid_prep_manifest.json`
 
+The prep registry now also records state-level diagnostics that make the impact
+of celerity capping and RAPID-only subreach splitting explicit:
+
+- `n_source_links`
+- `n_links`
+- `link_multiplier`
+- `n_split_parent_links`
+- `pct_split_parent_links`
+- `n_celerity_capped`
+- `pct_celerity_capped`
+- `min_link_length_m`
+- `max_link_length_m`
+- `rapid_k_min`
+- `rapid_k_max`
+
 Per-state prep outputs include:
 
 - `rapid_link_attributes.csv`
@@ -233,7 +248,11 @@ and `rapid_node_attributes.csv` records the RAPID-only virtual split nodes with:
 ```bash
 /opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python \
   RAPID/run_rapid_experiment.py \
-  network_variants/output/sarl03_indep_v2
+  network_variants/output/sarl03_indep_v2 \
+  --event-start-time 2023-02-12T06:00:00Z \
+  --event-start-buffer-hours 6 \
+  --event-end-time 2023-02-22T12:00:00Z \
+  --event-end-buffer-hours 12
 ```
 
 This writes per-state run outputs under:
@@ -244,6 +263,100 @@ and experiment-level summaries:
 
 - `rapid_run_registry.csv`
 - `rapid_run_manifest.json`
+
+Per-state RAPID run outputs now also include:
+
+- `Qout_rapid_framework.nc`
+- `outlet_hydrograph.csv`
+- `hydrograph_metrics.csv`
+- `hydrograph_metrics.json`
+
+`rapid_run_registry.csv` includes the hydrograph metrics directly so the
+experiment-level table can be used for quick comparisons across states.
+
+### Hydrograph Metric Definitions
+
+The run step computes outlet-hydrograph metrics from the summed discharge across
+all outlet reaches in the prepared RAPID state. The event start is defined from
+the normalized inflow series used during prep:
+
+- if `--event-start-time` is provided, the first inflow timestep at or after
+  that UTC timestamp is used
+- if `--event-start-time` and `--event-start-buffer-hours` are both provided,
+  RAPID searches symmetrically around that timestamp and uses the minimum inflow
+  discharge found within the window
+- otherwise, RAPID chooses the minimum inflow discharge before the inflow peak
+- if `--event-start-window-hours` is provided, that automatic minimum search is
+  restricted to the first `N` hours of the inflow series
+
+An optional end reference can also be supplied:
+
+- if `--event-end-time` is provided, the first inflow timestep at or after that
+  UTC timestamp is used as the event end reference
+- if `--event-end-time` and `--event-end-buffer-hours` are both provided,
+  RAPID searches symmetrically around that timestamp and uses the minimum inflow
+  discharge found within the window
+
+When an end reference is supplied, the outlet discharge at that detected event
+end time becomes the recession baseline for:
+
+- `fall_time_seconds`
+- `fall_time_50_seconds`
+- `fall_time_10_seconds`
+- `e_folding_time_seconds`
+
+If no end reference is supplied, those recession metrics continue to use the
+event-start outlet discharge as the baseline.
+
+The following metrics are exported:
+
+- `event_start_time_*`
+  baseline time used for the event definition
+- `event_end_time_*`
+  optional end-of-event reference time used for recession-baseline selection
+- `event_duration_seconds`
+  `event_end_time - event_start_time` when an end reference is supplied
+- `peak_time_*`
+  time of the outlet peak
+- `peak_discharge_cms`
+  outlet peak magnitude
+- `peak_excess_cms`
+  outlet peak above the outlet discharge at the event start
+- `peak_excess_to_end_baseline_cms`
+  outlet peak above the recession baseline defined by the event end when one is
+  supplied
+- `time_to_peak_seconds`
+  `peak_time - event_start_time`
+- `fall_time_seconds`
+  time from the peak until the outlet hydrograph first returns to the outlet
+  discharge at the event start
+- `fall_time_50_seconds`
+  time from the peak until the outlet discharge falls to 50% of the peak excess
+  above baseline
+- `fall_time_10_seconds`
+  time from the peak until the outlet discharge falls to 10% of the peak excess
+  above baseline
+- `e_folding_time_seconds`
+  time from the peak until the outlet discharge falls to
+  `baseline + peak_excess / e`
+- `lag_to_inflow_peak_seconds`
+  lag between the inflow peak and outlet peak
+- `peak_attenuation_ratio`
+  `outlet_peak / inflow_peak`
+- `outlet_volume_m3`
+  total outlet routed volume over the simulated run
+- `outlet_excess_volume_m3`
+  integrated outlet volume above the event-start outlet discharge
+- `rise_rate_cms_per_hour`
+  `peak_excess / time_to_peak`
+
+These definitions are intentionally consistent with the current single-event
+workflow: one forcing hydrograph, one event start, and one outlet hydrograph per
+state.
+
+For interactive post-run analysis, use:
+
+- `RAPID/notebooks/rapid_hydrograph_analysis.ipynb`
 
 ## Notes
 

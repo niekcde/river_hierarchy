@@ -459,6 +459,15 @@ def prepare_state(
             "forcing_dt_seconds": forcing_dt_seconds,
             "routing_dt_seconds": routing_dt_seconds,
         },
+        "diagnostics": {
+            "link_multiplier": float(len(rapid_links) / len(prepared_links)) if len(prepared_links) else float("nan"),
+            "n_celerity_capped": int(rapid_links["rapid_celerity_capped"].fillna(False).sum()) if "rapid_celerity_capped" in rapid_links.columns else 0,
+            "pct_celerity_capped": float(rapid_links["rapid_celerity_capped"].fillna(False).astype(bool).mean()) if "rapid_celerity_capped" in rapid_links.columns and len(rapid_links) else float("nan"),
+            "min_link_length_m": float(rapid_links["link_length_m"].min()) if len(rapid_links) else float("nan"),
+            "max_link_length_m": float(rapid_links["link_length_m"].max()) if len(rapid_links) else float("nan"),
+            "rapid_k_min": float(rapid_links["rapid_k"].min()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
+            "rapid_k_max": float(rapid_links["rapid_k"].max()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
+        },
     }
     manifest_path = context.rapid_prep_dir / "rapid_prep_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
@@ -480,6 +489,21 @@ def prepare_state(
         "inflow_nc": str(inflow_path) if inflow_path is not None else "",
         "forcing_dt_seconds": forcing_dt_seconds if forcing_dt_seconds is not None else "",
         "routing_dt_seconds": routing_dt_seconds if routing_dt_seconds is not None else "",
+        "n_source_links": int(len(prepared_links)),
+        "n_links": int(len(rapid_links)),
+        "link_multiplier": float(len(rapid_links) / len(prepared_links)) if len(prepared_links) else float("nan"),
+        "n_split_parent_links": int(rapid_links.loc[rapid_links["rapid_link_split"], "parent_link_id"].nunique()) if "rapid_link_split" in rapid_links.columns else 0,
+        "pct_split_parent_links": (
+            float(rapid_links.loc[rapid_links["rapid_link_split"], "parent_link_id"].nunique() / len(prepared_links))
+            if "rapid_link_split" in rapid_links.columns and len(prepared_links)
+            else 0.0
+        ),
+        "n_celerity_capped": int(rapid_links["rapid_celerity_capped"].fillna(False).sum()) if "rapid_celerity_capped" in rapid_links.columns else 0,
+        "pct_celerity_capped": float(rapid_links["rapid_celerity_capped"].fillna(False).astype(bool).mean()) if "rapid_celerity_capped" in rapid_links.columns and len(rapid_links) else float("nan"),
+        "min_link_length_m": float(rapid_links["link_length_m"].min()) if len(rapid_links) else float("nan"),
+        "max_link_length_m": float(rapid_links["link_length_m"].max()) if len(rapid_links) else float("nan"),
+        "rapid_k_min": float(rapid_links["rapid_k"].min()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
+        "rapid_k_max": float(rapid_links["rapid_k"].max()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
         "status": "prepared",
     }
 
