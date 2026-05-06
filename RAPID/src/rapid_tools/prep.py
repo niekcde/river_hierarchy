@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -9,6 +10,8 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
+from shapely.geometry import LineString
+from shapely.ops import substring
 
 from .forcing import ForcingConfig, infer_forcing_dt_seconds, load_forcing_table, write_inflow_netcdf
 from .k_values import KValueConfig, compute_k_values, compute_routing_dt_seconds
@@ -23,13 +26,139 @@ class RapidPrepConfig:
     kb_value: float = 20.0
     n_manning: float = 0.35
     min_width: float = 1.0
+    use_celerity_capping: bool = False
+    min_celerity_mps: float = 0.28
+    max_celerity_mps: float = 1.524
+    target_subreach_length_m: float | None = None
     min_slope: float = 1e-6
     preferred_length_field: str = "len"
     include_base_state: bool = True
     strict_sword: bool = True
 
 
-def create_conn_file(graph: nx.MultiDiGraph, output_dir: Path) -> Path:
+def _compute_subreach_count(link_length_m: float, target_length_m: float | None) -> int:
+    if target_length_m is None:
+        return 1
+    if target_length_m <= 0:
+        raise ValueError("target_subreach_length_m must be positive when provided.")
+    return max(1, int(round(float(link_length_m) / float(target_length_m))))
+
+
+def _extract_subreach_geometry(geometry, start_distance: float, end_distance: float):
+    if start_distance <= 0.0 and end_distance >= float(geometry.length):
+        return geometry
+    try:
+        segment = substring(geometry, start_distance, end_distance)
+    except Exception:
+        start_point = geometry.interpolate(start_distance)
+        end_point = geometry.interpolate(end_distance)
+        return LineString([start_point, end_point])
+    if segment.geom_type == "LineString":
+        return segment
+    start_point = geometry.interpolate(start_distance)
+    end_point = geometry.interpolate(end_distance)
+    return LineString([start_point, end_point])
+
+
+def split_links_into_subreaches(
+    prepared_links: gpd.GeoDataFrame,
+    nodes: gpd.GeoDataFrame,
+    *,
+    target_length_m: float | None,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    rapid_nodes = nodes.copy()
+    rapid_nodes["id_node"] = pd.to_numeric(rapid_nodes["id_node"], errors="coerce").astype(int)
+    rapid_nodes["rapid_node_source"] = "original"
+    rapid_nodes["parent_node_id"] = rapid_nodes["id_node"].astype(int)
+    rapid_nodes["rapid_node_split_from_link_id"] = pd.Series([pd.NA] * len(rapid_nodes), dtype="Int64")
+    rapid_nodes["rapid_node_subreach_boundary_index"] = pd.Series([pd.NA] * len(rapid_nodes), dtype="Int64")
+
+    if target_length_m is None:
+        rapid_links = prepared_links.copy()
+        rapid_links["reach_id"] = pd.to_numeric(rapid_links["id_link"], errors="coerce").astype(int)
+        rapid_links["parent_link_id"] = pd.to_numeric(rapid_links["id_link"], errors="coerce").astype(int)
+        rapid_links["parent_link_length_m"] = rapid_links["link_length_m"].astype(float)
+        rapid_links["subreach_index"] = 1
+        rapid_links["subreach_count"] = 1
+        rapid_links["subreach_length_fraction"] = 1.0
+        rapid_links["rapid_link_split"] = False
+        return rapid_links, rapid_nodes
+
+    link_sort_order = pd.to_numeric(prepared_links["id_link"], errors="coerce")
+    rapid_links_records: list[pd.Series] = []
+    virtual_node_records: list[dict[str, object]] = []
+    next_virtual_node_id = int(rapid_nodes["id_node"].max()) + 1 if not rapid_nodes.empty else 1
+    next_reach_id = int(pd.to_numeric(prepared_links["id_link"], errors="coerce").max()) + 1 if not prepared_links.empty else 1
+
+    for _, row in prepared_links.assign(_rapid_sort_id=link_sort_order).sort_values("_rapid_sort_id").drop(columns="_rapid_sort_id").iterrows():
+        parent_link_id = int(row["id_link"])
+        link_length_m = float(row["link_length_m"])
+        subreach_count = _compute_subreach_count(link_length_m, target_length_m)
+        node_sequence = [int(row["id_us_node"])]
+        geometry = row.geometry
+        geom_length = float(geometry.length) if geometry is not None else 0.0
+
+        for boundary_index in range(1, subreach_count):
+            distance = geom_length * (boundary_index / subreach_count)
+            point = geometry.interpolate(distance)
+            virtual_node_id = next_virtual_node_id
+            next_virtual_node_id += 1
+            node_sequence.append(virtual_node_id)
+
+            virtual_record = {column: pd.NA for column in rapid_nodes.columns if column != rapid_nodes.geometry.name}
+            virtual_record["id_node"] = virtual_node_id
+            if "is_inlet" in rapid_nodes.columns:
+                virtual_record["is_inlet"] = False
+            if "is_outlet" in rapid_nodes.columns:
+                virtual_record["is_outlet"] = False
+            virtual_record["rapid_node_source"] = "subreach_virtual"
+            virtual_record["parent_node_id"] = pd.NA
+            virtual_record["rapid_node_split_from_link_id"] = parent_link_id
+            virtual_record["rapid_node_subreach_boundary_index"] = boundary_index
+            virtual_record[rapid_nodes.geometry.name] = point
+            virtual_node_records.append(virtual_record)
+
+        node_sequence.append(int(row["id_ds_node"]))
+
+        if subreach_count == 1:
+            reach_ids = [parent_link_id]
+        else:
+            reach_ids = list(range(next_reach_id, next_reach_id + subreach_count))
+            next_reach_id += subreach_count
+
+        for subreach_index in range(subreach_count):
+            child = row.copy()
+            child["reach_id"] = int(reach_ids[subreach_index])
+            child["parent_link_id"] = parent_link_id
+            child["parent_link_length_m"] = link_length_m
+            child["subreach_index"] = subreach_index + 1
+            child["subreach_count"] = subreach_count
+            child["subreach_length_fraction"] = 1.0 / subreach_count
+            child["rapid_link_split"] = bool(subreach_count > 1)
+            child["id_us_node"] = int(node_sequence[subreach_index])
+            child["id_ds_node"] = int(node_sequence[subreach_index + 1])
+            child["link_length_m"] = link_length_m / subreach_count
+            if "is_inlet" in child.index:
+                child["is_inlet"] = bool(row.get("is_inlet", False)) and subreach_index == 0
+            if "is_outlet" in child.index:
+                child["is_outlet"] = bool(row.get("is_outlet", False)) and subreach_index == (subreach_count - 1)
+            start_distance = geom_length * (subreach_index / subreach_count)
+            end_distance = geom_length * ((subreach_index + 1) / subreach_count)
+            child.geometry = _extract_subreach_geometry(geometry, start_distance, end_distance)
+            rapid_links_records.append(child)
+
+    if virtual_node_records:
+        virtual_nodes = gpd.GeoDataFrame(virtual_node_records, geometry=rapid_nodes.geometry.name, crs=rapid_nodes.crs)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            rapid_nodes = pd.concat([rapid_nodes, virtual_nodes], ignore_index=True)
+        rapid_nodes = gpd.GeoDataFrame(rapid_nodes, geometry=nodes.geometry.name, crs=nodes.crs)
+
+    rapid_links = gpd.GeoDataFrame(rapid_links_records, geometry=prepared_links.geometry.name, crs=prepared_links.crs)
+    return rapid_links, rapid_nodes
+
+
+def create_conn_file(graph: nx.MultiDiGraph, output_dir: Path) -> tuple[Path, list[int]]:
     edge_list = list(graph.edges(data=True))
     node_to_edges_dn: dict[object, list[int]] = {}
     node_to_edges_up: dict[object, list[int]] = {}
@@ -58,13 +187,13 @@ def create_conn_file(graph: nx.MultiDiGraph, output_dir: Path) -> Path:
     if frame.empty:
         path = output_dir / "conn.csv"
         path.write_text("")
-        return path
+        return path, []
     dn_cols = sorted([c for c in frame.columns if c.startswith("rch_id_dn_")], key=lambda c: int(c.split("_")[3]))
     up_cols = sorted([c for c in frame.columns if c.startswith("rch_id_up_")], key=lambda c: int(c.split("_")[3]))
     frame = frame[["reach_id", "n_rch_dn"] + dn_cols + ["n_rch_up"] + up_cols].fillna(0)
     path = output_dir / "conn.csv"
     frame.to_csv(path, header=False, index=False)
-    return path
+    return path, frame["reach_id"].astype(int).tolist()
 
 
 def create_riv_file(graph: nx.MultiDiGraph, output_dir: Path) -> tuple[Path, list[int]]:
@@ -162,6 +291,24 @@ def write_routing_parameter_files(prepared_links: pd.DataFrame, output_dir: Path
     return kfc_path, xfc_path, coords_path
 
 
+def order_prepared_links_for_total_reach_order(
+    prepared_links: pd.DataFrame,
+    reach_order: list[int],
+) -> pd.DataFrame:
+    if not reach_order:
+        return prepared_links.iloc[0:0].copy()
+    by_reach = prepared_links.copy()
+    by_reach["reach_id"] = pd.to_numeric(by_reach["reach_id"], errors="coerce").astype(int)
+    by_reach = by_reach.set_index("reach_id", drop=False)
+    missing = [reach_id for reach_id in reach_order if reach_id not in by_reach.index]
+    if missing:
+        raise ValueError(
+            "Could not align RAPID prepared links to the connectivity order. "
+            f"Missing reach IDs: {missing[:10]}"
+        )
+    return by_reach.loc[reach_order].reset_index(drop=True)
+
+
 def build_rapid_graph(
     prepared_links: pd.DataFrame,
     nodes: gpd.GeoDataFrame,
@@ -226,25 +373,40 @@ def prepare_state(
         ),
     )
     prepared_links = links.merge(slope_frame, on=["id_link", "id_us_node", "id_ds_node"], how="left")
-    prepared_links["reach_id"] = pd.to_numeric(prepared_links["id_link"], errors="coerce").astype(int)
-    prepared_links["centroid_x"] = prepared_links.geometry.centroid.x.astype(float)
-    prepared_links["centroid_y"] = prepared_links.geometry.centroid.y.astype(float)
-    prepared_links = compute_k_values(
+    prepared_links["link_length_m"] = pd.to_numeric(prepared_links["link_length_m"], errors="coerce").astype(float)
+
+    rapid_links, rapid_nodes = split_links_into_subreaches(
         prepared_links,
+        nodes,
+        target_length_m=prep_config.target_subreach_length_m,
+    )
+    rapid_links["centroid_x"] = rapid_links.geometry.centroid.x.astype(float)
+    rapid_links["centroid_y"] = rapid_links.geometry.centroid.y.astype(float)
+    rapid_links = compute_k_values(
+        rapid_links,
         config=KValueConfig(
             width_field=prep_config.width_field,
             x_value=prep_config.x_value,
             kb_value=prep_config.kb_value,
             n_manning=prep_config.n_manning,
             min_width=prep_config.min_width,
+            use_celerity_capping=prep_config.use_celerity_capping,
+            min_celerity_mps=prep_config.min_celerity_mps,
+            max_celerity_mps=prep_config.max_celerity_mps,
         ),
     )
 
-    graph = build_rapid_graph(prepared_links, nodes)
-    conn_path = create_conn_file(graph, context.rapid_prep_dir)
+    graph = build_rapid_graph(rapid_links, rapid_nodes)
+    conn_path, total_reach_order = create_conn_file(graph, context.rapid_prep_dir)
+    rapid_links_total_order = order_prepared_links_for_total_reach_order(rapid_links, total_reach_order)
     riv_path, reach_order = create_riv_file(graph, context.rapid_prep_dir)
     rat_srt_path = compute_reach_ratios(graph, context.rapid_prep_dir, use_widths=True)
-    kfc_path, xfc_path, coords_path = write_routing_parameter_files(prepared_links, context.rapid_prep_dir)
+    kfc_path, xfc_path, coords_path = write_routing_parameter_files(rapid_links_total_order, context.rapid_prep_dir)
+
+    rapid_links_path = context.rapid_prep_dir / "rapid_link_attributes.csv"
+    rapid_links.drop(columns=rapid_links.geometry.name).to_csv(rapid_links_path, index=False)
+    rapid_nodes_path = context.rapid_prep_dir / "rapid_node_attributes.csv"
+    rapid_nodes.drop(columns=rapid_nodes.geometry.name).to_csv(rapid_nodes_path, index=False)
 
     forcing_table_path = None
     inflow_path = None
@@ -254,18 +416,13 @@ def prepare_state(
         forcing = load_forcing_table(forcing_path, config=forcing_config)
         forcing_dt_seconds = infer_forcing_dt_seconds(forcing)
         routing_dt_seconds = compute_routing_dt_seconds(
-            prepared_links["rapid_k"],
+            rapid_links["rapid_k"],
             x_value=prep_config.x_value,
             forcing_dt_seconds=forcing_dt_seconds,
         )
         forcing_table_path = context.rapid_prep_dir / "forcing_normalized.csv"
         forcing.to_csv(forcing_table_path, index=False)
-        inflow_path = write_inflow_netcdf(prepared_links, forcing, context.rapid_prep_dir / "inflow.nc")
-
-    rapid_links_path = context.rapid_prep_dir / "rapid_link_attributes.csv"
-    prepared_links.drop(columns=prepared_links.geometry.name).to_csv(rapid_links_path, index=False)
-    rapid_nodes_path = context.rapid_prep_dir / "rapid_node_attributes.csv"
-    nodes.drop(columns=nodes.geometry.name).to_csv(rapid_nodes_path, index=False)
+        inflow_path = write_inflow_netcdf(rapid_links_total_order, forcing, context.rapid_prep_dir / "inflow.nc")
 
     manifest = {
         "state_id": context.state_id,
@@ -288,11 +445,14 @@ def prepare_state(
             "inflow_nc": str(inflow_path) if inflow_path is not None else None,
         },
         "counts": {
-            "n_links": int(len(prepared_links)),
-            "n_nodes": int(len(nodes)),
-            "n_inlet_links": int(prepared_links["is_inlet"].fillna(False).sum()) if "is_inlet" in prepared_links.columns else 0,
-            "n_slope_adjusted": int(prepared_links["slope_adjusted"].fillna(False).sum()),
-            "n_width_adjusted": int(prepared_links["rapid_width_adjusted"].fillna(False).sum()),
+            "n_source_links": int(len(prepared_links)),
+            "n_links": int(len(rapid_links)),
+            "n_nodes": int(len(rapid_nodes)),
+            "n_virtual_nodes": int(rapid_nodes["rapid_node_source"].eq("subreach_virtual").sum()) if "rapid_node_source" in rapid_nodes.columns else 0,
+            "n_split_parent_links": int(rapid_links.loc[rapid_links["rapid_link_split"], "parent_link_id"].nunique()) if "rapid_link_split" in rapid_links.columns else 0,
+            "n_inlet_links": int(rapid_links["is_inlet"].fillna(False).sum()) if "is_inlet" in rapid_links.columns else 0,
+            "n_slope_adjusted": int(rapid_links["slope_adjusted"].fillna(False).sum()),
+            "n_width_adjusted": int(rapid_links["rapid_width_adjusted"].fillna(False).sum()),
         },
         "routing": {
             "reach_order": reach_order,

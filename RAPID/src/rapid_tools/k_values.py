@@ -13,6 +13,9 @@ class KValueConfig:
     kb_value: float = 20.0
     n_manning: float = 0.35
     min_width: float = 1.0
+    use_celerity_capping: bool = False
+    min_celerity_mps: float = 0.28
+    max_celerity_mps: float = 1.524
 
 
 WIDTH_FIELD_CANDIDATES = (
@@ -45,6 +48,17 @@ def compute_k_values(
     config: KValueConfig | None = None,
 ) -> pd.DataFrame:
     config = config or KValueConfig()
+    if config.n_manning <= 0:
+        raise ValueError("RAPID K-value preparation requires a positive Manning roughness.")
+    if config.kb_value <= 0:
+        raise ValueError("RAPID K-value preparation requires a positive kb value.")
+    if config.min_width <= 0:
+        raise ValueError("RAPID K-value preparation requires a positive minimum width.")
+    if config.min_celerity_mps <= 0 or config.max_celerity_mps <= 0:
+        raise ValueError("RAPID celerity caps must be positive when provided.")
+    if config.min_celerity_mps > config.max_celerity_mps:
+        raise ValueError("RAPID celerity cap minimum cannot exceed the maximum.")
+
     width_field = resolve_width_field(link_frame.columns, config.width_field)
 
     frame = link_frame.copy()
@@ -58,14 +72,39 @@ def compute_k_values(
     frame["rapid_width_m"] = frame["rapid_width_m"].clip(lower=config.min_width).astype(float)
 
     frame["rapid_x"] = float(config.x_value)
-    frame["rapid_k"] = (
-        (3.0 / 5.0)
-        * float(config.n_manning)
+    frame["rapid_celerity_mps_raw"] = (
+        (5.0 / (3.0 * float(config.n_manning)))
+        * np.sqrt(frame["slope_used"].astype(float))
         * (
-            (frame["link_length_m"] / np.sqrt(frame["slope_used"]))
-            * ((float(config.kb_value) ** (2.0 / 3.0)) / (frame["rapid_width_m"] ** (2.0 / 3.0)))
+            (frame["rapid_width_m"].astype(float) ** (2.0 / 3.0))
+            / (float(config.kb_value) ** (2.0 / 3.0))
         )
     ).astype(float)
+    if config.use_celerity_capping:
+        frame["rapid_celerity_mps"] = frame["rapid_celerity_mps_raw"].clip(
+            lower=float(config.min_celerity_mps),
+            upper=float(config.max_celerity_mps),
+        )
+        frame["rapid_celerity_capped"] = ~np.isclose(
+            frame["rapid_celerity_mps"],
+            frame["rapid_celerity_mps_raw"],
+            rtol=1e-12,
+            atol=1e-12,
+        )
+        frame["rapid_k_source_method"] = np.where(
+            frame["rapid_celerity_capped"],
+            "hydraulic_celerity_capped",
+            "hydraulic_celerity_uncapped",
+        )
+    else:
+        frame["rapid_celerity_mps"] = frame["rapid_celerity_mps_raw"].astype(float)
+        frame["rapid_celerity_capped"] = False
+        frame["rapid_k_source_method"] = "hydraulic_celerity_uncapped"
+
+    frame["rapid_celerity_cap_enabled"] = bool(config.use_celerity_capping)
+    frame["rapid_celerity_cap_min_mps"] = float(config.min_celerity_mps)
+    frame["rapid_celerity_cap_max_mps"] = float(config.max_celerity_mps)
+    frame["rapid_k"] = (frame["link_length_m"].astype(float) / frame["rapid_celerity_mps"]).astype(float)
     return frame
 
 
