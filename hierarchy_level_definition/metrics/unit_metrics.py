@@ -655,6 +655,53 @@ def compute_unit_metrics_from_units(
         use_pixel_widths_for_extremes=use_pixel_widths_for_extremes,
     )
     tree_metadata = _build_primary_tree_metadata(units)
+    unit_metric_columns = [
+        "unit_id",
+        "bifurcation",
+        "confluence",
+        "class",
+        "n_paths",
+        "n_valid_paths",
+        "equivalent_width",
+        "equivalent_length",
+        "elongation",
+        "path_length_min",
+        "path_length_max",
+        "path_length_mean",
+        "path_length_range",
+        "path_length_range_norm",
+        "path_length_cv",
+        "path_width_eq_min",
+        "path_width_eq_max",
+        "path_width_eq_mean",
+        "path_width_range",
+        "path_width_range_norm",
+        "largest_path_width_fraction",
+        "dominant_width_fraction",
+        "width_entropy",
+        "width_evenness",
+        "effective_n_paths_width",
+        "path_disparity_width",
+        "width_ratio_2",
+        "smaller_width_fraction_2",
+        "dominant_width_fraction_2",
+        "length_ratio_2",
+        "internal_bifurcation_count",
+        "internal_confluence_count",
+        "total_bifurcation_count",
+        "total_confluence_count",
+        "internal_branch_node_count",
+        "branching_density_by_length",
+        "path_redundancy",
+        "compound_indicator",
+        "topologic_complexity_score",
+        "dynamic_proxy_method",
+        "dynamic_proxy_weight_field",
+        "dynamic_proxy_entropy",
+        "effective_n_paths_dyn_width",
+        "dominant_dyn_fraction_width",
+        "dynamic_proxy_complexity_score",
+    ]
 
     unit_records: list[dict[str, Any]] = []
     for unit in units:
@@ -772,16 +819,23 @@ def compute_unit_metrics_from_units(
             }
         )
 
-    unit_metrics = pd.DataFrame.from_records(unit_records).merge(tree_metadata, on="unit_id", how="left")
-    unit_metrics["compound_indicator"] = unit_metrics["compound_indicator"].astype("Int64")
-    unit_metrics["unit_topodynamic_class"] = unit_metrics.apply(
-        lambda row: classify_unit_topodynamic(row, thresholds),
-        axis=1,
+    unit_metrics = pd.DataFrame.from_records(unit_records, columns=unit_metric_columns).merge(
+        tree_metadata,
+        on="unit_id",
+        how="left",
     )
-    unit_metrics = unit_metrics.sort_values(
-        ["root_unit_id", "depth_from_root", "collapse_level", "bifurcation", "confluence", "unit_id"],
-        kind="mergesort",
-    ).reset_index(drop=True)
+    unit_metrics["compound_indicator"] = unit_metrics["compound_indicator"].astype("Int64")
+    if unit_metrics.empty:
+        unit_metrics["unit_topodynamic_class"] = pd.Series(dtype=object)
+    else:
+        unit_metrics["unit_topodynamic_class"] = unit_metrics.apply(
+            lambda row: classify_unit_topodynamic(row, thresholds),
+            axis=1,
+        )
+        unit_metrics = unit_metrics.sort_values(
+            ["root_unit_id", "depth_from_root", "collapse_level", "bifurcation", "confluence", "unit_id"],
+            kind="mergesort",
+        ).reset_index(drop=True)
     _with_metrics_attrs(path_metrics, metrics_config)
     _with_metrics_attrs(unit_metrics, metrics_config)
     return unit_metrics, path_metrics
