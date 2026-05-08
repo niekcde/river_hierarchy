@@ -3,7 +3,9 @@ __pycache__/
 .pytest_cache/
 .venv/
 *.pyc
+**/output/
 **/outputs/
+**/experiments/
 **/configs/outputs/
 *.gpkg-shm
 *.gpkg-wal
