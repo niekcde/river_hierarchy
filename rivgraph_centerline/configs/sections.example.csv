@@ -1,0 +1,2 @@
+example_id,river_mask_path,permanent_mask_path,cleaned_mask_path,exit_sides,manual_clean_status,notes
+07,/Users/6256481/Desktop/PhD_icloud/projecten/river_hierarchy/niek_review_package/water_masks_sarl/sarl_river_07.tif,/Users/6256481/Desktop/PhD_icloud/projecten/river_hierarchy/niek_review_package/water_masks_sarl/sarl_permanent_07.tif,,,"not_started","Initial smoke-test candidate."

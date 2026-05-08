@@ -1,0 +1,19 @@
+project:
+  output_dir: outputs
+
+rivgraph:
+  source_repo: git@github.com:niekcde/RivGraph.git
+  source_ref: river-hierarchy
+
+masks:
+  inventory: configs/sections.example.csv
+  prepared_dir: outputs/masks_prepared
+  cleaned_dir: outputs/masks_cleaned
+  threshold: 0.5
+
+qa:
+  preview_dir: outputs/qa/previews
+
+run:
+  products_dir: outputs/runs
+  overwrite: false

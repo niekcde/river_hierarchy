@@ -10,3 +10,7 @@ __pycache__/
 *.gpkg-shm
 *.gpkg-wal
 .ipynb_checkpoints/
+
+# Local scratch/vendor checkouts. RivGraph should be referenced through the
+# environment file or a deliberate submodule, not committed as copied source.
+rivgraph_centerline/RivGraph-master/
