@@ -1,588 +1,422 @@
-#!/usr/bin/env python3
-# *****************************************************************************
-# RiverRoutingMultichannels.py
-# *****************************************************************************
+from __future__ import annotations
 
-# Purpose:
-# This program is a Python implementation of the core capabilities of the RAPID
-# model with additions for multichannel discharge partitioning. RAPID was 
-# initially developed using Fortran 90 and the PETSc parallel computing library.
-
-# Author:
-# Cedric H. David & Elyssa L. Collins, 2024-2025
-
-
-# *****************************************************************************
-# Import Python modules
-# *****************************************************************************
-import csv
-import netCDF4
-import numpy
-import os
 import ast
+import csv
+import json
+from pathlib import Path
 
-from datetime import datetime, timezone
+import numpy as np
+import pandas as pd
+from scipy.io import netcdf_file
 from scipy.sparse import csc_matrix, diags, identity
-from scipy.sparse.linalg import spsolve, spsolve_triangular, factorized, splu
-# from scikits.umfpack import splu as umlu
+from scipy.sparse.linalg import factorized, splu
+
+from .hydrograph import HydrographMetricConfig, write_hydrograph_outputs
 
 
-ROUTING_TIMESTEP_SECONDS = 10800
-DEFAULT_QOUT_NAME = 'Qout_MS_b82_20150101_20240531_GLDASv21_ens_dtR10800.nc'
+DEFAULT_QOUT_NAME = "Qout_rapid_framework.nc"
+LEGACY_QOUT_BASENAME = "Qout_MS_b82_20150101_20240531_GLDASv21_ens_dtR10800"
 
 
-# *****************************************************************************
-# Connectivity function
-# *****************************************************************************
-def con_vec(con_csv):
-
-    IV_riv_tot = []
-    IV_dwn_tot = []
-    ZV_dwn_rat = []
-    IV_dwn_cnt = []
-    with open(con_csv, 'r') as csvfile:
-        csvreader = csv.reader(csvfile)
-        IS_ncol = len(next(csvreader)) # Read first line and count columns
+def con_vec(con_csv: str | Path) -> tuple[list[int], list[list[int]], list[list[float]], list[int]]:
+    river_ids: list[int] = []
+    downstream_ids: list[list[int]] = []
+    downstream_ratios: list[list[float]] = []
+    downstream_counts: list[int] = []
+    with open(con_csv, "r", newline="") as csvfile:
+        reader = csv.reader(csvfile)
+        first = next(reader, None)
+        if first is None:
+            return river_ids, downstream_ids, downstream_ratios, downstream_counts
+        ncol = len(first)
         csvfile.seek(0)
-        for row in csvreader:
-            IS_dwn_cnt = 0
-            ZV_dwn_id_row = []
-            ZV_dwn_rat_row = []
-            for JS_ncol in range(1, IS_ncol):
-                if ast.literal_eval(row[JS_ncol])[0] != 0:
-                    ZV_dwn_id_row.append(ast.literal_eval(row[JS_ncol])[0])
-                    ZV_dwn_rat_row.append(ast.literal_eval(row[JS_ncol])[1])
-                    IS_dwn_cnt += 1
-            if len(ZV_dwn_rat_row) > 0 and not numpy.isclose(sum(ZV_dwn_rat_row), 1.0, atol=1e-6):
-                print('ERROR - The downstream ratio for reach ' + str(row[0]) + 
-                      ' in the connectivity file does not sum to 1!')
-                raise SystemExit(22)
-            IV_riv_tot.append(int(row[0]))
-            IV_dwn_tot.append(ZV_dwn_id_row)
-            ZV_dwn_rat.append(ZV_dwn_rat_row)
-            IV_dwn_cnt.append(IS_dwn_cnt)
-
-    return IV_riv_tot, IV_dwn_tot, ZV_dwn_rat, IV_dwn_cnt
-
-
-# *****************************************************************************
-# Basin function
-# *****************************************************************************
-def bas_vec(bas_csv):
-
-    IV_riv_bas = []
-    with open(bas_csv, 'r') as csvfile:
-        csvreader = csv.reader(csvfile)
-        for row in csvreader:
-            IV_riv_bas.append(int(row[0]))
-    IV_riv_bas = numpy.array(IV_riv_bas, dtype=numpy.int64)
-
-    return IV_riv_bas
-
-
-# *****************************************************************************
-# Hash tables function
-# *****************************************************************************
-def hsh_tbl(IV_riv_tot, IV_riv_bas):
-
-    IS_riv_tot = len(IV_riv_tot)
-    IM_hsh_tot = {}
-    for JS_riv_tot in range(IS_riv_tot):
-        IM_hsh_tot[IV_riv_tot[JS_riv_tot]] = JS_riv_tot
-    # IM_hsh_tot[IS_riv] = JS_riv_tot
-
-    IS_riv_bas = len(IV_riv_bas)
-    IM_hsh_bas = {}
-    for JS_riv_bas in range(IS_riv_bas):
-        IM_hsh_bas[IV_riv_bas[JS_riv_bas]] = JS_riv_bas
-    # IM_hsh_bas[IS_riv] = JS_riv_bas
-
-    IV_bas_tot = [IM_hsh_tot[IS_riv] for IS_riv in IV_riv_bas]
-    IV_bas_tot = numpy.array(IV_bas_tot, dtype=numpy.int32)
-    # This array allows for index mapping such that IV_riv_tot[JS_riv_tot]
-    #                                             = IV_riv_bas[JS_riv_bas]
-    # IV_bas_tot[JS_riv_bas] = JS_riv_tot
-
-    return IM_hsh_tot, IM_hsh_bas, IV_bas_tot
-
-
-# *****************************************************************************
-# Network matrix function
-# *****************************************************************************
-def net_mat(IV_dwn_tot, IV_dwn_cnt, ZV_dwn_rat, IM_hsh_tot, IV_riv_bas, IM_hsh_bas):
-
-    IS_riv_bas = len(IV_riv_bas)
-    IV_row = []
-    IV_col = []
-    ZV_val = []
-    for JS_riv_bas in range(IS_riv_bas):
-        JS_riv_tot = IM_hsh_tot[IV_riv_bas[JS_riv_bas]]
-
-        for JS_riv_dwn in range(IV_dwn_cnt[JS_riv_tot]):
-            IS_dwn = IV_dwn_tot[JS_riv_tot][JS_riv_dwn]
-            if IS_dwn != 0 and IS_dwn in IM_hsh_bas:
-                JS_riv_ba2 = IM_hsh_bas[IS_dwn]
-                IV_row.append(JS_riv_ba2)
-                IV_col.append(JS_riv_bas)
-                ZV_val.append(ZV_dwn_rat[JS_riv_tot][JS_riv_dwn])                
-
-    ZM_Net = csc_matrix((ZV_val, (IV_row, IV_col)),
-                        shape=(IS_riv_bas, IS_riv_bas),
-                        dtype=numpy.float32,
-                        )
-
-    return ZM_Net
-
-
-
-# *****************************************************************************
-# Muskingum k and x function
-# *****************************************************************************
-def k_x_vec(kpr_csv, xpr_csv, IV_bas_tot):
-
-    ZV_kpr_tot = []
-    with open(kpr_csv, 'r') as csvfile:
-        csvreader = csv.reader(csvfile)
-        for row in csvreader:
-            ZV_kpr_tot.append(float(row[0]))
-    ZV_kpr_tot = numpy.array(ZV_kpr_tot, dtype=numpy.float64)
-    ZV_kpr_bas = ZV_kpr_tot[IV_bas_tot]
-
-    ZV_xpr_tot = []
-    with open(xpr_csv, 'r') as csvfile:
-        csvreader = csv.reader(csvfile)
-        for row in csvreader:
-            ZV_xpr_tot.append(float(row[0]))
-    ZV_xpr_tot = numpy.array(ZV_xpr_tot, dtype=numpy.float64)
-    ZV_xpr_bas = ZV_xpr_tot[IV_bas_tot]
-
-    return ZV_kpr_bas, ZV_xpr_bas
-
-
-# *****************************************************************************
-# Muskingum C1, C2, C3 function
-# *****************************************************************************
-def ccc_mat(ZV_kpr_bas, ZV_xpr_bas, ZS_dtR):
-
-    ZV_den = ZS_dtR/2 + ZV_kpr_bas * (1 - ZV_xpr_bas)
-
-    ZV_C1m = ZS_dtR/2 - ZV_kpr_bas * ZV_xpr_bas
-    ZV_C1m = ZV_C1m / ZV_den
-    ZM_C1m = diags(ZV_C1m, format='csc', dtype=numpy.float64)
-
-    ZV_C2m = ZS_dtR/2 + ZV_kpr_bas * ZV_xpr_bas
-    ZV_C2m = ZV_C2m / ZV_den
-    ZM_C2m = diags(ZV_C2m, format='csc', dtype=numpy.float64)
-
-    ZV_C3m = - ZS_dtR/2 + ZV_kpr_bas * (1 - ZV_xpr_bas)
-    ZV_C3m = ZV_C3m / ZV_den
-    ZM_C3m = diags(ZV_C3m, format='csc', dtype=numpy.float64)
-
-    return ZM_C1m, ZM_C2m, ZM_C3m
-
-
-# *****************************************************************************
-# Muskingum routing matrices
-# *****************************************************************************
-def rte_mat(ZM_Net, ZM_C1m, ZM_C2m, ZM_C3m):
-
-    IS_riv_bas = ZM_Net.shape[0]
-    ZM_Idt = identity(IS_riv_bas, format='csc', dtype=numpy.int32)
-
-    ZM_Lin = ZM_Idt - ZM_C1m * ZM_Net
-    ZM_Qex = ZM_C1m + ZM_C2m
-    ZM_Qou = ZM_C3m + ZM_C2m * ZM_Net
-
-    return ZM_Lin, ZM_Qex, ZM_Qou
-
-
-# *****************************************************************************
-# Metadata of external inflow
-# *****************************************************************************
-def m3r_mdt(m3r_ncf):
-
-    f = netCDF4.Dataset(m3r_ncf, 'r')
-
-    # -------------------------------------------------------------------------
-    # Check dimensions exist
-    # -------------------------------------------------------------------------
-    if 'rivid' not in f.dimensions:
-        print('ERROR - rivid dimension does not exist in ' + m3r_ncf)
-        raise SystemExit(22)
-
-    if 'time' not in f.dimensions:
-        print('ERROR - time dimension does not exist in ' + m3r_ncf)
-        raise SystemExit(22)
-
-    if 'nv' not in f.dimensions:
-        print('ERROR - nv dimension does not exist in ' + m3r_ncf)
-        raise SystemExit(22)
-
-    if len(f.dimensions['nv']) != 2:
-        print('ERROR - nv dimension is not 2 ' + m3r_ncf)
-        raise SystemExit(22)
-
-    # -------------------------------------------------------------------------
-    # Check variables exist
-    # -------------------------------------------------------------------------
-    if 'rivid' not in f.variables:
-        print('ERROR - rivid variable does not exist in ' + m3r_ncf)
-        raise SystemExit(22)
-
-    if 'time' not in f.variables:
-        print('ERROR - time variable does not exist in ' + m3r_ncf)
-        raise SystemExit(22)
-
-    if 'time_bnds' not in f.variables:
-        print('ERROR - time_bnds variable does not exist in ' + m3r_ncf)
-        raise SystemExit(22)
-
-    if 'm3_riv' not in f.variables:
-        print('ERROR - m3_riv variable does not exist in ' + m3r_ncf)
-        raise SystemExit(22)
-
-    # -------------------------------------------------------------------------
-    # Retrieve variables
-    # -------------------------------------------------------------------------
-    IV_m3r_tot = f.variables['rivid']
-    IV_m3r_tim = f.variables['time']
-    IM_m3r_tim = f.variables['time_bnds']
-
-    IS_m3r_tim = len(IV_m3r_tim)
-    # ZS_TaR = IM_m3r_tim[0, 1] - IM_m3r_tim[0, 0]
-    # Using IM_m3r_tim rather than IV_m3r_tim which may have only one timestep
-    ZS_TaR = IV_m3r_tim[1] - IV_m3r_tim[0]
-
-    return IV_m3r_tot, IV_m3r_tim, IM_m3r_tim, IS_m3r_tim, ZS_TaR
-
-
-# *****************************************************************************
-# Time step correspondance
-# *****************************************************************************
-def stp_cor(ZS_TaR, ZS_dtR):
-
-    if round(ZS_TaR/ZS_dtR) == ZS_TaR/ZS_dtR:
-        IS_dtR = round(ZS_TaR/ZS_dtR)
-    else:
-        print('ERROR - quotient of time steps is not an integer')
-        raise SystemExit(22)
-
-    return IS_dtR
-
-
-# *****************************************************************************
-# Check topology
-# *****************************************************************************
-def chk_top(IV_riv_bas, IM_hsh_bas, IV_riv_tot, IV_dwn_tot, IM_hsh_tot):
-
-    # -------------------------------------------------------------------------
-    # Check for missing connections upstream
-    # -------------------------------------------------------------------------
-    IS_riv_tot = len(IV_riv_tot)
-    for JS_riv_tot in range(IS_riv_tot):
-        IS_riv = IV_riv_tot[JS_riv_tot]
-        IS_dwn = IV_dwn_tot[JS_riv_tot]
-        for JS_dwn in range(len(IS_dwn)):
-            if IS_dwn[JS_dwn] != 0:
-                if IS_dwn[JS_dwn] in IM_hsh_bas and IS_riv not in IM_hsh_bas:
-                    print('WARNING - connectivity: ' + str(IS_riv) +
-                        ' is upstream of ' + str(IS_dwn[JS_dwn]) +
-                        ' but is not the basin file')
-
-    # -------------------------------------------------------------------------
-    # Check for missing connections downstream
-    # -------------------------------------------------------------------------
-    for IS_riv in IV_riv_bas:
-        IS_dwn = IV_dwn_tot[IM_hsh_tot[IS_riv]]
-        for JS_dwn in range(len(IS_dwn)):
-            if IS_dwn[JS_dwn] != 0:
-                if IS_dwn[JS_dwn] not in IM_hsh_bas:
-                    print('WARNING - connectivity: ' + str(IS_dwn[JS_dwn]) +
-                        ' is downstream of ' + str(IS_riv) +
-                        ' but is not the basin file')
-
-    # -------------------------------------------------------------------------
-    # Check sorting from upstream to downstream
-    # -------------------------------------------------------------------------
-    for IS_riv in IV_riv_bas:
-        IS_dwn = IV_dwn_tot[IM_hsh_tot[IS_riv]]
-        for JS_dwn in range(len(IS_dwn)):
-            if IS_dwn[JS_dwn] != 0:
-                if IS_dwn[JS_dwn] in IM_hsh_bas:
-                    if IM_hsh_bas[IS_dwn[JS_dwn]] < IM_hsh_bas[IS_riv]:
-                        print('ERROR - sorting problem: ' + str(IS_dwn[JS_dwn]) +
-                            ' is downstream of ' + str(IS_riv) +
-                            ' but is located above in basin file')
-                        raise SystemExit(22)
-
-
-# *****************************************************************************
-# Check IDs
-# *****************************************************************************
-def chk_ids(IV_riv_tot, IV_m3r_tot):
-
-    if not numpy.all(IV_riv_tot - IV_m3r_tot == 0):
-        print('ERROR - The river IDs in con_csv and m3r_ncf differ')
-        raise SystemExit(22)
-
-
-# *****************************************************************************
-# Check time variables
-# *****************************************************************************
-def chk_tim(IV_m3r_tim, IM_m3r_tim, ZS_TaR):
-
-    if len(IV_m3r_tim) != len(IM_m3r_tim):
-        print('ERROR - The time and time_bnds variables have different sizes')
-        raise SystemExit(22)
-
-    # if not numpy.all(IV_m3r_tim - IM_m3r_tim[:, 0] == 0):
-    #     print('ERROR - inconsistent values in time and time_bnds[0]')
-    #     raise SystemExit(22)
-
-    # if not numpy.all(IV_m3r_tim - IM_m3r_tim[:, 1] == -ZS_TaR):
-    #     print('ERROR - inconsistent values in time and time_bnds[1]')
-    #     raise SystemExit(22)
-
-    if not numpy.all(IV_m3r_tim[:-1] - IV_m3r_tim[1:] == -ZS_TaR):
-        print('ERROR - uneven increment in time ')
-        raise SystemExit(22)
-
-
-# *****************************************************************************
-# Metadata of outflow
-# *****************************************************************************
-def Qou_mdt(m3r_ncf, Qou_ncf, IV_bas_tot):
-
-    # -------------------------------------------------------------------------
-    # Get UTC date and time
-    # -------------------------------------------------------------------------
-    YS_dat = datetime.now(timezone.utc)
-    YS_dat = YS_dat.replace(microsecond=0)
-    YS_dat = YS_dat.isoformat()+'+00:00'
-
-    # -------------------------------------------------------------------------
-    # Open one file and create the other
-    # -------------------------------------------------------------------------
-    f = netCDF4.Dataset(m3r_ncf, 'r')
-    g = netCDF4.Dataset(Qou_ncf, 'w', format='NETCDF4')
-
-    # -------------------------------------------------------------------------
-    # Copy dimensions
-    # -------------------------------------------------------------------------
-    YV_exc = ['nerr']
-    for nam, dim in f.dimensions.items():
-        if nam not in YV_exc:
-            g.createDimension(nam, len(dim) if not dim.isunlimited() else None)
-
-    g.createDimension('nerr', 3)
-
-    # -------------------------------------------------------------------------
-    # Create variables
-    # -------------------------------------------------------------------------
-    g.createVariable('Qout', 'float32', ('time', 'rivid'))
-    g['Qout'].long_name = ('average river water discharge downstream of '
-                           'each river reach')
-    g['Qout'].units = 'm3 s-1'
-    g['Qout'].coordinates = 'lon lat'
-    g['Qout'].grid_mapping = 'crs'
-    g['Qout'].cell_methods = 'time: mean'
-
-    g.createVariable('Qout_err', 'float32', ('nerr', 'rivid'))
-    g['Qout_err'].long_name = ('average river water discharge uncertainty '
-                               'downstream of each river reach')
-    g['Qout_err'].units = 'm3 s-1'
-    g['Qout_err'].coordinates = 'lon lat'
-    g['Qout_err'].grid_mapping = 'crs'
-    g['Qout_err'].cell_methods = 'time: mean'
-
-    # -------------------------------------------------------------------------
-    # Copy variables variables
-    # -------------------------------------------------------------------------
-    YV_exc = ['m3_riv', 'm3_riv_err']
-    YV_sub = ['rivid', 'lon', 'lat']
-    for nam, var in f.variables.items():
-        if nam not in YV_exc:
-            if nam in YV_sub:
-                g.createVariable(nam, var.datatype, var.dimensions)
-                g[nam][:] = f[nam][IV_bas_tot]
-
-            else:
-                g.createVariable(nam, var.datatype, var.dimensions)
-                g[nam][:] = f[nam][:]
-
-            g[nam].setncatts(f[nam].__dict__)
-            # copy variable attributes all at once via dictionary
-
-    # -------------------------------------------------------------------------
-    # Populate global attributes
-    # -------------------------------------------------------------------------
-    g.Conventions = f.Conventions
-    g.title = f.title
-    g.institution = f.institution
-    g.source = 'RAPID, ' + 'runoff: ' + os.path.basename(m3r_ncf)
-    g.history = 'date created: ' + YS_dat
-    g.references = ('https://doi.org/10.1175/2011JHM1345.1, '
-                    'https://github.com/c-h-david/rapid')
-    g.comment = ''
-    g.featureType = f.featureType
-
-    # -------------------------------------------------------------------------
-    # Close all files
-    # -------------------------------------------------------------------------
-    f.close()
-    g.close()
-
-
-# *****************************************************************************
-# Muskingum routing
-# *****************************************************************************
-def mus_rte(ZM_Lin, ZM_Qex, ZM_Qou, IS_dtR, ZV_Qou_ini, ZV_Qex_avg):
-
-    ZV_Qou = ZV_Qou_ini
-    ZV_avg = numpy.zeros(len(ZV_Qou_ini))
-    ZV_rh1 = ZM_Qex * ZV_Qex_avg
-
-    for JS_dtR in range(IS_dtR):
-        # ---------------------------------------------------------------------
-        # Updating average before routing to remain in [0, IS_dtR - 1] range
-        # ---------------------------------------------------------------------
-        ZV_avg = ZV_avg + ZV_Qou
-
-        # ---------------------------------------------------------------------
-        # Updating instantaneous value of right-hand side
-        # ---------------------------------------------------------------------
-        ZV_rhs = ZV_rh1 + ZM_Qou * ZV_Qou
-
-        # ---------------------------------------------------------------------
-        # Routing
-        # ---------------------------------------------------------------------
-        # ZV_Qou = spsolve(ZM_Lin, ZV_rhs)
-        ZV_Qou = spsolve_triangular(ZM_Lin, ZV_rhs,
-                                    lower=True, unit_diagonal=True)
-        # ZV_Qou = slv_fac(ZV_rhs)
-        # ZV_Qou = slv_umf.solve(ZV_rhs)
-        # ZV_Qou = slv_slu.solve(ZV_rhs)
-
-    ZV_avg = ZV_avg / IS_dtR
-
-    ZV_Qou_avg = ZV_avg
-    ZV_Qou_fin = ZV_Qou
-
-    return ZV_Qou_avg, ZV_Qou_fin
-
-
-def run_rapid(  ### changed
-    directory,  ### changed
-    ROUTING_TIMESTEP_SECONDS = 10800,  ### changed
-    runType = 'random',  ### changed
-    seed = 1,  ### changed
-    output_path = None,  ### changed
-    return_qout = False,  ### changed
-):  ### changed
-    """
-    Execute the RAPID routing workflow using inputs contained in `directory`.
-    Expected files in `directory`:
-        rat_srt.csv, inflow.nc, kfc.csv, xfc.csv, riv.csv
-    Output:
-        Qout NetCDF written in the same directory.
-    """
-    DEFAULT_QOUT_NAME = 'Qout_MS_b82_20150101_20240531_GLDASv21_ens_dtR10800'
-    
-
-    inp_fld = os.path.abspath(directory)
-    out_fld = inp_fld
-
-    con_csv = os.path.join(inp_fld, 'rat_srt.csv')
-    m3r_ncf = os.path.join(inp_fld, 'inflow.nc')
-    kpr_csv = os.path.join(inp_fld, 'kfc.csv')
-    xpr_csv = os.path.join(inp_fld, 'xfc.csv')
-    bas_csv = os.path.join(inp_fld, 'riv.csv')
-
-
-    DEFAULT_QOUT_NAME = DEFAULT_QOUT_NAME +runType + f'_{seed}' + '.nc'
-    # print(DEFAULT_QOUT_NAME)
-    if output_path is None:  ### changed
-        Qou_ncf = os.path.join(out_fld, DEFAULT_QOUT_NAME)  ### changed
-    else:  ### changed
-        Qou_ncf = os.path.abspath(output_path)  ### changed
-
-    # Make sure files and folders exist
-    for fil_ext in [con_csv, kpr_csv, xpr_csv, m3r_ncf, bas_csv]:
+        for row in reader:
+            count = 0
+            row_ids: list[int] = []
+            row_ratios: list[float] = []
+            for col in range(1, ncol):
+                entry = ast.literal_eval(row[col])
+                if entry[0] != 0:
+                    row_ids.append(int(entry[0]))
+                    row_ratios.append(float(entry[1]))
+                    count += 1
+            if row_ratios and not np.isclose(sum(row_ratios), 1.0, atol=1e-6):
+                raise ValueError(f"Downstream ratios for reach {row[0]} do not sum to 1.")
+            river_ids.append(int(row[0]))
+            downstream_ids.append(row_ids)
+            downstream_ratios.append(row_ratios)
+            downstream_counts.append(count)
+    return river_ids, downstream_ids, downstream_ratios, downstream_counts
+
+
+def bas_vec(bas_csv: str | Path) -> np.ndarray:
+    frame = pd.read_csv(bas_csv, header=None)
+    return frame.iloc[:, 0].to_numpy(dtype=np.int64)
+
+
+def hsh_tbl(
+    river_ids_total: list[int],
+    river_ids_basin: np.ndarray,
+) -> tuple[dict[int, int], dict[int, int], np.ndarray]:
+    hash_total = {river_id: idx for idx, river_id in enumerate(river_ids_total)}
+    hash_basin = {int(river_id): idx for idx, river_id in enumerate(river_ids_basin)}
+    basin_to_total = np.array([hash_total[int(river_id)] for river_id in river_ids_basin], dtype=np.int32)
+    return hash_total, hash_basin, basin_to_total
+
+
+def net_mat(
+    downstream_ids: list[list[int]],
+    downstream_counts: list[int],
+    downstream_ratios: list[list[float]],
+    hash_total: dict[int, int],
+    river_ids_basin: np.ndarray,
+    hash_basin: dict[int, int],
+) -> csc_matrix:
+    rows: list[int] = []
+    cols: list[int] = []
+    values: list[float] = []
+    for basin_idx, river_id in enumerate(river_ids_basin):
+        total_idx = hash_total[int(river_id)]
+        for downstream_idx in range(downstream_counts[total_idx]):
+            downstream_id = downstream_ids[total_idx][downstream_idx]
+            if downstream_id != 0 and downstream_id in hash_basin:
+                rows.append(hash_basin[downstream_id])
+                cols.append(basin_idx)
+                values.append(downstream_ratios[total_idx][downstream_idx])
+    return csc_matrix(
+        (values, (rows, cols)),
+        shape=(len(river_ids_basin), len(river_ids_basin)),
+        dtype=np.float32,
+    )
+
+
+def k_x_vec(kpr_csv: str | Path, xpr_csv: str | Path, basin_to_total: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    k_total = pd.read_csv(kpr_csv, header=None).iloc[:, 0].to_numpy(dtype=np.float64)
+    x_total = pd.read_csv(xpr_csv, header=None).iloc[:, 0].to_numpy(dtype=np.float64)
+    return k_total[basin_to_total], x_total[basin_to_total]
+
+
+def ccc_mat(kpr_basin: np.ndarray, xpr_basin: np.ndarray, dt_routing: int) -> tuple[csc_matrix, csc_matrix, csc_matrix]:
+    denominator = dt_routing / 2.0 + kpr_basin * (1.0 - xpr_basin)
+    c1 = (dt_routing / 2.0 - kpr_basin * xpr_basin) / denominator
+    c2 = (dt_routing / 2.0 + kpr_basin * xpr_basin) / denominator
+    c3 = (-dt_routing / 2.0 + kpr_basin * (1.0 - xpr_basin)) / denominator
+    return (
+        diags(c1, format="csc", dtype=np.float64),
+        diags(c2, format="csc", dtype=np.float64),
+        diags(c3, format="csc", dtype=np.float64),
+    )
+
+
+def rte_mat(net: csc_matrix, c1: csc_matrix, c2: csc_matrix, c3: csc_matrix) -> tuple[csc_matrix, csc_matrix, csc_matrix]:
+    identity_matrix = identity(net.shape[0], format="csc", dtype=np.int32)
+    linear = identity_matrix - c1 * net
+    q_external = c1 + c2
+    q_out = c3 + c2 * net
+    return linear, q_external, q_out
+
+
+def read_inflow_netcdf(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    with netcdf_file(path, "r", mmap=False) as ds:
+        river_ids = np.array(ds.variables["rivid"].data, dtype=np.int64).copy()
+        time = np.array(ds.variables["time"].data, dtype=np.int64).copy()
+        m3_riv = np.array(ds.variables["m3_riv"].data, dtype=np.float64).copy()
+    if len(time) < 2:
+        raise ValueError("RAPID inflow.nc requires at least two timesteps.")
+    dt_forcing = int(time[1] - time[0])
+    return river_ids, time, m3_riv, dt_forcing
+
+
+def stp_cor(dt_forcing: int, dt_routing: int) -> int:
+    quotient = dt_forcing / dt_routing
+    if round(quotient) != quotient:
+        raise ValueError(
+            f"The quotient of forcing dt ({dt_forcing}) and routing dt ({dt_routing}) must be an integer."
+        )
+    return int(round(quotient))
+
+
+def mus_rte(
+    linear: csc_matrix,
+    q_external: csc_matrix,
+    q_out: csc_matrix,
+    n_substeps: int,
+    q_out_initial: np.ndarray,
+    q_external_avg: np.ndarray,
+    solver,
+) -> tuple[np.ndarray, np.ndarray]:
+    q_out_final = q_out_initial.copy()
+    q_out_avg = np.zeros_like(q_out_initial)
+    for _ in range(n_substeps):
+        rhs = q_external.dot(q_external_avg) + q_out.dot(q_out_final)
+        q_out_final = solver(rhs)
+        q_out_avg += q_out_final
+    q_out_avg = q_out_avg / float(n_substeps)
+    return q_out_avg, q_out_final
+
+
+def write_qout_netcdf(
+    output_path: str | Path,
+    river_ids_basin: np.ndarray,
+    time: np.ndarray,
+    qout: np.ndarray,
+) -> Path:
+    path = Path(output_path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with netcdf_file(path, "w") as ds:
+        ds.createDimension("time", len(time))
+        ds.createDimension("rivid", len(river_ids_basin))
+        time_var = ds.createVariable("time", "i4", ("time",))
+        rivid_var = ds.createVariable("rivid", "i4", ("rivid",))
+        qout_var = ds.createVariable("Qout", "f8", ("time", "rivid"))
+        time_var[:] = time.astype(np.int32)
+        rivid_var[:] = river_ids_basin.astype(np.int32)
+        qout_var[:, :] = qout.astype(np.float64)
+        ds.history = b"Created by RAPID shared Python engine"
+    return path
+
+
+def run_prepared_state(
+    prep_dir: str | Path,
+    *,
+    routing_timestep_seconds: int | None = None,
+    output_path: str | Path | None = None,
+    return_qout: bool = False,
+) -> Path | tuple[Path, np.ndarray]:
+    prep_path = Path(prep_dir).expanduser().resolve()
+    manifest_path = prep_path / "rapid_prep_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"RAPID prep manifest was not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text())
+
+    con_csv = prep_path / "rat_srt.csv"
+    inflow_nc = prep_path / "inflow.nc"
+    kpr_csv = prep_path / "kfc.csv"
+    xpr_csv = prep_path / "xfc.csv"
+    bas_csv = prep_path / "riv.csv"
+
+    for required in (con_csv, inflow_nc, kpr_csv, xpr_csv, bas_csv):
+        if not required.exists():
+            raise FileNotFoundError(f"Required RAPID input file was not found: {required}")
+    if con_csv.stat().st_size == 0:
+        raise ValueError(f"Connectivity file is empty for prepared state: {con_csv}")
+
+    river_ids_total, downstream_ids, downstream_ratios, downstream_counts = con_vec(con_csv)
+    river_ids_basin = bas_vec(bas_csv)
+    hash_total, hash_basin, basin_to_total = hsh_tbl(river_ids_total, river_ids_basin)
+    net = net_mat(downstream_ids, downstream_counts, downstream_ratios, hash_total, river_ids_basin, hash_basin)
+
+    kpr_basin, xpr_basin = k_x_vec(kpr_csv, xpr_csv, basin_to_total)
+    if routing_timestep_seconds is None:
+        routing_timestep_seconds = int(manifest["routing"]["routing_dt_seconds"])
+    c1, c2, c3 = ccc_mat(kpr_basin, xpr_basin, int(routing_timestep_seconds))
+    linear, q_external, q_out = rte_mat(net, c1, c2, c3)
+
+    inflow_river_ids, time, m3_riv, dt_forcing = read_inflow_netcdf(inflow_nc)
+    if not np.array_equal(np.array(river_ids_total, dtype=np.int64), inflow_river_ids):
+        raise ValueError("The river IDs in rat_srt.csv and inflow.nc do not match.")
+    n_substeps = stp_cor(dt_forcing, int(routing_timestep_seconds))
+
+    q_out_initial = np.zeros(len(river_ids_basin), dtype=np.float64)
+    qout_records = np.zeros((len(time), len(river_ids_basin)), dtype=np.float64)
+    solver = factorized(linear)
+    _ = splu(linear)
+
+    for timestep_index in range(len(time)):
+        q_external_avg = m3_riv[timestep_index][basin_to_total] / float(dt_forcing)
+        q_out_avg, q_out_initial = mus_rte(
+            linear,
+            q_external,
+            q_out,
+            n_substeps,
+            q_out_initial,
+            q_external_avg,
+            solver,
+        )
+        qout_records[timestep_index, :] = q_out_avg
+
+    qout_path = Path(output_path).expanduser().resolve() if output_path is not None else prep_path / DEFAULT_QOUT_NAME
+    write_qout_netcdf(qout_path, river_ids_basin, time, qout_records)
+    if return_qout:
+        return qout_path, qout_records
+    return qout_path
+
+
+def run_prepared_experiment(
+    experiment_dir: str | Path,
+    *,
+    only_prepared: bool = True,
+    hydrograph_config: HydrographMetricConfig | None = None,
+) -> pd.DataFrame:
+    experiment_path = Path(experiment_dir).expanduser().resolve()
+    registry_path = experiment_path / "rapid_prep_registry.csv"
+    if not registry_path.exists():
+        raise FileNotFoundError(f"RAPID prep registry was not found: {registry_path}")
+    registry = pd.read_csv(registry_path)
+    run_rows: list[dict[str, object]] = []
+    for row in registry.itertuples(index=False):
+        status = getattr(row, "status", "")
+        if only_prepared and status != "prepared":
+            continue
+        prep_dir = Path(getattr(row, "rapid_prep_dir")).expanduser().resolve()
+        run_dir = prep_dir.parent / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        qout_path = run_dir / DEFAULT_QOUT_NAME
         try:
-            with open(fil_ext):
-                pass
-        except IOError:
-            print('ERROR - Unable to open ' + fil_ext)
-            raise SystemExit(22)
-    del fil_ext
+            output = run_prepared_state(prep_dir, output_path=qout_path)
+            run_row = {
+                "state_id": getattr(row, "state_id"),
+                "rapid_prep_dir": str(prep_dir),
+                "rapid_run_dir": str(run_dir),
+                "qout_nc": str(output),
+                "status": "ran",
+            }
+            try:
+                hydrograph_outputs = write_hydrograph_outputs(
+                    prep_dir,
+                    output,
+                    run_dir,
+                    config=hydrograph_config,
+                )
+                run_row.update(hydrograph_outputs)
+            except Exception as hydrograph_exc:  # pragma: no cover
+                run_row.update(
+                    {
+                        "hydrograph_status": "failed",
+                        "hydrograph_error": str(hydrograph_exc),
+                        "outlet_hydrograph_csv": "",
+                        "hydrograph_metrics_csv": "",
+                        "hydrograph_metrics_json": "",
+                    }
+                )
+            run_rows.append(run_row)
+        except Exception as exc:  # pragma: no cover
+            run_rows.append(
+                {
+                    "state_id": getattr(row, "state_id"),
+                    "rapid_prep_dir": str(prep_dir),
+                    "rapid_run_dir": str(run_dir),
+                    "qout_nc": "",
+                    "status": "failed",
+                    "error": str(exc),
+                    "hydrograph_status": "",
+                    "hydrograph_error": "",
+                    "outlet_hydrograph_csv": "",
+                    "hydrograph_metrics_csv": "",
+                    "hydrograph_metrics_json": "",
+                }
+            )
+    run_registry = pd.DataFrame(run_rows)
+    run_registry_path = experiment_path / "rapid_run_registry.csv"
+    run_registry.to_csv(run_registry_path, index=False)
+    manifest_path = experiment_path / "rapid_run_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "experiment_dir": str(experiment_path),
+                "states_total": int(len(run_registry)),
+                "states_ran": int(run_registry["status"].eq("ran").sum()) if not run_registry.empty else 0,
+                "states_failed": int(run_registry["status"].eq("failed").sum()) if not run_registry.empty else 0,
+                "hydrograph_metrics_computed": int(run_registry["hydrograph_status"].eq("computed").sum()) if "hydrograph_status" in run_registry.columns else 0,
+                "hydrograph_metrics_failed": int(run_registry["hydrograph_status"].eq("failed").sum()) if "hydrograph_status" in run_registry.columns else 0,
+                "hydrograph_metric_config": (
+                    {
+                        "event_start_time": hydrograph_config.event_start_time,
+                        "event_start_window_hours": hydrograph_config.event_start_window_hours,
+                        "event_start_buffer_hours": hydrograph_config.event_start_buffer_hours,
+                        "event_end_time": hydrograph_config.event_end_time,
+                        "event_end_buffer_hours": hydrograph_config.event_end_buffer_hours,
+                    }
+                    if hydrograph_config is not None
+                    else None
+                ),
+            },
+            indent=2,
+        )
+    )
+    return run_registry
 
-    # If connectivity file is empty, nothing to route
-    if os.path.getsize(con_csv) == 0:
+
+def run_rapid(
+    directory: str | Path,
+    ROUTING_TIMESTEP_SECONDS: int = 10800,
+    runType: str = "random",
+    seed: int = 1,
+    output_path: str | Path | None = None,
+    return_qout: bool = False,
+) -> str | tuple[str, np.ndarray] | None:
+    """Compatibility wrapper for legacy synthetic RAPID runs."""
+
+    prep_path = Path(directory).expanduser().resolve()
+    con_csv = prep_path / "rat_srt.csv"
+    inflow_nc = prep_path / "inflow.nc"
+    kpr_csv = prep_path / "kfc.csv"
+    xpr_csv = prep_path / "xfc.csv"
+    bas_csv = prep_path / "riv.csv"
+
+    for required in (con_csv, inflow_nc, kpr_csv, xpr_csv, bas_csv):
+        if not required.exists():
+            raise FileNotFoundError(f"Required RAPID input file was not found: {required}")
+    if con_csv.stat().st_size == 0:
         return None
 
-    os.makedirs(out_fld, exist_ok=True)
+    river_ids_total, downstream_ids, downstream_ratios, downstream_counts = con_vec(con_csv)
+    river_ids_basin = bas_vec(bas_csv)
+    hash_total, hash_basin, basin_to_total = hsh_tbl(river_ids_total, river_ids_basin)
+    net = net_mat(downstream_ids, downstream_counts, downstream_ratios, hash_total, river_ids_basin, hash_basin)
 
-    # Initialize network
-    IV_riv_tot, IV_dwn_tot, ZV_dwn_rat, IV_dwn_cnt = con_vec(con_csv)
-    IV_riv_bas = bas_vec(bas_csv)
-    IM_hsh_tot, IM_hsh_bas, IV_bas_tot = hsh_tbl(IV_riv_tot, IV_riv_bas)
-    ZM_Net = net_mat(IV_dwn_tot, IV_dwn_cnt, ZV_dwn_rat, IM_hsh_tot, IV_riv_bas, IM_hsh_bas)
+    kpr_basin, xpr_basin = k_x_vec(kpr_csv, xpr_csv, basin_to_total)
+    c1, c2, c3 = ccc_mat(kpr_basin, xpr_basin, int(ROUTING_TIMESTEP_SECONDS))
+    linear, q_external, q_out = rte_mat(net, c1, c2, c3)
 
-    # Model parameters
-    ZV_kpr_bas, ZV_xpr_bas = k_x_vec(kpr_csv, xpr_csv, IV_bas_tot)
-    ZM_C1m, ZM_C2m, ZM_C3m = ccc_mat(ZV_kpr_bas, ZV_xpr_bas, ROUTING_TIMESTEP_SECONDS)
-    ZM_Lin, ZM_Qex, ZM_Qou = rte_mat(ZM_Net, ZM_C1m, ZM_C2m, ZM_C3m)
+    inflow_river_ids, time, m3_riv, dt_forcing = read_inflow_netcdf(inflow_nc)
+    if not np.array_equal(np.array(river_ids_total, dtype=np.int64), inflow_river_ids):
+        raise ValueError("The river IDs in rat_srt.csv and inflow.nc do not match.")
+    n_substeps = stp_cor(dt_forcing, int(ROUTING_TIMESTEP_SECONDS))
 
-    # Metadata of external inflow, and time step correspondance
-    IV_m3r_tot, IV_m3r_tim, IM_m3r_tim, IS_m3r_tim, ZS_TaR = m3r_mdt(m3r_ncf)
-    IS_dtR = stp_cor(ZS_TaR, ROUTING_TIMESTEP_SECONDS)
+    q_out_initial = np.zeros(len(river_ids_basin), dtype=np.float64)
+    qout_records = np.zeros((len(time), len(river_ids_basin)), dtype=np.float64)
+    solver = factorized(linear)
+    _ = splu(linear)
 
-    # Initialize discharge
-    ZV_Qou_ini = numpy.zeros(len(IV_riv_bas), dtype=numpy.float64)
+    for timestep_index in range(len(time)):
+        q_external_avg = m3_riv[timestep_index][basin_to_total] / float(dt_forcing)
+        q_out_avg, q_out_initial = mus_rte(
+            linear,
+            q_external,
+            q_out,
+            n_substeps,
+            q_out_initial,
+            q_external_avg,
+            solver,
+        )
+        qout_records[timestep_index, :] = q_out_avg
 
-    # General checks
-    chk_top(IV_riv_bas, IM_hsh_bas, IV_riv_tot, IV_dwn_tot, IM_hsh_tot)
-    chk_ids(IV_riv_tot, IV_m3r_tot[:])
-    chk_tim(IV_m3r_tim, IM_m3r_tim, ZS_TaR)
+    default_name = f"{LEGACY_QOUT_BASENAME}{runType}_{seed}.nc"
+    qout_path = Path(output_path).expanduser().resolve() if output_path is not None else prep_path / default_name
+    write_qout_netcdf(qout_path, river_ids_basin, time, qout_records)
 
-    # Metadata of outflow
-    Qou_mdt(m3r_ncf, Qou_ncf, IV_bas_tot)
-
-    # Routing
-    slv_fac = factorized(ZM_Lin)
-    slv_slu = splu(ZM_Lin)
-    # slv_umf = umlu(ZM_Lin)
-
-    f = netCDF4.Dataset(m3r_ncf, 'r')
-    g = netCDF4.Dataset(Qou_ncf, 'a')
-    Qout = g.variables['Qout']
-
-    for JS_m3r_tim in range(IS_m3r_tim):
-        ZV_Qex_avg = f.variables['m3_riv'][JS_m3r_tim][IV_bas_tot] / ZS_TaR
-
-        ZV_Qou_avg, ZV_Qou_fin = mus_rte(ZM_Lin, ZM_Qex, ZM_Qou, IS_dtR,
-                                         ZV_Qou_ini, ZV_Qex_avg)
-        ZV_Qou_ini = ZV_Qou_fin
-
-        Qout[JS_m3r_tim, :] = ZV_Qou_avg[:]
-
-    qout_arr = None  ### changed
-    if return_qout:  ### changed
-        qout_arr = Qout[:]  ### changed
-
-    f.close()
-    g.close()
-
-    if return_qout:  ### changed
-        return Qou_ncf, qout_arr  ### changed
-    return Qou_ncf
+    if return_qout:
+        return str(qout_path), qout_records
+    return str(qout_path)
 
 
-if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) < 2:
-        print("Usage: python rapid_run.py <directory_with_rapid_inputs>")
-        raise SystemExit(1)
-
-    run_rapid(sys.argv[1])
+__all__ = [
+    "DEFAULT_QOUT_NAME",
+    "LEGACY_QOUT_BASENAME",
+    "HydrographMetricConfig",
+    "bas_vec",
+    "ccc_mat",
+    "con_vec",
+    "hsh_tbl",
+    "k_x_vec",
+    "mus_rte",
+    "net_mat",
+    "read_inflow_netcdf",
+    "rte_mat",
+    "run_prepared_experiment",
+    "run_prepared_state",
+    "run_rapid",
+    "stp_cor",
+    "write_qout_netcdf",
+]
