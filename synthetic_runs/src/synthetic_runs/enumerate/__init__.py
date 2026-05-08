@@ -1,0 +1,51 @@
+"""Synthetic network enumeration and width-sampling workflows."""
+
+from .geometry import (
+    break_is_legal_from_list,
+    break_sort_key,
+    enumerate_geometric_recipes_streamed,
+    geom_meta_from_params,
+    iter_candidate_breaks,
+    iter_initial_splits,
+    iter_realized_networks_from_geom_recipe,
+    make_geom_recipe,
+    realize_from_geometry_recipes_streamed,
+)
+from .sample_widths import (
+    SamplePlan,
+    SplitChoice,
+    ebi_stats_min_mean_max,
+    edge_stats_rows,
+    iter_geometry_recipes_with_id,
+    make_benchmark_plan,
+    make_random_plan,
+    network_summary_row,
+    pick_ratio_pair_feasible,
+    realize_geom_with_plan,
+    realized_signature,
+    sample_realized_networks_from_geometry,
+)
+
+__all__ = [
+    "SamplePlan",
+    "SplitChoice",
+    "break_is_legal_from_list",
+    "break_sort_key",
+    "ebi_stats_min_mean_max",
+    "edge_stats_rows",
+    "enumerate_geometric_recipes_streamed",
+    "geom_meta_from_params",
+    "iter_candidate_breaks",
+    "iter_geometry_recipes_with_id",
+    "iter_initial_splits",
+    "iter_realized_networks_from_geom_recipe",
+    "make_benchmark_plan",
+    "make_geom_recipe",
+    "make_random_plan",
+    "network_summary_row",
+    "pick_ratio_pair_feasible",
+    "realize_from_geometry_recipes_streamed",
+    "realize_geom_with_plan",
+    "realized_signature",
+    "sample_realized_networks_from_geometry",
+]

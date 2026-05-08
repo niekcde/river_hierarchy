@@ -1,0 +1,4 @@
+{
+  "out_path": "../../outputs/sensitivity_pipeline/networks_sensitivity.jsonl.gz",
+  "validate_against": null
+}

@@ -1,0 +1,10 @@
+{
+  "geometry_dir": "../../outputs/regular_pipeline/geometry",
+  "out_dir": "../../outputs/regular_pipeline/sampled",
+  "n_samples": 5,
+  "seed": 42,
+  "max_attempts_per_sample": 200,
+  "filter_k_admissible": false,
+  "summary_format": "csv",
+  "write_edges": true
+}

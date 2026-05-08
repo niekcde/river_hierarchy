@@ -1,0 +1,6 @@
+{
+  "sampled_dir": "../../outputs/regular_pipeline/sampled",
+  "q_outlet": "../../outputs/regular_pipeline/routed/q_outlet.parquet",
+  "out_csv": "../../outputs/regular_pipeline/routed/k_metrics.csv",
+  "max_paths": 100
+}
