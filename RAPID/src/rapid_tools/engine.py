@@ -7,6 +7,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+try:
+    import netCDF4
+except ImportError:  # pragma: no cover - optional dependency in some envs
+    netCDF4 = None
 from scipy.io import netcdf_file
 from scipy.sparse import csc_matrix, diags, identity
 from scipy.sparse.linalg import factorized, splu
@@ -117,10 +121,18 @@ def rte_mat(net: csc_matrix, c1: csc_matrix, c2: csc_matrix, c3: csc_matrix) -> 
 
 
 def read_inflow_netcdf(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    with netcdf_file(path, "r", mmap=False) as ds:
-        river_ids = np.array(ds.variables["rivid"].data, dtype=np.int64).copy()
-        time = np.array(ds.variables["time"].data, dtype=np.int64).copy()
-        m3_riv = np.array(ds.variables["m3_riv"].data, dtype=np.float64).copy()
+    try:
+        with netcdf_file(path, "r", mmap=False) as ds:
+            river_ids = np.array(ds.variables["rivid"].data, dtype=np.int64).copy()
+            time = np.array(ds.variables["time"].data, dtype=np.int64).copy()
+            m3_riv = np.array(ds.variables["m3_riv"].data, dtype=np.float64).copy()
+    except TypeError as exc:
+        if "valid NetCDF 3 file" not in str(exc) or netCDF4 is None:
+            raise
+        with netCDF4.Dataset(path, "r") as ds:
+            river_ids = np.array(ds.variables["rivid"][:], dtype=np.int64).copy()
+            time = np.array(ds.variables["time"][:], dtype=np.int64).copy()
+            m3_riv = np.array(ds.variables["m3_riv"][:], dtype=np.float64).copy()
     if len(time) < 2:
         raise ValueError("RAPID inflow.nc requires at least two timesteps.")
     dt_forcing = int(time[1] - time[0])
