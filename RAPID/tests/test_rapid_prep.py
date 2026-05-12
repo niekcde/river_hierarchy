@@ -14,8 +14,8 @@ SRC = ROOT / "RAPID" / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from rapid_tools.engine import run_prepared_experiment
-from rapid_tools.hydrograph import HydrographMetricConfig
+from rapid_tools.engine import run_prepared_experiment, write_qout_netcdf
+from rapid_tools.hydrograph import HydrographMetricConfig, summarize_outlet_hydrograph
 from rapid_tools.k_values import KValueConfig, compute_k_values
 from rapid_tools.prep import RapidPrepConfig, prepare_experiment
 from rapid_tools.slope import SlopeConfig, compute_link_slopes
@@ -135,7 +135,8 @@ def test_run_prepared_experiment_writes_qout(tmp_path: Path) -> None:
     hydrograph_metrics = pd.read_csv(run_registry.loc[0, "hydrograph_metrics_csv"])
     assert "peak_discharge_cms" in hydrograph_metrics.columns
     assert "time_to_peak_seconds" in hydrograph_metrics.columns
-    assert hydrograph_metrics.loc[0, "event_start_source"] == "auto_input_min_prepeak"
+    assert hydrograph_metrics.loc[0, "event_start_source"] == "auto_input_global_min_prepeak_fallback"
+    assert hydrograph_metrics.loc[0, "event_end_source"] == "auto_outlet_series_end_fallback"
 
 
 def test_prepare_experiment_accepts_real_link_id_zero(tmp_path: Path) -> None:
@@ -381,7 +382,7 @@ def test_run_prepared_experiment_supports_start_and_end_window_search(tmp_path: 
                 "2020-01-01T03:00:00Z",
                 "2020-01-01T04:00:00Z",
             ],
-            "discharge": [10.0, 5.0, 8.0, 4.0, 9.0],
+            "discharge": [7.0, 5.0, 8.0, 4.0, 9.0],
         }
     )
     forcing.to_csv(experiment_dir / "forcing.csv", index=False)
@@ -406,3 +407,72 @@ def test_run_prepared_experiment_supports_start_and_end_window_search(tmp_path: 
     assert run_registry.loc[0, "event_end_source"] == "manual_input_min_window"
     assert run_registry.loc[0, "event_start_time_utc"] == "2020-01-01T01:00:00+00:00"
     assert run_registry.loc[0, "event_end_time_utc"] == "2020-01-01T03:00:00+00:00"
+
+
+def test_run_prepared_experiment_prefers_nearest_prepeak_local_minimum(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path)
+    forcing = pd.DataFrame(
+        {
+            "time": [
+                "2020-01-01T00:00:00Z",
+                "2020-01-01T01:00:00Z",
+                "2020-01-01T02:00:00Z",
+                "2020-01-01T03:00:00Z",
+                "2020-01-01T04:00:00Z",
+            ],
+            "discharge": [4.0, 2.0, 5.0, 3.0, 9.0],
+        }
+    )
+    forcing.to_csv(experiment_dir / "forcing.csv", index=False)
+    prepare_experiment(
+        experiment_dir,
+        forcing_path=experiment_dir / "forcing.csv",
+        prep_config=RapidPrepConfig(),
+    )
+
+    run_registry = run_prepared_experiment(experiment_dir)
+
+    assert run_registry.loc[0, "hydrograph_status"] == "computed"
+    assert run_registry.loc[0, "event_start_source"] == "auto_input_local_min_prepeak"
+    assert run_registry.loc[0, "event_start_time_utc"] == "2020-01-01T03:00:00+00:00"
+
+
+def test_summarize_outlet_hydrograph_detects_postpeak_outlet_minimum(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path)
+    forcing = pd.DataFrame(
+        {
+            "time": [
+                "2020-01-01T00:00:00Z",
+                "2020-01-01T01:00:00Z",
+                "2020-01-01T02:00:00Z",
+                "2020-01-01T03:00:00Z",
+                "2020-01-01T04:00:00Z",
+                "2020-01-01T05:00:00Z",
+                "2020-01-01T06:00:00Z",
+            ],
+            "discharge": [4.0, 2.0, 5.0, 3.0, 9.0, 8.0, 7.0],
+        }
+    )
+    forcing.to_csv(experiment_dir / "forcing.csv", index=False)
+    prepare_experiment(
+        experiment_dir,
+        forcing_path=experiment_dir / "forcing.csv",
+        prep_config=RapidPrepConfig(),
+    )
+
+    prep_dir = experiment_dir / "states" / "S001_unit_1" / "rapid" / "prep"
+    forcing_normalized = pd.read_csv(prep_dir / "forcing_normalized.csv")
+    forcing_times = pd.to_datetime(forcing_normalized["time"], utc=True)
+    time_seconds = (forcing_times - forcing_times.iloc[0]).dt.total_seconds().to_numpy(dtype=np.float64)
+    river_ids = pd.read_csv(prep_dir / "riv.csv", header=None).iloc[:, 0].to_numpy(dtype=np.int64)
+    qout_path = prep_dir.parent / "run" / "custom_qout.nc"
+    qout_values = np.array([[2.0], [3.0], [5.0], [7.0], [6.0], [4.0], [5.0]], dtype=np.float64)
+    write_qout_netcdf(qout_path, river_ids, time_seconds, qout_values)
+
+    _, metrics = summarize_outlet_hydrograph(prep_dir, qout_path, config=HydrographMetricConfig())
+
+    assert metrics["event_start_source"] == "auto_input_local_min_prepeak"
+    assert metrics["event_start_time_utc"] == "2020-01-01T03:00:00+00:00"
+    assert metrics["event_end_source"] == "auto_outlet_local_min_postpeak"
+    assert metrics["event_end_time_utc"] == "2020-01-01T05:00:00+00:00"
+    assert metrics["event_end_censored"] is False

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import csv
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
@@ -332,13 +333,7 @@ def run_prepared_experiment(
                 "hydrograph_metrics_computed": int(run_registry["hydrograph_status"].eq("computed").sum()) if "hydrograph_status" in run_registry.columns else 0,
                 "hydrograph_metrics_failed": int(run_registry["hydrograph_status"].eq("failed").sum()) if "hydrograph_status" in run_registry.columns else 0,
                 "hydrograph_metric_config": (
-                    {
-                        "event_start_time": hydrograph_config.event_start_time,
-                        "event_start_window_hours": hydrograph_config.event_start_window_hours,
-                        "event_start_buffer_hours": hydrograph_config.event_start_buffer_hours,
-                        "event_end_time": hydrograph_config.event_end_time,
-                        "event_end_buffer_hours": hydrograph_config.event_end_buffer_hours,
-                    }
+                    asdict(hydrograph_config)
                     if hydrograph_config is not None
                     else None
                 ),
