@@ -1,4 +1,4 @@
-"""Run the staged RivGraph smoke-test workflow on any mask."""
+"""Run the staged RivGraph workflow on any mask."""
 
 from __future__ import annotations
 
@@ -8,13 +8,13 @@ import sys
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "rivgraph_centerline" / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from rivgraph_centerline.smoke_workflow import (  # noqa: E402
-    SmokePaths,
+from rivgraph_centerline.workflow import (  # noqa: E402
+    WorkflowPaths,
     apply_edits_for_run,
     run_all_for_run,
     run_rivgraph_for_run,
@@ -111,7 +111,7 @@ def add_run_identity_args(parser: argparse.ArgumentParser) -> None:
         "--run-dir",
         type=Path,
         default=None,
-        help="Optional run directory override. Defaults to rivgraph_centerline/outputs/smoke_tests/<name>.",
+        help="Optional run directory override. Defaults to rivgraph_centerline/outputs/runs/<name>.",
     )
 
 
@@ -154,7 +154,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, object]:
         return {"command": args.command, "run_paths": paths_to_dict(paths), "summary": summary}
 
     if args.command == "run-all":
-        paths = SmokePaths.from_name(args.name, args.run_dir)
+        paths = WorkflowPaths.from_name(args.name, args.run_dir)
         summary = run_all_for_run(
             name=args.name,
             source_mask=args.source_mask,
@@ -173,7 +173,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, object]:
     raise ValueError(f"Unsupported command: {args.command}")
 
 
-def paths_to_dict(paths: SmokePaths) -> dict[str, str]:
+def paths_to_dict(paths: WorkflowPaths) -> dict[str, str]:
     return {
         "run_dir": str(paths.run_dir),
         "prepared_mask": str(paths.prepared_mask),
@@ -183,6 +183,7 @@ def paths_to_dict(paths: SmokePaths) -> dict[str, str]:
         "prepare_summary": str(paths.prepare_summary),
         "manual_edits_summary": str(paths.manual_edits_summary),
         "rivgraph_summary": str(paths.rivgraph_summary),
+        "workflow_summary": str(paths.workflow_summary),
     }
 
 

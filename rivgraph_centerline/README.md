@@ -78,9 +78,9 @@ Apply the edits to a prepared binary mask with:
 ```bash
 /opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python \
   rivgraph_centerline/src/rivgraph_centerline/manual_edits.py \
-  --base-mask rivgraph_centerline/outputs/smoke_tests/sarl_river_07/masks_prepared/sarl_river_07_binary_projected.tif \
-  --edits rivgraph_centerline/outputs/smoke_tests/sarl_river_07/manual_edits/sarl_river_07_manual_edits.gpkg \
-  --output rivgraph_centerline/outputs/smoke_tests/sarl_river_07/masks_cleaned/sarl_river_07_cleaned.tif
+  --base-mask rivgraph_centerline/outputs/runs/sarl_river_07/masks_prepared/sarl_river_07_binary_projected.tif \
+  --edits rivgraph_centerline/outputs/runs/sarl_river_07/manual_edits/sarl_river_07_manual_edits.gpkg \
+  --output rivgraph_centerline/outputs/runs/sarl_river_07/masks_cleaned/sarl_river_07_cleaned.tif
 ```
 
 The cleaned mask remains a strict uint8 binary GeoTIFF with the prepared mask's
@@ -92,8 +92,12 @@ Use the staged runner:
 
 ```bash
 /opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
-  rivgraph_centerline/smoke_tests/run_smoke_workflow.py --help
+  rivgraph_centerline/run_workflow.py --help
 ```
+
+The older `smoke_tests/run_smoke_workflow.py` wrapper still exists for
+backward compatibility and A/B comparisons, but the main staged pipeline now
+lives in `run_workflow.py`.
 
 For a new mask named `my_test_01`, the normal steps are:
 
@@ -101,7 +105,7 @@ For a new mask named `my_test_01`, the normal steps are:
 
 ```bash
 /opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
-  rivgraph_centerline/smoke_tests/run_smoke_workflow.py prepare-mask \
+  rivgraph_centerline/run_workflow.py prepare-mask \
   --name my_test_01 \
   --source-mask /path/to/my_mask.tif
 ```
@@ -109,7 +113,7 @@ For a new mask named `my_test_01`, the normal steps are:
 This creates:
 
 ```text
-rivgraph_centerline/outputs/smoke_tests/my_test_01/
+rivgraph_centerline/outputs/runs/my_test_01/
   masks_prepared/my_test_01_binary_projected.tif
   manual_edits/my_test_01_manual_edits.gpkg   # expected QGIS edit path
   prepare_summary.json
@@ -119,7 +123,7 @@ rivgraph_centerline/outputs/smoke_tests/my_test_01/
 
 ```bash
 /opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
-  rivgraph_centerline/smoke_tests/run_smoke_workflow.py apply-edits \
+  rivgraph_centerline/run_workflow.py apply-edits \
   --name my_test_01
 ```
 
@@ -128,21 +132,39 @@ rivgraph_centerline/outputs/smoke_tests/my_test_01/
 ```bash
 MPLCONFIGDIR=/tmp/matplotlib-rivgraph \
 /opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
-  rivgraph_centerline/smoke_tests/run_smoke_workflow.py run-rivgraph \
+  rivgraph_centerline/run_workflow.py run-rivgraph \
   --name my_test_01 \
   --exit-sides NS
 ```
+
+To also run RivGraph's native flow-direction assignment in the same command:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-rivgraph \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  rivgraph_centerline/run_workflow.py run-rivgraph \
+  --name my_test_01 \
+  --exit-sides NS \
+  --assign-flow
+```
+
+When `--assign-flow` is used, RivGraph will create `rivgraph/<name>_fixlinks.csv`
+if it does not already exist. That file is the normal manual direction-fix input.
+Edit it if needed, then rerun the same `run-rivgraph --assign-flow` command.
 
 For a single command workflow without manual editing:
 
 ```bash
 MPLCONFIGDIR=/tmp/matplotlib-rivgraph \
 /opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
-  rivgraph_centerline/smoke_tests/run_smoke_workflow.py run-all \
+  rivgraph_centerline/run_workflow.py run-all \
   --name my_test_01 \
   --source-mask /path/to/my_mask.tif \
   --exit-sides NS
 ```
+
+You can also add `--assign-flow` to `run-all` if you want the directed network
+products in that single pass.
 
 `run-all` reuses the existing prepared mask unless you pass `--force-prepare`,
 so you do not need to rebuild the binary mask after making manual edits.
