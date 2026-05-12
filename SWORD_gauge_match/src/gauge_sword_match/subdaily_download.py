@@ -11,6 +11,7 @@ import pandas as pd
 
 from .canada_manual_download import load_canada_manual_archive
 from .chile_manual_excel import load_chile_manual_archive
+from .mrc_rating_curve import load_mrc_manual_waterlevel_archive
 from .subdaily_locator.brazil import BrazilAnaHydroClient
 from .subdaily_locator.canada import CanadaWaterofficeClient
 from .subdaily_locator.chile import (
@@ -90,6 +91,7 @@ SUPPORTED_DOWNLOAD_PROVIDERS = {
 class ProviderSeriesResult:
     frame: pd.DataFrame
     notes: str | None = None
+    manifest_metadata: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -220,6 +222,7 @@ def download_subdaily_from_audit(
                         "unit_normalized": bool(_first_non_null(selected_frame.get("unit_normalized"), default=False)),
                         "provider_series_name": _first_non_null(selected_frame.get("provider_series_name")),
                         "provider_series_id": _first_non_null(selected_frame.get("provider_series_id")),
+                        **(provider_result.manifest_metadata or {}),
                         "notes": provider_result.notes,
                     }
                 )
@@ -411,12 +414,15 @@ def _build_default_clients(overrides: Mapping[str, Any] | None) -> dict[str, Any
 def _build_country_provider_contexts(country_dir: Path) -> dict[str, Any]:
     chile_excel_dir = country_dir / "excel_download"
     manual_download_dir = country_dir / "manual_download"
+    mrc_waterlevel_dir = country_dir / "Waterlevel"
     contexts: dict[str, Any] = {}
     if chile_excel_dir.exists() and chile_excel_dir.is_dir():
         contexts["chile_dga"] = {"manual_excel_dir": chile_excel_dir}
     if manual_download_dir.exists() and manual_download_dir.is_dir():
         contexts["canada_wateroffice"] = {"manual_download_dir": manual_download_dir}
         contexts["usgs"] = {"manual_download_dir": manual_download_dir}
+    if mrc_waterlevel_dir.exists() and mrc_waterlevel_dir.is_dir():
+        contexts["mrc_timeseries"] = {"manual_waterlevel_dir": mrc_waterlevel_dir}
     return contexts
 
 
@@ -466,6 +472,7 @@ def _fetch_provider_series(
         return _fetch_mrc_subdaily_series(
             row,
             client=provider_clients["mrc_timeseries"],
+            provider_context=provider_context,
         )
     if provider == "chile_dga":
         return _fetch_chile_subdaily_series(
@@ -685,6 +692,7 @@ def _fetch_mrc_subdaily_series(
     row: pd.Series,
     *,
     client: MekongMrcClient,
+    provider_context: Mapping[str, Any] | None = None,
 ) -> ProviderSeriesResult:
     provider_station_id = _normalize_provider_station_id(
         row.get("resolved_site_number"),
@@ -693,6 +701,16 @@ def _fetch_mrc_subdaily_series(
     )
     if provider_station_id is None:
         return ProviderSeriesResult(_empty_internal_series(), notes="MRC downloader could not derive a station code from the audit row.")
+    manual_waterlevel_dir = None if provider_context is None else provider_context.get("manual_waterlevel_dir")
+    if manual_waterlevel_dir is not None:
+        manual_result = load_mrc_manual_waterlevel_archive(provider_station_id, manual_waterlevel_dir)
+        if manual_result is not None:
+            manual_frame, manifest_metadata, manual_notes = manual_result
+            return ProviderSeriesResult(
+                manual_frame,
+                notes=manual_notes,
+                manifest_metadata=manifest_metadata,
+            )
     inventory_rows = client.fetch_time_series_inventory()
     discharge_rows = [
         item

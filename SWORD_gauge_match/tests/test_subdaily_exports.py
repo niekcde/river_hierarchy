@@ -124,6 +124,9 @@ def test_export_subdaily_hierarchy_package_joins_download_manifests(tmp_path: Pa
                 "selected_start": "2015-01-01T00:00:00Z",
                 "selected_end": "2025-01-01T00:00:00Z",
                 "selected_row_count": 100,
+                "derivation_method": "rating_curve_from_telemetry_water_level",
+                "waterlevel_station_id": "04HA001",
+                "rating_curve_reference_doi": "10.52107/mrc.bjv4xx",
                 "notes": "Canada ok",
             }
         ]
@@ -160,3 +163,5 @@ def test_export_subdaily_hierarchy_package_joins_download_manifests(tmp_path: Pa
     assert ca_summary["download_window_strategy"] == "latest_10y"
     assert int(ca_summary["download_selected_row_count"]) == 100
     assert ca_summary["download_manifest_country"] == "CA"
+    assert ca_summary["download_derivation_method"] == "rating_curve_from_telemetry_water_level"
+    assert ca_summary["download_rating_curve_reference_doi"] == "10.52107/mrc.bjv4xx"

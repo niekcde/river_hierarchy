@@ -7,6 +7,7 @@ import click
 
 from .candidate_search import search_reach_candidates
 from .config import AppConfig, load_config
+from .example_bboxes import DEFAULT_SWORD_PARQUET_DIR, write_example_bbox_layer
 from .event_detection import summarize_events
 from .event_runner import run_detect_events_batched
 from .gauge_io import clean_gauges, gauges_to_geodataframe, load_gauges
@@ -315,6 +316,49 @@ def export_subdaily_gpkg_command(
         manifests_dir=manifests_dir,
     )
     LOGGER.info("Subdaily hierarchy GeoPackage written to %s", output_path)
+
+
+@main.command("build-example-bboxes")
+@click.option("--input-gpkg", "input_gpkg_path", required=True, type=click.Path(exists=True, path_type=Path))
+@click.option("--output", "output_path", required=True, type=click.Path(path_type=Path))
+@click.option("--input-layer", default="subdaily_station_summary", show_default=True, type=str)
+@click.option("--output-layer", default="example_bboxes", show_default=True, type=str)
+@click.option("--reach-lists", "reach_lists_path", default=None, type=click.Path(exists=True, path_type=Path))
+@click.option("--reach-summary", "reach_summary_path", default=None, type=click.Path(exists=True, path_type=Path))
+@click.option("--sword-parquet-dir", default=None, type=click.Path(exists=True, path_type=Path))
+@click.option("--width-field", default="width_obs_p50", show_default=True, type=str)
+@click.option("--buffer-multiplier", default=1.0, show_default=True, type=click.FloatRange(min=0.0))
+@click.option("--fallback-buffer-m", default=0.0, show_default=True, type=click.FloatRange(min=0.0))
+def build_example_bboxes_command(
+    input_gpkg_path: Path,
+    output_path: Path,
+    input_layer: str,
+    output_layer: str,
+    reach_lists_path: Path | None,
+    reach_summary_path: Path | None,
+    sword_parquet_dir: Path | None,
+    width_field: str,
+    buffer_multiplier: float,
+    fallback_buffer_m: float,
+) -> None:
+    layer = write_example_bbox_layer(
+        input_gpkg_path,
+        output_path,
+        input_layer=input_layer,
+        output_layer=output_layer,
+        reach_lists_path=reach_lists_path,
+        reach_summary_path=reach_summary_path,
+        sword_parquet_dir=sword_parquet_dir if sword_parquet_dir is not None else DEFAULT_SWORD_PARQUET_DIR,
+        width_field=width_field,
+        buffer_multiplier=buffer_multiplier,
+        fallback_buffer_m=fallback_buffer_m,
+    )
+    LOGGER.info(
+        "Example bbox layer wrote %s polygons to %s (%s)",
+        len(layer),
+        output_path,
+        output_layer,
+    )
 
 
 @main.command("download-subdaily")

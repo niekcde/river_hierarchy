@@ -187,7 +187,16 @@ def _prepare_download_manifests_for_export(manifests_dir: Path | None) -> pd.Dat
 
     frames: list[pd.DataFrame] = []
     for path in manifest_paths:
-        manifest = pd.read_csv(path)
+        manifest = pd.read_csv(
+            path,
+            dtype={
+                "station_key": "string",
+                "provider_station_id": "string",
+                "waterlevel_station_id": "string",
+                "rating_curve_station_id": "string",
+                "rating_curve_reference_doi": "string",
+            },
+        )
         if "station_key" not in manifest.columns:
             continue
         manifest["manifest_country"] = path.parent.name.upper()
@@ -217,6 +226,29 @@ def _prepare_download_manifests_for_export(manifests_dir: Path | None) -> pd.Dat
             "max_gap_days",
             "provider_series_name",
             "provider_series_id",
+            "derivation_method",
+            "waterlevel_station_id",
+            "waterlevel_station_name",
+            "waterlevel_station_relationship",
+            "waterlevel_source_csv",
+            "waterlevel_source_readme",
+            "waterlevel_source_location_name",
+            "rating_curve_station_id",
+            "rating_curve_station_name",
+            "rating_curve_equation",
+            "rating_curve_min_water_level_m",
+            "rating_curve_max_water_level_m",
+            "rating_curve_min_discharge_cms",
+            "rating_curve_max_discharge_cms",
+            "rating_curve_reference_title",
+            "rating_curve_reference_doi",
+            "rating_curve_reference_url",
+            "rating_curve_reference_pdf_url",
+            "rating_curve_reference_table",
+            "rating_curve_proxy_applied",
+            "rating_curve_out_of_range_row_count",
+            "rating_curve_raw_stage_row_count",
+            "rating_curve_station_note",
             "notes",
             "manifest_country",
         ]
@@ -240,6 +272,29 @@ def _prepare_download_manifests_for_export(manifests_dir: Path | None) -> pd.Dat
         "max_gap_days": "download_max_gap_days",
         "provider_series_name": "download_provider_series_name",
         "provider_series_id": "download_provider_series_id",
+        "derivation_method": "download_derivation_method",
+        "waterlevel_station_id": "download_waterlevel_station_id",
+        "waterlevel_station_name": "download_waterlevel_station_name",
+        "waterlevel_station_relationship": "download_waterlevel_station_relationship",
+        "waterlevel_source_csv": "download_waterlevel_source_csv",
+        "waterlevel_source_readme": "download_waterlevel_source_readme",
+        "waterlevel_source_location_name": "download_waterlevel_source_location_name",
+        "rating_curve_station_id": "download_rating_curve_station_id",
+        "rating_curve_station_name": "download_rating_curve_station_name",
+        "rating_curve_equation": "download_rating_curve_equation",
+        "rating_curve_min_water_level_m": "download_rating_curve_min_water_level_m",
+        "rating_curve_max_water_level_m": "download_rating_curve_max_water_level_m",
+        "rating_curve_min_discharge_cms": "download_rating_curve_min_discharge_cms",
+        "rating_curve_max_discharge_cms": "download_rating_curve_max_discharge_cms",
+        "rating_curve_reference_title": "download_rating_curve_reference_title",
+        "rating_curve_reference_doi": "download_rating_curve_reference_doi",
+        "rating_curve_reference_url": "download_rating_curve_reference_url",
+        "rating_curve_reference_pdf_url": "download_rating_curve_reference_pdf_url",
+        "rating_curve_reference_table": "download_rating_curve_reference_table",
+        "rating_curve_proxy_applied": "download_rating_curve_proxy_applied",
+        "rating_curve_out_of_range_row_count": "download_rating_curve_out_of_range_row_count",
+        "rating_curve_raw_stage_row_count": "download_rating_curve_raw_stage_row_count",
+        "rating_curve_station_note": "download_rating_curve_station_note",
         "notes": "download_notes",
         "manifest_country": "download_manifest_country",
     }

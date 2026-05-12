@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 from gauge_sword_match.chile_manual_excel import parse_chile_manual_sheet
+from gauge_sword_match.mrc_rating_curve import MRC_RATING_CURVES
 from gauge_sword_match.subdaily_download import (
     _load_download_station_rows,
     _select_download_window,
@@ -797,3 +798,166 @@ def test_download_subdaily_to_country_outputs_preserves_existing_summary_rows(tm
     )
 
     assert list(summary["country"]) == ["BR", "CA"]
+
+
+def test_download_subdaily_to_country_outputs_prefers_mrc_waterlevel_rating_curve_archive(tmp_path: Path):
+    audit = pd.DataFrame(
+        [
+            {
+                "station_key": "KH:2569004",
+                "country": "KH",
+                "provider": "mrc_timeseries",
+                "status": "subdaily_found",
+                "resolved_site_number": "014901",
+                "resolved_station_name": "Kratie",
+            }
+        ]
+    )
+    audit_path = tmp_path / "audit.csv"
+    audit.to_csv(audit_path, index=False)
+
+    output_dir = tmp_path / "subdaily_values"
+    waterlevel_dir = output_dir / "KH" / "Waterlevel"
+    waterlevel_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = waterlevel_dir / "Water Level.Telemetry@KH_014901_[Kratie].csv"
+    pd.DataFrame(
+        [
+            {
+                "Country Code": "KH",
+                "Station Code": "014901",
+                "Parameter": "Water Level",
+                "Label": "Telemetry",
+                "Timestamp (UTC+07:00)": "2025-10-27T00:00Z",
+                "Value": 14.661,
+                "Unit": "m",
+                "Observed or Estimated": "O",
+                "Approval Level": "Raw - Not Yet Reviewed",
+                "Grade": "Unverified data",
+            },
+            {
+                "Country Code": "KH",
+                "Station Code": "014901",
+                "Parameter": "Water Level",
+                "Label": "Telemetry",
+                "Timestamp (UTC+07:00)": "2025-10-27T00:15Z",
+                "Value": 14.650,
+                "Unit": "m",
+                "Observed or Estimated": "O",
+                "Approval Level": "Raw - Not Yet Reviewed",
+                "Grade": "Unverified data",
+            },
+        ]
+    ).to_csv(csv_path, index=False)
+    readme_path = waterlevel_dir / "Water Level.Telemetry@KH_014901_[Kratie]__README.txt"
+    readme_path.write_text(
+        "\n".join(
+            [
+                "# Time series identifier: Water Level.Telemetry@KH_014901_[Kratie]",
+                "# Location identifier: KH_014901_[Kratie]",
+                "# Location name: Kratie",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeMrcClient:
+        def fetch_time_series_inventory(self):
+            raise AssertionError("Manual MRC water-level archive should be preferred over the API discharge path.")
+
+    summary = download_subdaily_to_country_outputs(
+        audit_path,
+        output_dir=output_dir,
+        clients={"mrc_timeseries": FakeMrcClient()},
+        now_utc=datetime(2026, 5, 11, tzinfo=timezone.utc),
+        fallback_years=(1,),
+    )
+
+    assert list(summary["country"]) == ["KH"]
+    timeseries = pd.read_parquet(output_dir / "KH" / "subdaily_timeseries.parquet")
+    manifest = pd.read_csv(output_dir / "KH" / "subdaily_download_manifest.csv")
+
+    curve = MRC_RATING_CURVES["014901"]
+    expected = curve.coefficient_a * ((14.661 - curve.zero_flow_height_m) ** curve.exponent_m)
+    assert len(timeseries) == 2
+    assert timeseries["provider_series_name"].eq("mrc_telemetry_water_level_rating_curve").all()
+    assert abs(timeseries.loc[0, "discharge"] - expected) < 1e-6
+
+    row = manifest.iloc[0]
+    assert row["download_status"] == "ok"
+    assert row["derivation_method"] == "rating_curve_from_telemetry_water_level"
+    assert str(row["waterlevel_station_id"]).zfill(6) == "014901"
+    assert str(row["rating_curve_station_id"]).zfill(6) == "014901"
+    assert row["rating_curve_reference_doi"] == "10.52107/mrc.bjv4xx"
+    assert row["rating_curve_proxy_applied"] is False or row["rating_curve_proxy_applied"] == False
+
+
+def test_download_subdaily_from_audit_marks_mrc_nong_khai_proxy_stage_source(tmp_path: Path):
+    audit = pd.DataFrame(
+        [
+            {
+                "station_key": "TH:2969090",
+                "country": "TH",
+                "provider": "mrc_timeseries",
+                "status": "subdaily_found",
+                "resolved_site_number": "012001",
+                "resolved_station_name": "Nong Khai",
+            }
+        ]
+    )
+    audit_path = tmp_path / "audit.csv"
+    audit.to_csv(audit_path, index=False)
+
+    waterlevel_dir = tmp_path / "TH" / "Waterlevel"
+    waterlevel_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = waterlevel_dir / "Water Level.Telemetry@TH_012002_[Nong Khai 2].csv"
+    pd.DataFrame(
+        [
+            {
+                "Country Code": "TH",
+                "Station Code": "012002",
+                "Parameter": "Water Level",
+                "Label": "Telemetry",
+                "Timestamp (UTC+07:00)": "2025-10-27T00:00Z",
+                "Value": 6.088,
+                "Unit": "m",
+                "Observed or Estimated": "O",
+                "Approval Level": "Raw - Not Yet Reviewed",
+                "Grade": "Unverified data",
+            }
+        ]
+    ).to_csv(csv_path, index=False)
+    readme_path = waterlevel_dir / "Water Level.Telemetry@TH_012002_[Nong Khai 2]__README.txt"
+    readme_path.write_text(
+        "\n".join(
+            [
+                "# Time series identifier: Water Level.Telemetry@TH_012002_[Nong Khai 2]",
+                "# Location identifier: TH_012002_[Nong Khai 2]",
+                "# Location name: Nong Khai 2",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeMrcClient:
+        def fetch_time_series_inventory(self):
+            raise AssertionError("The Nong Khai proxy stage archive should be used before the API discharge path.")
+
+    timeseries, manifest = download_subdaily_from_audit(
+        audit_path,
+        countries=["TH"],
+        clients={"mrc_timeseries": FakeMrcClient()},
+        provider_contexts={"mrc_timeseries": {"manual_waterlevel_dir": waterlevel_dir}},
+        now_utc=datetime(2026, 5, 11, tzinfo=timezone.utc),
+        fallback_years=(1,),
+    )
+
+    curve = MRC_RATING_CURVES["012001"]
+    expected = curve.coefficient_a * ((6.088 - curve.zero_flow_height_m) ** curve.exponent_m)
+    assert len(timeseries) == 1
+    assert abs(timeseries.loc[0, "discharge"] - expected) < 1e-6
+    row = manifest.iloc[0]
+    assert str(row["provider_station_id"]).zfill(6) == "012001"
+    assert str(row["waterlevel_station_id"]).zfill(6) == "012002"
+    assert row["waterlevel_station_relationship"] == "nearby_stage_proxy"
+    assert str(row["rating_curve_station_id"]).zfill(6) == "012001"
+    assert row["rating_curve_proxy_applied"] is True or row["rating_curve_proxy_applied"] == True
