@@ -13,7 +13,7 @@ from network_variants.collapse_experiment import (
     _normalize_numeric_id_columns,
     run_collapse_experiment,
 )
-from network_variants.variant_generation import NetworkVariantOutputs
+from network_variants.variant_generation import NetworkVariantOutputs, VariantDirectionValidationError
 
 
 def _workflow_outputs(
@@ -186,6 +186,63 @@ def _make_variant_runner():
     return runner
 
 
+def _make_variant_outputs(output_dir: Path, variant_id: str, *, direction_valid: bool = True) -> NetworkVariantOutputs:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "mask").mkdir(exist_ok=True)
+    (output_dir / "matching").mkdir(exist_ok=True)
+    (output_dir / "directed").mkdir(exist_ok=True)
+    (output_dir / "rivgraph").mkdir(exist_ok=True)
+    (output_dir / "widths").mkdir(exist_ok=True)
+    (output_dir / "summary").mkdir(exist_ok=True)
+
+    collapsed_mask_path = output_dir / "mask" / f"{variant_id}_collapsed.tif"
+    directed_links_path = output_dir / "directed" / f"{variant_id}_directed_links.gpkg"
+    directed_nodes_path = output_dir / "directed" / f"{variant_id}_directed_nodes.gpkg"
+    rivgraph_links_path = output_dir / "rivgraph" / f"{variant_id}_links.gpkg"
+    rivgraph_nodes_path = output_dir / "rivgraph" / f"{variant_id}_nodes.gpkg"
+    direction_validation_report = output_dir / "directed" / "direction_validation_report.json"
+
+    for path in (
+        collapsed_mask_path,
+        directed_links_path,
+        directed_nodes_path,
+        rivgraph_links_path,
+        rivgraph_nodes_path,
+        direction_validation_report,
+    ):
+        path.touch()
+
+    empty_frame = pd.DataFrame()
+    empty_gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:3857")
+    return NetworkVariantOutputs(
+        collapse_components=empty_frame,
+        edit_geometries=empty_gdf,
+        node_match=empty_frame,
+        node_sword_match=empty_frame,
+        link_match=empty_frame,
+        link_lineage=empty_frame,
+        link_width_families=empty_frame,
+        link_width_samples=empty_frame,
+        enriched_links=empty_gdf,
+        directed_links=empty_gdf,
+        directed_nodes=empty_gdf,
+        output_dir=output_dir,
+        collapsed_mask_path=collapsed_mask_path,
+        rivgraph_links_path=rivgraph_links_path,
+        rivgraph_nodes_path=rivgraph_nodes_path,
+        directed_links_path=directed_links_path,
+        directed_nodes_path=directed_nodes_path,
+        rivgraph_centerline_path=None,
+        sword_reaches_path=None,
+        sword_nodes_path=None,
+        manifest={
+            "variant_id": variant_id,
+            "direction_summary": {"is_valid": direction_valid, "issues": [] if direction_valid else ["invalid flow graph"]},
+            "output_paths": {"direction_validation_report": str(direction_validation_report.resolve())},
+        },
+    )
+
+
 def _make_base_state_materializer():
     calls: list[dict[str, Any]] = []
 
@@ -333,6 +390,50 @@ def test_base_state_is_materialized_as_local_variant_outputs(tmp_path: Path) -> 
     assert Path(base_row["directed_nodes_path"]).name == "S000_base_directed_nodes.gpkg"
     assert "states/S000_base/variant" in base_row["variant_output_dir"]
     assert base_state_materializer.calls
+
+
+def test_independent_units_records_failed_variant_and_continues(tmp_path: Path) -> None:
+    workflow_runner = _make_workflow_runner(
+        [
+            _workflow_outputs([5, 7, 2]),
+            _workflow_outputs([1]),
+            _workflow_outputs([1]),
+        ]
+    )
+    base_state_materializer = _make_base_state_materializer()
+    calls: list[dict[str, Any]] = []
+
+    def variant_runner(**kwargs: Any) -> NetworkVariantOutputs:
+        calls.append(dict(kwargs))
+        output_dir = Path(kwargs["output_dir"])
+        variant_id = str(kwargs["variant_id"])
+        outputs = _make_variant_outputs(output_dir, variant_id, direction_valid=variant_id != "S002_unit_7")
+        if variant_id == "S002_unit_7":
+            raise VariantDirectionValidationError(outputs, ["invalid flow graph"])
+        return outputs
+
+    results = run_collapse_experiment(
+        "independent-units",
+        cleaned_mask_path=tmp_path / "base_cleaned.tif",
+        reviewed_links_path=tmp_path / "base_links.gpkg",
+        reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=tmp_path / "experiment",
+        unit_workflow_runner=workflow_runner,
+        unit_workflow_writer=write_unit_workflow_outputs,
+        variant_runner=variant_runner,
+        base_state_variant_materializer=base_state_materializer,
+    )
+
+    assert [call["unit_ids"] for call in calls] == [[5], [7], [2]]
+    statuses = results.state_registry.set_index("state_id")["status"].to_dict()
+    assert statuses["S001_unit_5"] == "complete"
+    assert statuses["S002_unit_7"] == "failed"
+    assert statuses["S003_unit_2"] == "complete"
+    failed_row = results.state_registry.loc[results.state_registry["state_id"] == "S002_unit_7"].iloc[0]
+    assert Path(failed_row["direction_validation_report"]).exists()
+    assert Path(failed_row["failure_artifact_path"]).exists()
+    assert results.manifest["n_failed_states"] == 1
 
 
 def test_build_unit_link_membership_derives_link_to_unit_mapping() -> None:

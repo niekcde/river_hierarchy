@@ -84,6 +84,15 @@ class NetworkVariantOutputs:
     manifest: dict[str, Any]
 
 
+class VariantDirectionValidationError(RuntimeError):
+    """Raised after writing variant outputs when directed-graph validation fails."""
+
+    def __init__(self, outputs: NetworkVariantOutputs, issues: Sequence[str]) -> None:
+        self.outputs = outputs
+        self.issues = [str(issue) for issue in issues]
+        super().__init__(f"Directed regenerated graph failed validation: {self.issues}")
+
+
 def _git_revision() -> str | None:
     repo_root = Path(__file__).resolve().parents[1]
     try:
@@ -1699,11 +1708,12 @@ def _assign_variant_directions(
         child_graph.add_edge(upstream, downstream, key=int(row.id_link), id_link=int(row.id_link))
 
     report = validate_single_inlet_single_outlet(child_graph, require_flag_match=False)
-    if not report.is_valid:
-        raise ValueError(f"Directed regenerated graph failed validation: {report.issues}")
-
-    source_node = int(report.source_nodes[0])
-    sink_node = int(report.sink_nodes[0])
+    source_nodes = sorted(int(node_id) for node_id in report.source_nodes)
+    sink_nodes = sorted(int(node_id) for node_id in report.sink_nodes)
+    source_node = source_nodes[0] if len(source_nodes) == 1 else None
+    sink_node = sink_nodes[0] if len(sink_nodes) == 1 else None
+    source_node_set = set(source_nodes)
+    sink_node_set = set(sink_nodes)
     upstream_nodes: list[int] = []
     downstream_nodes: list[int] = []
     direction_sources: list[str] = []
@@ -1716,8 +1726,8 @@ def _assign_variant_directions(
     directed_links["id_us_node"] = upstream_nodes
     directed_links["id_ds_node"] = downstream_nodes
     directed_links["id_nodes"] = [f"{int(upstream)}, {int(downstream)}" for upstream, downstream in zip(upstream_nodes, downstream_nodes)]
-    directed_links["is_inlet"] = directed_links["id_us_node"].astype(int) == source_node
-    directed_links["is_outlet"] = directed_links["id_ds_node"].astype(int) == sink_node
+    directed_links["is_inlet"] = directed_links["id_us_node"].astype(int).isin(source_node_set)
+    directed_links["is_outlet"] = directed_links["id_ds_node"].astype(int).isin(sink_node_set)
     directed_links["type_io"] = [
         _type_io_label(is_inlet=bool(is_inlet), is_outlet=bool(is_outlet))
         for is_inlet, is_outlet in zip(directed_links["is_inlet"], directed_links["is_outlet"])
@@ -1785,19 +1795,23 @@ def _assign_variant_directions(
     directed_nodes["n_links"] = n_links_values
     directed_nodes["in_degree"] = in_degree_values
     directed_nodes["out_degree"] = out_degree_values
-    directed_nodes["is_inlet"] = directed_nodes["id_node"].astype(int) == source_node
-    directed_nodes["is_outlet"] = directed_nodes["id_node"].astype(int) == sink_node
+    directed_nodes["is_inlet"] = directed_nodes["id_node"].astype(int).isin(source_node_set)
+    directed_nodes["is_outlet"] = directed_nodes["id_node"].astype(int).isin(sink_node_set)
     directed_nodes["type_io"] = [
         _type_io_label(is_inlet=bool(is_inlet), is_outlet=bool(is_outlet))
         for is_inlet, is_outlet in zip(directed_nodes["is_inlet"], directed_nodes["is_outlet"])
     ]
 
     summary = {
+        "is_valid": bool(report.is_valid),
         "source_node": source_node,
         "sink_node": sink_node,
+        "source_nodes": source_nodes,
+        "sink_nodes": sink_nodes,
         "n_oriented_links": int(len(directed_links)),
         "n_node_matches": int(node_match["match_within_tolerance"].fillna(False).sum()),
         "n_link_matches": int(link_match["child_id_link"].nunique()),
+        "issues": list(report.issues),
         "validation_report": report.to_dict(),
     }
     return directed_links, directed_nodes, summary
@@ -2131,7 +2145,7 @@ def generate_network_variant(
         "allow_noop": bool(allow_noop),
         "export_sword": bool(export_sword),
         "ready_for_graph_matching": True,
-        "ready_for_rapid": False,
+        "ready_for_rapid": bool(direction_summary.get("is_valid", False)),
         "scope": [
             "collapsed mask regeneration",
             "RivGraph rerun",
@@ -2206,7 +2220,7 @@ def generate_network_variant(
     with (summary_dir / "variant_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
 
-    return NetworkVariantOutputs(
+    results = NetworkVariantOutputs(
         collapse_components=collapse_components,
         edit_geometries=edit_geometries,
         node_match=node_match,
@@ -2229,6 +2243,9 @@ def generate_network_variant(
         sword_nodes_path=Path(rivgraph_paths["sword_nodes"]) if rivgraph_paths["sword_nodes"] is not None else None,
         manifest=manifest,
     )
+    if not bool(direction_summary.get("is_valid", False)):
+        raise VariantDirectionValidationError(results, direction_summary.get("issues", []))
+    return results
 
 
 def build_parser() -> argparse.ArgumentParser:

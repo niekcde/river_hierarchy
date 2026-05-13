@@ -26,6 +26,7 @@ from hierarchy_level_definition.run_unit_workflow import (
 from network_variants.sword_matching import match_variant_nodes_to_sword
 from network_variants.variant_generation import (
     NetworkVariantOutputs,
+    VariantDirectionValidationError,
     _apply_collapsed_selection_metadata,
     _collapsed_selection_metadata,
     compute_width_families,
@@ -293,6 +294,8 @@ def _state_record(context: ExperimentStateContext, mode: str) -> dict[str, Any]:
         "n_selected_groups": int(len(context.workflow.selected_groups)),
         "optimal_n_groups": _optimal_n_groups(context.workflow.group_count_summary),
         "status": "complete",
+        "error_stage": "",
+        "error": "",
     }
 
 
@@ -326,6 +329,133 @@ def _transition_record(
         "parent_hierarchy_output_dir": str(parent_context.hierarchy_output_dir.resolve()),
         "child_hierarchy_output_dir": str(child_context.hierarchy_output_dir.resolve()),
         "child_variant_output_dir": str(child_context.variant_output_dir.resolve()) if child_context.variant_output_dir is not None else "",
+        "status": "complete",
+        "error_stage": "",
+        "error": "",
+    }
+
+
+def _write_state_failure_artifact(state_dir: Path, payload: Mapping[str, Any]) -> Path:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / "state_failure.json"
+    path.write_text(json.dumps(dict(payload), indent=2), encoding="utf-8")
+    return path
+
+
+def _failed_state_record(
+    *,
+    state_id: str,
+    parent_state_id: str | None,
+    depth: int,
+    mode: str,
+    state_dir: Path,
+    selection: ExperimentSelection,
+    error_stage: str,
+    error: str,
+    variant_outputs: NetworkVariantOutputs | None = None,
+) -> dict[str, Any]:
+    direction_report = ""
+    if variant_outputs is not None:
+        direction_report = str(
+            Path(
+                variant_outputs.manifest.get("output_paths", {}).get("direction_validation_report", "")
+            ).resolve()
+        ) if variant_outputs.manifest.get("output_paths", {}).get("direction_validation_report") else ""
+    failure_payload = {
+        "state_id": state_id,
+        "parent_state_id": parent_state_id or "",
+        "mode": mode,
+        "selection_type": selection.selection_type,
+        "selected_unit_ids": selection.selected_unit_ids,
+        "selected_group_label": selection.selected_group_label,
+        "error_stage": error_stage,
+        "error": error,
+        "variant_output_dir": (
+            str(variant_outputs.output_dir.resolve()) if variant_outputs is not None else ""
+        ),
+        "direction_validation_report": direction_report,
+    }
+    failure_artifact = _write_state_failure_artifact(state_dir, failure_payload)
+    return {
+        "state_id": state_id,
+        "parent_state_id": parent_state_id or "",
+        "depth": int(depth),
+        "mode": mode,
+        "state_role": "base" if depth == 0 else "derived",
+        "selection_type": selection.selection_type,
+        "collapsed_selection_label": _selection_label(selection),
+        "selected_unit_ids": _serialize_int_list(selection.selected_unit_ids),
+        "selected_group_label": selection.selected_group_label or "",
+        "selected_group_size": int(selection.selected_group_size),
+        "selected_rank_start": selection.selected_rank_start,
+        "selected_rank_end": selection.selected_rank_end,
+        "selected_collapse_order": selection.selected_collapse_order,
+        "selected_collapse_priority_score": selection.selected_collapse_priority_score,
+        "state_dir": str(state_dir.resolve()),
+        "variant_output_dir": str(variant_outputs.output_dir.resolve()) if variant_outputs is not None else "",
+        "hierarchy_output_dir": "",
+        "cleaned_mask_path": (
+            str(variant_outputs.collapsed_mask_path.resolve()) if variant_outputs is not None else ""
+        ),
+        "directed_links_path": (
+            str(variant_outputs.directed_links_path.resolve())
+            if variant_outputs is not None and variant_outputs.directed_links_path is not None
+            else ""
+        ),
+        "directed_nodes_path": (
+            str(variant_outputs.directed_nodes_path.resolve())
+            if variant_outputs is not None and variant_outputs.directed_nodes_path is not None
+            else ""
+        ),
+        "direction_validation_report": direction_report,
+        "n_units_detected": pd.NA,
+        "n_paths_detected": pd.NA,
+        "n_selected_groups": pd.NA,
+        "optimal_n_groups": pd.NA,
+        "status": "failed",
+        "error_stage": error_stage,
+        "error": error,
+        "failure_artifact_path": str(failure_artifact.resolve()),
+    }
+
+
+def _failed_transition_record(
+    *,
+    transition_id: str,
+    step_index: int,
+    parent_context: ExperimentStateContext,
+    selection: ExperimentSelection,
+    child_state_id: str,
+    error_stage: str,
+    error: str,
+    variant_outputs: NetworkVariantOutputs | None = None,
+) -> dict[str, Any]:
+    return {
+        "transition_id": transition_id,
+        "step_index": int(step_index),
+        "parent_state_id": parent_context.state_id,
+        "child_state_id": child_state_id,
+        "depth": int(parent_context.depth + 1),
+        "mode": "",
+        "selection_type": selection.selection_type,
+        "collapsed_selection_label": _selection_label(selection),
+        "selected_unit_ids": _serialize_int_list(selection.selected_unit_ids),
+        "selected_group_label": selection.selected_group_label or "",
+        "selected_group_size": int(selection.selected_group_size),
+        "selected_rank_start": selection.selected_rank_start,
+        "selected_rank_end": selection.selected_rank_end,
+        "selected_collapse_order": selection.selected_collapse_order,
+        "selected_collapse_priority_score": selection.selected_collapse_priority_score,
+        "n_units_before": int(len(parent_context.workflow.unit_metrics)),
+        "n_units_after": pd.NA,
+        "parent_hierarchy_output_dir": str(parent_context.hierarchy_output_dir.resolve()),
+        "child_hierarchy_output_dir": "",
+        "child_variant_output_dir": (
+            str(variant_outputs.output_dir.resolve()) if variant_outputs is not None else ""
+        ),
+        "status": "failed",
+        "error_stage": error_stage,
+        "error": error,
     }
 
 
@@ -1043,6 +1173,8 @@ def run_collapse_experiment(
     terminal_state_id = base_context.state_id
 
     def write_metadata() -> None:
+        n_complete_states = sum(1 for record in state_records if record.get("status") == "complete")
+        n_failed_states = sum(1 for record in state_records if record.get("status") == "failed")
         manifest = {
             "experiment_id": experiment_id,
             "mode": mode,
@@ -1057,6 +1189,8 @@ def run_collapse_experiment(
             },
             "max_steps": max_steps,
             "n_states": len(state_records),
+            "n_complete_states": n_complete_states,
+            "n_failed_states": n_failed_states,
             "n_transitions": len(transition_records),
             "terminal_state_id": terminal_state_id,
             "stop_reason": stop_reason,
@@ -1120,18 +1254,77 @@ def run_collapse_experiment(
 
         for index, selection in enumerate(selections, start=1):
             state_id = f"S{index:03d}_{selection.state_suffix}"
-            child_context = _build_child_state(
-                parent_context=base_context,
-                selection=selection,
-                state_id=state_id,
-                state_dir=states_dir / state_id,
-                exit_sides=exit_sides,
-                variant_runner=variant_runner,
-                variant_kwargs=variant_kwargs,
-                unit_workflow_runner=unit_workflow_runner,
-                unit_workflow_writer=unit_workflow_writer,
-                unit_workflow_kwargs=unit_workflow_kwargs,
-            )
+            state_dir = states_dir / state_id
+            try:
+                child_context = _build_child_state(
+                    parent_context=base_context,
+                    selection=selection,
+                    state_id=state_id,
+                    state_dir=state_dir,
+                    exit_sides=exit_sides,
+                    variant_runner=variant_runner,
+                    variant_kwargs=variant_kwargs,
+                    unit_workflow_runner=unit_workflow_runner,
+                    unit_workflow_writer=unit_workflow_writer,
+                    unit_workflow_kwargs=unit_workflow_kwargs,
+                )
+            except VariantDirectionValidationError as exc:
+                state_records.append(
+                    _failed_state_record(
+                        state_id=state_id,
+                        parent_state_id=base_context.state_id,
+                        depth=base_context.depth + 1,
+                        mode=mode,
+                        state_dir=state_dir,
+                        selection=selection,
+                        error_stage="direction_validation",
+                        error=str(exc),
+                        variant_outputs=exc.outputs,
+                    )
+                )
+                transition = _failed_transition_record(
+                    transition_id=f"T{index:03d}",
+                    step_index=index,
+                    parent_context=base_context,
+                    selection=selection,
+                    child_state_id=state_id,
+                    error_stage="direction_validation",
+                    error=str(exc),
+                    variant_outputs=exc.outputs,
+                )
+                transition["mode"] = mode
+                transition_records.append(transition)
+                terminal_state_id = state_id
+                write_metadata()
+                continue
+            except Exception as exc:
+                state_records.append(
+                    _failed_state_record(
+                        state_id=state_id,
+                        parent_state_id=base_context.state_id,
+                        depth=base_context.depth + 1,
+                        mode=mode,
+                        state_dir=state_dir,
+                        selection=selection,
+                        error_stage="child_state_build",
+                        error=str(exc),
+                    )
+                )
+                transition = _failed_transition_record(
+                    transition_id=f"T{index:03d}",
+                    step_index=index,
+                    parent_context=base_context,
+                    selection=selection,
+                    child_state_id=state_id,
+                    error_stage="child_state_build",
+                    error=str(exc),
+                )
+                transition["mode"] = mode
+                transition_records.append(transition)
+                terminal_state_id = state_id
+                write_metadata()
+                continue
+
             state_records.append(_state_record(child_context, mode))
             transition = _transition_record(
                 transition_id=f"T{index:03d}",
@@ -1176,18 +1369,79 @@ def run_collapse_experiment(
 
         step_index += 1
         state_id = f"S{step_index:03d}_{selection.state_suffix}"
-        child_context = _build_child_state(
-            parent_context=current_context,
-            selection=selection,
-            state_id=state_id,
-            state_dir=states_dir / state_id,
-            exit_sides=exit_sides,
-            variant_runner=variant_runner,
-            variant_kwargs=variant_kwargs,
-            unit_workflow_runner=unit_workflow_runner,
-            unit_workflow_writer=unit_workflow_writer,
-            unit_workflow_kwargs=unit_workflow_kwargs,
-        )
+        state_dir = states_dir / state_id
+        try:
+            child_context = _build_child_state(
+                parent_context=current_context,
+                selection=selection,
+                state_id=state_id,
+                state_dir=state_dir,
+                exit_sides=exit_sides,
+                variant_runner=variant_runner,
+                variant_kwargs=variant_kwargs,
+                unit_workflow_runner=unit_workflow_runner,
+                unit_workflow_writer=unit_workflow_writer,
+                unit_workflow_kwargs=unit_workflow_kwargs,
+            )
+        except VariantDirectionValidationError as exc:
+            state_records.append(
+                _failed_state_record(
+                    state_id=state_id,
+                    parent_state_id=current_context.state_id,
+                    depth=current_context.depth + 1,
+                    mode=mode,
+                    state_dir=state_dir,
+                    selection=selection,
+                    error_stage="direction_validation",
+                    error=str(exc),
+                    variant_outputs=exc.outputs,
+                )
+            )
+            transition = _failed_transition_record(
+                transition_id=f"T{step_index:03d}",
+                step_index=step_index,
+                parent_context=current_context,
+                selection=selection,
+                child_state_id=state_id,
+                error_stage="direction_validation",
+                error=str(exc),
+                variant_outputs=exc.outputs,
+            )
+            transition["mode"] = mode
+            transition_records.append(transition)
+            terminal_state_id = state_id
+            stop_reason = "state_failed"
+            write_metadata()
+            break
+        except Exception as exc:
+            state_records.append(
+                _failed_state_record(
+                    state_id=state_id,
+                    parent_state_id=current_context.state_id,
+                    depth=current_context.depth + 1,
+                    mode=mode,
+                    state_dir=state_dir,
+                    selection=selection,
+                    error_stage="child_state_build",
+                    error=str(exc),
+                )
+            )
+            transition = _failed_transition_record(
+                transition_id=f"T{step_index:03d}",
+                step_index=step_index,
+                parent_context=current_context,
+                selection=selection,
+                child_state_id=state_id,
+                error_stage="child_state_build",
+                error=str(exc),
+            )
+            transition["mode"] = mode
+            transition_records.append(transition)
+            terminal_state_id = state_id
+            stop_reason = "state_failed"
+            write_metadata()
+            break
+
         state_records.append(_state_record(child_context, mode))
         transition = _transition_record(
             transition_id=f"T{step_index:03d}",
