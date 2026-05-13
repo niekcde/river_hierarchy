@@ -14,6 +14,10 @@ class SlopeConfig:
     interpolate_along_corridor: bool = True
     min_anchor_nodes_for_profile: int = 2
     fill_from_nearest_valid_link: bool = True
+    max_slope_for_k: float | None = None
+    section_slope_ratio_min: float | None = None
+    section_slope_ratio_max: float | None = None
+    use_section_slope_fallback: bool = True
 
 
 REQUIRED_NODE_COLUMNS = {
@@ -129,14 +133,14 @@ def _fill_invalid_slopes_from_neighbors(
     links: gpd.GeoDataFrame,
     *,
     config: SlopeConfig,
+    invalid_mask: pd.Series,
+    slope_column: str = "raw_slope",
 ) -> pd.DataFrame:
     frame = frame.copy()
     frame["slope_neighbor_source_link_id"] = pd.NA
     frame["slope_neighbor_distance"] = pd.NA
     frame["slope_neighbor_direction"] = ""
-    frame["slope_source_method"] = "raw_wse"
-
-    invalid_mask = frame["raw_slope"].isna() | frame["raw_slope"].lt(float(config.min_slope))
+    frame["slope_neighbor_value"] = np.nan
     if not config.fill_from_nearest_valid_link or not invalid_mask.any():
         return frame
 
@@ -157,11 +161,12 @@ def _fill_invalid_slopes_from_neighbors(
         successors[int(link_id)] = [candidate for candidate in outgoing_by_node.get(int(ds_node), []) if candidate != int(link_id)]
         predecessors[int(link_id)] = [candidate for candidate in incoming_by_node.get(int(us_node), []) if candidate != int(link_id)]
 
-    slope_by_link = dict(zip(link_ids, pd.to_numeric(frame["raw_slope"], errors="coerce")))
+    row_index_by_link = dict(zip(link_ids, frame_index))
+    slope_by_link = dict(zip(link_ids, pd.to_numeric(frame[slope_column], errors="coerce")))
     valid_links = {
         int(link_id)
         for link_id, raw_slope in slope_by_link.items()
-        if pd.notna(raw_slope) and float(raw_slope) >= float(config.min_slope)
+        if pd.notna(raw_slope) and not bool(invalid_mask.loc[row_index_by_link[int(link_id)]])
     }
 
     centroid_by_link: dict[int, object] = {}
@@ -221,7 +226,6 @@ def _fill_invalid_slopes_from_neighbors(
         distance, link_id, direction = candidate_rows[0]
         return link_id, distance, direction
 
-    row_index_by_link = dict(zip(link_ids, frame_index))
     for link_id in link_ids[invalid_mask.to_numpy()]:
         upstream_result = _nearest_valid(int(link_id), "upstream")
         downstream_result = _nearest_valid(int(link_id), "downstream")
@@ -237,9 +241,47 @@ def _fill_invalid_slopes_from_neighbors(
         frame.at[row_index, "slope_neighbor_source_link_id"] = int(neighbor_link)
         frame.at[row_index, "slope_neighbor_distance"] = int(neighbor_distance)
         frame.at[row_index, "slope_neighbor_direction"] = neighbor_direction
-        frame.at[row_index, "slope_source_method"] = "nearest_valid_link"
-        frame.at[row_index, "raw_slope"] = float(frame.at[neighbor_row_index, "raw_slope"])
+        frame.at[row_index, "slope_neighbor_value"] = float(frame.at[neighbor_row_index, slope_column])
     return frame
+
+
+def _compute_section_slope_reference(
+    node_attrs: pd.DataFrame,
+    *,
+    config: SlopeConfig,
+) -> tuple[float, str, int]:
+    if "node_sword_dist_out" not in node_attrs.columns:
+        return float("nan"), "missing_dist_out", 0
+
+    anchors = node_attrs.loc[
+        node_attrs["node_wse_raw"].notna() & node_attrs["node_sword_dist_out"].notna()
+    ].copy()
+    if anchors.empty:
+        return float("nan"), "missing_anchor_wse", 0
+
+    requested = anchors.loc[anchors["node_wse_fill_method"].eq("requested_field")].copy()
+    if len(requested) >= int(config.min_anchor_nodes_for_profile):
+        anchors = requested
+        source_method = "requested_field_nodes"
+    else:
+        source_method = "all_available_nodes"
+
+    anchors = (
+        anchors.groupby("node_sword_dist_out", as_index=False)["node_wse_raw"]
+        .mean()
+        .sort_values("node_sword_dist_out")
+    )
+    if len(anchors) < int(config.min_anchor_nodes_for_profile):
+        return float("nan"), "insufficient_anchor_nodes", int(len(anchors))
+
+    downstream = anchors.iloc[0]
+    upstream = anchors.iloc[-1]
+    delta_dist = float(upstream["node_sword_dist_out"] - downstream["node_sword_dist_out"])
+    delta_wse = float(upstream["node_wse_raw"] - downstream["node_wse_raw"])
+    if delta_dist <= 0 or delta_wse <= 0:
+        return float("nan"), "invalid_anchor_profile", int(len(anchors))
+
+    return float(delta_wse / delta_dist), source_method, int(len(anchors))
 
 
 def compute_link_slopes(
@@ -249,6 +291,18 @@ def compute_link_slopes(
     config: SlopeConfig | None = None,
 ) -> pd.DataFrame:
     config = config or SlopeConfig()
+    if config.max_slope_for_k is not None and config.max_slope_for_k <= 0:
+        raise ValueError("Slope outlier upper bound must be positive when provided.")
+    if config.section_slope_ratio_min is not None and config.section_slope_ratio_min <= 0:
+        raise ValueError("Section-slope ratio minimum must be positive when provided.")
+    if config.section_slope_ratio_max is not None and config.section_slope_ratio_max <= 0:
+        raise ValueError("Section-slope ratio maximum must be positive when provided.")
+    if (
+        config.section_slope_ratio_min is not None
+        and config.section_slope_ratio_max is not None
+        and config.section_slope_ratio_min > config.section_slope_ratio_max
+    ):
+        raise ValueError("Section-slope ratio minimum cannot exceed the maximum.")
     missing = sorted(REQUIRED_NODE_COLUMNS.difference(nodes.columns))
     if missing:
         raise ValueError(
@@ -265,6 +319,10 @@ def compute_link_slopes(
     )
 
     node_attrs = _resolve_rapid_wse_for_slope(nodes, config=config)
+    section_slope_ref, section_slope_source_method, section_slope_anchor_count = _compute_section_slope_reference(
+        node_attrs,
+        config=config,
+    )
 
     frame = links[["id_link", "id_us_node", "id_ds_node"]].copy()
     frame["link_length_m"] = lengths
@@ -307,18 +365,93 @@ def compute_link_slopes(
 
     frame = frame.merge(us, on="id_us_node", how="left").merge(ds, on="id_ds_node", how="left")
     frame["raw_slope"] = (pd.to_numeric(frame["wse_us"], errors="coerce") - pd.to_numeric(frame["wse_ds"], errors="coerce")) / frame["link_length_m"]
-    frame = _fill_invalid_slopes_from_neighbors(frame, links, config=config)
+    frame["slope_local_raw"] = pd.to_numeric(frame["raw_slope"], errors="coerce")
+    frame["slope_section_ref"] = float(section_slope_ref)
+    frame["slope_section_source_method"] = section_slope_source_method
+    frame["slope_section_anchor_count"] = int(section_slope_anchor_count)
+
     missing_wse = frame["wse_us"].isna() | frame["wse_ds"].isna()
-    invalid_raw = frame["raw_slope"].lt(float(config.min_slope)) | frame["raw_slope"].isna()
-    frame["slope_used"] = frame["raw_slope"].where(~missing_wse & ~invalid_raw, config.min_slope).astype(float)
-    frame["slope_adjusted"] = missing_wse | invalid_raw | frame["slope_source_method"].ne("raw_wse")
-    frame["slope_reason"] = np.select(
+    invalid_raw = frame["slope_local_raw"].isna() | frame["slope_local_raw"].lt(float(config.min_slope))
+    above_max = (
+        frame["slope_local_raw"].gt(float(config.max_slope_for_k))
+        if config.max_slope_for_k is not None
+        else pd.Series(False, index=frame.index)
+    )
+    section_slope_available = np.isfinite(section_slope_ref) and section_slope_ref >= float(config.min_slope)
+    slope_ratio = (
+        frame["slope_local_raw"] / float(section_slope_ref)
+        if section_slope_available
+        else pd.Series(np.nan, index=frame.index)
+    )
+    below_ratio = (
+        slope_ratio.lt(float(config.section_slope_ratio_min))
+        if section_slope_available and config.section_slope_ratio_min is not None
+        else pd.Series(False, index=frame.index)
+    )
+    above_ratio = (
+        slope_ratio.gt(float(config.section_slope_ratio_max))
+        if section_slope_available and config.section_slope_ratio_max is not None
+        else pd.Series(False, index=frame.index)
+    )
+
+    frame["slope_outlier_reason"] = np.select(
         [
             missing_wse,
-            frame["slope_source_method"].eq("nearest_valid_link"),
             invalid_raw,
+            above_max,
+            below_ratio,
+            above_ratio,
         ],
-        ["missing_wse", "filled_from_neighbor_link", "below_minimum_raw"],
+        [
+            "missing_wse",
+            "below_minimum_raw",
+            "above_maximum_raw",
+            "below_section_ratio",
+            "above_section_ratio",
+        ],
+        default="ok",
+    )
+    frame["slope_outlier_flag"] = frame["slope_outlier_reason"].ne("ok")
+    frame["slope_section_ratio"] = slope_ratio.astype(float)
+
+    frame = _fill_invalid_slopes_from_neighbors(
+        frame,
+        links,
+        config=config,
+        invalid_mask=frame["slope_outlier_flag"],
+        slope_column="slope_local_raw",
+    )
+
+    use_neighbor = frame["slope_outlier_flag"] & frame["slope_neighbor_value"].notna()
+    use_section = (
+        frame["slope_outlier_flag"]
+        & ~use_neighbor
+        & bool(config.use_section_slope_fallback)
+        & section_slope_available
+    )
+    use_minimum = frame["slope_outlier_flag"] & ~use_neighbor & ~use_section
+
+    frame["slope_source_method"] = "raw_wse"
+    frame["slope_used"] = frame["slope_local_raw"].astype(float)
+    frame.loc[use_neighbor, "slope_source_method"] = "nearest_valid_link"
+    frame.loc[use_neighbor, "slope_used"] = frame.loc[use_neighbor, "slope_neighbor_value"].astype(float)
+    frame.loc[use_section, "slope_source_method"] = "section_slope"
+    frame.loc[use_section, "slope_used"] = float(section_slope_ref)
+    frame.loc[use_minimum, "slope_source_method"] = "minimum_slope"
+    frame.loc[use_minimum, "slope_used"] = float(config.min_slope)
+
+    frame["slope_adjusted"] = frame["slope_source_method"].ne("raw_wse")
+    frame["slope_reason"] = np.select(
+        [
+            use_neighbor,
+            use_section,
+            use_minimum,
+        ],
+        [
+            "filled_from_neighbor_link",
+            "filled_from_section_slope",
+            frame["slope_outlier_reason"],
+        ],
         default="ok",
     )
     frame["slope_minimum_applied"] = frame["slope_used"].eq(config.min_slope)

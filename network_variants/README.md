@@ -254,6 +254,35 @@ Important:
 - when SWORD node matching is enabled, propagated SWORD attributes are carried
   forward through the directed node layers of successive states
 
+### Routing Interpretation
+
+When these collapse experiments are handed off to `RAPID/`, the routing stage
+should be interpreted as an example-level comparative response model across
+variants.
+
+In practice that means:
+
+- all states from the same example should use the same forcing series
+- all states from the same example should use the same RAPID prep settings
+- routing parameters should not be retuned per state just to make one variant
+  pass numerically
+
+The intent is to preserve a shared routing experiment while topology changes.
+Under this interpretation, routed outputs are most defensible as:
+
+- relative comparisons of peak timing, attenuation, and hydrograph shape
+  between variants
+
+rather than:
+
+- fully calibrated absolute hydraulic truth for each regenerated edge
+
+This matters because the regenerated graphs can contain short links and large
+local width/slope contrasts. A simple edge-based reach-routing model can
+become sensitive to those contrasts even after numerical regularization. That
+sensitivity is treated here as part of the modeling limitation of the routing
+layer, not as a reason to retune each state independently.
+
 Example: independent base-unit variants
 
 ```bash

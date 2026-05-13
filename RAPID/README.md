@@ -60,7 +60,9 @@ The state-based prep expects a `network_variants` experiment directory with:
 Prep writes RAPID inputs under `states/<state_id>/rapid/prep/` and can:
 
 - compute link slope from matched SWORD WSE
+- optionally guard local link slopes against section-scale outliers
 - compute RAPID `K` and `X`
+- optionally apply a K-only effective-length floor for very short routing links
 - optionally cap implied celerity
 - optionally split long links into RAPID-only subreaches
 - normalize forcing and write `inflow.nc`
@@ -102,7 +104,10 @@ python RAPID/run_prepare_experiment.py /path/to/experiment \
   --forcing-start-time 2023-02-12T00:00:00Z \
   --forcing-end-time 2023-02-23T00:00:00Z \
   --forcing-resample-minutes 15 \
-  --forcing-output-cache-dir SWORD_gauge_match/outputs/rapid_forcing_cache
+  --forcing-output-cache-dir SWORD_gauge_match/outputs/rapid_forcing_cache \
+  --min-effective-length-for-k-m 100 \
+  --max-slope-for-k 0.005 \
+  --section-slope-ratio-max 5
 ```
 
 After prep, routing and hydrograph metrics use the prepared forcing directly:
@@ -122,8 +127,112 @@ Important behavior:
 - resampling densifies the series; it does not create new hydrologic
   information beyond the source observations
 
+### K-Length And Slope Guard Options
+
+Two optional prep controls are now available for unstable or noisy hydraulic
+parameterization:
+
+- `--min-effective-length-for-k-m`
+  Applies a lower bound to the length term used inside the RAPID `K`
+  calculation only. This does not change geometry, topology, or exported link
+  length fields; it only regularizes `K` for very short routing elements.
+
+- `--max-slope-for-k`, `--section-slope-ratio-min`,
+  `--section-slope-ratio-max`
+  Keep local slopes as the primary source for RAPID `K`, but flag obviously
+  implausible local values relative to the section-scale WSE trend. Flagged
+  links first try to borrow the nearest valid neighboring slope; if that fails,
+  prep can fall back to the section reference slope.
+
+These controls are intended as numerical and hydraulic safeguards, not as a
+replacement for the underlying network geometry.
+
 Routing then writes per-state RAPID outputs under `states/<state_id>/rapid/run/`
 and can export outlet hydrograph summaries.
+
+### Interpretation In This Project
+
+For the hierarchy-driven `network_variants` workflow, RAPID is used here as a
+standardized comparative routing layer across topology variants, not as a
+per-state calibrated hydraulic truth model.
+
+That choice follows from the structure of this repository:
+
+- `hierarchy_level_definition/` defines topology-aware collapse candidates
+- `network_variants/` regenerates alternative directed networks from those
+  collapse choices
+- `RAPID/` propagates the same forcing through those alternative networks so
+  routed response can be compared on a common basis
+
+The primary question in this workflow is therefore:
+
+- how routed hydrograph response changes when network topology changes under a
+  shared forcing and shared routing configuration
+
+and not:
+
+- whether each individual state is a fully calibrated hydraulic model
+
+Accordingly, RAPID prep for a given example is intended to use one shared
+configuration across all states in that example:
+
+- one forcing series and forcing timestep
+- one Muskingum `x`
+- one Manning `n`
+- one `kb` method/value
+- one celerity-cap range
+- one effective-length floor
+- one slope-guard rule
+
+This shared configuration is part of the experiment definition. It should not
+be retuned state by state, because per-state retuning would weaken the
+comparability of the routing response metrics across variants.
+
+In this framing, outputs such as peak timing, peak attenuation, and recession
+behavior should be interpreted primarily as:
+
+- relative differences between topology variants
+
+rather than:
+
+- absolute hydraulic truth for every individual regenerated edge
+
+### Heterogeneous-Graph Caveat
+
+This comparative use of RAPID is important because the regenerated graphs can
+be both fine-scale and strongly heterogeneous. In such networks, a simple
+reach-routing formulation with one `K` and one `X` per edge can become
+sensitive to short links and strong width/slope contrasts.
+
+The current prep controls, including:
+
+- celerity caps
+- effective-length floors
+- guarded local slopes
+- optional RAPID-only subreach splitting
+
+should therefore be understood as explicit numerical and hydraulic
+regularization used to preserve stable and comparable routing behavior across
+variants.
+
+These controls do not make the workflow a replacement for a fully calibrated
+hydraulic model. They make it a more consistent comparative experiment.
+
+### Alternative Routing Models
+
+If the project goal changes from relative variant comparison to higher-fidelity
+absolute hydraulic realism, other routing formulations may be better suited to
+strongly heterogeneous fine-scale graphs, including:
+
+- diffusive-wave routing
+- local-inertial routing
+- full 1D dynamic-wave routing
+
+Those models can represent heterogeneous reach physics more directly, but they
+also require substantially richer geometry, roughness, boundary-condition, and
+calibration support than the current workflow assumes. For the present project,
+RAPID is retained because it provides a simpler, auditable, example-level
+comparative routing layer across many topology variants.
 
 ## Hydrograph Event Detection
 

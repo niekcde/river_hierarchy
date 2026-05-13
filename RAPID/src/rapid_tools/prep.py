@@ -33,11 +33,16 @@ class RapidPrepConfig:
     kb_value: float = 20.0
     n_manning: float = 0.35
     min_width: float = 1.0
+    min_effective_length_for_k_m: float | None = None
     use_celerity_capping: bool = False
     min_celerity_mps: float = 0.28
     max_celerity_mps: float = 1.524
     target_subreach_length_m: float | None = None
     min_slope: float = 1e-6
+    max_slope_for_k: float | None = None
+    section_slope_ratio_min: float | None = None
+    section_slope_ratio_max: float | None = None
+    use_section_slope_fallback: bool = True
     preferred_length_field: str = "len"
     include_base_state: bool = True
     strict_sword: bool = True
@@ -697,6 +702,10 @@ def prepare_state(
         nodes,
         config=SlopeConfig(
             min_slope=prep_config.min_slope,
+            max_slope_for_k=prep_config.max_slope_for_k,
+            section_slope_ratio_min=prep_config.section_slope_ratio_min,
+            section_slope_ratio_max=prep_config.section_slope_ratio_max,
+            use_section_slope_fallback=prep_config.use_section_slope_fallback,
             preferred_length_field=prep_config.preferred_length_field,
         ),
     )
@@ -718,6 +727,7 @@ def prepare_state(
             kb_value=prep_config.kb_value,
             n_manning=prep_config.n_manning,
             min_width=prep_config.min_width,
+            min_effective_length_m=prep_config.min_effective_length_for_k_m,
             use_celerity_capping=prep_config.use_celerity_capping,
             min_celerity_mps=prep_config.min_celerity_mps,
             max_celerity_mps=prep_config.max_celerity_mps,
@@ -782,7 +792,9 @@ def prepare_state(
             "n_split_parent_links": int(rapid_links.loc[rapid_links["rapid_link_split"], "parent_link_id"].nunique()) if "rapid_link_split" in rapid_links.columns else 0,
             "n_inlet_links": int(rapid_links["is_inlet"].fillna(False).sum()) if "is_inlet" in rapid_links.columns else 0,
             "n_slope_adjusted": int(rapid_links["slope_adjusted"].fillna(False).sum()),
+            "n_slope_outlier_flagged": int(rapid_links["slope_outlier_flag"].fillna(False).sum()) if "slope_outlier_flag" in rapid_links.columns else 0,
             "n_width_adjusted": int(rapid_links["rapid_width_adjusted"].fillna(False).sum()),
+            "n_length_floor_applied": int(rapid_links["rapid_length_floor_applied"].fillna(False).sum()) if "rapid_length_floor_applied" in rapid_links.columns else 0,
         },
         "routing": {
             "reach_order": reach_order,
@@ -795,6 +807,10 @@ def prepare_state(
             "pct_celerity_capped": float(rapid_links["rapid_celerity_capped"].fillna(False).astype(bool).mean()) if "rapid_celerity_capped" in rapid_links.columns and len(rapid_links) else float("nan"),
             "min_link_length_m": float(rapid_links["link_length_m"].min()) if len(rapid_links) else float("nan"),
             "max_link_length_m": float(rapid_links["link_length_m"].max()) if len(rapid_links) else float("nan"),
+            "min_effective_length_m": float(rapid_links["rapid_effective_length_m"].min()) if "rapid_effective_length_m" in rapid_links.columns and len(rapid_links) else float("nan"),
+            "max_effective_length_m": float(rapid_links["rapid_effective_length_m"].max()) if "rapid_effective_length_m" in rapid_links.columns and len(rapid_links) else float("nan"),
+            "pct_length_floor_applied": float(rapid_links["rapid_length_floor_applied"].fillna(False).astype(bool).mean()) if "rapid_length_floor_applied" in rapid_links.columns and len(rapid_links) else float("nan"),
+            "pct_slope_outlier_flagged": float(rapid_links["slope_outlier_flag"].fillna(False).astype(bool).mean()) if "slope_outlier_flag" in rapid_links.columns and len(rapid_links) else float("nan"),
             "rapid_k_min": float(rapid_links["rapid_k"].min()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
             "rapid_k_max": float(rapid_links["rapid_k"].max()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
         },
@@ -835,6 +851,12 @@ def prepare_state(
         "pct_celerity_capped": float(rapid_links["rapid_celerity_capped"].fillna(False).astype(bool).mean()) if "rapid_celerity_capped" in rapid_links.columns and len(rapid_links) else float("nan"),
         "min_link_length_m": float(rapid_links["link_length_m"].min()) if len(rapid_links) else float("nan"),
         "max_link_length_m": float(rapid_links["link_length_m"].max()) if len(rapid_links) else float("nan"),
+        "n_length_floor_applied": int(rapid_links["rapid_length_floor_applied"].fillna(False).sum()) if "rapid_length_floor_applied" in rapid_links.columns else 0,
+        "pct_length_floor_applied": float(rapid_links["rapid_length_floor_applied"].fillna(False).astype(bool).mean()) if "rapid_length_floor_applied" in rapid_links.columns and len(rapid_links) else float("nan"),
+        "n_slope_outlier_flagged": int(rapid_links["slope_outlier_flag"].fillna(False).sum()) if "slope_outlier_flag" in rapid_links.columns else 0,
+        "pct_slope_outlier_flagged": float(rapid_links["slope_outlier_flag"].fillna(False).astype(bool).mean()) if "slope_outlier_flag" in rapid_links.columns and len(rapid_links) else float("nan"),
+        "min_effective_length_m": float(rapid_links["rapid_effective_length_m"].min()) if "rapid_effective_length_m" in rapid_links.columns and len(rapid_links) else float("nan"),
+        "max_effective_length_m": float(rapid_links["rapid_effective_length_m"].max()) if "rapid_effective_length_m" in rapid_links.columns and len(rapid_links) else float("nan"),
         "rapid_k_min": float(rapid_links["rapid_k"].min()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
         "rapid_k_max": float(rapid_links["rapid_k"].max()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
         "status": "prepared",

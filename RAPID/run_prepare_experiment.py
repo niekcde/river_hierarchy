@@ -35,11 +35,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kb-value", type=float, default=20.0, help="K-value helper parameter kb.")
     parser.add_argument("--n-manning", type=float, default=0.35, help="Manning roughness used in K preparation.")
     parser.add_argument("--min-width", type=float, default=1.0, help="Minimum positive width used when width is missing or invalid.")
+    parser.add_argument("--min-effective-length-for-k-m", type=float, help="Optional K-only lower bound for effective reach length in meters. Geometry and exported link lengths are unchanged.")
     parser.add_argument("--use-celerity-capping", action="store_true", help="Cap the implied hydraulic celerity before converting it to RAPID K.")
     parser.add_argument("--min-celerity-mps", type=float, default=0.28, help="Minimum celerity bound in m/s when celerity capping is enabled.")
     parser.add_argument("--max-celerity-mps", type=float, default=1.524, help="Maximum celerity bound in m/s when celerity capping is enabled.")
     parser.add_argument("--target-subreach-length-m", type=float, help="Target RAPID-only subreach length in meters. Long links are split using max(1, round(L / target)).")
     parser.add_argument("--min-slope", type=float, default=1e-6, help="Minimum positive slope used when slope is missing or invalid.")
+    parser.add_argument("--max-slope-for-k", type=float, help="Optional upper bound for local slopes used in RAPID K preparation.")
+    parser.add_argument("--section-slope-ratio-min", type=float, help="Optional lower bound on local_slope / section_slope before a local slope is flagged as an outlier.")
+    parser.add_argument("--section-slope-ratio-max", type=float, help="Optional upper bound on local_slope / section_slope before a local slope is flagged as an outlier.")
+    parser.add_argument("--disable-section-slope-fallback", action="store_true", help="If a local slope is flagged and no valid neighboring slope is found, fall back to the minimum slope instead of the section reference slope.")
     parser.add_argument("--preferred-length-field", default="len", help="Fallback link-length field if geometry length is unavailable.")
     parser.add_argument("--exclude-base-state", action="store_true", help="Skip the base state and prepare only derived states.")
     parser.add_argument("--allow-missing-sword", action="store_true", help="Allow prep to continue when SWORD WSE columns are missing on directed nodes.")
@@ -69,11 +74,16 @@ def main(argv: list[str] | None = None) -> int:
             kb_value=args.kb_value,
             n_manning=args.n_manning,
             min_width=args.min_width,
+            min_effective_length_for_k_m=args.min_effective_length_for_k_m,
             use_celerity_capping=args.use_celerity_capping,
             min_celerity_mps=args.min_celerity_mps,
             max_celerity_mps=args.max_celerity_mps,
             target_subreach_length_m=args.target_subreach_length_m,
             min_slope=args.min_slope,
+            max_slope_for_k=args.max_slope_for_k,
+            section_slope_ratio_min=args.section_slope_ratio_min,
+            section_slope_ratio_max=args.section_slope_ratio_max,
+            use_section_slope_fallback=not args.disable_section_slope_fallback,
             preferred_length_field=args.preferred_length_field,
             include_base_state=not args.exclude_base_state,
             strict_sword=not args.allow_missing_sword,

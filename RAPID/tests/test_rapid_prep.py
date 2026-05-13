@@ -18,7 +18,7 @@ if str(SRC) not in sys.path:
 
 from rapid_tools.engine import run_prepared_experiment, write_qout_netcdf
 from rapid_tools.forcing import ForcingConfig
-from rapid_tools.hydrograph import HydrographMetricConfig, summarize_outlet_hydrograph
+from rapid_tools.hydrograph import HydrographMetricConfig, _integrate_trapezoid, summarize_outlet_hydrograph
 from rapid_tools.k_values import KValueConfig, compute_k_values
 from rapid_tools.prep import RapidPrepConfig, compute_reach_ratios, create_conn_file, prepare_experiment
 from rapid_tools.slope import SlopeConfig, compute_link_slopes
@@ -366,6 +366,39 @@ def test_compute_k_values_reports_raw_and_capped_celerity() -> None:
     assert abs(float(capped.loc[0, "rapid_k"]) - (1000.0 / 0.28)) < 1e-9
 
 
+def test_compute_k_values_applies_effective_length_floor() -> None:
+    frame = pd.DataFrame(
+        {
+            "id_link": [11, 12],
+            "link_length_m": [30.0, 130.0],
+            "slope_used": [1e-4, 1e-4],
+            "wid_adj_wet": [200.0, 200.0],
+        }
+    )
+
+    floored = compute_k_values(
+        frame,
+        config=KValueConfig(
+            min_effective_length_m=100.0,
+        ),
+    )
+
+    assert floored["rapid_effective_length_m"].round(6).tolist() == [100.0, 130.0]
+    assert floored["rapid_length_floor_applied"].tolist() == [True, False]
+    celerity = float(floored.loc[0, "rapid_celerity_mps"])
+    assert abs(float(floored.loc[0, "rapid_k"]) - (100.0 / celerity)) < 1e-9
+    assert abs(float(floored.loc[1, "rapid_k"]) - (130.0 / celerity)) < 1e-9
+
+
+def test_integrate_trapezoid_falls_back_to_trapz(monkeypatch) -> None:
+    monkeypatch.delattr(np, "trapezoid", raising=False)
+    area = _integrate_trapezoid(
+        np.array([0.0, 1.0, 0.0], dtype=float),
+        np.array([0.0, 1.0, 2.0], dtype=float),
+    )
+    assert abs(area - 1.0) < 1e-12
+
+
 def test_compute_link_slopes_interpolates_along_corridor() -> None:
     nodes = gpd.GeoDataFrame(
         {
@@ -450,6 +483,62 @@ def test_compute_link_slopes_fills_flat_segment_from_neighbor() -> None:
     assert abs(by_link.loc[12, "slope_used"] - 0.001) < 1e-9
 
 
+def test_compute_link_slopes_flags_section_ratio_outlier_and_fills_from_neighbor() -> None:
+    nodes = gpd.GeoDataFrame(
+        {
+            "id_node": [1, 2, 3, 4, 5],
+            "sword_wse": [10.0, 9.0, 3.0, 2.0, 1.0],
+            "sword_wse_field": ["wse_obs_p50"] * 5,
+            "sword_wse_fill_method": ["requested_field"] * 5,
+            "sword_wse_fallback_used": [False] * 5,
+            "sword_node_id": [101, 102, 103, 104, 105],
+            "sword_dist_out": [4000.0, 3000.0, 2000.0, 1000.0, 0.0],
+        },
+        geometry=[
+            Point(0.0, 0.0),
+            Point(1000.0, 0.0),
+            Point(2000.0, 0.0),
+            Point(3000.0, 0.0),
+            Point(4000.0, 0.0),
+        ],
+        crs="EPSG:3857",
+    )
+    links = gpd.GeoDataFrame(
+        {
+            "id_link": [11, 12, 13, 14],
+            "id_us_node": [1, 2, 3, 4],
+            "id_ds_node": [2, 3, 4, 5],
+            "len": [1000.0, 1000.0, 1000.0, 1000.0],
+        },
+        geometry=[
+            LineString([(0.0, 0.0), (1000.0, 0.0)]),
+            LineString([(1000.0, 0.0), (2000.0, 0.0)]),
+            LineString([(2000.0, 0.0), (3000.0, 0.0)]),
+            LineString([(3000.0, 0.0), (4000.0, 0.0)]),
+        ],
+        crs="EPSG:3857",
+    )
+
+    slopes = compute_link_slopes(
+        links,
+        nodes,
+        config=SlopeConfig(
+            section_slope_ratio_max=2.0,
+        ),
+    )
+
+    by_link = slopes.set_index("id_link")
+    assert abs(float(by_link.loc[12, "raw_slope"]) - 0.006) < 1e-9
+    assert abs(float(by_link.loc[12, "slope_section_ref"]) - 0.00225) < 1e-9
+    assert bool(by_link.loc[12, "slope_outlier_flag"])
+    assert by_link.loc[12, "slope_outlier_reason"] == "above_section_ratio"
+    assert by_link.loc[12, "slope_source_method"] == "nearest_valid_link"
+    assert by_link.loc[12, "slope_reason"] == "filled_from_neighbor_link"
+    assert int(by_link.loc[12, "slope_neighbor_distance"]) == 1
+    assert int(by_link.loc[12, "slope_neighbor_source_link_id"]) in {11, 13}
+    assert abs(float(by_link.loc[12, "slope_used"]) - 0.001) < 1e-9
+
+
 def test_prepare_experiment_writes_link_attributes_before_forcing_failure(tmp_path: Path, monkeypatch) -> None:
     experiment_dir = _write_state(tmp_path)
 
@@ -475,6 +564,7 @@ def test_prepare_experiment_exports_celerity_columns(tmp_path: Path) -> None:
         experiment_dir,
         forcing_path=experiment_dir / "forcing.csv",
         prep_config=RapidPrepConfig(
+            min_effective_length_for_k_m=1500.0,
             use_celerity_capping=True,
             min_celerity_mps=0.28,
             max_celerity_mps=1.524,
@@ -492,6 +582,9 @@ def test_prepare_experiment_exports_celerity_columns(tmp_path: Path) -> None:
         "rapid_celerity_cap_enabled",
         "rapid_celerity_cap_min_mps",
         "rapid_celerity_cap_max_mps",
+        "rapid_effective_length_m",
+        "rapid_length_floor_applied",
+        "slope_outlier_flag",
     ):
         assert column in rapid_links.columns
     for column in (
@@ -499,10 +592,15 @@ def test_prepare_experiment_exports_celerity_columns(tmp_path: Path) -> None:
         "n_links",
         "link_multiplier",
         "pct_celerity_capped",
+        "n_length_floor_applied",
+        "pct_length_floor_applied",
+        "n_slope_outlier_flagged",
+        "pct_slope_outlier_flagged",
         "rapid_k_min",
         "rapid_k_max",
     ):
         assert column in registry.columns
+    assert bool(rapid_links.loc[0, "rapid_length_floor_applied"])
 
 
 def test_run_prepared_experiment_allows_manual_event_start_time(tmp_path: Path) -> None:

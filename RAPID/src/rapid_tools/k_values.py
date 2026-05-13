@@ -13,6 +13,7 @@ class KValueConfig:
     kb_value: float = 20.0
     n_manning: float = 0.35
     min_width: float = 1.0
+    min_effective_length_m: float | None = None
     use_celerity_capping: bool = False
     min_celerity_mps: float = 0.28
     max_celerity_mps: float = 1.524
@@ -54,6 +55,8 @@ def compute_k_values(
         raise ValueError("RAPID K-value preparation requires a positive kb value.")
     if config.min_width <= 0:
         raise ValueError("RAPID K-value preparation requires a positive minimum width.")
+    if config.min_effective_length_m is not None and config.min_effective_length_m <= 0:
+        raise ValueError("RAPID effective-length floor must be positive when provided.")
     if config.min_celerity_mps <= 0 or config.max_celerity_mps <= 0:
         raise ValueError("RAPID celerity caps must be positive when provided.")
     if config.min_celerity_mps > config.max_celerity_mps:
@@ -104,7 +107,22 @@ def compute_k_values(
     frame["rapid_celerity_cap_enabled"] = bool(config.use_celerity_capping)
     frame["rapid_celerity_cap_min_mps"] = float(config.min_celerity_mps)
     frame["rapid_celerity_cap_max_mps"] = float(config.max_celerity_mps)
-    frame["rapid_k"] = (frame["link_length_m"].astype(float) / frame["rapid_celerity_mps"]).astype(float)
+    frame["rapid_effective_length_floor_m"] = (
+        float(config.min_effective_length_m) if config.min_effective_length_m is not None else np.nan
+    )
+    if config.min_effective_length_m is not None:
+        frame["rapid_effective_length_m"] = frame["link_length_m"].astype(float).clip(
+            lower=float(config.min_effective_length_m)
+        )
+    else:
+        frame["rapid_effective_length_m"] = frame["link_length_m"].astype(float)
+    frame["rapid_length_floor_applied"] = ~np.isclose(
+        frame["rapid_effective_length_m"],
+        frame["link_length_m"].astype(float),
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    frame["rapid_k"] = (frame["rapid_effective_length_m"].astype(float) / frame["rapid_celerity_mps"]).astype(float)
     return frame
 
 

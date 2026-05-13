@@ -33,6 +33,13 @@ class HydrographMetricConfig:
     event_end_buffer_hours: float | None = None
 
 
+def _integrate_trapezoid(y: np.ndarray, x: np.ndarray) -> float:
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is not None:
+        return float(trapezoid(y, x))
+    return float(np.trapz(y, x))
+
+
 def _load_qout(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     with netcdf_file(path, "r", mmap=False) as ds:
         river_ids = np.array(ds.variables["rivid"].data, dtype=np.int64).copy()
@@ -536,9 +543,10 @@ def summarize_outlet_hydrograph(
         "peak_attenuation_ratio": (
             peak_discharge / inflow_peak_discharge if inflow_peak_discharge > 0 else float("nan")
         ),
-        "outlet_volume_m3": float(np.trapezoid(outlet_q, time_seconds)),
-        "outlet_excess_volume_m3": float(
-            np.trapezoid(np.maximum(outlet_q - baseline_outlet, 0.0), time_seconds)
+        "outlet_volume_m3": _integrate_trapezoid(outlet_q, time_seconds),
+        "outlet_excess_volume_m3": _integrate_trapezoid(
+            np.maximum(outlet_q - baseline_outlet, 0.0),
+            time_seconds,
         ),
         "outlet_reach_count": len(outlet_reach_ids),
         "outlet_reach_ids": json.dumps(outlet_reach_ids),
