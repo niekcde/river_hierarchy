@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import itertools
 import math
 import os
 import re
@@ -57,6 +58,7 @@ DEFAULT_WIDTH_QUANTILES = (0.05, 0.5, 0.95)
 RIVGRAPH_WIDTH_TRIM_MULTIPLIER = 1.1
 DEFAULT_CORE_OVERLAP_FRACTION_THRESHOLD = 0.05
 DEFAULT_UNCHANGED_CORE_OVERLAP_FRACTION = 0.8
+MAX_LOCAL_DIRECTION_REPAIR_LINKS = 10
 
 
 @dataclass
@@ -1381,6 +1383,26 @@ def _build_progression_distance_maps(
     return source_distance, sink_distance
 
 
+def _build_oriented_child_graph(
+    *,
+    child_nodes: gpd.GeoDataFrame,
+    orientation_by_link: Mapping[int, tuple[int, int]],
+) -> nx.MultiDiGraph:
+    graph = nx.MultiDiGraph()
+    for node_row in child_nodes.itertuples(index=False):
+        graph.add_node(int(node_row.id_node), **node_row._asdict())
+    for link_id, (upstream, downstream) in orientation_by_link.items():
+        graph.add_edge(int(upstream), int(downstream), key=int(link_id), id_link=int(link_id))
+    return graph
+
+
+def _link_length_lookup(child_links: gpd.GeoDataFrame) -> dict[int, float]:
+    return {
+        int(row.id_link): float(row.len) if pd.notna(row.len) else float(row.geometry.length)
+        for row in child_links.itertuples(index=False)
+    }
+
+
 def _resolve_link_by_progression(
     *,
     node_a: int,
@@ -1415,6 +1437,354 @@ def _resolve_link_by_progression(
     if allow_geometry_fallback and geometry_order is not None:
         return geometry_order, "geometry_order_fallback"
     return None
+
+
+def _link_components(
+    link_ids: Sequence[int],
+    incident_links: Mapping[int, Sequence[int]],
+) -> list[list[int]]:
+    link_set = {int(link_id) for link_id in link_ids}
+    if not link_set:
+        return []
+
+    graph = nx.Graph()
+    graph.add_nodes_from(link_set)
+    for links_at_node in incident_links.values():
+        local = sorted(int(link_id) for link_id in links_at_node if int(link_id) in link_set)
+        if len(local) < 2:
+            continue
+        graph.add_edges_from((local[0], other) for other in local[1:])
+
+    return [sorted(int(link_id) for link_id in component) for component in nx.connected_components(graph)]
+
+
+def _expand_candidate_link_ids(
+    candidate_link_ids: Sequence[int],
+    *,
+    edge_nodes: Mapping[int, tuple[int, int]],
+    incident_links: Mapping[int, Sequence[int]],
+) -> list[int]:
+    expanded = {int(link_id) for link_id in candidate_link_ids}
+    touched_nodes: set[int] = set()
+    for link_id in expanded:
+        touched_nodes.update(int(node_id) for node_id in edge_nodes[int(link_id)])
+
+    for node_id in touched_nodes:
+        expanded.update(int(link_id) for link_id in incident_links.get(int(node_id), ()))
+    return sorted(expanded)
+
+
+def _local_direction_evidence_penalty(
+    *,
+    link_id: int,
+    candidate: tuple[int, int],
+    edge_nodes: Mapping[int, tuple[int, int]],
+    geometry_order_by_link: Mapping[int, tuple[int, int]],
+    orientation_score_forward: Mapping[int, float],
+    orientation_score_reverse: Mapping[int, float],
+    parent_order_lookup: Mapping[int, int],
+    source_distance: Mapping[int, float],
+    sink_distance: Mapping[int, float],
+    child_inlet_nodes: set[int],
+    child_outlet_nodes: set[int],
+) -> float:
+    node_a, node_b = edge_nodes[int(link_id)]
+    penalty = 0.0
+
+    if node_a in child_inlet_nodes and candidate != (node_a, node_b):
+        penalty += 1.0e12
+    if node_b in child_inlet_nodes and candidate != (node_b, node_a):
+        penalty += 1.0e12
+    if node_a in child_outlet_nodes and candidate != (node_b, node_a):
+        penalty += 1.0e12
+    if node_b in child_outlet_nodes and candidate != (node_a, node_b):
+        penalty += 1.0e12
+
+    geometry_order = geometry_order_by_link.get(int(link_id))
+    forward_score = orientation_score_forward.get(int(link_id))
+    reverse_score = orientation_score_reverse.get(int(link_id))
+    if (
+        geometry_order is not None
+        and forward_score is not None
+        and reverse_score is not None
+        and math.isfinite(float(forward_score))
+        and math.isfinite(float(reverse_score))
+        and not math.isclose(float(forward_score), float(reverse_score), rel_tol=1e-12, abs_tol=1e-9)
+    ):
+        preferred = geometry_order if float(forward_score) < float(reverse_score) else (geometry_order[1], geometry_order[0])
+        if candidate != preferred:
+            penalty += abs(float(forward_score) - float(reverse_score))
+
+    if node_a in parent_order_lookup and node_b in parent_order_lookup:
+        order_a = int(parent_order_lookup[node_a])
+        order_b = int(parent_order_lookup[node_b])
+        if order_a != order_b:
+            preferred = (node_a, node_b) if order_a < order_b else (node_b, node_a)
+            if candidate != preferred:
+                penalty += 1.0e6 + 1.0e3 * abs(order_a - order_b)
+
+    progression = _resolve_link_by_progression(
+        node_a=node_a,
+        node_b=node_b,
+        source_distance=source_distance,
+        sink_distance=sink_distance,
+        geometry_order=None,
+        allow_geometry_fallback=False,
+    )
+    if progression is not None and candidate != progression[0]:
+        penalty += 1.0e4
+
+    if geometry_order is not None and candidate != geometry_order:
+        penalty += 1.0
+
+    return penalty
+
+
+def _search_local_direction_repair(
+    *,
+    candidate_link_ids: Sequence[int],
+    edge_nodes: Mapping[int, tuple[int, int]],
+    incident_links: Mapping[int, Sequence[int]],
+    current_orientation_by_link: Mapping[int, tuple[int, int]],
+    child_links: gpd.GeoDataFrame,
+    child_nodes: gpd.GeoDataFrame,
+    geometry_order_by_link: Mapping[int, tuple[int, int]],
+    orientation_score_forward: Mapping[int, float],
+    orientation_score_reverse: Mapping[int, float],
+    parent_order_lookup: Mapping[int, int],
+    child_inlet_nodes: set[int],
+    child_outlet_nodes: set[int],
+    require_acyclic: bool = True,
+    max_candidate_links: int = MAX_LOCAL_DIRECTION_REPAIR_LINKS,
+) -> dict[int, tuple[int, int]] | None:
+    candidate_links = sorted(int(link_id) for link_id in candidate_link_ids)
+    if not candidate_links:
+        return None
+    if len(candidate_links) > max_candidate_links:
+        return None
+
+    fixed_orientation = {
+        int(link_id): (int(upstream), int(downstream))
+        for link_id, (upstream, downstream) in current_orientation_by_link.items()
+        if int(link_id) not in set(candidate_links)
+    }
+    source_distance, sink_distance = _build_progression_distance_maps(
+        child_links=child_links,
+        child_nodes=child_nodes,
+        orientation_by_link=fixed_orientation,
+        child_inlet_nodes=child_inlet_nodes,
+        child_outlet_nodes=child_outlet_nodes,
+    )
+    link_lengths = _link_length_lookup(child_links)
+
+    best_assignment: dict[int, tuple[int, int]] | None = None
+    best_score: tuple[float, int, float, tuple[int, ...]] | None = None
+    for bit_pattern in itertools.product((0, 1), repeat=len(candidate_links)):
+        proposal = fixed_orientation.copy()
+        changed_links: list[int] = []
+        total_penalty = 0.0
+        total_flipped_length = 0.0
+        signature: list[int] = []
+        for link_id, bit in zip(candidate_links, bit_pattern):
+            node_a, node_b = edge_nodes[int(link_id)]
+            candidate = (node_a, node_b) if bit == 0 else (node_b, node_a)
+            proposal[int(link_id)] = candidate
+            total_penalty += _local_direction_evidence_penalty(
+                link_id=int(link_id),
+                candidate=candidate,
+                edge_nodes=edge_nodes,
+                geometry_order_by_link=geometry_order_by_link,
+                orientation_score_forward=orientation_score_forward,
+                orientation_score_reverse=orientation_score_reverse,
+                parent_order_lookup=parent_order_lookup,
+                source_distance=source_distance,
+                sink_distance=sink_distance,
+                child_inlet_nodes=child_inlet_nodes,
+                child_outlet_nodes=child_outlet_nodes,
+            )
+            current = current_orientation_by_link.get(int(link_id))
+            if current is not None and candidate != current:
+                changed_links.append(int(link_id))
+                total_flipped_length += float(link_lengths.get(int(link_id), 0.0))
+            signature.extend(candidate)
+
+        candidate_graph = _build_oriented_child_graph(
+            child_nodes=child_nodes,
+            orientation_by_link=proposal,
+        )
+        report = validate_single_inlet_single_outlet(candidate_graph, require_flag_match=False)
+        if not report.is_valid:
+            continue
+        if require_acyclic and not nx.is_directed_acyclic_graph(nx.DiGraph(candidate_graph)):
+            continue
+
+        score = (
+            float(total_penalty),
+            int(len(changed_links)),
+            float(total_flipped_length),
+            tuple(int(value) for value in signature),
+        )
+        if best_score is None or score < best_score:
+            best_assignment = {int(link_id): proposal[int(link_id)] for link_id in candidate_links}
+            best_score = score
+
+    return best_assignment
+
+
+def _repair_unresolved_link_components(
+    *,
+    unresolved_links: Sequence[int],
+    edge_nodes: Mapping[int, tuple[int, int]],
+    incident_links: Mapping[int, Sequence[int]],
+    orientation_by_link: Mapping[int, tuple[int, int]],
+    child_links: gpd.GeoDataFrame,
+    child_nodes: gpd.GeoDataFrame,
+    geometry_order_by_link: Mapping[int, tuple[int, int]],
+    orientation_score_forward: Mapping[int, float],
+    orientation_score_reverse: Mapping[int, float],
+    parent_order_lookup: Mapping[int, int],
+    child_inlet_nodes: set[int],
+    child_outlet_nodes: set[int],
+) -> dict[int, tuple[int, int]]:
+    repaired: dict[int, tuple[int, int]] = {}
+    for component in _link_components(unresolved_links, incident_links):
+        candidate_links = list(component)
+        assignment = _search_local_direction_repair(
+            candidate_link_ids=candidate_links,
+            edge_nodes=edge_nodes,
+            incident_links=incident_links,
+            current_orientation_by_link={**orientation_by_link, **repaired},
+            child_links=child_links,
+            child_nodes=child_nodes,
+            geometry_order_by_link=geometry_order_by_link,
+            orientation_score_forward=orientation_score_forward,
+            orientation_score_reverse=orientation_score_reverse,
+            parent_order_lookup=parent_order_lookup,
+            child_inlet_nodes=child_inlet_nodes,
+            child_outlet_nodes=child_outlet_nodes,
+            require_acyclic=True,
+        )
+        if assignment is None:
+            expanded = _expand_candidate_link_ids(
+                candidate_links,
+                edge_nodes=edge_nodes,
+                incident_links=incident_links,
+            )
+            assignment = _search_local_direction_repair(
+                candidate_link_ids=expanded,
+                edge_nodes=edge_nodes,
+                incident_links=incident_links,
+                current_orientation_by_link={**orientation_by_link, **repaired},
+                child_links=child_links,
+                child_nodes=child_nodes,
+                geometry_order_by_link=geometry_order_by_link,
+                orientation_score_forward=orientation_score_forward,
+                orientation_score_reverse=orientation_score_reverse,
+                parent_order_lookup=parent_order_lookup,
+                child_inlet_nodes=child_inlet_nodes,
+                child_outlet_nodes=child_outlet_nodes,
+                require_acyclic=True,
+            )
+        if assignment is None:
+            continue
+        for link_id in component:
+            if int(link_id) in assignment:
+                repaired[int(link_id)] = assignment[int(link_id)]
+    return repaired
+
+
+def _repair_invalid_directionality(
+    *,
+    orientation_by_link: Mapping[int, tuple[int, int]],
+    edge_nodes: Mapping[int, tuple[int, int]],
+    incident_links: Mapping[int, Sequence[int]],
+    child_links: gpd.GeoDataFrame,
+    child_nodes: gpd.GeoDataFrame,
+    geometry_order_by_link: Mapping[int, tuple[int, int]],
+    orientation_score_forward: Mapping[int, float],
+    orientation_score_reverse: Mapping[int, float],
+    parent_order_lookup: Mapping[int, int],
+    child_inlet_nodes: set[int],
+    child_outlet_nodes: set[int],
+) -> dict[int, tuple[int, int]]:
+    repaired = {
+        int(link_id): (int(upstream), int(downstream))
+        for link_id, (upstream, downstream) in orientation_by_link.items()
+    }
+
+    for _ in range(3):
+        graph = _build_oriented_child_graph(
+            child_nodes=child_nodes,
+            orientation_by_link=repaired,
+        )
+        report = validate_single_inlet_single_outlet(graph, require_flag_match=False)
+        require_acyclic = nx.is_directed_acyclic_graph(nx.DiGraph(graph))
+        if report.is_valid and (not require_acyclic or nx.is_directed_acyclic_graph(nx.DiGraph(graph))):
+            return repaired
+
+        bad_nodes = sorted(set(int(node_id) for node_id in (report.source_nodes + report.sink_nodes)))
+        if not bad_nodes:
+            break
+        seed_links = sorted(
+            {
+                int(link_id)
+                for node_id in bad_nodes
+                for link_id in incident_links.get(int(node_id), ())
+            }
+        )
+        if not seed_links:
+            break
+
+        components = _link_components(seed_links, incident_links)
+        changed = False
+        for component in components:
+            assignment = _search_local_direction_repair(
+                candidate_link_ids=component,
+                edge_nodes=edge_nodes,
+                incident_links=incident_links,
+                current_orientation_by_link=repaired,
+                child_links=child_links,
+                child_nodes=child_nodes,
+                geometry_order_by_link=geometry_order_by_link,
+                orientation_score_forward=orientation_score_forward,
+                orientation_score_reverse=orientation_score_reverse,
+                parent_order_lookup=parent_order_lookup,
+                child_inlet_nodes=child_inlet_nodes,
+                child_outlet_nodes=child_outlet_nodes,
+                require_acyclic=require_acyclic,
+            )
+            if assignment is None:
+                expanded = _expand_candidate_link_ids(
+                    component,
+                    edge_nodes=edge_nodes,
+                    incident_links=incident_links,
+                )
+                assignment = _search_local_direction_repair(
+                    candidate_link_ids=expanded,
+                    edge_nodes=edge_nodes,
+                    incident_links=incident_links,
+                    current_orientation_by_link=repaired,
+                    child_links=child_links,
+                    child_nodes=child_nodes,
+                    geometry_order_by_link=geometry_order_by_link,
+                    orientation_score_forward=orientation_score_forward,
+                    orientation_score_reverse=orientation_score_reverse,
+                    parent_order_lookup=parent_order_lookup,
+                    child_inlet_nodes=child_inlet_nodes,
+                    child_outlet_nodes=child_outlet_nodes,
+                    require_acyclic=require_acyclic,
+                )
+            if assignment is None:
+                continue
+            for link_id, oriented_pair in assignment.items():
+                if repaired.get(int(link_id)) != oriented_pair:
+                    repaired[int(link_id)] = oriented_pair
+                    changed = True
+
+        if not changed:
+            break
+
+    return repaired
 
 
 def _resolve_single_remaining_link(
@@ -1690,6 +2060,28 @@ def _assign_variant_directions(
                 unresolved_links = []
 
     if unresolved_links:
+        repaired_orientations = _repair_unresolved_link_components(
+            unresolved_links=unresolved_links,
+            edge_nodes=edge_nodes,
+            incident_links=incident_links,
+            orientation_by_link=orientation_by_link,
+            child_links=child_links,
+            child_nodes=child_nodes,
+            geometry_order_by_link=geometry_order_by_link,
+            orientation_score_forward=orientation_score_forward,
+            orientation_score_reverse=orientation_score_reverse,
+            parent_order_lookup=parent_order_lookup,
+            child_inlet_nodes=child_inlet_nodes,
+            child_outlet_nodes=child_outlet_nodes,
+        )
+        for link_id, oriented_pair in repaired_orientations.items():
+            orientation_by_link[int(link_id)] = oriented_pair
+            orientation_source[int(link_id)] = "local_exact_repair"
+        unresolved_links = [
+            int(link_id) for link_id in unresolved_links if int(link_id) not in repaired_orientations
+        ]
+
+    if unresolved_links:
         raise ValueError(
             "Could not orient all regenerated links from parent matching/topology rules. "
             f"Unresolved id_link values: {sorted(int(link_id) for link_id in unresolved_links)}"
@@ -1700,14 +2092,36 @@ def _assign_variant_directions(
     directed_links["raw_is_inlet"] = directed_links["is_inlet"]
     directed_links["raw_is_outlet"] = directed_links["is_outlet"]
 
-    child_graph = nx.MultiDiGraph()
-    for node_row in child_nodes.itertuples(index=False):
-        child_graph.add_node(int(node_row.id_node), **node_row._asdict())
-    for row in directed_links.itertuples(index=False):
-        upstream, downstream = orientation_by_link[int(row.id_link)]
-        child_graph.add_edge(upstream, downstream, key=int(row.id_link), id_link=int(row.id_link))
+    child_graph = _build_oriented_child_graph(
+        child_nodes=child_nodes,
+        orientation_by_link=orientation_by_link,
+    )
 
     report = validate_single_inlet_single_outlet(child_graph, require_flag_match=False)
+    if not report.is_valid or not nx.is_directed_acyclic_graph(nx.DiGraph(child_graph)):
+        repaired_orientation = _repair_invalid_directionality(
+            orientation_by_link=orientation_by_link,
+            edge_nodes=edge_nodes,
+            incident_links=incident_links,
+            child_links=child_links,
+            child_nodes=child_nodes,
+            geometry_order_by_link=geometry_order_by_link,
+            orientation_score_forward=orientation_score_forward,
+            orientation_score_reverse=orientation_score_reverse,
+            parent_order_lookup=parent_order_lookup,
+            child_inlet_nodes=child_inlet_nodes,
+            child_outlet_nodes=child_outlet_nodes,
+        )
+        for link_id, oriented_pair in repaired_orientation.items():
+            if orientation_by_link.get(int(link_id)) != oriented_pair:
+                orientation_source[int(link_id)] = "local_exact_repair"
+        orientation_by_link = repaired_orientation
+        child_graph = _build_oriented_child_graph(
+            child_nodes=child_nodes,
+            orientation_by_link=orientation_by_link,
+        )
+        report = validate_single_inlet_single_outlet(child_graph, require_flag_match=False)
+
     source_nodes = sorted(int(node_id) for node_id in report.source_nodes)
     sink_nodes = sorted(int(node_id) for node_id in report.sink_nodes)
     source_node = source_nodes[0] if len(source_nodes) == 1 else None

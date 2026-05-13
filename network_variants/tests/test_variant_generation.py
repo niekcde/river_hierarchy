@@ -14,15 +14,21 @@ from network_variants.variant_generation import (
     _apply_collapsed_selection_metadata,
     _apply_collapse_components_to_mask,
     _assign_variant_directions,
+    _build_oriented_child_graph,
     _componentize_units,
     _compute_family_stats,
     _infer_parent_node_order,
     _match_child_links_to_parent_links,
     _match_child_nodes_to_parent_nodes,
+    _repair_invalid_directionality,
+    _repair_unresolved_link_components,
     _resolve_link_by_progression,
     _resolve_link_lineage,
     _resolve_single_remaining_link,
     _trim_slice,
+)
+from hierarchy_level_definition.graph_building.directed_network_checks import (
+    validate_single_inlet_single_outlet,
 )
 
 
@@ -458,3 +464,162 @@ def test_resolved_lineage_uses_parent_node_path_and_keeps_parallel_edges() -> No
     assert lineage_row["secondary_parent_link_ids"] == ""
     assert lineage_row["lineage_type"] == "collapsed_many_to_one"
     assert np.isclose(lineage_row["matched_parent_overlap_fraction"], 1.0)
+
+
+def test_repair_invalid_directionality_prefers_weaker_evidence_flip() -> None:
+    child_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 0, "is_inlet": True, "is_outlet": False, "geometry": Point(0, 0)},
+            {"id_node": 1, "is_inlet": False, "is_outlet": False, "geometry": Point(10, 0)},
+            {"id_node": 2, "is_inlet": False, "is_outlet": False, "geometry": Point(20, 10)},
+            {"id_node": 3, "is_inlet": False, "is_outlet": False, "geometry": Point(20, 0)},
+            {"id_node": 4, "is_inlet": False, "is_outlet": False, "geometry": Point(20, -10)},
+            {"id_node": 5, "is_inlet": False, "is_outlet": True, "geometry": Point(30, 0)},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+
+    child_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 0, "len": 10.0, "geometry": LineString([(0, 0), (10, 0)])},
+            {"id_link": 1, "len": 10.0, "geometry": LineString([(10, 0), (20, 0)])},
+            {"id_link": 2, "len": 14.0, "geometry": LineString([(10, 0), (20, -10)])},
+            {"id_link": 3, "len": 14.0, "geometry": LineString([(20, 0), (30, 0)])},
+            {"id_link": 4, "len": 14.0, "geometry": LineString([(20, -10), (30, 0)])},
+            {"id_link": 10, "len": 14.0, "geometry": LineString([(20, 10), (20, 0)])},
+            {"id_link": 11, "len": 20.0, "geometry": LineString([(20, 10), (20, -10)])},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+
+    orientation_by_link = {
+        0: (0, 1),
+        1: (1, 3),
+        2: (1, 4),
+        3: (3, 5),
+        4: (4, 5),
+        10: (2, 3),
+        11: (2, 4),
+    }
+    edge_nodes = {
+        0: (0, 1),
+        1: (1, 3),
+        2: (1, 4),
+        3: (3, 5),
+        4: (4, 5),
+        10: (2, 3),
+        11: (2, 4),
+    }
+    geometry_order_by_link = {link_id: nodes for link_id, nodes in edge_nodes.items()}
+    incident_links = {
+        0: [0],
+        1: [0, 1, 2],
+        2: [10, 11],
+        3: [1, 3, 10],
+        4: [2, 4, 11],
+        5: [3, 4],
+    }
+
+    repaired = _repair_invalid_directionality(
+        orientation_by_link=orientation_by_link,
+        edge_nodes=edge_nodes,
+        incident_links=incident_links,
+        child_links=child_links,
+        child_nodes=child_nodes,
+        geometry_order_by_link=geometry_order_by_link,
+        orientation_score_forward={10: 100.0, 11: 10.0},
+        orientation_score_reverse={10: 1000.0, 11: 20.0},
+        parent_order_lookup={},
+        child_inlet_nodes={0},
+        child_outlet_nodes={5},
+    )
+
+    assert repaired[10] == (2, 3)
+    assert repaired[11] == (4, 2)
+
+    graph = _build_oriented_child_graph(child_nodes=child_nodes, orientation_by_link=repaired)
+    report = validate_single_inlet_single_outlet(graph, require_flag_match=False)
+    assert report.is_valid
+    assert report.source_nodes == [0]
+    assert report.sink_nodes == [5]
+
+
+def test_repair_unresolved_link_components_solves_small_local_motif() -> None:
+    child_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 0, "is_inlet": True, "is_outlet": False, "geometry": Point(0, 0)},
+            {"id_node": 1, "is_inlet": False, "is_outlet": False, "geometry": Point(10, 0)},
+            {"id_node": 2, "is_inlet": False, "is_outlet": False, "geometry": Point(20, 10)},
+            {"id_node": 3, "is_inlet": False, "is_outlet": False, "geometry": Point(20, 0)},
+            {"id_node": 4, "is_inlet": False, "is_outlet": False, "geometry": Point(20, -10)},
+            {"id_node": 5, "is_inlet": False, "is_outlet": True, "geometry": Point(30, 0)},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+
+    child_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 0, "len": 10.0, "geometry": LineString([(0, 0), (10, 0)])},
+            {"id_link": 1, "len": 10.0, "geometry": LineString([(10, 0), (20, 0)])},
+            {"id_link": 2, "len": 14.0, "geometry": LineString([(10, 0), (20, -10)])},
+            {"id_link": 3, "len": 14.0, "geometry": LineString([(20, 0), (30, 0)])},
+            {"id_link": 4, "len": 14.0, "geometry": LineString([(20, -10), (30, 0)])},
+            {"id_link": 10, "len": 14.0, "geometry": LineString([(20, 10), (20, 0)])},
+            {"id_link": 11, "len": 20.0, "geometry": LineString([(20, 10), (20, -10)])},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+
+    orientation_by_link = {
+        0: (0, 1),
+        1: (1, 3),
+        2: (1, 4),
+        3: (3, 5),
+        4: (4, 5),
+    }
+    edge_nodes = {
+        0: (0, 1),
+        1: (1, 3),
+        2: (1, 4),
+        3: (3, 5),
+        4: (4, 5),
+        10: (2, 3),
+        11: (2, 4),
+    }
+    geometry_order_by_link = {link_id: nodes for link_id, nodes in edge_nodes.items()}
+    incident_links = {
+        0: [0],
+        1: [0, 1, 2],
+        2: [10, 11],
+        3: [1, 3, 10],
+        4: [2, 4, 11],
+        5: [3, 4],
+    }
+
+    repaired = _repair_unresolved_link_components(
+        unresolved_links=[10, 11],
+        edge_nodes=edge_nodes,
+        incident_links=incident_links,
+        orientation_by_link=orientation_by_link,
+        child_links=child_links,
+        child_nodes=child_nodes,
+        geometry_order_by_link=geometry_order_by_link,
+        orientation_score_forward={10: 100.0, 11: 10.0},
+        orientation_score_reverse={10: 1000.0, 11: 20.0},
+        parent_order_lookup={},
+        child_inlet_nodes={0},
+        child_outlet_nodes={5},
+    )
+
+    assert repaired == {10: (2, 3), 11: (4, 2)}
+
+    graph = _build_oriented_child_graph(
+        child_nodes=child_nodes,
+        orientation_by_link={**orientation_by_link, **repaired},
+    )
+    report = validate_single_inlet_single_outlet(graph, require_flag_match=False)
+    assert report.is_valid
