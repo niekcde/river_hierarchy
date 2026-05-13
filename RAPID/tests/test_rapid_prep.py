@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
 import geopandas as gpd
+import networkx as nx
 import numpy as np
 import pandas as pd
 from scipy.io import netcdf_file
@@ -15,9 +17,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from rapid_tools.engine import run_prepared_experiment, write_qout_netcdf
+from rapid_tools.forcing import ForcingConfig
 from rapid_tools.hydrograph import HydrographMetricConfig, summarize_outlet_hydrograph
 from rapid_tools.k_values import KValueConfig, compute_k_values
-from rapid_tools.prep import RapidPrepConfig, prepare_experiment
+from rapid_tools.prep import RapidPrepConfig, compute_reach_ratios, create_conn_file, prepare_experiment
 from rapid_tools.slope import SlopeConfig, compute_link_slopes
 
 
@@ -98,6 +101,33 @@ def _write_state(tmp_path: Path, *, link_id: int = 11, link_length: float = 1000
     return experiment_dir
 
 
+def _write_multistation_forcing_csv(experiment_dir: Path) -> Path:
+    forcing = pd.DataFrame(
+        {
+            "station_key": [
+                "BR:EXAMPLE_A",
+                "BR:EXAMPLE_A",
+                "BR:EXAMPLE_A",
+                "BR:EXAMPLE_B",
+                "BR:EXAMPLE_B",
+                "BR:EXAMPLE_B",
+            ],
+            "time": [
+                "2020-01-01T00:00:00Z",
+                "2020-01-01T00:30:00Z",
+                "2020-01-01T01:00:00Z",
+                "2020-01-01T00:00:00Z",
+                "2020-01-01T00:30:00Z",
+                "2020-01-01T01:00:00Z",
+            ],
+            "discharge": [10.0, 20.0, 30.0, 100.0, 200.0, 300.0],
+        }
+    )
+    path = experiment_dir / "forcing_multistation.csv"
+    forcing.to_csv(path, index=False)
+    return path
+
+
 def test_prepare_experiment_writes_state_outputs(tmp_path: Path) -> None:
     experiment_dir = _write_state(tmp_path)
     registry = prepare_experiment(
@@ -112,6 +142,113 @@ def test_prepare_experiment_writes_state_outputs(tmp_path: Path) -> None:
     assert (prep_dir / "rapid_link_attributes.csv").exists()
     assert (prep_dir / "kfc.csv").exists()
     assert (prep_dir / "inflow.nc").exists()
+
+
+def test_prepare_experiment_normalizes_station_key_forcing(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path)
+    forcing_path = _write_multistation_forcing_csv(experiment_dir)
+    cache_dir = tmp_path / "forcing_cache"
+
+    registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=forcing_path,
+        forcing_config=ForcingConfig(
+            station_key="BR:EXAMPLE_A",
+            start_time="2020-01-01T00:00:00Z",
+            end_time="2020-01-01T01:00:00Z",
+            resample_minutes=15,
+            output_cache_dir=str(cache_dir),
+        ),
+        prep_config=RapidPrepConfig(),
+    )
+
+    assert registry.loc[0, "status"] == "prepared"
+    assert registry.loc[0, "forcing_station_key"] == "BR:EXAMPLE_A"
+    assert not bool(registry.loc[0, "forcing_loaded_from_cache"])
+
+    prep_dir = experiment_dir / "states" / "S001_unit_1" / "rapid" / "prep"
+    forcing_normalized = pd.read_csv(prep_dir / "forcing_normalized.csv")
+    assert len(forcing_normalized) == 5
+    assert forcing_normalized["discharge_cms"].round(6).tolist() == [10.0, 15.0, 20.0, 25.0, 30.0]
+
+    manifest = json.loads((prep_dir / "rapid_prep_manifest.json").read_text())
+    forcing_metadata = manifest["forcing_metadata"]
+    assert forcing_metadata["selected_station_key"] == "BR:EXAMPLE_A"
+    assert forcing_metadata["normalized_dt_seconds"] == 900
+    assert forcing_metadata["forcing_loaded_from_cache"] is False
+    assert Path(forcing_metadata["forcing_cache_csv"]).exists()
+
+
+def test_prepare_experiment_requires_station_key_for_multistation_forcing(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path)
+    forcing_path = _write_multistation_forcing_csv(experiment_dir)
+
+    registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=forcing_path,
+        forcing_config=ForcingConfig(),
+        prep_config=RapidPrepConfig(),
+    )
+
+    assert registry.loc[0, "status"] == "failed"
+    assert "multiple station keys" in str(registry.loc[0, "error"])
+
+
+def test_prepare_experiment_reuses_station_key_forcing_cache(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path)
+    forcing_path = _write_multistation_forcing_csv(experiment_dir)
+    cache_dir = tmp_path / "forcing_cache"
+    forcing_config = ForcingConfig(
+        station_key="BR:EXAMPLE_A",
+        start_time="2020-01-01T00:00:00Z",
+        end_time="2020-01-01T01:00:00Z",
+        resample_minutes=15,
+        output_cache_dir=str(cache_dir),
+    )
+
+    prepare_experiment(
+        experiment_dir,
+        forcing_path=forcing_path,
+        forcing_config=forcing_config,
+        prep_config=RapidPrepConfig(),
+    )
+    prep_dir = experiment_dir / "states" / "S001_unit_1" / "rapid" / "prep"
+    first = pd.read_csv(prep_dir / "forcing_normalized.csv")
+
+    modified = pd.DataFrame(
+        {
+            "station_key": [
+                "BR:EXAMPLE_A",
+                "BR:EXAMPLE_A",
+                "BR:EXAMPLE_A",
+                "BR:EXAMPLE_B",
+                "BR:EXAMPLE_B",
+                "BR:EXAMPLE_B",
+            ],
+            "time": [
+                "2020-01-01T00:00:00Z",
+                "2020-01-01T00:30:00Z",
+                "2020-01-01T01:00:00Z",
+                "2020-01-01T00:00:00Z",
+                "2020-01-01T00:30:00Z",
+                "2020-01-01T01:00:00Z",
+            ],
+            "discharge": [999.0, 999.0, 999.0, 100.0, 200.0, 300.0],
+        }
+    )
+    modified.to_csv(forcing_path, index=False)
+
+    registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=forcing_path,
+        forcing_config=forcing_config,
+        prep_config=RapidPrepConfig(),
+    )
+
+    second = pd.read_csv(prep_dir / "forcing_normalized.csv")
+    pd.testing.assert_frame_equal(first, second)
+    assert registry.loc[0, "status"] == "prepared"
+    assert bool(registry.loc[0, "forcing_loaded_from_cache"])
 
 
 def test_run_prepared_experiment_writes_qout(tmp_path: Path) -> None:
@@ -147,6 +284,22 @@ def test_prepare_experiment_accepts_real_link_id_zero(tmp_path: Path) -> None:
         prep_config=RapidPrepConfig(),
     )
     assert registry.loc[0, "status"] == "prepared"
+
+
+def test_compute_reach_ratios_handles_real_reach_id_zero(tmp_path: Path) -> None:
+    graph = nx.MultiDiGraph()
+    graph.add_node(1, node_type="source")
+    graph.add_node(2, node_type="internal")
+    graph.add_node(3, node_type="outlet")
+    graph.add_edge(1, 2, key="0", reach_id=0, width=10.0, length=100.0, geometry=LineString([(0.0, 0.0), (1.0, 0.0)]).wkt, slope_local=1e-3)
+    graph.add_edge(2, 3, key="5", reach_id=5, width=20.0, length=100.0, geometry=LineString([(1.0, 0.0), (2.0, 0.0)]).wkt, slope_local=1e-3)
+
+    create_conn_file(graph, tmp_path)
+    rat_srt = compute_reach_ratios(graph, tmp_path, use_widths=True)
+
+    assert Path(rat_srt).exists()
+    rat = pd.read_csv(rat_srt, header=None)
+    assert set(rat[0].astype(int).tolist()) == {0, 5}
 
 
 def test_prepare_experiment_splits_long_links_into_target_subreaches(tmp_path: Path) -> None:

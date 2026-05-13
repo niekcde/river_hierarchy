@@ -19,6 +19,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("experiment_dir", help="Path to the network_variants experiment directory.")
     parser.add_argument("--forcing-path", help="CSV or parquet file with time/discharge forcing.")
+    parser.add_argument("--forcing-station-key", help="Explicit station_key to extract from a multi-station forcing source.")
+    parser.add_argument("--station-key-column", default="station_key", help="Station-key column in the forcing file.")
+    parser.add_argument("--forcing-start-time", help="Optional inclusive UTC truncation start for forcing normalization.")
+    parser.add_argument("--forcing-end-time", help="Optional inclusive UTC truncation end for forcing normalization.")
+    parser.add_argument("--forcing-resample-minutes", type=int, help="Optional normalized forcing interval in minutes, e.g. 15.")
+    parser.add_argument(
+        "--forcing-output-cache-dir",
+        help="Optional shared cache directory for normalized forcing tables keyed by source, station, time window, and timestep.",
+    )
     parser.add_argument("--time-column", default="time", help="Timestamp column in the forcing file.")
     parser.add_argument("--discharge-column", default="discharge", help="Discharge column in the forcing file.")
     parser.add_argument("--width-field", default="wid_adj_wet", help="Preferred link width field for RAPID K preparation.")
@@ -47,6 +56,12 @@ def main(argv: list[str] | None = None) -> int:
         forcing_config=ForcingConfig(
             time_column=args.time_column,
             discharge_column=args.discharge_column,
+            station_key_column=args.station_key_column,
+            station_key=args.forcing_station_key,
+            start_time=args.forcing_start_time,
+            end_time=args.forcing_end_time,
+            resample_minutes=args.forcing_resample_minutes,
+            output_cache_dir=args.forcing_output_cache_dir,
         ),
         prep_config=RapidPrepConfig(
             width_field=args.width_field,

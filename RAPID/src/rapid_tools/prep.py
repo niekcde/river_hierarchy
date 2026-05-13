@@ -10,17 +10,17 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import geopandas as gpd
-import netCDF4
 import networkx as nx
 import numpy as np
 import pandas as pd
 import shapely
 import shapely.wkt
+from scipy.io import netcdf_file
 from shapely import wkt
 from shapely.geometry import LineString
 from shapely.ops import substring
 
-from .forcing import ForcingConfig, infer_forcing_dt_seconds, load_forcing_table, write_inflow_netcdf
+from .forcing import ForcingConfig, infer_forcing_dt_seconds, prepare_forcing_table, write_inflow_netcdf
 from .k_values import KValueConfig, compute_k_values, compute_routing_dt_seconds
 from .registry import RapidStateContext, iter_preparable_states, load_state_registry
 from .slope import SlopeConfig, compute_link_slopes
@@ -291,43 +291,49 @@ def compute_reach_ratios(
         reach_to_uv[rid] = (u, v)
         width_of[rid] = float(data.get("width", 1.0))
 
+    outlet_sentinel = -1
+    while outlet_sentinel in reach_to_uv:
+        outlet_sentinel -= 1
+
     reach_graph = nx.DiGraph()
     reach_graph.add_nodes_from(reach_to_uv.keys())
     for rid, (_u, v) in reach_to_uv.items():
         for _, _v2, downstream_data in graph.out_edges(v, data=True):
             reach_graph.add_edge(rid, int(downstream_data["reach_id"]))
         if reach_graph.out_degree(rid) == 0:
-            reach_graph.add_edge(rid, 0)
-    if 0 in reach_graph.nodes:
-        reach_graph.nodes[0]["outlet"] = True
+            reach_graph.add_edge(rid, outlet_sentinel)
+    if outlet_sentinel in reach_graph.nodes:
+        reach_graph.nodes[outlet_sentinel]["outlet"] = True
 
     if len(reach_to_uv) <= 1:
-        order = list(reach_to_uv.keys()) + ([0] if 0 in reach_graph.nodes else [])
+        order = list(reach_to_uv.keys()) + ([outlet_sentinel] if outlet_sentinel in reach_graph.nodes else [])
     else:
         try:
             order = list(nx.topological_sort(reach_graph))
         except nx.NetworkXUnfeasible as exc:
             raise ValueError("Graph contains cycles; reach connectivity invalid") from exc
-    order = [rid for rid in order if rid != 0] + ([0] if 0 in reach_graph.nodes else [])
+    order = [rid for rid in order if rid != outlet_sentinel] + (
+        [outlet_sentinel] if outlet_sentinel in reach_graph.nodes else []
+    )
 
-    max_down = max((len(list(reach_graph.successors(rid))) for rid in order if rid != 0), default=1)
+    max_down = max((len(list(reach_graph.successors(rid))) for rid in order if rid != outlet_sentinel), default=1)
     ratios: dict[int, list[list[float]]] = {}
     for rid in order:
-        if rid == 0:
+        if rid == outlet_sentinel:
             continue
         downstream = list(reach_graph.successors(rid))
-        if 0 in downstream and len(downstream) > 1:
-            downstream.remove(0)
+        if outlet_sentinel in downstream and len(downstream) > 1:
+            downstream.remove(outlet_sentinel)
 
         if not use_widths:
-            if downstream == [0]:
+            if downstream == [outlet_sentinel]:
                 pairs = [[0, 0]]
             elif len(downstream) == 1:
                 pairs = [[downstream[0], 1]]
             else:
                 pairs = [[downstream_id, 1] for downstream_id in downstream]
         else:
-            if downstream == [0]:
+            if downstream == [outlet_sentinel]:
                 pairs = [[0, 0]]
             elif len(downstream) == 1:
                 pairs = [[downstream[0], 1]]
@@ -474,44 +480,42 @@ def create_runoff(
         volume_m3[~source_mask] = 0.0
         m3_riv[timestep_index, :] = volume_m3
 
-    ds = netCDF4.Dataset(output_netcdf, "w", format="NETCDF4")
-    ds.title = "Synthetic runoff for RAPID routing"
-    ds.institution = "River Hierarchy Synthetic runs"
-    ds.createDimension("time", n_timesteps)
-    ds.createDimension("rivid", n_reaches)
-    ds.createDimension("nv", 2)
+    with netcdf_file(output_netcdf, "w") as ds:
+        ds.title = b"Synthetic runoff for RAPID routing"
+        ds.institution = b"River Hierarchy Synthetic runs"
+        ds.createDimension("time", n_timesteps)
+        ds.createDimension("rivid", n_reaches)
+        ds.createDimension("nv", 2)
 
-    m3_var = ds.createVariable("m3_riv", "f4", ("time", "rivid"))
-    rivid_var = ds.createVariable("rivid", "i8", ("rivid",))
-    time_var = ds.createVariable("time", "i8", ("time",))
-    time_bnds_var = ds.createVariable("time_bnds", "i8", ("time", "nv"))
-    lon_var = ds.createVariable("lon", "f8", ("rivid",))
-    lat_var = ds.createVariable("lat", "f8", ("rivid",))
-    ds.createVariable("crs", "i4")
+        m3_var = ds.createVariable("m3_riv", "f4", ("time", "rivid"))
+        rivid_var = ds.createVariable("rivid", "i8", ("rivid",))
+        time_var = ds.createVariable("time", "i8", ("time",))
+        time_bnds_var = ds.createVariable("time_bnds", "i8", ("time", "nv"))
+        lon_var = ds.createVariable("lon", "f8", ("rivid",))
+        lat_var = ds.createVariable("lat", "f8", ("rivid",))
+        ds.createVariable("crs", "i4", ())
 
-    ds.Conventions = "CF-1.6"
-    ds.featureType = "timeSeries"
-    ds.history = f"Created on {datetime.now(UTC).isoformat()}"
+        ds.Conventions = b"CF-1.6"
+        ds.featureType = b"timeSeries"
+        ds.history = f"Created on {datetime.now(UTC).isoformat()}".encode("utf-8")
 
-    rivid_var[:] = reach_ids
-    lon_var[:] = lons
-    lat_var[:] = lats
-    m3_var[:, :] = m3_riv
+        rivid_var[:] = reach_ids
+        lon_var[:] = lons
+        lat_var[:] = lats
+        m3_var[:, :] = m3_riv
 
-    base_time = datetime(2015, 1, 1)
-    times = [
-        int((base_time + timedelta(seconds=dt_seconds * timestep_index) - base_time).total_seconds())
-        for timestep_index in range(n_timesteps)
-    ]
-    time_var[:] = times
-    time_var.units = "seconds since 2015-01-01 00:00:00 +00:00"
-    time_var.calendar = "gregorian"
-    time_var.bounds = "time_bnds"
-    for timestep_index in range(n_timesteps):
-        time_bnds_var[timestep_index, 0] = times[timestep_index]
-        time_bnds_var[timestep_index, 1] = times[timestep_index] + dt_seconds
-
-    ds.close()
+        base_time = datetime(2015, 1, 1)
+        times = [
+            int((base_time + timedelta(seconds=dt_seconds * timestep_index) - base_time).total_seconds())
+            for timestep_index in range(n_timesteps)
+        ]
+        time_var[:] = times
+        time_var.units = b"seconds since 2015-01-01 00:00:00 +00:00"
+        time_var.calendar = b"gregorian"
+        time_var.bounds = b"time_bnds"
+        for timestep_index in range(n_timesteps):
+            time_bnds_var[timestep_index, 0] = times[timestep_index]
+            time_bnds_var[timestep_index, 1] = times[timestep_index] + dt_seconds
     if return_times:
         return np.array(times, dtype=np.int64)
     return None
@@ -736,8 +740,9 @@ def prepare_state(
     inflow_path = None
     forcing_dt_seconds = None
     routing_dt_seconds = None
+    forcing_metadata: dict[str, object] | None = None
     if forcing_path is not None:
-        forcing = load_forcing_table(forcing_path, config=forcing_config)
+        forcing, forcing_metadata = prepare_forcing_table(forcing_path, config=forcing_config)
         forcing_dt_seconds = infer_forcing_dt_seconds(forcing)
         routing_dt_seconds = compute_routing_dt_seconds(
             rapid_links["rapid_k"],
@@ -753,6 +758,7 @@ def prepare_state(
         "state_role": context.state_role,
         "prep_config": asdict(prep_config),
         "forcing_config": asdict(forcing_config) if forcing_path is not None else None,
+        "forcing_metadata": forcing_metadata,
         "paths": {
             "directed_links": str(context.directed_links_path),
             "directed_nodes": str(context.directed_nodes_path),
@@ -811,6 +817,9 @@ def prepare_state(
         "rapid_node_attributes_csv": str(rapid_nodes_path),
         "forcing_normalized_csv": str(forcing_table_path) if forcing_table_path is not None else "",
         "inflow_nc": str(inflow_path) if inflow_path is not None else "",
+        "forcing_station_key": forcing_metadata.get("selected_station_key", "") if forcing_metadata is not None else "",
+        "forcing_cache_csv": forcing_metadata.get("forcing_cache_csv", "") if forcing_metadata is not None else "",
+        "forcing_loaded_from_cache": bool(forcing_metadata.get("forcing_loaded_from_cache", False)) if forcing_metadata is not None else False,
         "forcing_dt_seconds": forcing_dt_seconds if forcing_dt_seconds is not None else "",
         "routing_dt_seconds": routing_dt_seconds if routing_dt_seconds is not None else "",
         "n_source_links": int(len(prepared_links)),
@@ -874,6 +883,7 @@ def prepare_experiment(
             {
                 "experiment_dir": str(experiment_path),
                 "forcing_path": str(Path(forcing_path).expanduser().resolve()) if forcing_path is not None else None,
+                "forcing_config": asdict(forcing_config) if forcing_config is not None else None,
                 "states_total": int(len(prep_registry)),
                 "states_prepared": int(prep_registry["status"].eq("prepared").sum()) if not prep_registry.empty else 0,
                 "states_failed": int(prep_registry["status"].eq("failed").sum()) if not prep_registry.empty else 0,

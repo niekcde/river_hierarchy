@@ -65,6 +65,63 @@ Prep writes RAPID inputs under `states/<state_id>/rapid/prep/` and can:
 - optionally split long links into RAPID-only subreaches
 - normalize forcing and write `inflow.nc`
 
+### Forcing Normalization In Prep
+
+The forcing normalization step belongs to `run_prepare_experiment.py`, not to
+`run_rapid_experiment.py`.
+
+Prep can now:
+
+- select one explicit `station_key` from a multi-station forcing source
+- truncate the record to an inclusive UTC start/end window
+- resample the selected hydrograph to a fixed interval in minutes
+- interpolate missing interior bins using time interpolation
+- optionally reuse a shared normalized-forcing cache across repeated prep runs
+
+The canonical forcing actually used by RAPID is still written per state to:
+
+- `states/<state_id>/rapid/prep/forcing_normalized.csv`
+
+If a shared cache directory is provided, prep also writes a reusable normalized
+forcing CSV plus sidecar metadata JSON keyed by:
+
+- source file stem
+- `station_key`
+- forcing start/end window
+- normalized timestep
+
+Example:
+
+```bash
+python RAPID/run_prepare_experiment.py /path/to/experiment \
+  --forcing-path SWORD_gauge_match/outputs/subdaily_values/BR/subdaily_timeseries.parquet \
+  --forcing-station-key BR:3652880 \
+  --station-key-column station_key \
+  --time-column time \
+  --discharge-column discharge \
+  --forcing-start-time 2023-02-12T00:00:00Z \
+  --forcing-end-time 2023-02-23T00:00:00Z \
+  --forcing-resample-minutes 15 \
+  --forcing-output-cache-dir SWORD_gauge_match/outputs/rapid_forcing_cache
+```
+
+After prep, routing and hydrograph metrics use the prepared forcing directly:
+
+```bash
+python RAPID/run_rapid_experiment.py /path/to/experiment
+```
+
+Important behavior:
+
+- if the forcing source contains multiple station keys, `--forcing-station-key`
+  is required
+- if the source contains exactly one station key, prep can infer it
+- forcing truncation uses inclusive bounds
+- resampling changes the forcing timestep seen by RAPID, so prep will still
+  validate that a stable routing timestep exists for the chosen normalized dt
+- resampling densifies the series; it does not create new hydrologic
+  information beyond the source observations
+
 Routing then writes per-state RAPID outputs under `states/<state_id>/rapid/run/`
 and can export outlet hydrograph summaries.
 
