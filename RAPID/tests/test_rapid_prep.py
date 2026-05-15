@@ -251,6 +251,71 @@ def test_prepare_experiment_reuses_station_key_forcing_cache(tmp_path: Path) -> 
     assert bool(registry.loc[0, "forcing_loaded_from_cache"])
 
 
+def test_prepare_experiment_uses_reference_section_kb(tmp_path: Path, monkeypatch) -> None:
+    experiment_dir = _write_state(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_compute_reference_section_kb(
+        experiment_dir_arg,
+        *,
+        forcing,
+        width_sample_field,
+        width_percentile,
+        model_path,
+    ):
+        captured["experiment_dir"] = str(experiment_dir_arg)
+        captured["forcing_peak"] = float(pd.to_numeric(forcing["discharge_cms"], errors="coerce").max())
+        captured["width_sample_field"] = width_sample_field
+        captured["width_percentile"] = width_percentile
+        captured["model_path"] = model_path
+        return {
+            "kb_source_method": "based_reference_section",
+            "kb_value": 12.5,
+            "reference_discharge_cms": 120.0,
+            "reference_width_m": 320.0,
+            "reference_slope": 1.2e-4,
+            "reference_depth_m": 25.6,
+            "reference_section_summary_path": str(experiment_dir / "reference_section" / "reference_section_summary.json"),
+            "based_model_path": "/tmp/based_model_v2.ubj",
+        }
+
+    monkeypatch.setattr("rapid_tools.prep.compute_reference_section_kb", fake_compute_reference_section_kb)
+
+    registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=experiment_dir / "forcing.csv",
+        prep_config=RapidPrepConfig(
+            kb_mode="based_reference_section",
+            kb_width_sample_field="width_wet",
+            kb_width_percentile=90.0,
+        ),
+    )
+
+    assert registry.loc[0, "status"] == "prepared"
+    assert registry.loc[0, "rapid_kb_value"] == 12.5
+    assert registry.loc[0, "rapid_kb_source_method"] == "based_reference_section"
+    assert captured["forcing_peak"] == 120.0
+    assert captured["width_sample_field"] == "width_wet"
+    assert captured["width_percentile"] == 90.0
+
+    prep_dir = experiment_dir / "states" / "S001_unit_1" / "rapid" / "prep"
+    rapid_links = pd.read_csv(prep_dir / "rapid_link_attributes.csv")
+    assert set(rapid_links["rapid_kb_value"].round(6)) == {12.5}
+    assert set(rapid_links["rapid_kb_source_method"]) == {"based_reference_section"}
+    assert set(rapid_links["rapid_kb_reference_discharge_cms"].round(6)) == {120.0}
+    assert set(rapid_links["rapid_kb_reference_width_m"].round(6)) == {320.0}
+    assert set(rapid_links["rapid_kb_reference_slope"].round(9)) == {0.00012}
+    assert set(rapid_links["rapid_kb_reference_depth_m"].round(6)) == {25.6}
+
+    manifest = json.loads((prep_dir / "rapid_prep_manifest.json").read_text())
+    assert manifest["kb_summary"]["kb_value"] == 12.5
+    assert manifest["kb_summary"]["kb_source_method"] == "based_reference_section"
+
+    experiment_manifest = json.loads((experiment_dir / "rapid_prep_manifest.json").read_text())
+    assert experiment_manifest["reference_kb_summary"]["kb_value"] == 12.5
+    assert experiment_manifest["reference_kb_summary"]["kb_source_method"] == "based_reference_section"
+
+
 def test_run_prepared_experiment_writes_qout(tmp_path: Path) -> None:
     experiment_dir = _write_state(tmp_path)
     prepare_experiment(
@@ -274,6 +339,34 @@ def test_run_prepared_experiment_writes_qout(tmp_path: Path) -> None:
     assert "time_to_peak_seconds" in hydrograph_metrics.columns
     assert hydrograph_metrics.loc[0, "event_start_source"] == "auto_input_global_min_prepeak_fallback"
     assert hydrograph_metrics.loc[0, "event_end_source"] == "auto_outlet_series_end_fallback"
+
+
+def test_compute_k_values_exports_kb_provenance() -> None:
+    frame = pd.DataFrame(
+        {
+            "link_length_m": [1000.0],
+            "wid_adj_wet": [50.0],
+            "slope_used": [1e-3],
+        }
+    )
+    prepared = compute_k_values(
+        frame,
+        config=KValueConfig(
+            kb_value=18.0,
+            kb_source_method="based_reference_section",
+            kb_reference_discharge_cms=345.0,
+            kb_reference_width_m=275.0,
+            kb_reference_slope=2.5e-4,
+            kb_reference_depth_m=15.2777778,
+        ),
+    )
+
+    assert prepared.loc[0, "rapid_kb_value"] == 18.0
+    assert prepared.loc[0, "rapid_kb_source_method"] == "based_reference_section"
+    assert prepared.loc[0, "rapid_kb_reference_discharge_cms"] == 345.0
+    assert prepared.loc[0, "rapid_kb_reference_width_m"] == 275.0
+    assert prepared.loc[0, "rapid_kb_reference_slope"] == 2.5e-4
+    assert prepared.loc[0, "rapid_kb_reference_depth_m"] == 15.2777778
 
 
 def test_prepare_experiment_accepts_real_link_id_zero(tmp_path: Path) -> None:

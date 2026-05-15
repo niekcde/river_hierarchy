@@ -33,6 +33,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width-field", default="wid_adj_wet", help="Preferred link width field for RAPID K preparation.")
     parser.add_argument("--x-value", type=float, default=0.1, help="Muskingum X parameter.")
     parser.add_argument("--kb-value", type=float, default=20.0, help="K-value helper parameter kb.")
+    parser.add_argument("--kb-mode", choices=["fixed", "based_reference_section"], default="fixed", help="How to select kb for RAPID K preparation.")
+    parser.add_argument("--kb-model-path", help="Optional local path to the BASED model .ubj file when kb-mode=based_reference_section.")
+    parser.add_argument("--kb-width-sample-field", default="width_wet", help="Reference-section width sample field used when kb-mode=based_reference_section.")
+    parser.add_argument("--kb-width-percentile", type=float, default=90.0, help="Reference-section width percentile used when kb-mode=based_reference_section.")
     parser.add_argument("--n-manning", type=float, default=0.35, help="Manning roughness used in K preparation.")
     parser.add_argument("--min-width", type=float, default=1.0, help="Minimum positive width used when width is missing or invalid.")
     parser.add_argument("--min-effective-length-for-k-m", type=float, help="Optional K-only lower bound for effective reach length in meters. Geometry and exported link lengths are unchanged.")
@@ -72,6 +76,10 @@ def main(argv: list[str] | None = None) -> int:
             width_field=args.width_field,
             x_value=args.x_value,
             kb_value=args.kb_value,
+            kb_mode=args.kb_mode,
+            kb_model_path=args.kb_model_path,
+            kb_width_sample_field=args.kb_width_sample_field,
+            kb_width_percentile=args.kb_width_percentile,
             n_manning=args.n_manning,
             min_width=args.min_width,
             min_effective_length_for_k_m=args.min_effective_length_for_k_m,

@@ -11,6 +11,11 @@ class KValueConfig:
     width_field: str = "wid_adj_wet"
     x_value: float = 0.1
     kb_value: float = 20.0
+    kb_source_method: str = "fixed_scalar"
+    kb_reference_discharge_cms: float | None = None
+    kb_reference_width_m: float | None = None
+    kb_reference_slope: float | None = None
+    kb_reference_depth_m: float | None = None
     n_manning: float = 0.35
     min_width: float = 1.0
     min_effective_length_m: float | None = None
@@ -75,6 +80,20 @@ def compute_k_values(
     frame["rapid_width_m"] = frame["rapid_width_m"].clip(lower=config.min_width).astype(float)
 
     frame["rapid_x"] = float(config.x_value)
+    frame["rapid_kb_value"] = float(config.kb_value)
+    frame["rapid_kb_source_method"] = str(config.kb_source_method)
+    frame["rapid_kb_reference_discharge_cms"] = (
+        float(config.kb_reference_discharge_cms) if config.kb_reference_discharge_cms is not None else np.nan
+    )
+    frame["rapid_kb_reference_width_m"] = (
+        float(config.kb_reference_width_m) if config.kb_reference_width_m is not None else np.nan
+    )
+    frame["rapid_kb_reference_slope"] = (
+        float(config.kb_reference_slope) if config.kb_reference_slope is not None else np.nan
+    )
+    frame["rapid_kb_reference_depth_m"] = (
+        float(config.kb_reference_depth_m) if config.kb_reference_depth_m is not None else np.nan
+    )
     frame["rapid_celerity_mps_raw"] = (
         (5.0 / (3.0 * float(config.n_manning)))
         * np.sqrt(frame["slope_used"].astype(float))

@@ -22,6 +22,7 @@ from shapely.ops import substring
 
 from .forcing import ForcingConfig, infer_forcing_dt_seconds, prepare_forcing_table, write_inflow_netcdf
 from .k_values import KValueConfig, compute_k_values, compute_routing_dt_seconds
+from .reference_section import compute_reference_section_kb
 from .registry import RapidStateContext, iter_preparable_states, load_state_registry
 from .slope import SlopeConfig, compute_link_slopes
 
@@ -31,6 +32,10 @@ class RapidPrepConfig:
     width_field: str = "wid_adj_wet"
     x_value: float = 0.1
     kb_value: float = 20.0
+    kb_mode: str = "fixed"
+    kb_model_path: str | None = None
+    kb_width_sample_field: str = "width_wet"
+    kb_width_percentile: float = 90.0
     n_manning: float = 0.35
     min_width: float = 1.0
     min_effective_length_for_k_m: float | None = None
@@ -676,12 +681,49 @@ def build_rapid_graph(
     return graph
 
 
+def _resolve_selected_kb(
+    prep_config: RapidPrepConfig,
+    reference_kb_summary: Mapping[str, object] | None,
+) -> dict[str, object]:
+    kb_mode = str(prep_config.kb_mode or "fixed")
+    if kb_mode == "fixed":
+        return {
+            "kb_value": float(prep_config.kb_value),
+            "kb_source_method": "fixed_scalar",
+            "reference_discharge_cms": np.nan,
+            "reference_width_m": np.nan,
+            "reference_slope": np.nan,
+            "reference_depth_m": np.nan,
+            "reference_section_summary_path": "",
+            "based_model_path": "",
+        }
+    if kb_mode == "based_reference_section":
+        if reference_kb_summary is None:
+            raise ValueError("based_reference_section kb mode requires a reference_kb_summary.")
+        return {
+            "kb_value": float(reference_kb_summary["kb_value"]),
+            "kb_source_method": str(reference_kb_summary["kb_source_method"]),
+            "reference_discharge_cms": float(reference_kb_summary["reference_discharge_cms"]),
+            "reference_width_m": float(reference_kb_summary["reference_width_m"]),
+            "reference_slope": float(reference_kb_summary["reference_slope"]),
+            "reference_depth_m": float(reference_kb_summary["reference_depth_m"]),
+            "reference_section_summary_path": str(reference_kb_summary.get("reference_section_summary_path", "") or ""),
+            "based_model_path": str(reference_kb_summary.get("based_model_path", "") or ""),
+        }
+    raise ValueError(
+        f"Unsupported kb_mode '{kb_mode}'. Expected one of: fixed, based_reference_section."
+    )
+
+
 def prepare_state(
     context: RapidStateContext,
     *,
     forcing_path: str | Path | None = None,
     forcing_config: ForcingConfig | None = None,
     prep_config: RapidPrepConfig | None = None,
+    forcing_table: pd.DataFrame | None = None,
+    forcing_metadata: Mapping[str, object] | None = None,
+    reference_kb_summary: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     prep_config = prep_config or RapidPrepConfig()
     forcing_config = forcing_config or ForcingConfig()
@@ -719,12 +761,34 @@ def prepare_state(
     )
     rapid_links["centroid_x"] = rapid_links.geometry.centroid.x.astype(float)
     rapid_links["centroid_y"] = rapid_links.geometry.centroid.y.astype(float)
+    selected_kb = _resolve_selected_kb(prep_config, reference_kb_summary)
     rapid_links = compute_k_values(
         rapid_links,
         config=KValueConfig(
             width_field=prep_config.width_field,
             x_value=prep_config.x_value,
-            kb_value=prep_config.kb_value,
+            kb_value=float(selected_kb["kb_value"]),
+            kb_source_method=str(selected_kb["kb_source_method"]),
+            kb_reference_discharge_cms=(
+                float(selected_kb["reference_discharge_cms"])
+                if pd.notna(selected_kb["reference_discharge_cms"])
+                else None
+            ),
+            kb_reference_width_m=(
+                float(selected_kb["reference_width_m"])
+                if pd.notna(selected_kb["reference_width_m"])
+                else None
+            ),
+            kb_reference_slope=(
+                float(selected_kb["reference_slope"])
+                if pd.notna(selected_kb["reference_slope"])
+                else None
+            ),
+            kb_reference_depth_m=(
+                float(selected_kb["reference_depth_m"])
+                if pd.notna(selected_kb["reference_depth_m"])
+                else None
+            ),
             n_manning=prep_config.n_manning,
             min_width=prep_config.min_width,
             min_effective_length_m=prep_config.min_effective_length_for_k_m,
@@ -750,9 +814,14 @@ def prepare_state(
     inflow_path = None
     forcing_dt_seconds = None
     routing_dt_seconds = None
-    forcing_metadata: dict[str, object] | None = None
-    if forcing_path is not None:
-        forcing, forcing_metadata = prepare_forcing_table(forcing_path, config=forcing_config)
+    resolved_forcing_metadata = dict(forcing_metadata) if forcing_metadata is not None else None
+    if forcing_table is not None:
+        forcing = forcing_table.copy()
+    elif forcing_path is not None:
+        forcing, resolved_forcing_metadata = prepare_forcing_table(forcing_path, config=forcing_config)
+    else:
+        forcing = None
+    if forcing is not None:
         forcing_dt_seconds = infer_forcing_dt_seconds(forcing)
         routing_dt_seconds = compute_routing_dt_seconds(
             rapid_links["rapid_k"],
@@ -768,7 +837,33 @@ def prepare_state(
         "state_role": context.state_role,
         "prep_config": asdict(prep_config),
         "forcing_config": asdict(forcing_config) if forcing_path is not None else None,
-        "forcing_metadata": forcing_metadata,
+        "forcing_metadata": resolved_forcing_metadata,
+        "kb_summary": {
+            "kb_value": float(selected_kb["kb_value"]),
+            "kb_source_method": str(selected_kb["kb_source_method"]),
+            "reference_discharge_cms": (
+                float(selected_kb["reference_discharge_cms"])
+                if pd.notna(selected_kb["reference_discharge_cms"])
+                else None
+            ),
+            "reference_width_m": (
+                float(selected_kb["reference_width_m"])
+                if pd.notna(selected_kb["reference_width_m"])
+                else None
+            ),
+            "reference_slope": (
+                float(selected_kb["reference_slope"])
+                if pd.notna(selected_kb["reference_slope"])
+                else None
+            ),
+            "reference_depth_m": (
+                float(selected_kb["reference_depth_m"])
+                if pd.notna(selected_kb["reference_depth_m"])
+                else None
+            ),
+            "reference_section_summary_path": selected_kb["reference_section_summary_path"],
+            "based_model_path": selected_kb["based_model_path"],
+        },
         "paths": {
             "directed_links": str(context.directed_links_path),
             "directed_nodes": str(context.directed_nodes_path),
@@ -833,11 +928,13 @@ def prepare_state(
         "rapid_node_attributes_csv": str(rapid_nodes_path),
         "forcing_normalized_csv": str(forcing_table_path) if forcing_table_path is not None else "",
         "inflow_nc": str(inflow_path) if inflow_path is not None else "",
-        "forcing_station_key": forcing_metadata.get("selected_station_key", "") if forcing_metadata is not None else "",
-        "forcing_cache_csv": forcing_metadata.get("forcing_cache_csv", "") if forcing_metadata is not None else "",
-        "forcing_loaded_from_cache": bool(forcing_metadata.get("forcing_loaded_from_cache", False)) if forcing_metadata is not None else False,
+        "forcing_station_key": resolved_forcing_metadata.get("selected_station_key", "") if resolved_forcing_metadata is not None else "",
+        "forcing_cache_csv": resolved_forcing_metadata.get("forcing_cache_csv", "") if resolved_forcing_metadata is not None else "",
+        "forcing_loaded_from_cache": bool(resolved_forcing_metadata.get("forcing_loaded_from_cache", False)) if resolved_forcing_metadata is not None else False,
         "forcing_dt_seconds": forcing_dt_seconds if forcing_dt_seconds is not None else "",
         "routing_dt_seconds": routing_dt_seconds if routing_dt_seconds is not None else "",
+        "rapid_kb_value": float(selected_kb["kb_value"]),
+        "rapid_kb_source_method": str(selected_kb["kb_source_method"]),
         "n_source_links": int(len(prepared_links)),
         "n_links": int(len(rapid_links)),
         "link_multiplier": float(len(rapid_links) / len(prepared_links)) if len(prepared_links) else float("nan"),
@@ -873,17 +970,55 @@ def prepare_experiment(
     experiment_path = Path(experiment_dir).expanduser().resolve()
     registry = load_state_registry(experiment_path)
     prep_rows: list[dict[str, object]] = []
+    prep_config = prep_config or RapidPrepConfig()
+    forcing_config = forcing_config or ForcingConfig()
+
+    forcing_table: pd.DataFrame | None = None
+    forcing_metadata: dict[str, object] | None = None
+    reference_kb_summary: dict[str, object] | None = None
+    experiment_prepass_error: str | None = None
+
+    try:
+        if forcing_path is not None:
+            forcing_table, forcing_metadata = prepare_forcing_table(forcing_path, config=forcing_config)
+        if str(prep_config.kb_mode or "fixed") == "based_reference_section":
+            if forcing_table is None:
+                raise ValueError("based_reference_section kb mode requires forcing_path to be provided.")
+            reference_kb_summary = compute_reference_section_kb(
+                experiment_path,
+                forcing=forcing_table,
+                width_sample_field=prep_config.kb_width_sample_field,
+                width_percentile=prep_config.kb_width_percentile,
+                model_path=prep_config.kb_model_path,
+            )
+    except Exception as exc:  # pragma: no cover
+        experiment_prepass_error = str(exc)
 
     for context in iter_preparable_states(
         registry,
-        include_base_state=(prep_config.include_base_state if prep_config is not None else True),
+        include_base_state=prep_config.include_base_state,
     ):
+        if experiment_prepass_error is not None:
+            prep_rows.append(
+                {
+                    "state_id": context.state_id,
+                    "state_role": context.state_role,
+                    "rapid_prep_dir": str(context.rapid_prep_dir),
+                    "rapid_prep_manifest": "",
+                    "status": "failed",
+                    "error": experiment_prepass_error,
+                }
+            )
+            continue
         try:
             result = prepare_state(
                 context,
                 forcing_path=forcing_path,
                 forcing_config=forcing_config,
                 prep_config=prep_config,
+                forcing_table=forcing_table,
+                forcing_metadata=forcing_metadata,
+                reference_kb_summary=reference_kb_summary,
             )
         except Exception as exc:  # pragma: no cover
             result = {
@@ -906,6 +1041,9 @@ def prepare_experiment(
                 "experiment_dir": str(experiment_path),
                 "forcing_path": str(Path(forcing_path).expanduser().resolve()) if forcing_path is not None else None,
                 "forcing_config": asdict(forcing_config) if forcing_config is not None else None,
+                "prep_config": asdict(prep_config),
+                "reference_kb_summary": reference_kb_summary,
+                "experiment_prepass_error": experiment_prepass_error,
                 "states_total": int(len(prep_registry)),
                 "states_prepared": int(prep_registry["status"].eq("prepared").sum()) if not prep_registry.empty else 0,
                 "states_failed": int(prep_registry["status"].eq("failed").sum()) if not prep_registry.empty else 0,

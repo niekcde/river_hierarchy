@@ -456,3 +456,27 @@ def compute_link_slopes(
     )
     frame["slope_minimum_applied"] = frame["slope_used"].eq(config.min_slope)
     return frame
+
+
+def compute_section_slope_reference(
+    nodes: gpd.GeoDataFrame,
+    *,
+    config: SlopeConfig | None = None,
+) -> dict[str, object]:
+    config = config or SlopeConfig()
+    missing = sorted(REQUIRED_NODE_COLUMNS.difference(nodes.columns))
+    if missing:
+        raise ValueError(
+            "Directed nodes are missing required SWORD WSE columns: "
+            + ", ".join(missing)
+        )
+    node_attrs = _resolve_rapid_wse_for_slope(nodes, config=config)
+    slope_ref, source_method, anchor_count = _compute_section_slope_reference(
+        node_attrs,
+        config=config,
+    )
+    return {
+        "slope": float(slope_ref),
+        "source_method": str(source_method),
+        "anchor_count": int(anchor_count),
+    }
