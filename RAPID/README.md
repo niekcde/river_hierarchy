@@ -66,6 +66,7 @@ Prep writes RAPID inputs under `states/<state_id>/rapid/prep/` and can:
 - optionally apply a K-only effective-length floor for very short routing links
 - optionally cap implied celerity
 - optionally split long links into RAPID-only subreaches
+- optionally derive one width per RAPID subreach from `link_width_samples.csv`
 - normalize forcing and write `inflow.nc`
 
 ### Forcing Normalization In Prep
@@ -147,6 +148,39 @@ parameterization:
 
 These controls are intended as numerical and hydraulic safeguards, not as a
 replacement for the underlying network geometry.
+
+### Subreach-Varying Width
+
+When `--target-subreach-length-m` is used, RAPID can now optionally assign a
+different width to each derived subreach instead of copying one parent-link
+width across every segment.
+
+This uses the existing per-link transect samples already written by
+`network_variants` in:
+
+- `variant/widths/link_width_samples.csv`
+
+Relevant flags:
+
+- `--vary-width-by-subreach`
+- `--subreach-width-sample-field width_wet`
+
+Current behavior:
+
+- slope still stays constant within a split parent link
+- width is summarized independently for each subreach from the requested raw
+  width sample field
+- the current summary statistic is the median of positive samples that fall on
+  that subreach
+- subreach-varying width is used for RAPID `K`
+- bifurcation split ratios still use a stable parent-link width so the first
+  split segment does not over-allocate a small branch just because the branch
+  mouth is locally wide
+- if a subreach has no usable samples, prep falls back to the parent-link
+  width field
+
+This is mainly intended to preserve along-link width variation when a long
+collapsed link is segmented for RAPID routing.
 
 ### Example-Level Reference `kb`
 

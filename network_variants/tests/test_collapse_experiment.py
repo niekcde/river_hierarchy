@@ -20,9 +20,16 @@ def _workflow_outputs(
     unit_ids: list[int],
     *,
     group_specs: list[tuple[str, list[int]]] | None = None,
+    compound_rows: list[dict[str, Any]] | None = None,
 ) -> UnitWorkflowOutputs:
     unit_summary = pd.DataFrame({"unit_id": unit_ids})
     unit_metrics = pd.DataFrame({"unit_id": unit_ids})
+    if compound_rows:
+        compound_frame = pd.DataFrame(compound_rows)
+        if "unit_id" not in compound_frame.columns:
+            raise ValueError("compound_rows must contain unit_id values.")
+        unit_summary = unit_summary.merge(compound_frame, on="unit_id", how="left", validate="1:1")
+        unit_metrics = unit_metrics.merge(compound_frame, on="unit_id", how="left", validate="1:1")
     path_metrics = pd.DataFrame(columns=["unit_id", "path_id"])
     hierarchy_level_metrics = pd.DataFrame(columns=["collapse_level"])
 
@@ -366,6 +373,81 @@ def test_independent_units_creates_one_child_per_base_unit(tmp_path: Path) -> No
     assert results.manifest["stop_reason"] == "all_base_units_processed"
 
 
+def test_compound_bubbles_creates_one_child_per_compound_bubble(tmp_path: Path) -> None:
+    workflow_runner = _make_workflow_runner(
+        [
+            _workflow_outputs(
+                [5, 7, 2, 9, 11],
+                compound_rows=[
+                    {
+                        "unit_id": 5,
+                        "compound_bubble_id": 13,
+                        "in_compound_bubble": True,
+                        "compound_bubble_role": "bubble_root",
+                        "unit_node_count": 12,
+                    },
+                    {
+                        "unit_id": 7,
+                        "compound_bubble_id": 13,
+                        "in_compound_bubble": True,
+                        "compound_bubble_role": "bubble_member",
+                        "unit_node_count": 9,
+                    },
+                    {
+                        "unit_id": 2,
+                        "compound_bubble_id": 8,
+                        "in_compound_bubble": True,
+                        "compound_bubble_role": "bubble_root",
+                        "unit_node_count": 7,
+                    },
+                    {
+                        "unit_id": 9,
+                        "compound_bubble_id": 8,
+                        "in_compound_bubble": True,
+                        "compound_bubble_role": "bubble_member",
+                        "unit_node_count": 6,
+                    },
+                    {
+                        "unit_id": 11,
+                        "compound_bubble_id": 21,
+                        "in_compound_bubble": False,
+                        "compound_bubble_role": "standalone",
+                        "unit_node_count": 5,
+                    },
+                ],
+            ),
+            _workflow_outputs([1]),
+            _workflow_outputs([1]),
+        ]
+    )
+    variant_runner = _make_variant_runner()
+    base_state_materializer = _make_base_state_materializer()
+
+    results = run_collapse_experiment(
+        "compound-bubbles",
+        cleaned_mask_path=tmp_path / "base_cleaned.tif",
+        reviewed_links_path=tmp_path / "base_links.gpkg",
+        reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=tmp_path / "experiment",
+        unit_workflow_runner=workflow_runner,
+        unit_workflow_writer=write_unit_workflow_outputs,
+        variant_runner=variant_runner,
+        base_state_variant_materializer=base_state_materializer,
+    )
+
+    assert [call["unit_ids"] for call in variant_runner.calls] == [[5, 7], [2, 9]]
+    assert list(results.state_registry["state_id"]) == ["S000_base", "CB001_bubble_13", "CB002_bubble_8"]
+    derived = results.state_registry.loc[results.state_registry["state_role"] == "derived"].copy()
+    assert derived["selection_type"].tolist() == ["compound_bubble", "compound_bubble"]
+    assert derived["is_compound_state"].tolist() == [True, True]
+    assert derived["compound_bubble_id"].astype(int).tolist() == [13, 8]
+    assert derived["bubble_root_unit_id"].astype(int).tolist() == [5, 2]
+    assert derived["total_unit_nodes_selected"].astype(int).tolist() == [21, 13]
+    assert results.manifest["stop_reason"] == "all_compound_bubbles_processed"
+    assert results.manifest["n_compound_states"] == 2
+
+
 def test_base_state_is_materialized_as_local_variant_outputs(tmp_path: Path) -> None:
     workflow_runner = _make_workflow_runner([_workflow_outputs([5]), _workflow_outputs([])])
     variant_runner = _make_variant_runner()
@@ -434,6 +516,77 @@ def test_independent_units_records_failed_variant_and_continues(tmp_path: Path) 
     assert Path(failed_row["direction_validation_report"]).exists()
     assert Path(failed_row["failure_artifact_path"]).exists()
     assert results.manifest["n_failed_states"] == 1
+
+
+def test_independent_units_rerun_cleans_existing_state_directories(tmp_path: Path) -> None:
+    def make_runner() -> Any:
+        return _make_workflow_runner([_workflow_outputs([5]), _workflow_outputs([])])
+
+    variant_runner = _make_variant_runner()
+    base_state_materializer = _make_base_state_materializer()
+    output_dir = tmp_path / "experiment"
+
+    first = run_collapse_experiment(
+        "independent-units",
+        cleaned_mask_path=tmp_path / "base_cleaned.tif",
+        reviewed_links_path=tmp_path / "base_links.gpkg",
+        reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=output_dir,
+        unit_workflow_runner=make_runner(),
+        unit_workflow_writer=write_unit_workflow_outputs,
+        variant_runner=variant_runner,
+        base_state_variant_materializer=base_state_materializer,
+    )
+
+    base_stale = output_dir / "states" / "S000_base" / "stale.txt"
+    child_stale = output_dir / "states" / "S001_unit_5" / "stale.txt"
+    base_stale.write_text("old")
+    child_stale.write_text("old")
+
+    second = run_collapse_experiment(
+        "independent-units",
+        cleaned_mask_path=tmp_path / "base_cleaned.tif",
+        reviewed_links_path=tmp_path / "base_links.gpkg",
+        reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=output_dir,
+        unit_workflow_runner=make_runner(),
+        unit_workflow_writer=write_unit_workflow_outputs,
+        variant_runner=variant_runner,
+        base_state_variant_materializer=base_state_materializer,
+    )
+
+    assert first.manifest["n_complete_states"] == 2
+    assert second.manifest["n_complete_states"] == 2
+    assert not base_stale.exists()
+    assert not child_stale.exists()
+
+
+def test_independent_units_records_exception_type_for_child_build_failures(tmp_path: Path) -> None:
+    workflow_runner = _make_workflow_runner([_workflow_outputs([5])])
+    base_state_materializer = _make_base_state_materializer()
+
+    def variant_runner(**kwargs: Any) -> NetworkVariantOutputs:
+        raise KeyError(6)
+
+    results = run_collapse_experiment(
+        "independent-units",
+        cleaned_mask_path=tmp_path / "base_cleaned.tif",
+        reviewed_links_path=tmp_path / "base_links.gpkg",
+        reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=tmp_path / "experiment",
+        unit_workflow_runner=workflow_runner,
+        unit_workflow_writer=write_unit_workflow_outputs,
+        variant_runner=variant_runner,
+        base_state_variant_materializer=base_state_materializer,
+    )
+
+    failed_row = results.state_registry.loc[results.state_registry["state_id"] == "S001_unit_5"].iloc[0]
+    assert failed_row["status"] == "failed"
+    assert failed_row["error"] == "KeyError: 6"
+    assert "KeyError" in failed_row["error_traceback"]
 
 
 def test_build_unit_link_membership_derives_link_to_unit_mapping() -> None:

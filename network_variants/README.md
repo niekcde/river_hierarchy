@@ -238,6 +238,10 @@ Available modes:
 
 - `independent-units`
   Collapse each base-state unit independently from the same base network.
+- `compound-bubbles`
+  Collapse each real multi-unit `compound_bubble_id` independently from the
+  same base network. These states are written as a separate scenario family
+  and are explicitly marked as compound-bubble states in the registry.
 - `sequential-units`
   Collapse the currently highest-ranked unit, regenerate the network, rerun
   hierarchy, then repeat.
@@ -294,6 +298,19 @@ Example: independent base-unit variants
   --reviewed-nodes hierarchy_level_definition/manual_review/outputs/sarl_03/reviewed_nodes.gpkg \
   --exit-sides NS \
   --experiment-id sarl_03_independent_units
+```
+
+Example: independent compound-bubble variants
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python \
+  network_variants/run_collapse_experiment.py \
+  compound-bubbles \
+  --cleaned-mask rivgraph_centerline/outputs/smoke_tests/sarl_03/masks_cleaned/sarl_03_cleaned.tif \
+  --reviewed-links hierarchy_level_definition/manual_review/outputs/sarl_03/directed_links.gpkg \
+  --reviewed-nodes hierarchy_level_definition/manual_review/outputs/sarl_03/reviewed_nodes.gpkg \
+  --exit-sides NS \
+  --experiment-id sarl_03_compound_bubbles
 ```
 
 Example: adaptive sequential unit collapse

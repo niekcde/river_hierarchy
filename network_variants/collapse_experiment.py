@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import sys
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,7 @@ from network_variants.variant_generation import (
 
 EXPERIMENT_MODES = (
     "independent-units",
+    "compound-bubbles",
     "sequential-units",
     "sequential-groups",
 )
@@ -52,6 +54,13 @@ class ExperimentSelection:
     selected_collapse_order: int | None
     selected_collapse_priority_score: float | None
     state_suffix: str
+    compound_bubble_id: int | None = None
+    bubble_root_unit_id: int | None = None
+    total_unit_nodes_selected: int | None = None
+
+    @property
+    def is_compound_state(self) -> bool:
+        return self.selection_type == "compound_bubble"
 
 
 @dataclass
@@ -242,6 +251,94 @@ def _select_all_units_from_ranking(
     ]
 
 
+def _select_compound_bubbles_from_workflow(workflow: UnitWorkflowOutputs) -> list[ExperimentSelection]:
+    summary = workflow.unit_summary.copy()
+    if summary.empty:
+        return []
+
+    fallback_columns = [
+        column
+        for column in (
+            "unit_id",
+            "compound_bubble_id",
+            "in_compound_bubble",
+            "compound_bubble_role",
+            "unit_node_count",
+        )
+        if column in workflow.unit_metrics.columns and column not in summary.columns
+    ]
+    if fallback_columns:
+        summary = summary.merge(
+            workflow.unit_metrics[["unit_id"] + fallback_columns],
+            on="unit_id",
+            how="left",
+            validate="1:1",
+        )
+
+    required = {"unit_id", "compound_bubble_id", "compound_bubble_role"}
+    if not required.issubset(summary.columns):
+        return []
+
+    working = summary.copy()
+    working["unit_id"] = pd.to_numeric(working["unit_id"], errors="coerce").astype("Int64")
+    working["compound_bubble_id"] = pd.to_numeric(working["compound_bubble_id"], errors="coerce").astype("Int64")
+    if "unit_node_count" in working.columns:
+        working["unit_node_count"] = pd.to_numeric(working["unit_node_count"], errors="coerce")
+    else:
+        working["unit_node_count"] = pd.Series([pd.NA] * len(working), dtype="Float64")
+
+    mask = (
+        working["compound_bubble_id"].notna()
+        & working["compound_bubble_role"].isin(["bubble_root", "bubble_member"])
+    )
+    working = working.loc[mask].copy()
+    if working.empty:
+        return []
+
+    selections: list[ExperimentSelection] = []
+    grouped = working.groupby("compound_bubble_id", sort=True)
+    for bubble_id, group in grouped:
+        unit_ids = sorted(int(unit_id) for unit_id in group["unit_id"].dropna().astype(int).tolist())
+        if len(unit_ids) < 2:
+            continue
+        bubble_root_rows = group.loc[group["compound_bubble_role"] == "bubble_root", "unit_id"]
+        if bubble_root_rows.empty:
+            bubble_root_unit_id = min(unit_ids)
+        else:
+            bubble_root_unit_id = int(pd.to_numeric(bubble_root_rows, errors="coerce").dropna().astype(int).min())
+        total_unit_nodes = (
+            int(group["unit_node_count"].fillna(0).sum())
+            if "unit_node_count" in group.columns
+            else None
+        )
+        bubble_numeric = int(bubble_id)
+        selections.append(
+            ExperimentSelection(
+                selection_type="compound_bubble",
+                selected_unit_ids=unit_ids,
+                selected_group_label=None,
+                selected_group_size=len(unit_ids),
+                selected_rank_start=None,
+                selected_rank_end=None,
+                selected_collapse_order=None,
+                selected_collapse_priority_score=None,
+                state_suffix=f"bubble_{bubble_numeric}",
+                compound_bubble_id=bubble_numeric,
+                bubble_root_unit_id=bubble_root_unit_id,
+                total_unit_nodes_selected=total_unit_nodes,
+            )
+        )
+
+    selections.sort(
+        key=lambda selection: (
+            -int(selection.selected_group_size),
+            -int(selection.total_unit_nodes_selected or 0),
+            int(selection.compound_bubble_id or 0),
+        )
+    )
+    return selections
+
+
 def _select_group_from_selected_groups(selected_groups: pd.DataFrame) -> ExperimentSelection | None:
     if selected_groups.empty or "group_label" not in selected_groups.columns or "unit_ids" not in selected_groups.columns:
         return None
@@ -283,6 +380,10 @@ def _state_record(context: ExperimentStateContext, mode: str) -> dict[str, Any]:
         "selected_rank_end": selection.selected_rank_end if selection is not None else pd.NA,
         "selected_collapse_order": selection.selected_collapse_order if selection is not None else pd.NA,
         "selected_collapse_priority_score": selection.selected_collapse_priority_score if selection is not None else float("nan"),
+        "is_compound_state": bool(selection.is_compound_state) if selection is not None else False,
+        "compound_bubble_id": selection.compound_bubble_id if selection is not None else pd.NA,
+        "bubble_root_unit_id": selection.bubble_root_unit_id if selection is not None else pd.NA,
+        "total_unit_nodes_selected": selection.total_unit_nodes_selected if selection is not None else pd.NA,
         "state_dir": str(context.state_dir.resolve()),
         "variant_output_dir": str(context.variant_output_dir.resolve()) if context.variant_output_dir is not None else "",
         "hierarchy_output_dir": str(context.hierarchy_output_dir.resolve()),
@@ -324,6 +425,10 @@ def _transition_record(
         "selected_rank_end": selection.selected_rank_end,
         "selected_collapse_order": selection.selected_collapse_order,
         "selected_collapse_priority_score": selection.selected_collapse_priority_score,
+        "is_compound_state": bool(selection.is_compound_state),
+        "compound_bubble_id": selection.compound_bubble_id if selection is not None else pd.NA,
+        "bubble_root_unit_id": selection.bubble_root_unit_id if selection is not None else pd.NA,
+        "total_unit_nodes_selected": selection.total_unit_nodes_selected if selection is not None else pd.NA,
         "n_units_before": int(len(parent_context.workflow.unit_metrics)),
         "n_units_after": int(len(child_context.workflow.unit_metrics)),
         "parent_hierarchy_output_dir": str(parent_context.hierarchy_output_dir.resolve()),
@@ -342,6 +447,23 @@ def _write_state_failure_artifact(state_dir: Path, payload: Mapping[str, Any]) -
     return path
 
 
+def _reset_state_dir(state_dir: Path) -> None:
+    if state_dir.exists():
+        shutil.rmtree(state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _format_exception(exc: BaseException) -> str:
+    message = str(exc).strip()
+    if message:
+        return f"{type(exc).__name__}: {message}"
+    return type(exc).__name__
+
+
+def _format_traceback(exc: BaseException) -> str:
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+
+
 def _failed_state_record(
     *,
     state_id: str,
@@ -352,6 +474,7 @@ def _failed_state_record(
     selection: ExperimentSelection,
     error_stage: str,
     error: str,
+    error_traceback: str = "",
     variant_outputs: NetworkVariantOutputs | None = None,
 ) -> dict[str, Any]:
     direction_report = ""
@@ -370,6 +493,7 @@ def _failed_state_record(
         "selected_group_label": selection.selected_group_label,
         "error_stage": error_stage,
         "error": error,
+        "error_traceback": error_traceback,
         "variant_output_dir": (
             str(variant_outputs.output_dir.resolve()) if variant_outputs is not None else ""
         ),
@@ -391,6 +515,10 @@ def _failed_state_record(
         "selected_rank_end": selection.selected_rank_end,
         "selected_collapse_order": selection.selected_collapse_order,
         "selected_collapse_priority_score": selection.selected_collapse_priority_score,
+        "is_compound_state": bool(selection.is_compound_state),
+        "compound_bubble_id": selection.compound_bubble_id if selection is not None else pd.NA,
+        "bubble_root_unit_id": selection.bubble_root_unit_id if selection is not None else pd.NA,
+        "total_unit_nodes_selected": selection.total_unit_nodes_selected if selection is not None else pd.NA,
         "state_dir": str(state_dir.resolve()),
         "variant_output_dir": str(variant_outputs.output_dir.resolve()) if variant_outputs is not None else "",
         "hierarchy_output_dir": "",
@@ -415,6 +543,7 @@ def _failed_state_record(
         "status": "failed",
         "error_stage": error_stage,
         "error": error,
+        "error_traceback": error_traceback,
         "failure_artifact_path": str(failure_artifact.resolve()),
     }
 
@@ -428,6 +557,7 @@ def _failed_transition_record(
     child_state_id: str,
     error_stage: str,
     error: str,
+    error_traceback: str = "",
     variant_outputs: NetworkVariantOutputs | None = None,
 ) -> dict[str, Any]:
     return {
@@ -446,6 +576,10 @@ def _failed_transition_record(
         "selected_rank_end": selection.selected_rank_end,
         "selected_collapse_order": selection.selected_collapse_order,
         "selected_collapse_priority_score": selection.selected_collapse_priority_score,
+        "is_compound_state": bool(selection.is_compound_state),
+        "compound_bubble_id": selection.compound_bubble_id if selection is not None else pd.NA,
+        "bubble_root_unit_id": selection.bubble_root_unit_id if selection is not None else pd.NA,
+        "total_unit_nodes_selected": selection.total_unit_nodes_selected if selection is not None else pd.NA,
         "n_units_before": int(len(parent_context.workflow.unit_metrics)),
         "n_units_after": pd.NA,
         "parent_hierarchy_output_dir": str(parent_context.hierarchy_output_dir.resolve()),
@@ -456,6 +590,7 @@ def _failed_transition_record(
         "status": "failed",
         "error_stage": error_stage,
         "error": error,
+        "error_traceback": error_traceback,
     }
 
 
@@ -1019,6 +1154,7 @@ def _build_child_state(
     unit_workflow_writer: Callable[..., None],
     unit_workflow_kwargs: Mapping[str, Any],
 ) -> ExperimentStateContext:
+    _reset_state_dir(state_dir)
     variant_dir = state_dir / "variant"
     variant_call_kwargs = dict(variant_kwargs)
     variant_call_kwargs.update(
@@ -1136,6 +1272,7 @@ def run_collapse_experiment(
     }
 
     base_state_id = "S000_base"
+    _reset_state_dir(states_dir / base_state_id)
     base_context = _run_state_hierarchy(
         state_id=base_state_id,
         parent_state_id=None,
@@ -1175,6 +1312,7 @@ def run_collapse_experiment(
     def write_metadata() -> None:
         n_complete_states = sum(1 for record in state_records if record.get("status") == "complete")
         n_failed_states = sum(1 for record in state_records if record.get("status") == "failed")
+        n_compound_states = sum(1 for record in state_records if bool(record.get("is_compound_state", False)))
         manifest = {
             "experiment_id": experiment_id,
             "mode": mode,
@@ -1191,6 +1329,7 @@ def run_collapse_experiment(
             "n_states": len(state_records),
             "n_complete_states": n_complete_states,
             "n_failed_states": n_failed_states,
+            "n_compound_states": n_compound_states,
             "n_transitions": len(transition_records),
             "terminal_state_id": terminal_state_id,
             "stop_reason": stop_reason,
@@ -1240,20 +1379,24 @@ def run_collapse_experiment(
 
     write_metadata()
 
-    if mode == "independent-units":
-        selections = _select_all_units_from_ranking(base_context.workflow.collapse_ranking, base_context.workflow.unit_metrics)
+    if mode in {"independent-units", "compound-bubbles"}:
+        if mode == "compound-bubbles":
+            selections = _select_compound_bubbles_from_workflow(base_context.workflow)
+        else:
+            selections = _select_all_units_from_ranking(base_context.workflow.collapse_ranking, base_context.workflow.unit_metrics)
         if not selections:
-            stop_reason = "no_units_in_base_state"
+            stop_reason = "no_compound_bubbles_in_base_state" if mode == "compound-bubbles" else "no_units_in_base_state"
             write_metadata()
             return CollapseExperimentOutputs(
                 state_registry=pd.DataFrame.from_records(state_records),
                 transition_registry=pd.DataFrame.from_records(transition_records),
                 output_dir=output_path,
                 manifest=json.loads((output_path / "experiment_manifest.json").read_text(encoding="utf-8")),
-            )
+        )
 
         for index, selection in enumerate(selections, start=1):
-            state_id = f"S{index:03d}_{selection.state_suffix}"
+            prefix = "CB" if mode == "compound-bubbles" else "S"
+            state_id = f"{prefix}{index:03d}_{selection.state_suffix}"
             state_dir = states_dir / state_id
             try:
                 child_context = _build_child_state(
@@ -1269,6 +1412,8 @@ def run_collapse_experiment(
                     unit_workflow_kwargs=unit_workflow_kwargs,
                 )
             except VariantDirectionValidationError as exc:
+                error_text = _format_exception(exc)
+                error_traceback = _format_traceback(exc)
                 state_records.append(
                     _failed_state_record(
                         state_id=state_id,
@@ -1278,7 +1423,8 @@ def run_collapse_experiment(
                         state_dir=state_dir,
                         selection=selection,
                         error_stage="direction_validation",
-                        error=str(exc),
+                        error=error_text,
+                        error_traceback=error_traceback,
                         variant_outputs=exc.outputs,
                     )
                 )
@@ -1289,7 +1435,8 @@ def run_collapse_experiment(
                     selection=selection,
                     child_state_id=state_id,
                     error_stage="direction_validation",
-                    error=str(exc),
+                    error=error_text,
+                    error_traceback=error_traceback,
                     variant_outputs=exc.outputs,
                 )
                 transition["mode"] = mode
@@ -1298,6 +1445,8 @@ def run_collapse_experiment(
                 write_metadata()
                 continue
             except Exception as exc:
+                error_text = _format_exception(exc)
+                error_traceback = _format_traceback(exc)
                 state_records.append(
                     _failed_state_record(
                         state_id=state_id,
@@ -1307,7 +1456,8 @@ def run_collapse_experiment(
                         state_dir=state_dir,
                         selection=selection,
                         error_stage="child_state_build",
-                        error=str(exc),
+                        error=error_text,
+                        error_traceback=error_traceback,
                     )
                 )
                 transition = _failed_transition_record(
@@ -1317,7 +1467,8 @@ def run_collapse_experiment(
                     selection=selection,
                     child_state_id=state_id,
                     error_stage="child_state_build",
-                    error=str(exc),
+                    error=error_text,
+                    error_traceback=error_traceback,
                 )
                 transition["mode"] = mode
                 transition_records.append(transition)
@@ -1337,7 +1488,7 @@ def run_collapse_experiment(
             terminal_state_id = child_context.state_id
             write_metadata()
 
-        stop_reason = "all_base_units_processed"
+        stop_reason = "all_compound_bubbles_processed" if mode == "compound-bubbles" else "all_base_units_processed"
         write_metadata()
         return CollapseExperimentOutputs(
             state_registry=pd.DataFrame.from_records(state_records),
@@ -1384,6 +1535,8 @@ def run_collapse_experiment(
                 unit_workflow_kwargs=unit_workflow_kwargs,
             )
         except VariantDirectionValidationError as exc:
+            error_text = _format_exception(exc)
+            error_traceback = _format_traceback(exc)
             state_records.append(
                 _failed_state_record(
                     state_id=state_id,
@@ -1393,7 +1546,8 @@ def run_collapse_experiment(
                     state_dir=state_dir,
                     selection=selection,
                     error_stage="direction_validation",
-                    error=str(exc),
+                    error=error_text,
+                    error_traceback=error_traceback,
                     variant_outputs=exc.outputs,
                 )
             )
@@ -1404,7 +1558,8 @@ def run_collapse_experiment(
                 selection=selection,
                 child_state_id=state_id,
                 error_stage="direction_validation",
-                error=str(exc),
+                error=error_text,
+                error_traceback=error_traceback,
                 variant_outputs=exc.outputs,
             )
             transition["mode"] = mode
@@ -1414,6 +1569,8 @@ def run_collapse_experiment(
             write_metadata()
             break
         except Exception as exc:
+            error_text = _format_exception(exc)
+            error_traceback = _format_traceback(exc)
             state_records.append(
                 _failed_state_record(
                     state_id=state_id,
@@ -1423,7 +1580,8 @@ def run_collapse_experiment(
                     state_dir=state_dir,
                     selection=selection,
                     error_stage="child_state_build",
-                    error=str(exc),
+                    error=error_text,
+                    error_traceback=error_traceback,
                 )
             )
             transition = _failed_transition_record(
@@ -1433,7 +1591,8 @@ def run_collapse_experiment(
                 selection=selection,
                 child_state_id=state_id,
                 error_stage="child_state_build",
-                error=str(exc),
+                error=error_text,
+                error_traceback=error_traceback,
             )
             transition["mode"] = mode
             transition_records.append(transition)
@@ -1468,7 +1627,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run one of the collapse experiment workflows over a graph-like river network: "
-            "independent base-unit variants, adaptive sequential unit collapse, or adaptive sequential group collapse."
+            "independent base-unit variants, whole-compound-bubble variants, "
+            "adaptive sequential unit collapse, or adaptive sequential group collapse."
         )
     )
     parser.add_argument("mode", choices=EXPERIMENT_MODES, help="Experiment mode to run.")

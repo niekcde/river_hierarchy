@@ -61,6 +61,39 @@ DEFAULT_UNCHANGED_CORE_OVERLAP_FRACTION = 0.8
 MAX_LOCAL_DIRECTION_REPAIR_LINKS = 10
 
 
+def _sanitize_rivgraph_topology_metadata(links: dict[str, object], nodes: dict[str, object]) -> None:
+    """Drop stale provisional references left behind by RivGraph pruning."""
+
+    valid_link_ids = set(links.get("id", []))
+    valid_node_ids = set(nodes.get("id", []))
+
+    if "parallels" in links:
+        cleaned_parallels = []
+        for pair in links["parallels"]:
+            kept = [lid for lid in pair if lid in valid_link_ids]
+            if len(kept) >= 2:
+                cleaned_parallels.append(kept)
+        links["parallels"] = cleaned_parallels
+
+    if "arts" in links:
+        cleaned_arts = []
+        for triad in links["arts"]:
+            kept = [lid for lid in triad if lid in valid_link_ids]
+            if len(kept) >= 2:
+                cleaned_arts.append(kept)
+        links["arts"] = cleaned_arts
+
+    if "link_conn" in links:
+        links["link_conn"] = [[lid for lid in conn if lid in valid_link_ids] for conn in links["link_conn"]]
+
+    for key in ("inlets", "outlets", "arts"):
+        if key in nodes:
+            nodes[key] = [nid for nid in nodes[key] if nid in valid_node_ids]
+
+    if "super_apex" in nodes and nodes["super_apex"] not in valid_node_ids:
+        del nodes["super_apex"]
+
+
 @dataclass
 class NetworkVariantOutputs:
     collapse_components: pd.DataFrame
@@ -2242,6 +2275,8 @@ def _run_rivgraph(
     verbose: bool = False,
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Path | None]:
+    import rivgraph.rivers.river_utils as ru
+
     output_dir = Path(rivgraph_output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2254,7 +2289,14 @@ def _run_rivgraph(
         single_thread=single_thread,
     )
     network.compute_network()
-    network.prune_network()
+    network.links, network.nodes = ru.prune_river(
+        network.links,
+        network.nodes,
+        network.exit_sides,
+        network.Iskel,
+    )
+    _sanitize_rivgraph_topology_metadata(network.links, network.nodes)
+    network.finalize_ids()
     network.compute_distance_transform()
     network.compute_link_width_and_length()
     network.compute_centerline()

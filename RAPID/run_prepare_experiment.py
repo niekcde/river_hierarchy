@@ -31,6 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--time-column", default="time", help="Timestamp column in the forcing file.")
     parser.add_argument("--discharge-column", default="discharge", help="Discharge column in the forcing file.")
     parser.add_argument("--width-field", default="wid_adj_wet", help="Preferred link width field for RAPID K preparation.")
+    parser.add_argument("--vary-width-by-subreach", action="store_true", help="Derive a width for each RAPID subreach from variant link_width_samples.csv instead of copying one parent-link width across all segments.")
+    parser.add_argument("--subreach-width-sample-field", default="width_wet", help="Width sample field from link_width_samples.csv used when --vary-width-by-subreach is enabled.")
     parser.add_argument("--x-value", type=float, default=0.1, help="Muskingum X parameter.")
     parser.add_argument("--kb-value", type=float, default=20.0, help="K-value helper parameter kb.")
     parser.add_argument("--kb-mode", choices=["fixed", "based_reference_section"], default="fixed", help="How to select kb for RAPID K preparation.")
@@ -74,6 +76,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
         prep_config=RapidPrepConfig(
             width_field=args.width_field,
+            vary_width_by_subreach=args.vary_width_by_subreach,
+            subreach_width_sample_field=args.subreach_width_sample_field,
             x_value=args.x_value,
             kb_value=args.kb_value,
             kb_mode=args.kb_mode,

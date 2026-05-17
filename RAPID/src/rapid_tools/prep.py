@@ -17,11 +17,11 @@ import shapely
 import shapely.wkt
 from scipy.io import netcdf_file
 from shapely import wkt
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
 from shapely.ops import substring
 
 from .forcing import ForcingConfig, infer_forcing_dt_seconds, prepare_forcing_table, write_inflow_netcdf
-from .k_values import KValueConfig, compute_k_values, compute_routing_dt_seconds
+from .k_values import KValueConfig, compute_k_values, compute_routing_dt_seconds, resolve_width_field
 from .reference_section import compute_reference_section_kb
 from .registry import RapidStateContext, iter_preparable_states, load_state_registry
 from .slope import SlopeConfig, compute_link_slopes
@@ -30,6 +30,8 @@ from .slope import SlopeConfig, compute_link_slopes
 @dataclass(frozen=True, slots=True)
 class RapidPrepConfig:
     width_field: str = "wid_adj_wet"
+    vary_width_by_subreach: bool = False
+    subreach_width_sample_field: str = "width_wet"
     x_value: float = 0.1
     kb_value: float = 20.0
     kb_mode: str = "fixed"
@@ -51,6 +53,25 @@ class RapidPrepConfig:
     preferred_length_field: str = "len"
     include_base_state: bool = True
     strict_sword: bool = True
+
+
+def _apply_branch_widths(
+    links: pd.DataFrame,
+    *,
+    preferred_field: str,
+    min_width: float,
+) -> pd.DataFrame:
+    resolved_field = resolve_width_field(links.columns, preferred_field)
+    frame = links.copy()
+    frame["rapid_branch_width_source_field"] = resolved_field
+    frame["rapid_branch_width_m_raw"] = pd.to_numeric(frame[resolved_field], errors="coerce")
+    frame["rapid_branch_width_adjusted"] = frame["rapid_branch_width_m_raw"].isna() | frame["rapid_branch_width_m_raw"].le(0)
+    frame["rapid_branch_width_m"] = frame["rapid_branch_width_m_raw"].where(
+        ~frame["rapid_branch_width_adjusted"],
+        float(min_width),
+    )
+    frame["rapid_branch_width_m"] = frame["rapid_branch_width_m"].clip(lower=float(min_width)).astype(float)
+    return frame
 
 
 def _normalize_dir_path(raw: str | Path) -> Path:
@@ -193,6 +214,107 @@ def split_links_into_subreaches(
 
     rapid_links = gpd.GeoDataFrame(rapid_links_records, geometry=prepared_links.geometry.name, crs=prepared_links.crs)
     return rapid_links, rapid_nodes
+
+
+def _resolve_link_width_samples_path(link_widths_path: Path) -> Path | None:
+    candidate = link_widths_path.parent / "link_width_samples.csv"
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def apply_subreach_widths_from_samples(
+    rapid_links: gpd.GeoDataFrame,
+    prepared_links: gpd.GeoDataFrame,
+    *,
+    link_width_samples_path: Path,
+    sample_field: str,
+    fallback_width_field: str,
+) -> gpd.GeoDataFrame:
+    if not link_width_samples_path.exists():
+        raise FileNotFoundError(f"Subreach width samples were not found: {link_width_samples_path}")
+
+    samples = pd.read_csv(link_width_samples_path)
+    if sample_field not in samples.columns:
+        raise ValueError(
+            f"Subreach width samples do not contain '{sample_field}'. "
+            f"Available columns: {samples.columns.tolist()}"
+        )
+    for column in ("id_link", "x", "y"):
+        if column not in samples.columns:
+            raise ValueError(f"Subreach width samples are missing required column '{column}'.")
+
+    frame = rapid_links.copy()
+    resolved_fallback_field = resolve_width_field(frame.columns, fallback_width_field)
+    frame["rapid_subreach_width_enabled"] = True
+    frame["rapid_subreach_width_sample_field"] = sample_field
+    frame["rapid_subreach_width_stat"] = "median"
+    frame["rapid_subreach_width_fallback_field"] = resolved_fallback_field
+    frame["rapid_subreach_width_sample_count"] = 0
+    frame["rapid_subreach_width_fallback_used"] = True
+    frame["rapid_subreach_width_m"] = pd.to_numeric(frame[resolved_fallback_field], errors="coerce")
+
+    valid_samples = samples.loc[
+        pd.to_numeric(samples[sample_field], errors="coerce").gt(0)
+        & pd.to_numeric(samples["x"], errors="coerce").notna()
+        & pd.to_numeric(samples["y"], errors="coerce").notna()
+        & pd.to_numeric(samples["id_link"], errors="coerce").notna()
+    ].copy()
+    if valid_samples.empty:
+        return frame
+
+    valid_samples["id_link"] = pd.to_numeric(valid_samples["id_link"], errors="coerce").astype(int)
+    valid_samples[sample_field] = pd.to_numeric(valid_samples[sample_field], errors="coerce").astype(float)
+    valid_samples["x"] = pd.to_numeric(valid_samples["x"], errors="coerce").astype(float)
+    valid_samples["y"] = pd.to_numeric(valid_samples["y"], errors="coerce").astype(float)
+
+    parent_geometry_frame = prepared_links[["id_link", prepared_links.geometry.name]].drop_duplicates(subset=["id_link"]).copy()
+    parent_geometry_frame["id_link"] = pd.to_numeric(parent_geometry_frame["id_link"], errors="coerce").astype(int)
+    parent_geometry_by_id = parent_geometry_frame.set_index("id_link")[prepared_links.geometry.name].to_dict()
+
+    for parent_link_id, group in frame.groupby("parent_link_id", sort=False):
+        parent_link_id = int(parent_link_id)
+        parent_geometry = parent_geometry_by_id.get(parent_link_id)
+        if parent_geometry is None or parent_geometry.is_empty:
+            continue
+        parent_length = float(parent_geometry.length)
+        if not np.isfinite(parent_length) or parent_length <= 0.0:
+            continue
+
+        link_samples = valid_samples.loc[valid_samples["id_link"] == parent_link_id].copy()
+        if link_samples.empty:
+            continue
+
+        distances = [
+            float(parent_geometry.project(Point(float(x), float(y))))
+            for x, y in zip(link_samples["x"], link_samples["y"])
+        ]
+        fractions = np.clip(np.asarray(distances, dtype=float) / parent_length, 0.0, 1.0)
+        subreach_count = int(group["subreach_count"].iloc[0]) if "subreach_count" in group.columns else 1
+        if subreach_count <= 0:
+            continue
+        sample_bins = np.floor(fractions * subreach_count).astype(int) + 1
+        sample_bins = np.clip(sample_bins, 1, subreach_count)
+        link_samples["subreach_index"] = sample_bins
+
+        summary = (
+            link_samples.groupby("subreach_index")
+            .agg(
+                rapid_subreach_width_m=(sample_field, "median"),
+                rapid_subreach_width_sample_count=(sample_field, "size"),
+            )
+            .reset_index()
+        )
+
+        for summary_row in summary.itertuples(index=False):
+            mask = (frame["parent_link_id"].astype(int) == parent_link_id) & (
+                frame["subreach_index"].astype(int) == int(summary_row.subreach_index)
+            )
+            frame.loc[mask, "rapid_subreach_width_m"] = float(summary_row.rapid_subreach_width_m)
+            frame.loc[mask, "rapid_subreach_width_sample_count"] = int(summary_row.rapid_subreach_width_sample_count)
+            frame.loc[mask, "rapid_subreach_width_fallback_used"] = False
+
+    return frame
 
 
 def create_conn_file(
@@ -673,7 +795,9 @@ def build_rapid_graph(
             ds,
             key=str(int(row.reach_id)),
             reach_id=int(row.reach_id),
-            width=float(row.rapid_width_m),
+            width=float(getattr(row, "rapid_branch_width_m", row.rapid_width_m)),
+            width_branch=float(getattr(row, "rapid_branch_width_m", row.rapid_width_m)),
+            width_k=float(row.rapid_width_m),
             length=float(row.link_length_m),
             geometry=row.geometry.wkt,
             slope_local=float(row.slope_used),
@@ -753,19 +877,39 @@ def prepare_state(
     )
     prepared_links = links.merge(slope_frame, on=["id_link", "id_us_node", "id_ds_node"], how="left")
     prepared_links["link_length_m"] = pd.to_numeric(prepared_links["link_length_m"], errors="coerce").astype(float)
+    prepared_links = _apply_branch_widths(
+        prepared_links,
+        preferred_field=prep_config.width_field,
+        min_width=prep_config.min_width,
+    )
 
     rapid_links, rapid_nodes = split_links_into_subreaches(
         prepared_links,
         nodes,
         target_length_m=prep_config.target_subreach_length_m,
     )
+    selected_width_field = prep_config.width_field
+    subreach_width_samples_path = _resolve_link_width_samples_path(context.link_widths_path)
+    if prep_config.vary_width_by_subreach:
+        if subreach_width_samples_path is None:
+            raise FileNotFoundError(
+                f"Subreach-width adjustment was requested, but link_width_samples.csv was not found beside {context.link_widths_path}."
+            )
+        rapid_links = apply_subreach_widths_from_samples(
+            rapid_links,
+            prepared_links,
+            link_width_samples_path=subreach_width_samples_path,
+            sample_field=prep_config.subreach_width_sample_field,
+            fallback_width_field=prep_config.width_field,
+        )
+        selected_width_field = "rapid_subreach_width_m"
     rapid_links["centroid_x"] = rapid_links.geometry.centroid.x.astype(float)
     rapid_links["centroid_y"] = rapid_links.geometry.centroid.y.astype(float)
     selected_kb = _resolve_selected_kb(prep_config, reference_kb_summary)
     rapid_links = compute_k_values(
         rapid_links,
         config=KValueConfig(
-            width_field=prep_config.width_field,
+            width_field=selected_width_field,
             x_value=prep_config.x_value,
             kb_value=float(selected_kb["kb_value"]),
             kb_source_method=str(selected_kb["kb_source_method"]),
@@ -868,6 +1012,7 @@ def prepare_state(
             "directed_links": str(context.directed_links_path),
             "directed_nodes": str(context.directed_nodes_path),
             "link_widths": str(context.link_widths_path),
+            "link_width_samples_csv": str(subreach_width_samples_path) if subreach_width_samples_path is not None else None,
             "conn_csv": str(conn_path),
             "riv_csv": str(riv_path),
             "rat_srt_csv": str(rat_srt_path),
@@ -889,6 +1034,7 @@ def prepare_state(
             "n_slope_adjusted": int(rapid_links["slope_adjusted"].fillna(False).sum()),
             "n_slope_outlier_flagged": int(rapid_links["slope_outlier_flag"].fillna(False).sum()) if "slope_outlier_flag" in rapid_links.columns else 0,
             "n_width_adjusted": int(rapid_links["rapid_width_adjusted"].fillna(False).sum()),
+            "n_subreach_width_fallback_used": int(rapid_links["rapid_subreach_width_fallback_used"].fillna(False).sum()) if "rapid_subreach_width_fallback_used" in rapid_links.columns else 0,
             "n_length_floor_applied": int(rapid_links["rapid_length_floor_applied"].fillna(False).sum()) if "rapid_length_floor_applied" in rapid_links.columns else 0,
         },
         "routing": {
@@ -906,6 +1052,7 @@ def prepare_state(
             "max_effective_length_m": float(rapid_links["rapid_effective_length_m"].max()) if "rapid_effective_length_m" in rapid_links.columns and len(rapid_links) else float("nan"),
             "pct_length_floor_applied": float(rapid_links["rapid_length_floor_applied"].fillna(False).astype(bool).mean()) if "rapid_length_floor_applied" in rapid_links.columns and len(rapid_links) else float("nan"),
             "pct_slope_outlier_flagged": float(rapid_links["slope_outlier_flag"].fillna(False).astype(bool).mean()) if "slope_outlier_flag" in rapid_links.columns and len(rapid_links) else float("nan"),
+            "pct_subreach_width_fallback_used": float(rapid_links["rapid_subreach_width_fallback_used"].fillna(False).astype(bool).mean()) if "rapid_subreach_width_fallback_used" in rapid_links.columns and len(rapid_links) else float("nan"),
             "rapid_k_min": float(rapid_links["rapid_k"].min()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
             "rapid_k_max": float(rapid_links["rapid_k"].max()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
         },
@@ -952,6 +1099,8 @@ def prepare_state(
         "pct_length_floor_applied": float(rapid_links["rapid_length_floor_applied"].fillna(False).astype(bool).mean()) if "rapid_length_floor_applied" in rapid_links.columns and len(rapid_links) else float("nan"),
         "n_slope_outlier_flagged": int(rapid_links["slope_outlier_flag"].fillna(False).sum()) if "slope_outlier_flag" in rapid_links.columns else 0,
         "pct_slope_outlier_flagged": float(rapid_links["slope_outlier_flag"].fillna(False).astype(bool).mean()) if "slope_outlier_flag" in rapid_links.columns and len(rapid_links) else float("nan"),
+        "n_subreach_width_fallback_used": int(rapid_links["rapid_subreach_width_fallback_used"].fillna(False).sum()) if "rapid_subreach_width_fallback_used" in rapid_links.columns else 0,
+        "pct_subreach_width_fallback_used": float(rapid_links["rapid_subreach_width_fallback_used"].fillna(False).astype(bool).mean()) if "rapid_subreach_width_fallback_used" in rapid_links.columns and len(rapid_links) else float("nan"),
         "min_effective_length_m": float(rapid_links["rapid_effective_length_m"].min()) if "rapid_effective_length_m" in rapid_links.columns and len(rapid_links) else float("nan"),
         "max_effective_length_m": float(rapid_links["rapid_effective_length_m"].max()) if "rapid_effective_length_m" in rapid_links.columns and len(rapid_links) else float("nan"),
         "rapid_k_min": float(rapid_links["rapid_k"].min()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),

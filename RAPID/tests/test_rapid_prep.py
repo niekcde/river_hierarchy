@@ -20,11 +20,17 @@ from rapid_tools.engine import run_prepared_experiment, write_qout_netcdf
 from rapid_tools.forcing import ForcingConfig
 from rapid_tools.hydrograph import HydrographMetricConfig, _integrate_trapezoid, summarize_outlet_hydrograph
 from rapid_tools.k_values import KValueConfig, compute_k_values
-from rapid_tools.prep import RapidPrepConfig, compute_reach_ratios, create_conn_file, prepare_experiment
+from rapid_tools.prep import RapidPrepConfig, build_rapid_graph, compute_reach_ratios, create_conn_file, prepare_experiment
 from rapid_tools.slope import SlopeConfig, compute_link_slopes
 
 
-def _write_state(tmp_path: Path, *, link_id: int = 11, link_length: float = 1000.0) -> Path:
+def _write_state(
+    tmp_path: Path,
+    *,
+    link_id: int = 11,
+    link_length: float = 1000.0,
+    width_samples_wet: list[float] | None = None,
+) -> Path:
     experiment_dir = tmp_path / "experiment"
     state_dir = experiment_dir / "states" / "S001_unit_1"
     variant_dir = state_dir / "variant"
@@ -65,9 +71,28 @@ def _write_state(tmp_path: Path, *, link_id: int = 11, link_length: float = 1000
     directed_links_path = directed_dir / "test_directed_links.gpkg"
     directed_nodes_path = directed_dir / "test_directed_nodes.gpkg"
     widths_path = widths_dir / "links_with_width_families.gpkg"
+    width_samples_path = widths_dir / "link_width_samples.csv"
     links.to_file(directed_links_path, driver="GPKG")
     nodes.to_file(directed_nodes_path, driver="GPKG")
     links.to_file(widths_path, driver="GPKG")
+    wet_widths = width_samples_wet or [50.0] * 11
+    sample_count = len(wet_widths)
+    sample_x = np.linspace(0.0, link_length, sample_count)
+    width_samples = pd.DataFrame(
+        {
+            "id_link": [link_id] * sample_count,
+            "sample_index": list(range(sample_count)),
+            "x": sample_x,
+            "y": [0.0] * sample_count,
+            "width_total": wet_widths,
+            "width_wet": wet_widths,
+            "width_dry": [0.0] * sample_count,
+            "wet_fraction": [1.0] * sample_count,
+            "dry_fraction": [0.0] * sample_count,
+            "n_wet_threads": [1] * sample_count,
+        }
+    )
+    width_samples.to_csv(width_samples_path, index=False)
 
     registry = pd.DataFrame(
         [
@@ -395,6 +420,49 @@ def test_compute_reach_ratios_handles_real_reach_id_zero(tmp_path: Path) -> None
     assert set(rat[0].astype(int).tolist()) == {0, 5}
 
 
+def test_build_rapid_graph_uses_branch_widths_for_split_ratios(tmp_path: Path) -> None:
+    nodes = gpd.GeoDataFrame(
+        {
+            "id_node": [1, 2, 3, 4],
+            "is_inlet": [True, False, False, False],
+            "is_outlet": [False, False, True, True],
+        },
+        geometry=[
+            Point(0.0, 0.0),
+            Point(1.0, 0.0),
+            Point(2.0, 1.0),
+            Point(2.0, -1.0),
+        ],
+        crs="EPSG:3857",
+    )
+    rapid_links = gpd.GeoDataFrame(
+        {
+            "reach_id": [10, 11, 12],
+            "id_us_node": [1, 2, 2],
+            "id_ds_node": [2, 3, 4],
+            "rapid_width_m": [50.0, 90.0, 10.0],
+            "rapid_branch_width_m": [50.0, 20.0, 80.0],
+            "link_length_m": [100.0, 100.0, 100.0],
+            "slope_used": [1e-3, 1e-3, 1e-3],
+        },
+        geometry=[
+            LineString([(0.0, 0.0), (1.0, 0.0)]),
+            LineString([(1.0, 0.0), (2.0, 1.0)]),
+            LineString([(1.0, 0.0), (2.0, -1.0)]),
+        ],
+        crs="EPSG:3857",
+    )
+
+    graph = build_rapid_graph(rapid_links, nodes)
+    create_conn_file(graph, tmp_path)
+    rat_srt = compute_reach_ratios(graph, tmp_path, use_widths=True)
+    rat = pd.read_csv(rat_srt, header=None)
+    row = rat.loc[rat[0].astype(int) == 10].iloc[0].tolist()
+
+    assert row[1] == "[11, 0.2]"
+    assert row[2] == "[12, 0.8]"
+
+
 def test_prepare_experiment_splits_long_links_into_target_subreaches(tmp_path: Path) -> None:
     experiment_dir = _write_state(tmp_path, link_length=1100.0)
     registry = prepare_experiment(
@@ -414,6 +482,34 @@ def test_prepare_experiment_splits_long_links_into_target_subreaches(tmp_path: P
     assert set(rapid_links["subreach_index"]) == {1, 2}
     assert set(np.round(rapid_links["link_length_m"], 6)) == {550.0}
     assert int(rapid_nodes["rapid_node_source"].eq("subreach_virtual").sum()) == 1
+
+
+def test_prepare_experiment_can_vary_width_by_subreach_from_samples(tmp_path: Path) -> None:
+    experiment_dir = _write_state(
+        tmp_path,
+        link_length=1100.0,
+        width_samples_wet=[20.0, 20.0, 30.0, 30.0, 100.0, 110.0, 120.0],
+    )
+    registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=experiment_dir / "forcing.csv",
+        prep_config=RapidPrepConfig(
+            target_subreach_length_m=500.0,
+            vary_width_by_subreach=True,
+            subreach_width_sample_field="width_wet",
+        ),
+    )
+    assert registry.loc[0, "status"] == "prepared"
+
+    prep_dir = experiment_dir / "states" / "S001_unit_1" / "rapid" / "prep"
+    rapid_links = pd.read_csv(prep_dir / "rapid_link_attributes.csv").sort_values("subreach_index").reset_index(drop=True)
+
+    assert set(rapid_links["rapid_width_source_field"]) == {"rapid_subreach_width_m"}
+    assert rapid_links["rapid_subreach_width_fallback_used"].tolist() == [False, False]
+    assert rapid_links["rapid_subreach_width_sample_count"].tolist() == [3, 4]
+    assert rapid_links["rapid_branch_width_m"].round(6).tolist() == [50.0, 50.0]
+    assert rapid_links.loc[0, "rapid_width_m"] < rapid_links.loc[1, "rapid_width_m"]
+    assert rapid_links["rapid_width_m"].round(6).tolist() == [20.0, 105.0]
 
 
 def test_run_prepared_experiment_handles_split_subreaches(tmp_path: Path) -> None:
