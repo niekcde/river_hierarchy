@@ -951,8 +951,12 @@ def prepare_state(
 
     rapid_links_path = context.rapid_prep_dir / "rapid_link_attributes.csv"
     rapid_links.drop(columns=rapid_links.geometry.name).to_csv(rapid_links_path, index=False)
+    rapid_links_gpkg_path = context.rapid_prep_dir / "rapid_reach_attributes.gpkg"
+    rapid_links.to_file(rapid_links_gpkg_path, driver="GPKG")
     rapid_nodes_path = context.rapid_prep_dir / "rapid_node_attributes.csv"
     rapid_nodes.drop(columns=rapid_nodes.geometry.name).to_csv(rapid_nodes_path, index=False)
+    rapid_nodes_gpkg_path = context.rapid_prep_dir / "rapid_node_attributes.gpkg"
+    rapid_nodes.to_file(rapid_nodes_gpkg_path, driver="GPKG")
 
     forcing_table_path = None
     inflow_path = None
@@ -1020,7 +1024,9 @@ def prepare_state(
             "xfc_csv": str(xfc_path),
             "coords_csv": str(coords_path),
             "rapid_link_attributes_csv": str(rapid_links_path),
+            "rapid_reach_attributes_gpkg": str(rapid_links_gpkg_path),
             "rapid_node_attributes_csv": str(rapid_nodes_path),
+            "rapid_node_attributes_gpkg": str(rapid_nodes_gpkg_path),
             "forcing_normalized_csv": str(forcing_table_path) if forcing_table_path is not None else None,
             "inflow_nc": str(inflow_path) if inflow_path is not None else None,
         },
@@ -1072,7 +1078,9 @@ def prepare_state(
         "xfc_csv": str(xfc_path),
         "coords_csv": str(coords_path),
         "rapid_link_attributes_csv": str(rapid_links_path),
+        "rapid_reach_attributes_gpkg": str(rapid_links_gpkg_path),
         "rapid_node_attributes_csv": str(rapid_nodes_path),
+        "rapid_node_attributes_gpkg": str(rapid_nodes_gpkg_path),
         "forcing_normalized_csv": str(forcing_table_path) if forcing_table_path is not None else "",
         "inflow_nc": str(inflow_path) if inflow_path is not None else "",
         "forcing_station_key": resolved_forcing_metadata.get("selected_station_key", "") if resolved_forcing_metadata is not None else "",

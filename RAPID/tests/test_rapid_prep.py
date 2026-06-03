@@ -165,6 +165,7 @@ def test_prepare_experiment_writes_state_outputs(tmp_path: Path) -> None:
     prep_dir = experiment_dir / "states" / "S001_unit_1" / "rapid" / "prep"
     assert (prep_dir / "rapid_prep_manifest.json").exists()
     assert (prep_dir / "rapid_link_attributes.csv").exists()
+    assert (prep_dir / "rapid_reach_attributes.gpkg").exists()
     assert (prep_dir / "kfc.csv").exists()
     assert (prep_dir / "inflow.nc").exists()
 

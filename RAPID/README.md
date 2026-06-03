@@ -48,6 +48,7 @@ At the same time, the newer `network_variants` workflow uses:
 - `RapidPrepConfig`
 - `prepare_experiment(...)`
 - `run_prepared_experiment(...)`
+- `rapid_tools.analysis`
 
 ## Network Variants Workflow
 
@@ -68,6 +69,8 @@ Prep writes RAPID inputs under `states/<state_id>/rapid/prep/` and can:
 - optionally split long links into RAPID-only subreaches
 - optionally derive one width per RAPID subreach from `link_width_samples.csv`
 - normalize forcing and write `inflow.nc`
+- export geometry-preserving RAPID reach and node GeoPackages for downstream
+  visualization
 
 ### Forcing Normalization In Prep
 
@@ -250,6 +253,61 @@ python RAPID/run_prepare_experiment.py /path/to/experiment \
 
 Routing then writes per-state RAPID outputs under `states/<state_id>/rapid/run/`
 and can export outlet hydrograph summaries.
+
+### Analysis Utilities
+
+The reusable analysis helpers live in:
+
+- `src/rapid_tools/analysis.py`
+
+They are intended to be imported from the notebook instead of rewriting
+analysis logic inline. The current utilities cover:
+
+- per-experiment merged analysis tables from `rapid_run_registry.csv`,
+  `rapid_prep_registry.csv`, `state_registry.csv`, `transition_registry.csv`,
+  and base `collapse_ranking.csv`
+- combined unit-plus-compound-bubble comparison tables
+- outlet hydrograph translation/shape comparison against the base state
+- Plotly summary figures for effect-signature and hydrograph overlays
+- reach-level wave products for animation
+
+Prep now also writes:
+
+- `states/<state_id>/rapid/prep/rapid_reach_attributes.gpkg`
+- `states/<state_id>/rapid/prep/rapid_node_attributes.gpkg`
+
+Those geometry-preserving files are used by the wave-visualization helpers.
+
+Typical notebook imports:
+
+```python
+from rapid_tools.analysis import (
+    build_combined_analysis_frame,
+    build_parent_link_difference_timeseries,
+    build_reach_timing_comparison,
+    plot_corridor_difference_heatmap,
+    plot_effect_signature,
+    plot_hydrograph_overlay,
+    plot_reach_timing_map,
+    write_wave_comparison_mp4,
+    write_wave_gif,
+    write_wave_mp4,
+)
+```
+
+`write_wave_mp4(...)` uses `ffmpeg` for video encoding. If `ffmpeg` is not on
+your `PATH`, pass `ffmpeg_path=...` explicitly or install it in the active
+environment before exporting MP4 files. For non-base states, `write_wave_mp4`
+now defaults to a synchronized four-panel presentation layout:
+
+- base state
+- target variant
+- signed difference (`variant - base`)
+- zoomed difference panel
+
+Use `compare_to_reference=False` if you want the old single-state MP4 instead,
+or call `write_wave_comparison_mp4(...)` directly when you want to choose a
+non-default reference state or zoom window.
 
 ### Interpretation In This Project
 
