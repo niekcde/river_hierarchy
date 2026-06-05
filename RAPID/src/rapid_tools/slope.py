@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import geopandas as gpd
+import networkx as nx
 import numpy as np
 import pandas as pd
 
@@ -18,6 +19,12 @@ class SlopeConfig:
     section_slope_ratio_min: float | None = None
     section_slope_ratio_max: float | None = None
     use_section_slope_fallback: bool = True
+    use_compound_bubble_slope_qc: bool = True
+    use_compound_bubble_slope_repair: bool = True
+    compound_bubble_slope_repair_flag_factor: float = 3.0
+    compound_bubble_max_paths_for_qc: int = 500
+    compound_bubble_path_drop_rel_tol: float = 0.1
+    compound_bubble_path_drop_abs_tol_m: float = 0.05
 
 
 REQUIRED_NODE_COLUMNS = {
@@ -25,6 +32,34 @@ REQUIRED_NODE_COLUMNS = {
     "sword_wse",
     "sword_wse_field",
     "sword_wse_fill_method",
+}
+
+
+COMPOUND_BUBBLE_QC_COLUMNS: dict[str, object] = {
+    "compound_bubble_id_link": pd.Series(dtype="Int64"),
+    "bubble_slope_qc_candidate": False,
+    "bubble_slope_qc_valid": False,
+    "bubble_slope_qc_reason": "",
+    "bubble_entry_node_id": pd.Series(dtype="Int64"),
+    "bubble_exit_node_id": pd.Series(dtype="Int64"),
+    "bubble_reference_drop_m": np.nan,
+    "bubble_reference_dist_span_m": np.nan,
+    "bubble_reference_slope": np.nan,
+    "bubble_reference_profile_method": "",
+    "bubble_link_slope_ref": np.nan,
+    "bubble_slope_repair_candidate": False,
+    "bubble_slope_repair_applied": False,
+    "bubble_slope_repair_method": "",
+    "bubble_slope_repair_change_factor": np.nan,
+    "bubble_slope_repair_large_change_flag": False,
+    "bubble_n_internal_links": pd.Series(dtype="Int64"),
+    "bubble_n_paths_checked": pd.Series(dtype="Int64"),
+    "bubble_path_drop_min_m": np.nan,
+    "bubble_path_drop_max_m": np.nan,
+    "bubble_path_drop_spread_m": np.nan,
+    "bubble_path_drop_max_abs_error_m": np.nan,
+    "bubble_path_drop_max_rel_error": np.nan,
+    "bubble_path_drop_qc_failed": False,
 }
 
 
@@ -59,16 +94,232 @@ def _select_variant_lengths(
     return lengths.astype(float), length_source
 
 
+def _compute_network_dist_out(
+    links: gpd.GeoDataFrame,
+    nodes: gpd.GeoDataFrame,
+    *,
+    lengths: pd.Series,
+) -> pd.DataFrame:
+    frame = links[["id_link", "id_us_node", "id_ds_node"]].copy()
+    frame["id_link"] = pd.to_numeric(frame["id_link"], errors="coerce").astype(int)
+    frame["id_us_node"] = pd.to_numeric(frame["id_us_node"], errors="coerce").astype(int)
+    frame["id_ds_node"] = pd.to_numeric(frame["id_ds_node"], errors="coerce").astype(int)
+    frame["link_length_m"] = pd.to_numeric(lengths, errors="coerce").astype(float).to_numpy()
+
+    node_ids = pd.to_numeric(nodes["id_node"], errors="coerce").dropna().astype(int).tolist()
+    if not node_ids:
+        return pd.DataFrame(columns=["id_node", "node_network_dist_out_m", "node_network_dist_source"])
+
+    graph = nx.DiGraph()
+    graph.add_nodes_from(node_ids)
+    successors_by_node: dict[int, list[tuple[int, float]]] = {}
+    for row in frame.itertuples(index=False):
+        us = int(row.id_us_node)
+        ds = int(row.id_ds_node)
+        length = float(row.link_length_m)
+        graph.add_edge(us, ds)
+        successors_by_node.setdefault(us, []).append((ds, length))
+
+    result = pd.DataFrame({"id_node": pd.Series(node_ids, dtype="Int64")})
+    if not nx.is_directed_acyclic_graph(graph):
+        result["node_network_dist_out_m"] = np.nan
+        result["node_network_dist_source"] = "cycle_detected"
+        return result
+
+    if "is_outlet" in nodes.columns and nodes["is_outlet"].fillna(False).any():
+        outlet_nodes = set(pd.to_numeric(nodes.loc[nodes["is_outlet"].fillna(False), "id_node"], errors="coerce").dropna().astype(int).tolist())
+    else:
+        outlet_nodes = {int(node_id) for node_id in graph.nodes if graph.out_degree(node_id) == 0}
+    if not outlet_nodes:
+        outlet_nodes = {int(node_id) for node_id in graph.nodes if graph.out_degree(node_id) == 0}
+
+    dist_out: dict[int, float] = {}
+    for node_id in reversed(list(nx.topological_sort(graph))):
+        downstream_options = [float(length) + float(dist_out.get(int(ds), 0.0)) for ds, length in successors_by_node.get(int(node_id), [])]
+        if downstream_options:
+            dist_out[int(node_id)] = float(max(downstream_options))
+        else:
+            dist_out[int(node_id)] = 0.0 if int(node_id) in outlet_nodes or graph.out_degree(node_id) == 0 else float("nan")
+
+    result["node_network_dist_out_m"] = result["id_node"].map(lambda value: dist_out.get(int(value), float("nan")) if pd.notna(value) else float("nan")).astype(float)
+    result["node_network_dist_source"] = "graph_longest_path_to_outlet"
+    return result
+
+
+def _fit_monotone_increasing_profile(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    if len(x) != len(y):
+        raise ValueError("x and y must have the same length for monotone profile fitting.")
+    if len(x) == 0:
+        return np.asarray([], dtype=float)
+    if len(x) == 1:
+        return np.asarray(y, dtype=float)
+
+    blocks: list[dict[str, float | int]] = []
+    for index, value in enumerate(y):
+        blocks.append(
+            {
+                "start": index,
+                "end": index,
+                "weight": 1.0,
+                "sum": float(value),
+            }
+        )
+        while len(blocks) >= 2:
+            right = blocks[-1]
+            left = blocks[-2]
+            left_mean = float(left["sum"]) / float(left["weight"])
+            right_mean = float(right["sum"]) / float(right["weight"])
+            if left_mean <= right_mean:
+                break
+            merged = {
+                "start": int(left["start"]),
+                "end": int(right["end"]),
+                "weight": float(left["weight"]) + float(right["weight"]),
+                "sum": float(left["sum"]) + float(right["sum"]),
+            }
+            blocks = blocks[:-2] + [merged]
+
+    fitted = np.empty(len(y), dtype=float)
+    for block in blocks:
+        mean_value = float(block["sum"]) / float(block["weight"])
+        fitted[int(block["start"]) : int(block["end"]) + 1] = mean_value
+    return fitted
+
+
+def _interp_linear_extrapolation(
+    xp: np.ndarray,
+    yp: np.ndarray,
+    x: np.ndarray,
+) -> np.ndarray:
+    if len(xp) != len(yp):
+        raise ValueError("xp and yp must have the same length.")
+    if len(xp) == 0:
+        return np.full(len(x), np.nan, dtype=float)
+    if len(xp) == 1:
+        return np.full(len(x), float(yp[0]), dtype=float)
+
+    xp = np.asarray(xp, dtype=float)
+    yp = np.asarray(yp, dtype=float)
+    x = np.asarray(x, dtype=float)
+    interpolated = np.interp(x, xp, yp)
+
+    left_slope = float((yp[1] - yp[0]) / (xp[1] - xp[0])) if xp[1] != xp[0] else 0.0
+    right_slope = float((yp[-1] - yp[-2]) / (xp[-1] - xp[-2])) if xp[-1] != xp[-2] else 0.0
+
+    left_mask = x < xp[0]
+    right_mask = x > xp[-1]
+    if left_mask.any():
+        interpolated[left_mask] = yp[0] + (x[left_mask] - xp[0]) * left_slope
+    if right_mask.any():
+        interpolated[right_mask] = yp[-1] + (x[right_mask] - xp[-1]) * right_slope
+    return interpolated
+
+
+def _load_corridor_profile_anchors(
+    node_attrs: pd.DataFrame,
+    *,
+    config: SlopeConfig,
+) -> tuple[pd.DataFrame, str] | None:
+    source_col = "node_sword_source_file"
+    reach_col = "node_sword_reach_id"
+    region_col = "node_sword_region"
+    if source_col not in node_attrs.columns or reach_col not in node_attrs.columns:
+        return None
+
+    source_paths = [
+        str(value).strip()
+        for value in node_attrs[source_col].dropna().astype(str).tolist()
+        if str(value).strip()
+    ]
+    unique_source_paths = sorted(dict.fromkeys(source_paths))
+    if len(unique_source_paths) != 1:
+        return None
+
+    reach_ids = [
+        int(value)
+        for value in pd.to_numeric(node_attrs[reach_col], errors="coerce").dropna().astype(int).tolist()
+    ]
+    unique_reach_ids = sorted(dict.fromkeys(reach_ids))
+    if not unique_reach_ids:
+        return None
+
+    regions = None
+    if region_col in node_attrs.columns:
+        region_values = [
+            str(value).strip().lower()
+            for value in node_attrs[region_col].dropna().astype(str).tolist()
+            if str(value).strip()
+        ]
+        unique_regions = sorted(dict.fromkeys(region_values))
+        if unique_regions:
+            regions = unique_regions
+
+    requested_wse_field = None
+    if "node_wse_field" in node_attrs.columns:
+        requested_fields = [
+            str(value).strip()
+            for value in node_attrs.loc[node_attrs["node_wse_fill_method"].eq("requested_field"), "node_wse_field"].dropna().astype(str).tolist()
+            if str(value).strip()
+        ]
+        unique_fields = sorted(dict.fromkeys(requested_fields))
+        if unique_fields:
+            requested_wse_field = unique_fields[0]
+
+    try:
+        from network_variants.sword_matching import load_sword_node_reference
+    except ModuleNotFoundError:
+        return None
+
+    sword_nodes = load_sword_node_reference(
+        unique_source_paths[0],
+        sword_wse_field=requested_wse_field,
+        regions=regions,
+        reach_ids=unique_reach_ids,
+    )
+    if sword_nodes.empty:
+        return None
+
+    source = sword_nodes.rename(
+        columns={
+            "sword_dist_out": "corridor_dist_out",
+            "sword_wse": "corridor_wse_raw",
+            "sword_wse_fill_method": "corridor_wse_fill_method",
+        }
+    ).copy()
+    source["corridor_dist_out"] = pd.to_numeric(source["corridor_dist_out"], errors="coerce")
+    source["corridor_wse_raw"] = pd.to_numeric(source["corridor_wse_raw"], errors="coerce")
+    requested_anchor_mask = (
+        source["corridor_wse_fill_method"].eq("requested_field")
+        & source["corridor_wse_raw"].notna()
+        & source["corridor_dist_out"].notna()
+    )
+    anchors = source.loc[requested_anchor_mask, ["corridor_dist_out", "corridor_wse_raw"]].copy()
+    profile_method = "profile_monotone_corridor_requested_field_nodes"
+    if len(anchors) < int(config.min_anchor_nodes_for_profile):
+        anchors = source.loc[
+            source["corridor_wse_raw"].notna() & source["corridor_dist_out"].notna(),
+            ["corridor_dist_out", "corridor_wse_raw"],
+        ].copy()
+        profile_method = "profile_monotone_corridor_all_available_nodes"
+    anchors = anchors.dropna(subset=["corridor_dist_out", "corridor_wse_raw"]).copy()
+    if len(anchors) < int(config.min_anchor_nodes_for_profile):
+        return None
+    return anchors, profile_method
+
+
 def _resolve_rapid_wse_for_slope(
     nodes: gpd.GeoDataFrame,
     *,
     config: SlopeConfig,
+    network_dist_out: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     optional_columns = [
         "sword_wse_fallback_used",
         "sword_node_id",
         "sword_reach_id",
+        "sword_region",
         "sword_dist_out",
+        "sword_source_file",
     ]
     columns = [column for column in ["id_node", "sword_wse", "sword_wse_field", "sword_wse_fill_method"] + optional_columns if column in nodes.columns]
     node_attrs = (
@@ -82,7 +333,9 @@ def _resolve_rapid_wse_for_slope(
                 "sword_wse_fallback_used": "node_wse_fallback_used",
                 "sword_node_id": "node_sword_node_id",
                 "sword_reach_id": "node_sword_reach_id",
+                "sword_region": "node_sword_region",
                 "sword_dist_out": "node_sword_dist_out",
+                "sword_source_file": "node_sword_source_file",
             }
         )
     )
@@ -91,39 +344,88 @@ def _resolve_rapid_wse_for_slope(
     if "node_sword_dist_out" in node_attrs.columns:
         node_attrs["node_sword_dist_out"] = pd.to_numeric(node_attrs["node_sword_dist_out"], errors="coerce")
 
+    if network_dist_out is not None and not network_dist_out.empty:
+        node_attrs = node_attrs.merge(network_dist_out, on="id_node", how="left")
+    else:
+        node_attrs["node_network_dist_out_m"] = pd.to_numeric(node_attrs.get("node_sword_dist_out"), errors="coerce")
+        node_attrs["node_network_dist_source"] = np.where(
+            node_attrs["node_network_dist_out_m"].notna(),
+            "sword_dist_out_fallback",
+            "missing",
+        )
+
     node_attrs["rapid_wse_for_slope"] = node_attrs["node_wse_raw"]
     node_attrs["rapid_wse_source_method"] = node_attrs["node_wse_fill_method"].fillna("unresolved").astype("object")
     node_attrs["rapid_wse_interpolated"] = False
     node_attrs["rapid_wse_anchor_count"] = 0
+    node_attrs["rapid_wse_profile_residual"] = np.nan
 
-    if not config.interpolate_along_corridor or "node_sword_dist_out" not in node_attrs.columns:
+    if not config.interpolate_along_corridor or "node_network_dist_out_m" not in node_attrs.columns:
         return node_attrs
 
-    anchor_mask = node_attrs["node_wse_fill_method"].eq("requested_field") & node_attrs["node_wse_raw"].notna()
-    anchors = node_attrs.loc[anchor_mask & node_attrs["node_sword_dist_out"].notna()].copy()
-    anchors = anchors.sort_values("node_sword_dist_out")
-    xp = anchors["node_sword_dist_out"].to_numpy(dtype=float)
-    yp = anchors["node_wse_raw"].to_numpy(dtype=float)
-    xp_unique, unique_index = np.unique(xp, return_index=True)
-    yp_unique = yp[unique_index]
-    node_attrs["rapid_wse_anchor_count"] = int(len(xp_unique))
-    if len(xp_unique) < int(config.min_anchor_nodes_for_profile):
+    coord = pd.to_numeric(node_attrs["node_network_dist_out_m"], errors="coerce")
+    requested_anchor_mask = pd.Series(False, index=node_attrs.index)
+    corridor_anchors = _load_corridor_profile_anchors(node_attrs, config=config)
+    profile_method = ""
+    if corridor_anchors is not None:
+        anchors, profile_method = corridor_anchors
+        anchors = (
+            anchors.groupby("corridor_dist_out", as_index=False)["corridor_wse_raw"]
+            .mean()
+            .sort_values("corridor_dist_out")
+        )
+        xp = anchors["corridor_dist_out"].to_numpy(dtype=float)
+        yp = anchors["corridor_wse_raw"].to_numpy(dtype=float)
+        state_coord_min = float(coord.min())
+        state_coord_max = float(coord.max())
+        if not np.isfinite(state_coord_min) or not np.isfinite(state_coord_max) or state_coord_max <= state_coord_min:
+            corridor_anchors = None
+    if corridor_anchors is None:
+        requested_anchor_mask = node_attrs["node_wse_fill_method"].eq("requested_field") & node_attrs["node_wse_raw"].notna() & coord.notna()
+        anchors = node_attrs.loc[requested_anchor_mask, ["id_node", "node_network_dist_out_m", "node_wse_raw"]].copy()
+        profile_method = "profile_monotone_requested_field_nodes"
+        if len(anchors) < int(config.min_anchor_nodes_for_profile):
+            available_mask = node_attrs["node_wse_raw"].notna() & coord.notna()
+            anchors = node_attrs.loc[available_mask, ["id_node", "node_network_dist_out_m", "node_wse_raw"]].copy()
+            profile_method = "profile_monotone_all_available_nodes"
+
+        anchors["node_network_dist_out_m"] = pd.to_numeric(anchors["node_network_dist_out_m"], errors="coerce")
+        anchors["node_wse_raw"] = pd.to_numeric(anchors["node_wse_raw"], errors="coerce")
+        anchors = anchors.dropna(subset=["node_network_dist_out_m", "node_wse_raw"]).copy()
+        if anchors.empty:
+            return node_attrs
+
+        anchors = (
+            anchors.groupby("node_network_dist_out_m", as_index=False)["node_wse_raw"]
+            .mean()
+            .sort_values("node_network_dist_out_m")
+        )
+        xp = anchors["node_network_dist_out_m"].to_numpy(dtype=float)
+        yp = anchors["node_wse_raw"].to_numpy(dtype=float)
+    node_attrs["rapid_wse_anchor_count"] = int(len(xp))
+    if len(xp) < int(config.min_anchor_nodes_for_profile):
         return node_attrs
 
-    target_mask = ~anchor_mask & node_attrs["node_sword_dist_out"].notna()
-    targets = node_attrs.loc[target_mask].copy()
-    if targets.empty:
-        return node_attrs
-
-    targets = targets.sort_values("node_sword_dist_out")
-    interpolated = np.interp(
-        targets["node_sword_dist_out"].to_numpy(dtype=float),
-        xp_unique,
-        yp_unique,
+    fitted = _fit_monotone_increasing_profile(xp, yp)
+    target_mask = coord.notna()
+    eval_coord = coord.loc[target_mask].to_numpy(dtype=float)
+    if corridor_anchors is not None:
+        sword_coord_min = float(np.min(xp))
+        sword_coord_max = float(np.max(xp))
+        eval_coord = sword_coord_min + (
+            (eval_coord - state_coord_min) / (state_coord_max - state_coord_min)
+        ) * (sword_coord_max - sword_coord_min)
+    profile_values = _interp_linear_extrapolation(
+        xp,
+        fitted,
+        eval_coord,
     )
-    node_attrs.loc[targets.index, "rapid_wse_for_slope"] = interpolated
-    node_attrs.loc[targets.index, "rapid_wse_source_method"] = "interpolated_along_corridor"
-    node_attrs.loc[targets.index, "rapid_wse_interpolated"] = True
+    node_attrs.loc[target_mask, "rapid_wse_for_slope"] = profile_values
+    node_attrs.loc[target_mask, "rapid_wse_source_method"] = profile_method
+    node_attrs.loc[target_mask, "rapid_wse_interpolated"] = ~requested_anchor_mask.loc[target_mask]
+    node_attrs.loc[target_mask, "rapid_wse_profile_residual"] = (
+        node_attrs.loc[target_mask, "node_wse_raw"].astype(float) - node_attrs.loc[target_mask, "rapid_wse_for_slope"].astype(float)
+    )
 
     return node_attrs
 
@@ -250,44 +552,450 @@ def _compute_section_slope_reference(
     *,
     config: SlopeConfig,
 ) -> tuple[float, str, int]:
-    if "node_sword_dist_out" not in node_attrs.columns:
+    coordinate_column = "node_network_dist_out_m" if "node_network_dist_out_m" in node_attrs.columns else "node_sword_dist_out"
+    if coordinate_column not in node_attrs.columns:
         return float("nan"), "missing_dist_out", 0
 
     anchors = node_attrs.loc[
-        node_attrs["node_wse_raw"].notna() & node_attrs["node_sword_dist_out"].notna()
+        node_attrs["rapid_wse_for_slope"].notna() & pd.to_numeric(node_attrs[coordinate_column], errors="coerce").notna()
     ].copy()
     if anchors.empty:
         return float("nan"), "missing_anchor_wse", 0
 
-    requested = anchors.loc[anchors["node_wse_fill_method"].eq("requested_field")].copy()
-    if len(requested) >= int(config.min_anchor_nodes_for_profile):
-        anchors = requested
-        source_method = "requested_field_nodes"
-    else:
-        source_method = "all_available_nodes"
-
     anchors = (
-        anchors.groupby("node_sword_dist_out", as_index=False)["node_wse_raw"]
+        anchors.groupby(coordinate_column, as_index=False)["rapid_wse_for_slope"]
         .mean()
-        .sort_values("node_sword_dist_out")
+        .sort_values(coordinate_column)
     )
     if len(anchors) < int(config.min_anchor_nodes_for_profile):
         return float("nan"), "insufficient_anchor_nodes", int(len(anchors))
 
     downstream = anchors.iloc[0]
     upstream = anchors.iloc[-1]
-    delta_dist = float(upstream["node_sword_dist_out"] - downstream["node_sword_dist_out"])
-    delta_wse = float(upstream["node_wse_raw"] - downstream["node_wse_raw"])
+    delta_dist = float(upstream[coordinate_column] - downstream[coordinate_column])
+    delta_wse = float(upstream["rapid_wse_for_slope"] - downstream["rapid_wse_for_slope"])
     if delta_dist <= 0 or delta_wse <= 0:
         return float("nan"), "invalid_anchor_profile", int(len(anchors))
 
+    source_method = "profile_network_dist_out" if coordinate_column == "node_network_dist_out_m" else "profile_sword_dist_out"
     return float(delta_wse / delta_dist), source_method, int(len(anchors))
+
+
+def _initialize_compound_bubble_qc_columns(
+    frame: pd.DataFrame,
+    *,
+    default_reason: str,
+) -> pd.DataFrame:
+    result = frame.copy()
+    for column, default in COMPOUND_BUBBLE_QC_COLUMNS.items():
+        if isinstance(default, pd.Series):
+            result[column] = default.reindex(result.index)
+        else:
+            result[column] = default
+    result["bubble_slope_qc_reason"] = str(default_reason)
+    return result
+
+
+def _parse_unit_node_ids(value: object) -> set[int]:
+    if value is None or pd.isna(value):
+        return set()
+    text = str(value).strip()
+    if not text:
+        return set()
+    node_ids: set[int] = set()
+    for token in text.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            node_ids.add(int(token))
+        except ValueError:
+            continue
+    return node_ids
+
+
+def _build_bubble_linear_reference_profile(
+    *,
+    internal_node_ids: set[int],
+    node_lookup: pd.DataFrame,
+    entry_node: int,
+    exit_node: int,
+    entry_wse: float,
+    exit_wse: float,
+    entry_dist: float,
+    exit_dist: float,
+) -> tuple[dict[int, float] | None, str]:
+    reference_drop = float(entry_wse - exit_wse)
+    reference_dist_span = float(entry_dist - exit_dist)
+    if reference_drop <= 0 or reference_dist_span <= 0:
+        return None, ""
+
+    node_profile: dict[int, float] = {}
+    for node_id in sorted(internal_node_ids):
+        if node_id not in node_lookup.index:
+            return None, ""
+        node_dist = float(node_lookup.loc[node_id].get("node_network_dist_out_m", np.nan))
+        if not np.isfinite(node_dist):
+            return None, ""
+        fraction = (node_dist - exit_dist) / reference_dist_span
+        node_profile[int(node_id)] = float(exit_wse + fraction * reference_drop)
+
+    node_profile[int(entry_node)] = float(entry_wse)
+    node_profile[int(exit_node)] = float(exit_wse)
+    return node_profile, "bubble_local_linear_network_dist_out"
+
+
+def _build_bubble_reference_slopes(
+    *,
+    bubble_links: pd.DataFrame,
+    node_profile: dict[int, float],
+) -> tuple[dict[int, float], bool]:
+    ref_slopes: dict[int, float] = {}
+    for row in bubble_links.itertuples(index=False):
+        numerator = float(node_profile[int(row.id_us_node)] - node_profile[int(row.id_ds_node)])
+        denominator = float(row.link_length_m)
+        ref_slope = numerator / denominator if denominator > 0 else float("nan")
+        if not np.isfinite(ref_slope) or ref_slope <= 0:
+            return {}, False
+        ref_slopes[int(row.id_link)] = float(ref_slope)
+    return ref_slopes, True
+
+
+def _project_bubble_link_drops(
+    *,
+    bubble_links: pd.DataFrame,
+    path_link_sequences: list[list[int]],
+    reference_drop: float,
+    min_slope: float,
+) -> tuple[dict[int, float] | None, dict[int, float] | None]:
+    if not path_link_sequences:
+        return None, None
+
+    link_ids = [int(value) for value in bubble_links["id_link"].tolist()]
+    link_lengths = {
+        int(row.id_link): float(row.link_length_m)
+        for row in bubble_links.itertuples(index=False)
+    }
+    prior_slopes = {
+        int(row.id_link): float(row.slope_used)
+        for row in bubble_links.itertuples(index=False)
+    }
+    min_drops = {
+        link_id: float(min_slope) * max(float(link_lengths[link_id]), 1.0)
+        for link_id in link_ids
+    }
+    prior_drops = {
+        link_id: max(float(prior_slopes[link_id]) * float(link_lengths[link_id]), float(min_drops[link_id]))
+        for link_id in link_ids
+    }
+
+    A = np.zeros((len(path_link_sequences), len(link_ids)), dtype=float)
+    link_index = {link_id: idx for idx, link_id in enumerate(link_ids)}
+    for row_index, path in enumerate(path_link_sequences):
+        for link_id in path:
+            A[row_index, link_index[int(link_id)]] = 1.0
+    b = np.full(len(path_link_sequences), float(reference_drop), dtype=float)
+    p = np.asarray([prior_drops[link_id] for link_id in link_ids], dtype=float)
+    w_inv = np.diag(np.maximum(p, 1e-9) ** 2)
+    residual = A @ p - b
+    try:
+        lagrange = np.linalg.pinv(A @ w_inv @ A.T) @ residual
+    except np.linalg.LinAlgError:
+        return None, None
+    projected = p - w_inv @ A.T @ lagrange
+    if not np.isfinite(projected).all():
+        return None, None
+    if np.any(projected <= np.asarray([min_drops[link_id] for link_id in link_ids], dtype=float)):
+        return None, None
+
+    drop_map = {link_id: float(projected[link_index[link_id]]) for link_id in link_ids}
+    slope_map = {
+        link_id: float(drop_map[link_id] / float(link_lengths[link_id]))
+        for link_id in link_ids
+    }
+    if not all(np.isfinite(value) and value > 0 for value in slope_map.values()):
+        return None, None
+    return drop_map, slope_map
+
+
+def _apply_compound_bubble_qc(
+    frame: pd.DataFrame,
+    *,
+    node_attrs: pd.DataFrame,
+    unit_summary: pd.DataFrame | None,
+    config: SlopeConfig,
+) -> pd.DataFrame:
+    if not bool(config.use_compound_bubble_slope_qc):
+        return _initialize_compound_bubble_qc_columns(frame, default_reason="disabled")
+    if unit_summary is None or unit_summary.empty:
+        return _initialize_compound_bubble_qc_columns(frame, default_reason="unavailable_unit_summary")
+
+    required_columns = {"compound_bubble_id", "in_compound_bubble", "unit_node_ids"}
+    if not required_columns.issubset(unit_summary.columns):
+        return _initialize_compound_bubble_qc_columns(frame, default_reason="unit_summary_missing_columns")
+
+    result = _initialize_compound_bubble_qc_columns(frame, default_reason="not_in_compound_bubble")
+    result["id_link"] = pd.to_numeric(result["id_link"], errors="coerce").astype(int)
+    result["id_us_node"] = pd.to_numeric(result["id_us_node"], errors="coerce").astype(int)
+    result["id_ds_node"] = pd.to_numeric(result["id_ds_node"], errors="coerce").astype(int)
+    link_index_by_id = dict(zip(result["id_link"], result.index))
+
+    node_lookup = node_attrs.copy()
+    node_lookup["id_node"] = pd.to_numeric(node_lookup["id_node"], errors="coerce").astype("Int64")
+    node_lookup = node_lookup.dropna(subset=["id_node"]).copy()
+    node_lookup["id_node"] = node_lookup["id_node"].astype(int)
+    node_lookup = node_lookup.set_index("id_node", drop=False)
+
+    working = unit_summary.copy()
+    working["compound_bubble_id"] = pd.to_numeric(working["compound_bubble_id"], errors="coerce").astype("Int64")
+    working["in_compound_bubble"] = working["in_compound_bubble"].fillna(False).astype(bool)
+    working = working.loc[working["compound_bubble_id"].notna() & working["in_compound_bubble"]].copy()
+    if working.empty:
+        return result
+
+    bubble_nodes: dict[int, set[int]] = {}
+    bubble_candidate_indices: dict[int, list[int]] = {}
+    link_to_candidate_bubbles: dict[int, set[int]] = {}
+    for bubble_id, group in working.groupby("compound_bubble_id", sort=True):
+        bubble_numeric = int(bubble_id)
+        node_ids: set[int] = set()
+        for value in group["unit_node_ids"]:
+            node_ids.update(_parse_unit_node_ids(value))
+        if not node_ids:
+            continue
+        bubble_nodes[bubble_numeric] = node_ids
+        candidate_mask = result["id_us_node"].isin(node_ids) & result["id_ds_node"].isin(node_ids)
+        candidate_indices = result.index[candidate_mask].tolist()
+        bubble_candidate_indices[bubble_numeric] = candidate_indices
+        for index in candidate_indices:
+            link_to_candidate_bubbles.setdefault(int(index), set()).add(bubble_numeric)
+
+    for bubble_numeric, node_ids in bubble_nodes.items():
+        candidate_indices = bubble_candidate_indices.get(bubble_numeric, [])
+        if not candidate_indices:
+            continue
+
+        result.loc[candidate_indices, "bubble_slope_qc_candidate"] = True
+        ambiguous_indices = [index for index in candidate_indices if len(link_to_candidate_bubbles.get(int(index), set())) > 1]
+        unique_candidate_indices = [index for index in candidate_indices if index not in ambiguous_indices]
+        if unique_candidate_indices:
+            result.loc[unique_candidate_indices, "compound_bubble_id_link"] = bubble_numeric
+            result.loc[unique_candidate_indices, "bubble_n_internal_links"] = int(len(unique_candidate_indices))
+        if ambiguous_indices:
+            result.loc[ambiguous_indices, "bubble_slope_qc_reason"] = "ambiguous_link_assignment"
+            result.loc[ambiguous_indices, "bubble_n_internal_links"] = int(len(candidate_indices))
+        if not unique_candidate_indices:
+            continue
+        if ambiguous_indices:
+            result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "ambiguous_link_assignment"
+            continue
+
+        bubble_links = result.loc[unique_candidate_indices].copy()
+        internal_node_ids = set(bubble_links["id_us_node"].tolist()) | set(bubble_links["id_ds_node"].tolist())
+        incoming_boundary_nodes = sorted(
+            {
+                int(row.id_ds_node)
+                for row in result.itertuples(index=False)
+                if int(row.id_ds_node) in internal_node_ids and int(row.id_us_node) not in internal_node_ids
+            }
+        )
+        outgoing_boundary_nodes = sorted(
+            {
+                int(row.id_us_node)
+                for row in result.itertuples(index=False)
+                if int(row.id_us_node) in internal_node_ids and int(row.id_ds_node) not in internal_node_ids
+            }
+        )
+        if len(incoming_boundary_nodes) != 1:
+            reason = "multiple_entry_nodes" if len(incoming_boundary_nodes) > 1 else "missing_entry_node"
+            result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = reason
+            continue
+        if len(outgoing_boundary_nodes) != 1:
+            reason = "multiple_exit_nodes" if len(outgoing_boundary_nodes) > 1 else "missing_exit_node"
+            result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = reason
+            continue
+
+        entry_node = int(incoming_boundary_nodes[0])
+        exit_node = int(outgoing_boundary_nodes[0])
+        result.loc[unique_candidate_indices, "bubble_entry_node_id"] = entry_node
+        result.loc[unique_candidate_indices, "bubble_exit_node_id"] = exit_node
+
+        internal_graph = nx.MultiDiGraph()
+        internal_graph.add_nodes_from(sorted(internal_node_ids))
+        for row in bubble_links.itertuples(index=False):
+            internal_graph.add_edge(int(row.id_us_node), int(row.id_ds_node), key=int(row.id_link), id_link=int(row.id_link))
+        if not nx.is_directed_acyclic_graph(internal_graph):
+            result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "cycle_detected"
+            continue
+        if not nx.has_path(internal_graph, entry_node, exit_node):
+            result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "no_entry_exit_path"
+            continue
+
+        if entry_node not in node_lookup.index or exit_node not in node_lookup.index:
+            result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "missing_reference_nodes"
+            continue
+        entry_meta = node_lookup.loc[entry_node]
+        exit_meta = node_lookup.loc[exit_node]
+        entry_wse = float(entry_meta.get("rapid_wse_for_slope", np.nan))
+        exit_wse = float(exit_meta.get("rapid_wse_for_slope", np.nan))
+        entry_dist = float(entry_meta.get("node_network_dist_out_m", np.nan))
+        exit_dist = float(exit_meta.get("node_network_dist_out_m", np.nan))
+        if not all(np.isfinite([entry_wse, exit_wse, entry_dist, exit_dist])):
+            result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "missing_reference_profile"
+            continue
+        reference_drop = float(entry_wse - exit_wse)
+        reference_dist_span = float(entry_dist - exit_dist)
+        if reference_drop <= 0:
+            result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "nonpositive_reference_drop"
+            continue
+        if reference_dist_span <= 0:
+            result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "nonpositive_reference_dist_span"
+            continue
+
+        path_link_sequences: list[list[int]] = []
+        max_paths = int(config.compound_bubble_max_paths_for_qc)
+        path_limit_exceeded = False
+        for path_index, edge_path in enumerate(nx.all_simple_edge_paths(internal_graph, entry_node, exit_node), start=1):
+            if path_index > max_paths:
+                path_limit_exceeded = True
+                break
+            path_link_sequences.append([int(link_key) for _, _, link_key in edge_path])
+        if path_limit_exceeded:
+            result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "path_limit_exceeded"
+            result.loc[unique_candidate_indices, "bubble_n_paths_checked"] = int(max_paths)
+            continue
+        if not path_link_sequences:
+            result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "no_entry_exit_path"
+            continue
+
+        profile_node_ids = {
+            int(node_id)
+            for node_id in internal_node_ids
+            if int(node_id) in node_lookup.index and np.isfinite(float(node_lookup.loc[int(node_id)].get("rapid_wse_for_slope", np.nan)))
+        }
+        if not internal_node_ids.issubset(profile_node_ids):
+            result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "missing_internal_dist_out"
+            continue
+        node_profile = {
+            int(node_id): float(node_lookup.loc[int(node_id), "rapid_wse_for_slope"])
+            for node_id in sorted(internal_node_ids)
+        }
+        ref_slopes, valid_reference_slopes = _build_bubble_reference_slopes(
+            bubble_links=bubble_links,
+            node_profile=node_profile,
+        )
+        reference_profile_method = "state_profile_network_dist_out"
+        repair_candidate = False
+        repair_method = ""
+        if not valid_reference_slopes:
+            repair_candidate = True
+            projected_drops, projected_slopes = _project_bubble_link_drops(
+                bubble_links=bubble_links,
+                path_link_sequences=path_link_sequences,
+                reference_drop=reference_drop,
+                min_slope=float(config.min_slope),
+            )
+            if projected_slopes is not None and projected_drops is not None:
+                ref_slopes = projected_slopes
+                valid_reference_slopes = True
+                reference_profile_method = "bubble_weighted_path_drop_projection"
+                repair_method = "bubble_weighted_path_drop_projection"
+            else:
+                linear_profile, linear_method = _build_bubble_linear_reference_profile(
+                    internal_node_ids=internal_node_ids,
+                    node_lookup=node_lookup,
+                    entry_node=entry_node,
+                    exit_node=exit_node,
+                    entry_wse=entry_wse,
+                    exit_wse=exit_wse,
+                    entry_dist=entry_dist,
+                    exit_dist=exit_dist,
+                )
+                if linear_profile is None:
+                    result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "invalid_reference_profile"
+                    result.loc[unique_candidate_indices, "bubble_slope_repair_candidate"] = True
+                    continue
+                ref_slopes, valid_reference_slopes = _build_bubble_reference_slopes(
+                    bubble_links=bubble_links,
+                    node_profile=linear_profile,
+                )
+                if not valid_reference_slopes:
+                    result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "invalid_reference_profile"
+                    result.loc[unique_candidate_indices, "bubble_slope_repair_candidate"] = True
+                    continue
+                node_profile = linear_profile
+                reference_profile_method = linear_method
+                repair_method = linear_method
+
+        result.loc[unique_candidate_indices, "bubble_slope_repair_candidate"] = repair_candidate
+        if repair_candidate and bool(config.use_compound_bubble_slope_repair):
+            result.loc[unique_candidate_indices, "bubble_slope_repair_applied"] = True
+            result.loc[unique_candidate_indices, "bubble_slope_repair_method"] = repair_method
+            for row_index, row in bubble_links.iterrows():
+                prior_slope = float(row["slope_used"])
+                repaired_slope = float(ref_slopes[int(row["id_link"])])
+                result.at[int(row_index), "slope_used"] = repaired_slope
+                result.at[int(row_index), "slope_source_method"] = "compound_bubble_profile"
+                result.at[int(row_index), "slope_adjusted"] = True
+                result.at[int(row_index), "slope_reason"] = "filled_from_compound_bubble_profile"
+                result.at[int(row_index), "slope_minimum_applied"] = False
+                if np.isfinite(prior_slope) and prior_slope > 0:
+                    factor = float(repaired_slope / prior_slope)
+                    result.at[int(row_index), "bubble_slope_repair_change_factor"] = factor
+                    result.at[int(row_index), "bubble_slope_repair_large_change_flag"] = bool(
+                        factor >= float(config.compound_bubble_slope_repair_flag_factor)
+                    )
+
+        path_drops: list[float] = []
+        for path in path_link_sequences:
+            drop = 0.0
+            for link_key in path:
+                row_index = link_index_by_id.get(int(link_key))
+                if row_index is None:
+                    drop = float("nan")
+                    break
+                slope_value = float(result.at[row_index, "slope_used"])
+                length_value = float(result.at[row_index, "link_length_m"])
+                drop += slope_value * length_value
+            path_drops.append(float(drop))
+
+        path_drop_array = np.asarray(path_drops, dtype=float)
+        if not np.isfinite(path_drop_array).all():
+            result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "nonfinite_path_drop"
+            continue
+        abs_errors = np.abs(path_drop_array - reference_drop)
+        rel_errors = abs_errors / reference_drop
+        max_abs_error = float(abs_errors.max()) if len(abs_errors) else float("nan")
+        max_rel_error = float(rel_errors.max()) if len(rel_errors) else float("nan")
+        qc_failed = bool(
+            max_abs_error > float(config.compound_bubble_path_drop_abs_tol_m)
+            or max_rel_error > float(config.compound_bubble_path_drop_rel_tol)
+        )
+
+        result.loc[unique_candidate_indices, "bubble_slope_qc_valid"] = True
+        result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "path_drop_mismatch" if qc_failed else "ok"
+        result.loc[unique_candidate_indices, "bubble_reference_drop_m"] = reference_drop
+        result.loc[unique_candidate_indices, "bubble_reference_dist_span_m"] = reference_dist_span
+        result.loc[unique_candidate_indices, "bubble_reference_slope"] = float(reference_drop / reference_dist_span)
+        result.loc[unique_candidate_indices, "bubble_reference_profile_method"] = reference_profile_method
+        result.loc[unique_candidate_indices, "bubble_n_paths_checked"] = int(len(path_drop_array))
+        result.loc[unique_candidate_indices, "bubble_path_drop_min_m"] = float(path_drop_array.min())
+        result.loc[unique_candidate_indices, "bubble_path_drop_max_m"] = float(path_drop_array.max())
+        result.loc[unique_candidate_indices, "bubble_path_drop_spread_m"] = float(path_drop_array.max() - path_drop_array.min())
+        result.loc[unique_candidate_indices, "bubble_path_drop_max_abs_error_m"] = max_abs_error
+        result.loc[unique_candidate_indices, "bubble_path_drop_max_rel_error"] = max_rel_error
+        result.loc[unique_candidate_indices, "bubble_path_drop_qc_failed"] = qc_failed
+        for row_index, row in bubble_links.iterrows():
+            result.at[int(row_index), "bubble_link_slope_ref"] = float(ref_slopes[int(row["id_link"])])
+
+    return result
 
 
 def compute_link_slopes(
     links: gpd.GeoDataFrame,
     nodes: gpd.GeoDataFrame,
     *,
+    unit_summary: pd.DataFrame | None = None,
     config: SlopeConfig | None = None,
 ) -> pd.DataFrame:
     config = config or SlopeConfig()
@@ -297,6 +1005,12 @@ def compute_link_slopes(
         raise ValueError("Section-slope ratio minimum must be positive when provided.")
     if config.section_slope_ratio_max is not None and config.section_slope_ratio_max <= 0:
         raise ValueError("Section-slope ratio maximum must be positive when provided.")
+    if config.compound_bubble_max_paths_for_qc <= 0:
+        raise ValueError("Compound-bubble max paths for QC must be positive.")
+    if config.compound_bubble_path_drop_rel_tol < 0:
+        raise ValueError("Compound-bubble relative path-drop tolerance cannot be negative.")
+    if config.compound_bubble_path_drop_abs_tol_m < 0:
+        raise ValueError("Compound-bubble absolute path-drop tolerance cannot be negative.")
     if (
         config.section_slope_ratio_min is not None
         and config.section_slope_ratio_max is not None
@@ -318,7 +1032,12 @@ def compute_link_slopes(
         preferred_length_field=config.preferred_length_field,
     )
 
-    node_attrs = _resolve_rapid_wse_for_slope(nodes, config=config)
+    network_dist_out = _compute_network_dist_out(links, nodes, lengths=lengths)
+    node_attrs = _resolve_rapid_wse_for_slope(
+        nodes,
+        config=config,
+        network_dist_out=network_dist_out,
+    )
     section_slope_ref, section_slope_source_method, section_slope_anchor_count = _compute_section_slope_reference(
         node_attrs,
         config=config,
@@ -341,9 +1060,12 @@ def compute_link_slopes(
             "node_sword_node_id": "sword_us_node_id",
             "node_sword_reach_id": "sword_us_reach_id",
             "node_sword_dist_out": "sword_us_dist_out",
+            "node_network_dist_out_m": "network_us_dist_out_m",
+            "node_network_dist_source": "network_us_dist_source",
             "rapid_wse_source_method": "wse_us_source_method",
             "rapid_wse_interpolated": "wse_us_interpolated",
             "rapid_wse_anchor_count": "wse_us_anchor_count",
+            "rapid_wse_profile_residual": "wse_us_profile_residual",
         }
     )
     ds = node_attrs.rename(
@@ -357,9 +1079,12 @@ def compute_link_slopes(
             "node_sword_node_id": "sword_ds_node_id",
             "node_sword_reach_id": "sword_ds_reach_id",
             "node_sword_dist_out": "sword_ds_dist_out",
+            "node_network_dist_out_m": "network_ds_dist_out_m",
+            "node_network_dist_source": "network_ds_dist_source",
             "rapid_wse_source_method": "wse_ds_source_method",
             "rapid_wse_interpolated": "wse_ds_interpolated",
             "rapid_wse_anchor_count": "wse_ds_anchor_count",
+            "rapid_wse_profile_residual": "wse_ds_profile_residual",
         }
     )
 
@@ -455,6 +1180,12 @@ def compute_link_slopes(
         default="ok",
     )
     frame["slope_minimum_applied"] = frame["slope_used"].eq(config.min_slope)
+    frame = _apply_compound_bubble_qc(
+        frame,
+        node_attrs=node_attrs,
+        unit_summary=unit_summary,
+        config=config,
+    )
     return frame
 
 
@@ -470,7 +1201,7 @@ def compute_section_slope_reference(
             "Directed nodes are missing required SWORD WSE columns: "
             + ", ".join(missing)
         )
-    node_attrs = _resolve_rapid_wse_for_slope(nodes, config=config)
+    node_attrs = _resolve_rapid_wse_for_slope(nodes, config=config, network_dist_out=None)
     slope_ref, source_method, anchor_count = _compute_section_slope_reference(
         node_attrs,
         config=config,

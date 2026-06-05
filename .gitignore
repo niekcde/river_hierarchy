@@ -17,3 +17,9 @@ tmp/
 # Local scratch/vendor checkouts. RivGraph should be referenced through the
 # environment file or a deliberate submodule, not committed as copied source.
 rivgraph_centerline/RivGraph-master/
+
+# Notebook-exported figures
+RAPID/notebooks/conceptual_channel_splitting_celerity.pdf
+RAPID/notebooks/conceptual_channel_splitting_celerity.png
+RAPID/notebooks/conceptual_ebi_celerity.pdf
+RAPID/notebooks/conceptual_ebi_celerity.png

@@ -50,6 +50,11 @@ class RapidPrepConfig:
     section_slope_ratio_min: float | None = None
     section_slope_ratio_max: float | None = None
     use_section_slope_fallback: bool = True
+    use_compound_bubble_slope_qc: bool = True
+    use_compound_bubble_slope_repair: bool = True
+    compound_bubble_max_paths_for_qc: int = 500
+    compound_bubble_path_drop_rel_tol: float = 0.1
+    compound_bubble_path_drop_abs_tol_m: float = 0.05
     preferred_length_field: str = "len"
     include_base_state: bool = True
     strict_sword: bool = True
@@ -76,6 +81,15 @@ def _apply_branch_widths(
 
 def _normalize_dir_path(raw: str | Path) -> Path:
     return Path(raw).expanduser().resolve()
+
+
+def _load_unit_summary_if_exists(hierarchy_output_dir: Path | None) -> pd.DataFrame | None:
+    if hierarchy_output_dir is None:
+        return None
+    unit_summary_path = hierarchy_output_dir / "unit_summary.csv"
+    if not unit_summary_path.exists():
+        return None
+    return pd.read_csv(unit_summary_path)
 
 
 def _coerce_output_dir(
@@ -866,12 +880,18 @@ def prepare_state(
     slope_frame = compute_link_slopes(
         links,
         nodes,
+        unit_summary=_load_unit_summary_if_exists(context.hierarchy_output_dir),
         config=SlopeConfig(
             min_slope=prep_config.min_slope,
             max_slope_for_k=prep_config.max_slope_for_k,
             section_slope_ratio_min=prep_config.section_slope_ratio_min,
             section_slope_ratio_max=prep_config.section_slope_ratio_max,
             use_section_slope_fallback=prep_config.use_section_slope_fallback,
+            use_compound_bubble_slope_qc=prep_config.use_compound_bubble_slope_qc,
+            use_compound_bubble_slope_repair=prep_config.use_compound_bubble_slope_repair,
+            compound_bubble_max_paths_for_qc=prep_config.compound_bubble_max_paths_for_qc,
+            compound_bubble_path_drop_rel_tol=prep_config.compound_bubble_path_drop_rel_tol,
+            compound_bubble_path_drop_abs_tol_m=prep_config.compound_bubble_path_drop_abs_tol_m,
             preferred_length_field=prep_config.preferred_length_field,
         ),
     )
@@ -1039,6 +1059,10 @@ def prepare_state(
             "n_inlet_links": int(rapid_links["is_inlet"].fillna(False).sum()) if "is_inlet" in rapid_links.columns else 0,
             "n_slope_adjusted": int(rapid_links["slope_adjusted"].fillna(False).sum()),
             "n_slope_outlier_flagged": int(rapid_links["slope_outlier_flag"].fillna(False).sum()) if "slope_outlier_flag" in rapid_links.columns else 0,
+            "n_links_in_compound_bubble_qc": int(rapid_links["bubble_slope_qc_candidate"].fillna(False).sum()) if "bubble_slope_qc_candidate" in rapid_links.columns else 0,
+            "n_links_in_valid_compound_bubble_qc": int(rapid_links["bubble_slope_qc_valid"].fillna(False).sum()) if "bubble_slope_qc_valid" in rapid_links.columns else 0,
+            "n_links_in_failed_compound_bubble_qc": int(rapid_links["bubble_path_drop_qc_failed"].fillna(False).sum()) if "bubble_path_drop_qc_failed" in rapid_links.columns else 0,
+            "n_links_in_compound_bubble_repair": int(rapid_links["bubble_slope_repair_applied"].fillna(False).sum()) if "bubble_slope_repair_applied" in rapid_links.columns else 0,
             "n_width_adjusted": int(rapid_links["rapid_width_adjusted"].fillna(False).sum()),
             "n_subreach_width_fallback_used": int(rapid_links["rapid_subreach_width_fallback_used"].fillna(False).sum()) if "rapid_subreach_width_fallback_used" in rapid_links.columns else 0,
             "n_length_floor_applied": int(rapid_links["rapid_length_floor_applied"].fillna(False).sum()) if "rapid_length_floor_applied" in rapid_links.columns else 0,
@@ -1058,6 +1082,10 @@ def prepare_state(
             "max_effective_length_m": float(rapid_links["rapid_effective_length_m"].max()) if "rapid_effective_length_m" in rapid_links.columns and len(rapid_links) else float("nan"),
             "pct_length_floor_applied": float(rapid_links["rapid_length_floor_applied"].fillna(False).astype(bool).mean()) if "rapid_length_floor_applied" in rapid_links.columns and len(rapid_links) else float("nan"),
             "pct_slope_outlier_flagged": float(rapid_links["slope_outlier_flag"].fillna(False).astype(bool).mean()) if "slope_outlier_flag" in rapid_links.columns and len(rapid_links) else float("nan"),
+            "n_compound_bubbles_qc": int(rapid_links.loc[rapid_links["compound_bubble_id_link"].notna(), "compound_bubble_id_link"].nunique()) if "compound_bubble_id_link" in rapid_links.columns else 0,
+            "n_valid_compound_bubbles_qc": int(rapid_links.loc[rapid_links["bubble_slope_qc_valid"].fillna(False), "compound_bubble_id_link"].nunique()) if "bubble_slope_qc_valid" in rapid_links.columns and "compound_bubble_id_link" in rapid_links.columns else 0,
+            "n_failed_compound_bubbles_qc": int(rapid_links.loc[rapid_links["bubble_path_drop_qc_failed"].fillna(False), "compound_bubble_id_link"].nunique()) if "bubble_path_drop_qc_failed" in rapid_links.columns and "compound_bubble_id_link" in rapid_links.columns else 0,
+            "n_repaired_compound_bubbles_qc": int(rapid_links.loc[rapid_links["bubble_slope_repair_applied"].fillna(False), "compound_bubble_id_link"].nunique()) if "bubble_slope_repair_applied" in rapid_links.columns and "compound_bubble_id_link" in rapid_links.columns else 0,
             "pct_subreach_width_fallback_used": float(rapid_links["rapid_subreach_width_fallback_used"].fillna(False).astype(bool).mean()) if "rapid_subreach_width_fallback_used" in rapid_links.columns and len(rapid_links) else float("nan"),
             "rapid_k_min": float(rapid_links["rapid_k"].min()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
             "rapid_k_max": float(rapid_links["rapid_k"].max()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
@@ -1107,6 +1135,10 @@ def prepare_state(
         "pct_length_floor_applied": float(rapid_links["rapid_length_floor_applied"].fillna(False).astype(bool).mean()) if "rapid_length_floor_applied" in rapid_links.columns and len(rapid_links) else float("nan"),
         "n_slope_outlier_flagged": int(rapid_links["slope_outlier_flag"].fillna(False).sum()) if "slope_outlier_flag" in rapid_links.columns else 0,
         "pct_slope_outlier_flagged": float(rapid_links["slope_outlier_flag"].fillna(False).astype(bool).mean()) if "slope_outlier_flag" in rapid_links.columns and len(rapid_links) else float("nan"),
+        "n_compound_bubbles_qc": int(rapid_links.loc[rapid_links["compound_bubble_id_link"].notna(), "compound_bubble_id_link"].nunique()) if "compound_bubble_id_link" in rapid_links.columns else 0,
+        "n_valid_compound_bubbles_qc": int(rapid_links.loc[rapid_links["bubble_slope_qc_valid"].fillna(False), "compound_bubble_id_link"].nunique()) if "bubble_slope_qc_valid" in rapid_links.columns and "compound_bubble_id_link" in rapid_links.columns else 0,
+        "n_failed_compound_bubbles_qc": int(rapid_links.loc[rapid_links["bubble_path_drop_qc_failed"].fillna(False), "compound_bubble_id_link"].nunique()) if "bubble_path_drop_qc_failed" in rapid_links.columns and "compound_bubble_id_link" in rapid_links.columns else 0,
+        "n_repaired_compound_bubbles_qc": int(rapid_links.loc[rapid_links["bubble_slope_repair_applied"].fillna(False), "compound_bubble_id_link"].nunique()) if "bubble_slope_repair_applied" in rapid_links.columns and "compound_bubble_id_link" in rapid_links.columns else 0,
         "n_subreach_width_fallback_used": int(rapid_links["rapid_subreach_width_fallback_used"].fillna(False).sum()) if "rapid_subreach_width_fallback_used" in rapid_links.columns else 0,
         "pct_subreach_width_fallback_used": float(rapid_links["rapid_subreach_width_fallback_used"].fillna(False).astype(bool).mean()) if "rapid_subreach_width_fallback_used" in rapid_links.columns and len(rapid_links) else float("nan"),
         "min_effective_length_m": float(rapid_links["rapid_effective_length_m"].min()) if "rapid_effective_length_m" in rapid_links.columns and len(rapid_links) else float("nan"),

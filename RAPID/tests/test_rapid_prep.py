@@ -34,10 +34,12 @@ def _write_state(
     experiment_dir = tmp_path / "experiment"
     state_dir = experiment_dir / "states" / "S001_unit_1"
     variant_dir = state_dir / "variant"
+    hierarchy_dir = state_dir / "hierarchy"
     directed_dir = variant_dir / "directed"
     widths_dir = variant_dir / "widths"
     directed_dir.mkdir(parents=True)
     widths_dir.mkdir(parents=True)
+    hierarchy_dir.mkdir(parents=True)
 
     nodes = gpd.GeoDataFrame(
         {
@@ -93,6 +95,19 @@ def _write_state(
         }
     )
     width_samples.to_csv(width_samples_path, index=False)
+    pd.DataFrame(
+        [
+            {
+                "unit_id": 1,
+                "bifurcation": 1,
+                "confluence": 2,
+                "unit_node_ids": "1,2",
+                "compound_bubble_id": 1,
+                "in_compound_bubble": False,
+                "compound_bubble_role": "standalone",
+            }
+        ]
+    ).to_csv(hierarchy_dir / "unit_summary.csv", index=False)
 
     registry = pd.DataFrame(
         [
@@ -104,6 +119,7 @@ def _write_state(
                 "state_role": "derived",
                 "state_dir": str(state_dir.resolve()),
                 "variant_output_dir": str(variant_dir.resolve()),
+                "hierarchy_output_dir": str(hierarchy_dir.resolve()),
                 "directed_links_path": str(directed_links_path.resolve()),
                 "directed_nodes_path": str(directed_nodes_path.resolve()),
                 "status": "complete",
@@ -620,11 +636,11 @@ def test_compute_link_slopes_interpolates_along_corridor() -> None:
 
     slopes = compute_link_slopes(links, nodes, config=SlopeConfig())
     by_link = slopes.set_index("id_link")
-    assert by_link.loc[11, "wse_ds_source_method"] == "interpolated_along_corridor"
+    assert by_link.loc[11, "wse_ds_source_method"] == "profile_monotone_requested_field_nodes"
     assert by_link.loc[11, "wse_ds_interpolated"]
     assert abs(by_link.loc[11, "wse_ds"] - 9.0) < 1e-9
     assert abs(by_link.loc[11, "raw_slope"] - 0.001) < 1e-9
-    assert by_link.loc[12, "wse_us_source_method"] == "interpolated_along_corridor"
+    assert by_link.loc[12, "wse_us_source_method"] == "profile_monotone_requested_field_nodes"
     assert abs(by_link.loc[12, "wse_us"] - 9.0) < 1e-9
 
 
@@ -729,6 +745,233 @@ def test_compute_link_slopes_flags_section_ratio_outlier_and_fills_from_neighbor
     assert abs(float(by_link.loc[12, "slope_used"]) - 0.001) < 1e-9
 
 
+def test_compute_link_slopes_exports_compound_bubble_qc_for_valid_bubble() -> None:
+    nodes = gpd.GeoDataFrame(
+        {
+            "id_node": [1, 2, 3, 4, 5, 6],
+            "sword_wse": [12.0, 11.0, 10.9, 10.3, 10.0, 9.5],
+            "sword_wse_field": ["wse_obs_p50"] * 6,
+            "sword_wse_fill_method": ["requested_field"] * 6,
+            "sword_wse_fallback_used": [False] * 6,
+            "sword_node_id": [101, 102, 103, 104, 105, 106],
+            "sword_dist_out": [600.0, 500.0, 400.0, 350.0, 200.0, 0.0],
+        },
+        geometry=[
+            Point(0.0, 0.0),
+            Point(1.0, 0.0),
+            Point(2.0, 1.0),
+            Point(2.0, -1.0),
+            Point(3.0, 0.0),
+            Point(4.0, 0.0),
+        ],
+        crs="EPSG:3857",
+    )
+    links = gpd.GeoDataFrame(
+        {
+            "id_link": [10, 11, 12, 13, 14, 15],
+            "id_us_node": [1, 2, 3, 2, 4, 5],
+            "id_ds_node": [2, 3, 5, 4, 5, 6],
+            "len": [100.0] * 6,
+        },
+        geometry=[
+            LineString([(0.0, 0.0), (1.0, 0.0)]),
+            LineString([(1.0, 0.0), (2.0, 1.0)]),
+            LineString([(2.0, 1.0), (3.0, 0.0)]),
+            LineString([(1.0, 0.0), (2.0, -1.0)]),
+            LineString([(2.0, -1.0), (3.0, 0.0)]),
+            LineString([(3.0, 0.0), (4.0, 0.0)]),
+        ],
+        crs="EPSG:3857",
+    )
+    unit_summary = pd.DataFrame(
+        [
+            {
+                "unit_id": 10,
+                "unit_node_ids": "2,3,5",
+                "compound_bubble_id": 6,
+                "in_compound_bubble": True,
+                "compound_bubble_role": "bubble_root",
+            },
+            {
+                "unit_id": 11,
+                "unit_node_ids": "2,4,5",
+                "compound_bubble_id": 6,
+                "in_compound_bubble": True,
+                "compound_bubble_role": "bubble_member",
+            },
+        ]
+    )
+
+    slopes = compute_link_slopes(links, nodes, unit_summary=unit_summary, config=SlopeConfig())
+    by_link = slopes.set_index("id_link")
+    for link_id in (11, 12, 13, 14):
+        assert int(by_link.loc[link_id, "compound_bubble_id_link"]) == 6
+        assert bool(by_link.loc[link_id, "bubble_slope_qc_candidate"]) is True
+        assert bool(by_link.loc[link_id, "bubble_slope_qc_valid"]) is True
+        assert bool(by_link.loc[link_id, "bubble_path_drop_qc_failed"]) is False
+        assert by_link.loc[link_id, "bubble_slope_qc_reason"] == "ok"
+        assert int(by_link.loc[link_id, "bubble_entry_node_id"]) == 2
+        assert int(by_link.loc[link_id, "bubble_exit_node_id"]) == 5
+        assert int(by_link.loc[link_id, "bubble_n_paths_checked"]) == 2
+        assert abs(float(by_link.loc[link_id, "bubble_reference_drop_m"]) - 1.0) < 1e-9
+        assert abs(float(by_link.loc[link_id, "bubble_reference_slope"]) - 0.3535533905932738) < 1e-9
+        assert abs(float(by_link.loc[link_id, "bubble_link_slope_ref"]) - float(by_link.loc[link_id, "slope_local_raw"])) < 1e-9
+
+
+def test_compute_link_slopes_exports_compound_bubble_qc_failure_for_adjusted_path_drop() -> None:
+    nodes = gpd.GeoDataFrame(
+        {
+            "id_node": [1, 2, 3, 4, 5, 6],
+            "sword_wse": [12.0, 11.0, 10.9, 10.3, 10.0, 9.5],
+            "sword_wse_field": ["wse_obs_p50"] * 6,
+            "sword_wse_fill_method": ["requested_field"] * 6,
+            "sword_wse_fallback_used": [False] * 6,
+            "sword_node_id": [101, 102, 103, 104, 105, 106],
+            "sword_dist_out": [600.0, 500.0, 400.0, 350.0, 200.0, 0.0],
+        },
+        geometry=[
+            Point(0.0, 0.0),
+            Point(1.0, 0.0),
+            Point(2.0, 1.0),
+            Point(2.0, -1.0),
+            Point(3.0, 0.0),
+            Point(4.0, 0.0),
+        ],
+        crs="EPSG:3857",
+    )
+    links = gpd.GeoDataFrame(
+        {
+            "id_link": [10, 11, 12, 13, 14, 15],
+            "id_us_node": [1, 2, 3, 2, 4, 5],
+            "id_ds_node": [2, 3, 5, 4, 5, 6],
+            "len": [100.0] * 6,
+        },
+        geometry=[
+            LineString([(0.0, 0.0), (1.0, 0.0)]),
+            LineString([(1.0, 0.0), (2.0, 1.0)]),
+            LineString([(2.0, 1.0), (3.0, 0.0)]),
+            LineString([(1.0, 0.0), (2.0, -1.0)]),
+            LineString([(2.0, -1.0), (3.0, 0.0)]),
+            LineString([(3.0, 0.0), (4.0, 0.0)]),
+        ],
+        crs="EPSG:3857",
+    )
+    unit_summary = pd.DataFrame(
+        [
+            {
+                "unit_id": 10,
+                "unit_node_ids": "2,3,5",
+                "compound_bubble_id": 6,
+                "in_compound_bubble": True,
+                "compound_bubble_role": "bubble_root",
+            },
+            {
+                "unit_id": 11,
+                "unit_node_ids": "2,4,5",
+                "compound_bubble_id": 6,
+                "in_compound_bubble": True,
+                "compound_bubble_role": "bubble_member",
+            },
+        ]
+    )
+
+    slopes = compute_link_slopes(
+        links,
+        nodes,
+        unit_summary=unit_summary,
+        config=SlopeConfig(max_slope_for_k=0.005),
+    )
+    by_link = slopes.set_index("id_link")
+    for link_id in (11, 12, 13, 14):
+        assert int(by_link.loc[link_id, "compound_bubble_id_link"]) == 6
+        assert bool(by_link.loc[link_id, "bubble_slope_qc_candidate"]) is True
+        assert bool(by_link.loc[link_id, "bubble_slope_qc_valid"]) is True
+        assert bool(by_link.loc[link_id, "bubble_path_drop_qc_failed"]) is True
+        assert by_link.loc[link_id, "bubble_slope_qc_reason"] == "path_drop_mismatch"
+        assert float(by_link.loc[link_id, "bubble_path_drop_max_abs_error_m"]) > 0.0
+
+
+def test_compute_link_slopes_repairs_plateaued_bubble_reference_profile() -> None:
+    nodes = gpd.GeoDataFrame(
+        {
+            "id_node": [1, 2, 3, 4, 5, 6],
+            "sword_wse": [6.0, 5.2, 2.87703, 4.07494, 3.755675, 3.14151],
+            "sword_wse_field": ["wse_obs_p50"] * 6,
+            "sword_wse_fill_method": [
+                "requested_field",
+                "same_node_wse",
+                "requested_field",
+                "requested_field",
+                "requested_field",
+                "requested_field",
+            ],
+            "sword_wse_fallback_used": [False] * 6,
+            "sword_node_id": [101, 102, 103, 104, 105, 106],
+            "sword_dist_out": [12000.0, 10000.0, 8900.0, 8100.0, 7300.0, 0.0],
+        },
+        geometry=[
+            Point(0.0, 0.0),
+            Point(1.0, 0.0),
+            Point(2.0, 1.0),
+            Point(2.0, -1.0),
+            Point(3.0, 0.0),
+            Point(4.0, 0.0),
+        ],
+        crs="EPSG:3857",
+    )
+    links = gpd.GeoDataFrame(
+        {
+            "id_link": [10, 11, 12, 13, 14, 15],
+            "id_us_node": [1, 2, 3, 2, 4, 5],
+            "id_ds_node": [2, 3, 5, 4, 5, 6],
+            "len": [100.0] * 6,
+        },
+        geometry=[
+            LineString([(0.0, 0.0), (1.0, 0.0)]),
+            LineString([(1.0, 0.0), (2.0, 1.0)]),
+            LineString([(2.0, 1.0), (3.0, 0.0)]),
+            LineString([(1.0, 0.0), (2.0, -1.0)]),
+            LineString([(2.0, -1.0), (3.0, 0.0)]),
+            LineString([(3.0, 0.0), (4.0, 0.0)]),
+        ],
+        crs="EPSG:3857",
+    )
+    unit_summary = pd.DataFrame(
+        [
+            {
+                "unit_id": 10,
+                "unit_node_ids": "2,3,5",
+                "compound_bubble_id": 16,
+                "in_compound_bubble": True,
+                "compound_bubble_role": "bubble_root",
+            },
+            {
+                "unit_id": 11,
+                "unit_node_ids": "2,4,5",
+                "compound_bubble_id": 16,
+                "in_compound_bubble": True,
+                "compound_bubble_role": "bubble_member",
+            },
+        ]
+    )
+
+    slopes = compute_link_slopes(links, nodes, unit_summary=unit_summary, config=SlopeConfig())
+    by_link = slopes.set_index("id_link")
+    for link_id in (11, 12, 13, 14):
+        assert int(by_link.loc[link_id, "compound_bubble_id_link"]) == 16
+        assert bool(by_link.loc[link_id, "bubble_slope_qc_valid"]) is True
+        assert bool(by_link.loc[link_id, "bubble_path_drop_qc_failed"]) is False
+        assert bool(by_link.loc[link_id, "bubble_slope_repair_candidate"]) is True
+        assert bool(by_link.loc[link_id, "bubble_slope_repair_applied"]) is True
+        assert by_link.loc[link_id, "bubble_slope_repair_method"] == "bubble_weighted_path_drop_projection"
+        assert by_link.loc[link_id, "bubble_reference_profile_method"] == "bubble_weighted_path_drop_projection"
+        assert by_link.loc[link_id, "slope_source_method"] == "compound_bubble_profile"
+        assert by_link.loc[link_id, "slope_reason"] == "filled_from_compound_bubble_profile"
+        assert float(by_link.loc[link_id, "bubble_link_slope_ref"]) > 0.0
+        assert float(by_link.loc[link_id, "slope_used"]) == float(by_link.loc[link_id, "bubble_link_slope_ref"])
+        assert float(by_link.loc[link_id, "bubble_slope_repair_change_factor"]) > 0.0
+
+
 def test_prepare_experiment_writes_link_attributes_before_forcing_failure(tmp_path: Path, monkeypatch) -> None:
     experiment_dir = _write_state(tmp_path)
 
@@ -775,6 +1018,16 @@ def test_prepare_experiment_exports_celerity_columns(tmp_path: Path) -> None:
         "rapid_effective_length_m",
         "rapid_length_floor_applied",
         "slope_outlier_flag",
+        "bubble_slope_qc_candidate",
+        "bubble_slope_qc_valid",
+        "bubble_slope_qc_reason",
+        "compound_bubble_id_link",
+        "bubble_path_drop_qc_failed",
+        "bubble_slope_repair_candidate",
+        "bubble_slope_repair_applied",
+        "bubble_slope_repair_method",
+        "bubble_slope_repair_change_factor",
+        "bubble_slope_repair_large_change_flag",
     ):
         assert column in rapid_links.columns
     for column in (
@@ -786,6 +1039,10 @@ def test_prepare_experiment_exports_celerity_columns(tmp_path: Path) -> None:
         "pct_length_floor_applied",
         "n_slope_outlier_flagged",
         "pct_slope_outlier_flagged",
+        "n_compound_bubbles_qc",
+        "n_valid_compound_bubbles_qc",
+        "n_failed_compound_bubbles_qc",
+        "n_repaired_compound_bubbles_qc",
         "rapid_k_min",
         "rapid_k_max",
     ):

@@ -14,6 +14,7 @@ class RapidStateContext:
     directed_links_path: Path
     directed_nodes_path: Path
     link_widths_path: Path
+    hierarchy_output_dir: Path | None
     rapid_prep_dir: Path
     rapid_run_dir: Path
     status: str
@@ -80,6 +81,7 @@ def iter_preparable_states(
             directed_links_path=directed_links_path,
             directed_nodes_path=directed_nodes_path,
             link_widths_path=_resolve_link_widths_path(row),
+            hierarchy_output_dir=_optional_path(row.get("hierarchy_output_dir")),
             rapid_prep_dir=state_dir / "rapid" / "prep",
             rapid_run_dir=state_dir / "rapid" / "run",
             status=status or "complete",
