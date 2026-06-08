@@ -15,6 +15,7 @@ class RapidStateContext:
     directed_nodes_path: Path
     link_widths_path: Path
     hierarchy_output_dir: Path | None
+    hydraulic_context_output_dir: Path | None
     rapid_prep_dir: Path
     rapid_run_dir: Path
     status: str
@@ -54,6 +55,20 @@ def _resolve_link_widths_path(row: pd.Series) -> Path:
     return directed_links_path
 
 
+def _resolve_hydraulic_context_output_dir(
+    row: pd.Series,
+    *,
+    state_dir: Path | None,
+) -> Path | None:
+    explicit = _optional_path(row.get("hydraulic_context_output_dir"))
+    if explicit is not None:
+        return explicit
+    if state_dir is None:
+        return None
+    candidate = (state_dir / "hydraulic_context").resolve()
+    return candidate if candidate.exists() else None
+
+
 def iter_preparable_states(
     registry: pd.DataFrame,
     *,
@@ -82,6 +97,7 @@ def iter_preparable_states(
             directed_nodes_path=directed_nodes_path,
             link_widths_path=_resolve_link_widths_path(row),
             hierarchy_output_dir=_optional_path(row.get("hierarchy_output_dir")),
+            hydraulic_context_output_dir=_resolve_hydraulic_context_output_dir(row, state_dir=state_dir),
             rapid_prep_dir=state_dir / "rapid" / "prep",
             rapid_run_dir=state_dir / "rapid" / "run",
             status=status or "complete",

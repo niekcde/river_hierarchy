@@ -20,6 +20,8 @@ from shapely import wkt
 from shapely.geometry import LineString, Point
 from shapely.ops import substring
 
+from network_variants.reference_context import resolve_kb_context
+
 from .forcing import ForcingConfig, infer_forcing_dt_seconds, prepare_forcing_table, write_inflow_netcdf
 from .k_values import KValueConfig, compute_k_values, compute_routing_dt_seconds, resolve_width_field
 from .reference_section import compute_reference_section_kb
@@ -60,6 +62,16 @@ class RapidPrepConfig:
     strict_sword: bool = True
 
 
+REQUIRED_LINK_HYDRAULIC_CONTEXT_COLUMNS = (
+    "id_link",
+    "id_us_node",
+    "id_ds_node",
+    "link_length_m",
+    "slope_used",
+    "slope_adjusted",
+)
+
+
 def _apply_branch_widths(
     links: pd.DataFrame,
     *,
@@ -90,6 +102,24 @@ def _load_unit_summary_if_exists(hierarchy_output_dir: Path | None) -> pd.DataFr
     if not unit_summary_path.exists():
         return None
     return pd.read_csv(unit_summary_path)
+
+
+def _load_link_hydraulic_context_if_exists(
+    context: RapidStateContext,
+) -> tuple[pd.DataFrame | None, Path | None]:
+    if context.hydraulic_context_output_dir is None:
+        return None, None
+    link_context_path = context.hydraulic_context_output_dir / "link_hydraulic_context.csv"
+    if not link_context_path.exists():
+        return None, None
+
+    link_context = pd.read_csv(link_context_path)
+    missing = sorted(set(REQUIRED_LINK_HYDRAULIC_CONTEXT_COLUMNS).difference(link_context.columns))
+    if missing:
+        raise ValueError(
+            f"Precomputed hydraulic context for state {context.state_id} is missing required columns: {missing}"
+        )
+    return link_context, link_context_path
 
 
 def _coerce_output_dir(
@@ -819,40 +849,6 @@ def build_rapid_graph(
     return graph
 
 
-def _resolve_selected_kb(
-    prep_config: RapidPrepConfig,
-    reference_kb_summary: Mapping[str, object] | None,
-) -> dict[str, object]:
-    kb_mode = str(prep_config.kb_mode or "fixed")
-    if kb_mode == "fixed":
-        return {
-            "kb_value": float(prep_config.kb_value),
-            "kb_source_method": "fixed_scalar",
-            "reference_discharge_cms": np.nan,
-            "reference_width_m": np.nan,
-            "reference_slope": np.nan,
-            "reference_depth_m": np.nan,
-            "reference_section_summary_path": "",
-            "based_model_path": "",
-        }
-    if kb_mode == "based_reference_section":
-        if reference_kb_summary is None:
-            raise ValueError("based_reference_section kb mode requires a reference_kb_summary.")
-        return {
-            "kb_value": float(reference_kb_summary["kb_value"]),
-            "kb_source_method": str(reference_kb_summary["kb_source_method"]),
-            "reference_discharge_cms": float(reference_kb_summary["reference_discharge_cms"]),
-            "reference_width_m": float(reference_kb_summary["reference_width_m"]),
-            "reference_slope": float(reference_kb_summary["reference_slope"]),
-            "reference_depth_m": float(reference_kb_summary["reference_depth_m"]),
-            "reference_section_summary_path": str(reference_kb_summary.get("reference_section_summary_path", "") or ""),
-            "based_model_path": str(reference_kb_summary.get("based_model_path", "") or ""),
-        }
-    raise ValueError(
-        f"Unsupported kb_mode '{kb_mode}'. Expected one of: fixed, based_reference_section."
-    )
-
-
 def prepare_state(
     context: RapidStateContext,
     *,
@@ -877,24 +873,31 @@ def prepare_state(
                 f"State {context.state_id} is missing required SWORD node columns for strict RAPID prep: {missing}"
             )
 
-    slope_frame = compute_link_slopes(
-        links,
-        nodes,
-        unit_summary=_load_unit_summary_if_exists(context.hierarchy_output_dir),
-        config=SlopeConfig(
-            min_slope=prep_config.min_slope,
-            max_slope_for_k=prep_config.max_slope_for_k,
-            section_slope_ratio_min=prep_config.section_slope_ratio_min,
-            section_slope_ratio_max=prep_config.section_slope_ratio_max,
-            use_section_slope_fallback=prep_config.use_section_slope_fallback,
-            use_compound_bubble_slope_qc=prep_config.use_compound_bubble_slope_qc,
-            use_compound_bubble_slope_repair=prep_config.use_compound_bubble_slope_repair,
-            compound_bubble_max_paths_for_qc=prep_config.compound_bubble_max_paths_for_qc,
-            compound_bubble_path_drop_rel_tol=prep_config.compound_bubble_path_drop_rel_tol,
-            compound_bubble_path_drop_abs_tol_m=prep_config.compound_bubble_path_drop_abs_tol_m,
-            preferred_length_field=prep_config.preferred_length_field,
-        ),
-    )
+    unit_summary = _load_unit_summary_if_exists(context.hierarchy_output_dir)
+    hydraulic_context_source = "computed_in_rapid_prep_fallback"
+    hydraulic_context_link_path: Path | None = None
+    slope_frame, hydraulic_context_link_path = _load_link_hydraulic_context_if_exists(context)
+    if slope_frame is None:
+        slope_frame = compute_link_slopes(
+            links,
+            nodes,
+            unit_summary=unit_summary,
+            config=SlopeConfig(
+                min_slope=prep_config.min_slope,
+                max_slope_for_k=prep_config.max_slope_for_k,
+                section_slope_ratio_min=prep_config.section_slope_ratio_min,
+                section_slope_ratio_max=prep_config.section_slope_ratio_max,
+                use_section_slope_fallback=prep_config.use_section_slope_fallback,
+                use_compound_bubble_slope_qc=prep_config.use_compound_bubble_slope_qc,
+                use_compound_bubble_slope_repair=prep_config.use_compound_bubble_slope_repair,
+                compound_bubble_max_paths_for_qc=prep_config.compound_bubble_max_paths_for_qc,
+                compound_bubble_path_drop_rel_tol=prep_config.compound_bubble_path_drop_rel_tol,
+                compound_bubble_path_drop_abs_tol_m=prep_config.compound_bubble_path_drop_abs_tol_m,
+                preferred_length_field=prep_config.preferred_length_field,
+            ),
+        )
+    else:
+        hydraulic_context_source = "precomputed_state_hydraulic_context"
     prepared_links = links.merge(slope_frame, on=["id_link", "id_us_node", "id_ds_node"], how="left")
     prepared_links["link_length_m"] = pd.to_numeric(prepared_links["link_length_m"], errors="coerce").astype(float)
     prepared_links = _apply_branch_widths(
@@ -925,34 +928,22 @@ def prepare_state(
         selected_width_field = "rapid_subreach_width_m"
     rapid_links["centroid_x"] = rapid_links.geometry.centroid.x.astype(float)
     rapid_links["centroid_y"] = rapid_links.geometry.centroid.y.astype(float)
-    selected_kb = _resolve_selected_kb(prep_config, reference_kb_summary)
+    selected_kb = resolve_kb_context(
+        kb_mode=prep_config.kb_mode,
+        kb_value=prep_config.kb_value,
+        reference_kb_summary=reference_kb_summary,
+    )
     rapid_links = compute_k_values(
         rapid_links,
         config=KValueConfig(
             width_field=selected_width_field,
             x_value=prep_config.x_value,
-            kb_value=float(selected_kb["kb_value"]),
-            kb_source_method=str(selected_kb["kb_source_method"]),
-            kb_reference_discharge_cms=(
-                float(selected_kb["reference_discharge_cms"])
-                if pd.notna(selected_kb["reference_discharge_cms"])
-                else None
-            ),
-            kb_reference_width_m=(
-                float(selected_kb["reference_width_m"])
-                if pd.notna(selected_kb["reference_width_m"])
-                else None
-            ),
-            kb_reference_slope=(
-                float(selected_kb["reference_slope"])
-                if pd.notna(selected_kb["reference_slope"])
-                else None
-            ),
-            kb_reference_depth_m=(
-                float(selected_kb["reference_depth_m"])
-                if pd.notna(selected_kb["reference_depth_m"])
-                else None
-            ),
+            kb_value=float(selected_kb.kb_value),
+            kb_source_method=str(selected_kb.kb_source_method),
+            kb_reference_discharge_cms=selected_kb.reference_discharge_cms,
+            kb_reference_width_m=selected_kb.reference_width_m,
+            kb_reference_slope=selected_kb.reference_slope,
+            kb_reference_depth_m=selected_kb.reference_depth_m,
             n_manning=prep_config.n_manning,
             min_width=prep_config.min_width,
             min_effective_length_m=prep_config.min_effective_length_for_k_m,
@@ -1006,31 +997,13 @@ def prepare_state(
         "prep_config": asdict(prep_config),
         "forcing_config": asdict(forcing_config) if forcing_path is not None else None,
         "forcing_metadata": resolved_forcing_metadata,
+        "hydraulic_context": {
+            "source": hydraulic_context_source,
+            "output_dir": str(context.hydraulic_context_output_dir) if context.hydraulic_context_output_dir is not None else None,
+            "link_context_csv": str(hydraulic_context_link_path) if hydraulic_context_link_path is not None else None,
+        },
         "kb_summary": {
-            "kb_value": float(selected_kb["kb_value"]),
-            "kb_source_method": str(selected_kb["kb_source_method"]),
-            "reference_discharge_cms": (
-                float(selected_kb["reference_discharge_cms"])
-                if pd.notna(selected_kb["reference_discharge_cms"])
-                else None
-            ),
-            "reference_width_m": (
-                float(selected_kb["reference_width_m"])
-                if pd.notna(selected_kb["reference_width_m"])
-                else None
-            ),
-            "reference_slope": (
-                float(selected_kb["reference_slope"])
-                if pd.notna(selected_kb["reference_slope"])
-                else None
-            ),
-            "reference_depth_m": (
-                float(selected_kb["reference_depth_m"])
-                if pd.notna(selected_kb["reference_depth_m"])
-                else None
-            ),
-            "reference_section_summary_path": selected_kb["reference_section_summary_path"],
-            "based_model_path": selected_kb["based_model_path"],
+            **selected_kb.to_dict(),
         },
         "paths": {
             "directed_links": str(context.directed_links_path),
@@ -1116,8 +1089,12 @@ def prepare_state(
         "forcing_loaded_from_cache": bool(resolved_forcing_metadata.get("forcing_loaded_from_cache", False)) if resolved_forcing_metadata is not None else False,
         "forcing_dt_seconds": forcing_dt_seconds if forcing_dt_seconds is not None else "",
         "routing_dt_seconds": routing_dt_seconds if routing_dt_seconds is not None else "",
-        "rapid_kb_value": float(selected_kb["kb_value"]),
-        "rapid_kb_source_method": str(selected_kb["kb_source_method"]),
+        "hydraulic_context_source": hydraulic_context_source,
+        "hydraulic_context_output_dir": str(context.hydraulic_context_output_dir) if context.hydraulic_context_output_dir is not None else "",
+        "hydraulic_context_link_csv": str(hydraulic_context_link_path) if hydraulic_context_link_path is not None else "",
+        "rapid_kb_value": float(selected_kb.kb_value),
+        "rapid_kb_source_method": str(selected_kb.kb_source_method),
+        "rapid_kb_mode": str(selected_kb.kb_mode),
         "n_source_links": int(len(prepared_links)),
         "n_links": int(len(rapid_links)),
         "link_multiplier": float(len(rapid_links) / len(prepared_links)) if len(prepared_links) else float("nan"),
@@ -1165,6 +1142,7 @@ def prepare_experiment(
     forcing_table: pd.DataFrame | None = None
     forcing_metadata: dict[str, object] | None = None
     reference_kb_summary: dict[str, object] | None = None
+    resolved_kb_summary: dict[str, object] | None = None
     experiment_prepass_error: str | None = None
 
     try:
@@ -1180,6 +1158,11 @@ def prepare_experiment(
                 width_percentile=prep_config.kb_width_percentile,
                 model_path=prep_config.kb_model_path,
             )
+        resolved_kb_summary = resolve_kb_context(
+            kb_mode=prep_config.kb_mode,
+            kb_value=prep_config.kb_value,
+            reference_kb_summary=reference_kb_summary,
+        ).to_dict()
     except Exception as exc:  # pragma: no cover
         experiment_prepass_error = str(exc)
 
@@ -1232,6 +1215,7 @@ def prepare_experiment(
                 "forcing_config": asdict(forcing_config) if forcing_config is not None else None,
                 "prep_config": asdict(prep_config),
                 "reference_kb_summary": reference_kb_summary,
+                "resolved_kb_summary": resolved_kb_summary,
                 "experiment_prepass_error": experiment_prepass_error,
                 "states_total": int(len(prep_registry)),
                 "states_prepared": int(prep_registry["status"].eq("prepared").sum()) if not prep_registry.empty else 0,

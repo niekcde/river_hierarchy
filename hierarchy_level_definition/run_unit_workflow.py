@@ -21,9 +21,12 @@ from hierarchy_level_definition.collapse_decisions import (
     summarize_group_count_selection,
 )
 from hierarchy_level_definition.metrics import (
+    BubbleEquivalentResistanceConfig,
+    compute_bubble_equivalent_metrics_from_units,
     compute_unit_metrics,
     summarize_by_hierarchy_level,
 )
+from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import analyze_network, load_network
 
 
 @dataclass
@@ -35,6 +38,9 @@ class UnitWorkflowOutputs:
     collapse_ranking: pd.DataFrame
     merge_tree: pd.DataFrame
     bubble_summary: pd.DataFrame
+    bubble_equivalent_metrics: pd.DataFrame
+    bubble_edge_resistance: pd.DataFrame
+    bubble_node_heads: pd.DataFrame
     group_count_summary: pd.DataFrame
     selected_groups: pd.DataFrame
 
@@ -97,6 +103,7 @@ def run_unit_workflow(
     ranking_sequence: Sequence[tuple[str, bool]] | None = None,
     merge_feature_columns: Sequence[str] | None = None,
     merge_log_feature_columns: Sequence[str] | None = None,
+    equivalent_resistance_config: BubbleEquivalentResistanceConfig | None = None,
     debug: bool = False,
 ) -> UnitWorkflowOutputs:
     unit_summary, unit_metrics, path_metrics = compute_unit_metrics(
@@ -119,6 +126,82 @@ def run_unit_workflow(
     )
     group_count_summary = summarize_group_count_selection(merge_tree)
     selected_groups = select_optimal_groups(merge_tree, group_count_summary)
+    if equivalent_resistance_config is None:
+        bubble_equivalent_metrics = pd.DataFrame(
+            columns=[
+                "compound_bubble_id",
+                "bubble_root_unit_id",
+                "upstream_boundary_node",
+                "downstream_boundary_node",
+                "n_member_units",
+                "member_unit_ids",
+                "n_nodes",
+                "n_edges",
+                "solver_success",
+                "solver_method",
+                "solver_message",
+                "solver_nfev",
+                "K_eq",
+                "G_eq",
+                "Q_unit",
+                "residual_norm",
+                "residual_relative",
+                "resistance_law",
+                "geometry_method",
+                "kb_mode",
+                "kb_value",
+                "kb_source_method",
+            ]
+        )
+        bubble_edge_resistance = pd.DataFrame(
+            columns=[
+                "compound_bubble_id",
+                "bubble_root_unit_id",
+                "edge_id",
+                "u",
+                "v",
+                "L",
+                "w",
+                "k_b",
+                "d",
+                "A",
+                "R_h",
+                "n",
+                "C_z",
+                "K_e",
+                "G_e",
+                "q_unit",
+                "dh",
+            ]
+        )
+        bubble_node_heads = pd.DataFrame(
+            columns=[
+                "compound_bubble_id",
+                "bubble_root_unit_id",
+                "node_id",
+                "head_norm",
+                "is_boundary",
+                "is_upstream_boundary",
+                "is_downstream_boundary",
+                "head_source",
+                "continuity_residual",
+            ]
+        )
+    else:
+        links, nodes = load_network(links_path, nodes_path)
+        _, units, _ = analyze_network(
+            links_path,
+            nodes_path,
+            max_path_cutoff=max_path_cutoff,
+            max_paths=max_paths,
+            debug=debug,
+        )
+        bubble_equivalent_metrics, bubble_edge_resistance, bubble_node_heads = compute_bubble_equivalent_metrics_from_units(
+            links,
+            nodes,
+            units,
+            config=equivalent_resistance_config,
+        )
 
     return UnitWorkflowOutputs(
         unit_summary=unit_summary,
@@ -128,6 +211,9 @@ def run_unit_workflow(
         collapse_ranking=collapse_ranking,
         merge_tree=merge_tree,
         bubble_summary=bubble_summary,
+        bubble_equivalent_metrics=bubble_equivalent_metrics,
+        bubble_edge_resistance=bubble_edge_resistance,
+        bubble_node_heads=bubble_node_heads,
         group_count_summary=group_count_summary,
         selected_groups=selected_groups,
     )
@@ -151,10 +237,15 @@ def write_unit_workflow_outputs(
     results.merge_tree.to_csv(output_path / "ordered_group_partitions.csv", index=False)
     results.group_count_summary.to_csv(output_path / "group_count_summary.csv", index=False)
     results.bubble_summary.to_csv(output_path / "bubble_summary.csv", index=False)
+    results.bubble_equivalent_metrics.to_csv(output_path / "bubble_equivalent_metrics.csv", index=False)
+    results.bubble_edge_resistance.to_csv(output_path / "bubble_edge_resistance.csv", index=False)
+    results.bubble_node_heads.to_csv(output_path / "bubble_node_heads.csv", index=False)
     results.selected_groups.to_csv(output_path / "selected_groups.csv", index=False)
 
     metrics_config = dict(results.unit_metrics.attrs.get("metrics_config", {}))
     collapse_config = dict(results.merge_tree.attrs.get("collapse_config", {}))
+    equivalent_resistance_config = dict(results.bubble_equivalent_metrics.attrs.get("equivalent_resistance_config", {}))
+    resolved_kb_context = dict(results.bubble_equivalent_metrics.attrs.get("resolved_kb_context", {}))
     if manifest_overrides:
         collapse_config.update(dict(manifest_overrides))
 
@@ -175,17 +266,25 @@ def write_unit_workflow_outputs(
             "ordered_group_partitions.csv",
             "group_count_summary.csv",
             "bubble_summary.csv",
+            "bubble_equivalent_metrics.csv",
+            "bubble_edge_resistance.csv",
+            "bubble_node_heads.csv",
             "selected_groups.csv",
         ],
         "n_units": int(len(results.unit_metrics)),
         "n_paths": int(len(results.path_metrics)),
         "n_group_rows": int(len(results.merge_tree)),
+        "n_equivalent_bubbles": int(len(results.bubble_equivalent_metrics)),
+        "n_equivalent_edges": int(len(results.bubble_edge_resistance)),
+        "n_equivalent_nodes": int(len(results.bubble_node_heads)),
         "n_selected_groups": int(len(results.selected_groups)),
         "optimal_n_groups": optimal_n_groups,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "code_version": _git_revision(),
         **metrics_config,
         **collapse_config,
+        "equivalent_resistance_config": equivalent_resistance_config,
+        "resolved_kb_context": resolved_kb_context,
     }
     with (output_path / "unit_workflow_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
@@ -222,6 +321,41 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force path width min/max diagnostics to use representative widths instead of pixel samples.",
     )
+    parser.add_argument(
+        "--compute-equivalent-resistance",
+        action="store_true",
+        help="Also compute geometry-informed equivalent resistance/conductance for each bubble.",
+    )
+    parser.add_argument(
+        "--equivalent-resistance-law",
+        choices=("manning", "chezy"),
+        default="manning",
+        help="Resistance law for equivalent-resistance edge K values.",
+    )
+    parser.add_argument(
+        "--equivalent-geometry-method",
+        choices=("wide", "rectangular"),
+        default="wide",
+        help="Hydraulic geometry method for equivalent-resistance edge K values.",
+    )
+    parser.add_argument(
+        "--equivalent-kb-value",
+        type=float,
+        default=20.0,
+        help="Fixed width-depth ratio used when no per-edge kb field is available.",
+    )
+    parser.add_argument(
+        "--equivalent-manning-n",
+        type=float,
+        default=0.035,
+        help="Default Manning n used when the links do not provide one.",
+    )
+    parser.add_argument(
+        "--equivalent-chezy-cz",
+        type=float,
+        default=22.0,
+        help="Default Chezy Cz used when the links do not provide one.",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable unit-detection debug output.")
     return parser
 
@@ -229,6 +363,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    equivalent_resistance_config = None
+    if args.compute_equivalent_resistance:
+        equivalent_resistance_config = BubbleEquivalentResistanceConfig(
+            resistance_law=args.equivalent_resistance_law,
+            geometry_method=args.equivalent_geometry_method,
+            kb_mode="fixed",
+            kb_value=args.equivalent_kb_value,
+            default_manning_n=args.equivalent_manning_n,
+            default_chezy_cz=args.equivalent_chezy_cz,
+        )
 
     results = run_unit_workflow(
         args.links_gpkg,
@@ -238,6 +382,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         pixel_width_fields=args.pixel_width_fields,
         pixel_width_percentiles=args.pixel_width_percentiles,
         use_pixel_widths_for_extremes=not args.disable_pixel_width_extremes,
+        equivalent_resistance_config=equivalent_resistance_config,
         debug=args.debug,
     )
 
@@ -250,6 +395,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Wrote workflow outputs to {output_dir}")
     print(f"Units: {len(results.unit_metrics)}")
     print(f"Paths: {len(results.path_metrics)}")
+    print(f"Equivalent bubbles: {len(results.bubble_equivalent_metrics)}")
     print(f"Ordered group rows: {len(results.merge_tree)}")
     print(f"Optimal n_groups: {optimal_n_groups}")
     print("Selected groups:")

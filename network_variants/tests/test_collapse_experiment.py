@@ -5,6 +5,7 @@ from typing import Any
 
 import geopandas as gpd
 import pandas as pd
+import pytest
 
 from hierarchy_level_definition.run_unit_workflow import UnitWorkflowOutputs, write_unit_workflow_outputs
 from network_variants.collapse_experiment import (
@@ -13,6 +14,7 @@ from network_variants.collapse_experiment import (
     _normalize_numeric_id_columns,
     run_collapse_experiment,
 )
+from network_variants.hydraulic_context import StateHydraulicContextOutputs
 from network_variants.variant_generation import NetworkVariantOutputs, VariantDirectionValidationError
 
 
@@ -21,6 +23,7 @@ def _workflow_outputs(
     *,
     group_specs: list[tuple[str, list[int]]] | None = None,
     compound_rows: list[dict[str, Any]] | None = None,
+    bubble_equivalent_rows: list[dict[str, Any]] | None = None,
 ) -> UnitWorkflowOutputs:
     unit_summary = pd.DataFrame({"unit_id": unit_ids})
     unit_metrics = pd.DataFrame({"unit_id": unit_ids})
@@ -105,6 +108,36 @@ def _workflow_outputs(
     )
 
     bubble_summary = pd.DataFrame(columns=["compound_bubble_id"])
+    bubble_equivalent_metrics = pd.DataFrame.from_records(bubble_equivalent_rows or [])
+    if bubble_equivalent_metrics.empty:
+        bubble_equivalent_metrics = pd.DataFrame(
+            columns=[
+                "compound_bubble_id",
+                "bubble_root_unit_id",
+                "upstream_boundary_node",
+                "downstream_boundary_node",
+                "n_member_units",
+                "member_unit_ids",
+                "n_nodes",
+                "n_edges",
+                "solver_success",
+                "solver_method",
+                "solver_message",
+                "solver_nfev",
+                "K_eq",
+                "G_eq",
+                "Q_unit",
+                "residual_norm",
+                "residual_relative",
+                "resistance_law",
+                "geometry_method",
+                "kb_mode",
+                "kb_value",
+                "kb_source_method",
+            ]
+        )
+    bubble_edge_resistance = pd.DataFrame(columns=["compound_bubble_id", "edge_id"])
+    bubble_node_heads = pd.DataFrame(columns=["compound_bubble_id", "node_id"])
     return UnitWorkflowOutputs(
         unit_summary=unit_summary,
         unit_metrics=unit_metrics,
@@ -113,6 +146,9 @@ def _workflow_outputs(
         collapse_ranking=collapse_ranking,
         merge_tree=merge_tree,
         bubble_summary=bubble_summary,
+        bubble_equivalent_metrics=bubble_equivalent_metrics,
+        bubble_edge_resistance=bubble_edge_resistance,
+        bubble_node_heads=bubble_node_heads,
         group_count_summary=group_count_summary,
         selected_groups=selected_groups,
     )
@@ -277,6 +313,33 @@ def _make_base_state_materializer():
     return materializer
 
 
+def _make_state_hydraulic_context_runner():
+    calls: list[dict[str, Any]] = []
+
+    def runner(**kwargs: Any) -> StateHydraulicContextOutputs:
+        calls.append(dict(kwargs))
+        output_dir = Path(kwargs["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        link_context_path = output_dir / "link_hydraulic_context.csv"
+        node_context_path = output_dir / "node_hydraulic_context.csv"
+        manifest_path = output_dir / "hydraulic_context_manifest.json"
+        pd.DataFrame(columns=["id_link", "slope_used"]).to_csv(link_context_path, index=False)
+        pd.DataFrame(columns=["id_node", "rapid_wse_for_slope"]).to_csv(node_context_path, index=False)
+        manifest_path.write_text("{}", encoding="utf-8")
+        return StateHydraulicContextOutputs(
+            output_dir=output_dir,
+            link_context_path=link_context_path,
+            node_context_path=node_context_path,
+            manifest_path=manifest_path,
+            link_context=pd.DataFrame(columns=["id_link", "slope_used"]),
+            node_context=pd.DataFrame(columns=["id_node", "rapid_wse_for_slope"]),
+            manifest={},
+        )
+
+    runner.calls = calls
+    return runner
+
+
 def test_sequential_units_recomputes_hierarchy_on_each_child_state(tmp_path: Path) -> None:
     workflow_runner = _make_workflow_runner(
         [
@@ -287,6 +350,7 @@ def test_sequential_units_recomputes_hierarchy_on_each_child_state(tmp_path: Pat
     )
     variant_runner = _make_variant_runner()
     base_state_materializer = _make_base_state_materializer()
+    state_hydraulic_context_runner = _make_state_hydraulic_context_runner()
 
     results = run_collapse_experiment(
         "sequential-units",
@@ -299,6 +363,7 @@ def test_sequential_units_recomputes_hierarchy_on_each_child_state(tmp_path: Pat
         unit_workflow_writer=write_unit_workflow_outputs,
         variant_runner=variant_runner,
         base_state_variant_materializer=base_state_materializer,
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
     )
 
     assert [call["unit_ids"] for call in variant_runner.calls] == [[5], [2]]
@@ -318,6 +383,7 @@ def test_sequential_groups_uses_current_state_group_labels(tmp_path: Path) -> No
     )
     variant_runner = _make_variant_runner()
     base_state_materializer = _make_base_state_materializer()
+    state_hydraulic_context_runner = _make_state_hydraulic_context_runner()
 
     results = run_collapse_experiment(
         "sequential-groups",
@@ -330,6 +396,7 @@ def test_sequential_groups_uses_current_state_group_labels(tmp_path: Path) -> No
         unit_workflow_writer=write_unit_workflow_outputs,
         variant_runner=variant_runner,
         base_state_variant_materializer=base_state_materializer,
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
     )
 
     assert [call["group_label"] for call in variant_runner.calls] == ["G3_1", "G2_1"]
@@ -352,6 +419,7 @@ def test_independent_units_creates_one_child_per_base_unit(tmp_path: Path) -> No
     )
     variant_runner = _make_variant_runner()
     base_state_materializer = _make_base_state_materializer()
+    state_hydraulic_context_runner = _make_state_hydraulic_context_runner()
 
     results = run_collapse_experiment(
         "independent-units",
@@ -364,6 +432,7 @@ def test_independent_units_creates_one_child_per_base_unit(tmp_path: Path) -> No
         unit_workflow_writer=write_unit_workflow_outputs,
         variant_runner=variant_runner,
         base_state_variant_materializer=base_state_materializer,
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
     )
 
     assert [call["unit_ids"] for call in variant_runner.calls] == [[5], [7], [2]]
@@ -422,6 +491,7 @@ def test_compound_bubbles_creates_one_child_per_compound_bubble(tmp_path: Path) 
     )
     variant_runner = _make_variant_runner()
     base_state_materializer = _make_base_state_materializer()
+    state_hydraulic_context_runner = _make_state_hydraulic_context_runner()
 
     results = run_collapse_experiment(
         "compound-bubbles",
@@ -434,6 +504,7 @@ def test_compound_bubbles_creates_one_child_per_compound_bubble(tmp_path: Path) 
         unit_workflow_writer=write_unit_workflow_outputs,
         variant_runner=variant_runner,
         base_state_variant_materializer=base_state_materializer,
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
     )
 
     assert [call["unit_ids"] for call in variant_runner.calls] == [[5, 7], [2, 9]]
@@ -452,6 +523,7 @@ def test_base_state_is_materialized_as_local_variant_outputs(tmp_path: Path) -> 
     workflow_runner = _make_workflow_runner([_workflow_outputs([5]), _workflow_outputs([])])
     variant_runner = _make_variant_runner()
     base_state_materializer = _make_base_state_materializer()
+    state_hydraulic_context_runner = _make_state_hydraulic_context_runner()
 
     results = run_collapse_experiment(
         "independent-units",
@@ -464,14 +536,115 @@ def test_base_state_is_materialized_as_local_variant_outputs(tmp_path: Path) -> 
         unit_workflow_writer=write_unit_workflow_outputs,
         variant_runner=variant_runner,
         base_state_variant_materializer=base_state_materializer,
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
     )
 
     base_row = results.state_registry.loc[results.state_registry["state_id"] == "S000_base"].iloc[0]
     assert Path(base_row["variant_output_dir"]).name == "variant"
+    assert Path(base_row["hydraulic_context_output_dir"]).name == "hydraulic_context"
     assert Path(base_row["directed_links_path"]).name == "S000_base_directed_links.gpkg"
     assert Path(base_row["directed_nodes_path"]).name == "S000_base_directed_nodes.gpkg"
     assert "states/S000_base/variant" in base_row["variant_output_dir"]
     assert base_state_materializer.calls
+    assert state_hydraulic_context_runner.calls
+
+
+def test_independent_units_writes_equivalent_transition_comparisons(tmp_path: Path) -> None:
+    workflow_runner = _make_workflow_runner(
+        [
+            _workflow_outputs(
+                [5],
+                bubble_equivalent_rows=[
+                    {
+                        "compound_bubble_id": 1,
+                        "bubble_root_unit_id": 5,
+                        "upstream_boundary_node": 1,
+                        "downstream_boundary_node": 2,
+                        "n_member_units": 1,
+                        "member_unit_ids": "5",
+                        "n_nodes": 2,
+                        "n_edges": 2,
+                        "solver_success": True,
+                        "solver_method": "boundary_only",
+                        "solver_message": "",
+                        "solver_nfev": 0,
+                        "K_eq": 4.0,
+                        "G_eq": 0.25,
+                        "Q_unit": 0.5,
+                        "residual_norm": 0.0,
+                        "residual_relative": 0.0,
+                        "resistance_law": "manning",
+                        "geometry_method": "wide",
+                        "kb_mode": "fixed",
+                        "kb_value": 20.0,
+                        "kb_source_method": "fixed_scalar",
+                    }
+                ],
+            ),
+            _workflow_outputs(
+                [],
+                bubble_equivalent_rows=[
+                    {
+                        "compound_bubble_id": 9,
+                        "bubble_root_unit_id": 50,
+                        "upstream_boundary_node": 1,
+                        "downstream_boundary_node": 2,
+                        "n_member_units": 1,
+                        "member_unit_ids": "50",
+                        "n_nodes": 2,
+                        "n_edges": 1,
+                        "solver_success": True,
+                        "solver_method": "boundary_only",
+                        "solver_message": "",
+                        "solver_nfev": 0,
+                        "K_eq": 8.0,
+                        "G_eq": 0.125,
+                        "Q_unit": 0.3535533906,
+                        "residual_norm": 0.0,
+                        "residual_relative": 0.0,
+                        "resistance_law": "manning",
+                        "geometry_method": "wide",
+                        "kb_mode": "fixed",
+                        "kb_value": 20.0,
+                        "kb_source_method": "fixed_scalar",
+                    }
+                ],
+            ),
+        ]
+    )
+    variant_runner = _make_variant_runner()
+    base_state_materializer = _make_base_state_materializer()
+    state_hydraulic_context_runner = _make_state_hydraulic_context_runner()
+
+    results = run_collapse_experiment(
+        "independent-units",
+        cleaned_mask_path=tmp_path / "base_cleaned.tif",
+        reviewed_links_path=tmp_path / "base_links.gpkg",
+        reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=tmp_path / "experiment",
+        unit_workflow_runner=workflow_runner,
+        unit_workflow_writer=write_unit_workflow_outputs,
+        variant_runner=variant_runner,
+        base_state_variant_materializer=base_state_materializer,
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
+    )
+
+    assert len(results.equivalent_transition_registry) == 1
+    row = results.equivalent_transition_registry.iloc[0]
+    assert row["match_method"] == "upstream_boundary_node__downstream_boundary_node"
+    assert row["Lambda_K"] == pytest.approx(2.0)
+    assert row["percent_change_K"] == pytest.approx(100.0)
+
+    transition = results.transition_registry.iloc[0]
+    assert int(transition["n_equivalent_bubbles_matched"]) == 1
+    assert Path(transition["equivalent_transition_comparison_csv"]).exists()
+    assert Path(transition["equivalent_transition_summary_json"]).exists()
+
+    derived_row = results.state_registry.loc[results.state_registry["state_id"] == "S001_unit_5"].iloc[0]
+    assert int(derived_row["n_equivalent_bubbles_matched_to_parent"]) == 1
+    assert Path(derived_row["equivalent_transition_comparison_csv"]).exists()
+    assert (tmp_path / "experiment" / "equivalent_transition_registry.csv").exists()
 
 
 def test_independent_units_records_failed_variant_and_continues(tmp_path: Path) -> None:
@@ -483,6 +656,7 @@ def test_independent_units_records_failed_variant_and_continues(tmp_path: Path) 
         ]
     )
     base_state_materializer = _make_base_state_materializer()
+    state_hydraulic_context_runner = _make_state_hydraulic_context_runner()
     calls: list[dict[str, Any]] = []
 
     def variant_runner(**kwargs: Any) -> NetworkVariantOutputs:
@@ -505,6 +679,7 @@ def test_independent_units_records_failed_variant_and_continues(tmp_path: Path) 
         unit_workflow_writer=write_unit_workflow_outputs,
         variant_runner=variant_runner,
         base_state_variant_materializer=base_state_materializer,
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
     )
 
     assert [call["unit_ids"] for call in calls] == [[5], [7], [2]]
@@ -524,6 +699,7 @@ def test_independent_units_rerun_cleans_existing_state_directories(tmp_path: Pat
 
     variant_runner = _make_variant_runner()
     base_state_materializer = _make_base_state_materializer()
+    state_hydraulic_context_runner = _make_state_hydraulic_context_runner()
     output_dir = tmp_path / "experiment"
 
     first = run_collapse_experiment(
@@ -537,6 +713,7 @@ def test_independent_units_rerun_cleans_existing_state_directories(tmp_path: Pat
         unit_workflow_writer=write_unit_workflow_outputs,
         variant_runner=variant_runner,
         base_state_variant_materializer=base_state_materializer,
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
     )
 
     base_stale = output_dir / "states" / "S000_base" / "stale.txt"
@@ -555,6 +732,7 @@ def test_independent_units_rerun_cleans_existing_state_directories(tmp_path: Pat
         unit_workflow_writer=write_unit_workflow_outputs,
         variant_runner=variant_runner,
         base_state_variant_materializer=base_state_materializer,
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
     )
 
     assert first.manifest["n_complete_states"] == 2
@@ -566,6 +744,7 @@ def test_independent_units_rerun_cleans_existing_state_directories(tmp_path: Pat
 def test_independent_units_records_exception_type_for_child_build_failures(tmp_path: Path) -> None:
     workflow_runner = _make_workflow_runner([_workflow_outputs([5])])
     base_state_materializer = _make_base_state_materializer()
+    state_hydraulic_context_runner = _make_state_hydraulic_context_runner()
 
     def variant_runner(**kwargs: Any) -> NetworkVariantOutputs:
         raise KeyError(6)
@@ -581,6 +760,7 @@ def test_independent_units_records_exception_type_for_child_build_failures(tmp_p
         unit_workflow_writer=write_unit_workflow_outputs,
         variant_runner=variant_runner,
         base_state_variant_materializer=base_state_materializer,
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
     )
 
     failed_row = results.state_registry.loc[results.state_registry["state_id"] == "S001_unit_5"].iloc[0]
