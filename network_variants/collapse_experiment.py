@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import sys
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -15,8 +15,12 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
+repo_root = Path(__file__).resolve().parents[1]
+rapid_src = repo_root / "RAPID" / "src"
+if str(rapid_src) not in sys.path:
+    sys.path.insert(0, str(rapid_src))
+
 if __package__ is None or __package__ == "":
-    repo_root = Path(__file__).resolve().parents[1]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
@@ -32,6 +36,7 @@ from network_variants.hydraulic_context import (
 )
 from network_variants.sword_matching import match_variant_nodes_to_sword
 from network_variants.variant_generation import (
+    COLLAPSE_CORRIDOR_MODES,
     NetworkVariantOutputs,
     VariantDirectionValidationError,
     _apply_collapsed_selection_metadata,
@@ -39,6 +44,8 @@ from network_variants.variant_generation import (
     compute_width_families,
     generate_network_variant,
 )
+from rapid_tools.forcing import ForcingConfig, prepare_forcing_table
+from rapid_tools.reference_section import compute_reference_section_kb
 
 
 EXPERIMENT_MODES = (
@@ -47,6 +54,7 @@ EXPERIMENT_MODES = (
     "sequential-units",
     "sequential-groups",
 )
+COLLAPSE_CORRIDOR_MODE_CHOICES = COLLAPSE_CORRIDOR_MODES + ("both",)
 
 
 @dataclass
@@ -147,6 +155,19 @@ def _default_output_dir(cleaned_mask_path: str | Path, experiment_id: str) -> Pa
     return Path(__file__).resolve().parent / "experiments" / example_id / experiment_id
 
 
+def _suffix_experiment_id_for_collapse_mode(experiment_id: str, collapse_corridor_mode: str) -> str:
+    suffix = f"__{collapse_corridor_mode}"
+    return experiment_id if experiment_id.endswith(suffix) else f"{experiment_id}{suffix}"
+
+
+def _suffix_output_dir_for_collapse_mode(output_dir: str | Path, collapse_corridor_mode: str) -> Path:
+    path = Path(output_dir)
+    suffix = f"__{collapse_corridor_mode}"
+    if path.name.endswith(suffix):
+        return path
+    return path.with_name(f"{path.name}{suffix}")
+
+
 def _serialize_int_list(values: Sequence[int]) -> str:
     return ",".join(str(int(value)) for value in values)
 
@@ -203,6 +224,65 @@ def _record_int_or_zero(record: Mapping[str, Any], key: str) -> int:
     if value is None or value is pd.NA or pd.isna(value):
         return 0
     return int(value)
+
+
+def _needs_equivalent_reference_kb_prepass(
+    config: BubbleEquivalentResistanceConfig | None,
+) -> bool:
+    if config is None:
+        return False
+    return (
+        str(config.kb_mode or "fixed").strip() == "based_reference_section"
+        and config.reference_kb_summary is None
+    )
+
+
+def _resolve_equivalent_reference_kb_summary(
+    *,
+    experiment_dir: Path,
+    equivalent_resistance_config: BubbleEquivalentResistanceConfig,
+    equivalent_forcing_path: str | Path | None,
+    equivalent_forcing_config: ForcingConfig | None,
+    equivalent_kb_model_path: str | Path | None,
+    equivalent_kb_width_sample_field: str,
+    equivalent_kb_width_percentile: float,
+    equivalent_forcing_table_runner: Callable[..., tuple[pd.DataFrame, dict[str, object]]],
+    equivalent_reference_kb_summary_runner: Callable[..., dict[str, Any]],
+) -> tuple[BubbleEquivalentResistanceConfig, dict[str, Any] | None, dict[str, object] | None]:
+    if not _needs_equivalent_reference_kb_prepass(equivalent_resistance_config):
+        return (
+            equivalent_resistance_config,
+            (
+                dict(equivalent_resistance_config.reference_kb_summary)
+                if equivalent_resistance_config.reference_kb_summary is not None
+                else None
+            ),
+            None,
+        )
+
+    if equivalent_forcing_path is None:
+        raise ValueError(
+            "Equivalent-resistance kb_mode='based_reference_section' requires "
+            "equivalent_forcing_path to be provided."
+        )
+
+    forcing_config = equivalent_forcing_config or ForcingConfig()
+    forcing_table, forcing_metadata = equivalent_forcing_table_runner(
+        equivalent_forcing_path,
+        config=forcing_config,
+    )
+    reference_kb_summary = equivalent_reference_kb_summary_runner(
+        experiment_dir,
+        forcing=forcing_table,
+        width_sample_field=equivalent_kb_width_sample_field,
+        width_percentile=equivalent_kb_width_percentile,
+        model_path=equivalent_kb_model_path,
+    )
+    resolved_config = replace(
+        equivalent_resistance_config,
+        reference_kb_summary=dict(reference_kb_summary),
+    )
+    return resolved_config, dict(reference_kb_summary), dict(forcing_metadata)
 
 
 def _match_equivalent_bubble_rows(
@@ -1255,6 +1335,8 @@ def _materialize_base_state_variant(
     *,
     context: ExperimentStateContext,
     example_id: str,
+    exit_sides: str,
+    collapse_corridor_mode: str,
     preferred_width_field: str,
     transect_scale: float,
     min_transect_pixels: float,
@@ -1447,6 +1529,8 @@ def _materialize_base_state_variant(
     manifest = {
         "example_id": example_id,
         "variant_id": base_variant_id,
+        "exit_sides": exit_sides,
+        "collapse_corridor_mode": collapse_corridor_mode,
         "selection_source": "base_state",
         "selected_unit_ids": [],
         "group_label": None,
@@ -1571,6 +1655,7 @@ def run_collapse_experiment(
     exit_sides: str,
     experiment_id: str | None = None,
     output_dir: str | Path | None = None,
+    collapse_corridor_mode: str = "realized",
     max_steps: int | None = None,
     unit_workflow_runner: Callable[..., UnitWorkflowOutputs] = run_unit_workflow,
     unit_workflow_writer: Callable[..., None] = write_unit_workflow_outputs,
@@ -1601,9 +1686,21 @@ def run_collapse_experiment(
     verbose_rivgraph: bool = False,
     state_hydraulic_context_kwargs: Mapping[str, Any] | None = None,
     equivalent_resistance_config: BubbleEquivalentResistanceConfig | None = None,
+    equivalent_forcing_path: str | Path | None = None,
+    equivalent_forcing_config: ForcingConfig | None = None,
+    equivalent_kb_model_path: str | Path | None = None,
+    equivalent_kb_width_sample_field: str = "width_wet",
+    equivalent_kb_width_percentile: float = 90.0,
+    equivalent_forcing_table_runner: Callable[..., tuple[pd.DataFrame, dict[str, object]]] = prepare_forcing_table,
+    equivalent_reference_kb_summary_runner: Callable[..., dict[str, Any]] = compute_reference_section_kb,
 ) -> CollapseExperimentOutputs:
     if mode not in EXPERIMENT_MODES:
         raise ValueError(f"Unsupported mode {mode!r}. Expected one of {EXPERIMENT_MODES}.")
+    if collapse_corridor_mode not in COLLAPSE_CORRIDOR_MODES:
+        raise ValueError(
+            f"Unsupported collapse_corridor_mode {collapse_corridor_mode!r}. "
+            f"Expected one of {COLLAPSE_CORRIDOR_MODES}."
+        )
 
     root_example_id = _infer_example_id(cleaned_mask_path)
     experiment_id = experiment_id or _default_experiment_id(cleaned_mask_path, mode)
@@ -1611,17 +1708,23 @@ def run_collapse_experiment(
     states_dir = output_path / "states"
     states_dir.mkdir(parents=True, exist_ok=True)
 
+    active_equivalent_resistance_config = equivalent_resistance_config
+    base_equivalent_resistance_config = active_equivalent_resistance_config
+    if _needs_equivalent_reference_kb_prepass(active_equivalent_resistance_config):
+        base_equivalent_resistance_config = None
+
     unit_workflow_kwargs = {
         "max_path_cutoff": max_path_cutoff,
         "max_paths": max_paths,
         "pixel_width_fields": pixel_width_fields,
         "pixel_width_percentiles": pixel_width_percentiles,
         "use_pixel_widths_for_extremes": use_pixel_widths_for_extremes,
-        "equivalent_resistance_config": equivalent_resistance_config,
+        "equivalent_resistance_config": base_equivalent_resistance_config,
         "debug": debug_hierarchy,
     }
     variant_kwargs = {
         "example_id": root_example_id,
+        "collapse_corridor_mode": collapse_corridor_mode,
         "preferred_width_field": preferred_width_field,
         "footprint_buffer_scale": footprint_buffer_scale,
         "all_touched": all_touched,
@@ -1660,6 +1763,8 @@ def run_collapse_experiment(
     base_variant_outputs = base_state_variant_materializer(
         context=base_context,
         example_id=root_example_id,
+        exit_sides=exit_sides,
+        collapse_corridor_mode=collapse_corridor_mode,
         preferred_width_field=preferred_width_field,
         transect_scale=transect_scale,
         min_transect_pixels=min_transect_pixels,
@@ -1683,6 +1788,13 @@ def run_collapse_experiment(
     state_records: list[dict[str, Any]] = [_state_record(base_context, mode)]
     transition_records: list[dict[str, Any]] = []
     equivalent_transition_records: list[dict[str, Any]] = []
+    equivalent_reference_kb_summary: dict[str, Any] | None = (
+        dict(active_equivalent_resistance_config.reference_kb_summary)
+        if active_equivalent_resistance_config is not None
+        and active_equivalent_resistance_config.reference_kb_summary is not None
+        else None
+    )
+    equivalent_forcing_metadata: dict[str, object] | None = None
     stop_reason = "base_state_only"
     terminal_state_id = base_context.state_id
 
@@ -1701,6 +1813,7 @@ def run_collapse_experiment(
             "mode": mode,
             "example_id": _infer_example_id(cleaned_mask_path),
             "root_example_id": root_example_id,
+            "exit_sides": exit_sides,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "code_version": _git_revision(),
             "root_paths": {
@@ -1726,11 +1839,34 @@ def run_collapse_experiment(
                     "pixel_width_percentiles": list(pixel_width_percentiles) if pixel_width_percentiles is not None else None,
                     "use_pixel_widths_for_extremes": bool(use_pixel_widths_for_extremes),
                     "equivalent_resistance_config": (
-                        asdict(equivalent_resistance_config) if equivalent_resistance_config is not None else None
+                        asdict(active_equivalent_resistance_config)
+                        if active_equivalent_resistance_config is not None
+                        else None
                     ),
+                    "equivalent_reference_kb_summary": equivalent_reference_kb_summary,
+                    "equivalent_forcing_path": (
+                        str(Path(equivalent_forcing_path).expanduser().resolve())
+                        if equivalent_forcing_path is not None
+                        else None
+                    ),
+                    "equivalent_forcing_config": (
+                        asdict(equivalent_forcing_config)
+                        if equivalent_forcing_config is not None
+                        else None
+                    ),
+                    "equivalent_forcing_metadata": equivalent_forcing_metadata,
+                    "equivalent_kb_model_path": (
+                        str(Path(equivalent_kb_model_path).expanduser().resolve())
+                        if equivalent_kb_model_path is not None
+                        else None
+                    ),
+                    "equivalent_kb_width_sample_field": equivalent_kb_width_sample_field,
+                    "equivalent_kb_width_percentile": float(equivalent_kb_width_percentile),
                     "debug_hierarchy": bool(debug_hierarchy),
                 },
                 "variant": {
+                    "collapse_corridor_mode": collapse_corridor_mode,
+                    "exit_sides": exit_sides,
                     "preferred_width_field": preferred_width_field,
                     "footprint_buffer_scale": float(footprint_buffer_scale),
                     "all_touched": bool(all_touched),
@@ -1767,6 +1903,39 @@ def run_collapse_experiment(
         )
 
     write_metadata()
+
+    if _needs_equivalent_reference_kb_prepass(active_equivalent_resistance_config):
+        assert active_equivalent_resistance_config is not None
+        active_equivalent_resistance_config, equivalent_reference_kb_summary, equivalent_forcing_metadata = (
+            _resolve_equivalent_reference_kb_summary(
+                experiment_dir=output_path,
+                equivalent_resistance_config=active_equivalent_resistance_config,
+                equivalent_forcing_path=equivalent_forcing_path,
+                equivalent_forcing_config=equivalent_forcing_config,
+                equivalent_kb_model_path=equivalent_kb_model_path,
+                equivalent_kb_width_sample_field=equivalent_kb_width_sample_field,
+                equivalent_kb_width_percentile=equivalent_kb_width_percentile,
+                equivalent_forcing_table_runner=equivalent_forcing_table_runner,
+                equivalent_reference_kb_summary_runner=equivalent_reference_kb_summary_runner,
+            )
+        )
+        unit_workflow_kwargs["equivalent_resistance_config"] = active_equivalent_resistance_config
+        base_context.workflow = unit_workflow_runner(
+            base_context.reviewed_links_path,
+            base_context.reviewed_nodes_path,
+            **dict(unit_workflow_kwargs),
+        )
+        unit_workflow_writer(
+            base_context.hierarchy_output_dir,
+            base_context.workflow,
+            manifest_overrides={
+                "state_id": base_context.state_id,
+                "parent_state_id": base_context.parent_state_id,
+                "depth": int(base_context.depth),
+            },
+        )
+        state_records[0] = _state_record(base_context, mode)
+        write_metadata()
 
     if mode in {"independent-units", "compound-bubbles"}:
         if mode == "compound-bubbles":
@@ -2050,6 +2219,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exit-sides", required=True, help="River exit sides for RivGraph, e.g. NS or EW.")
     parser.add_argument("--experiment-id", default=None, help="Optional experiment identifier.")
     parser.add_argument("--output-dir", default=None, help="Optional experiment output directory.")
+    parser.add_argument(
+        "--collapse-corridor-mode",
+        choices=COLLAPSE_CORRIDOR_MODE_CHOICES,
+        default="realized",
+        help=(
+            "How to materialize collapsed corridors: keep the full realized corridor, "
+            "split it back to the nominal selection anchors, or run both experiment variants."
+        ),
+    )
     parser.add_argument("--max-steps", type=int, default=None, help="Optional maximum number of sequential collapse steps.")
     parser.add_argument("--max-path-cutoff", type=int, default=100, help="Maximum edge-count cutoff for unit path enumeration.")
     parser.add_argument("--max-paths", type=int, default=5000, help="Maximum number of simple paths per unit.")
@@ -2089,10 +2267,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hydraulic geometry method for equivalent-resistance edge K values.",
     )
     parser.add_argument(
+        "--equivalent-kb-mode",
+        choices=("fixed", "based_reference_section"),
+        default="fixed",
+        help="How to select kb for the equivalent-resistance workflow.",
+    )
+    parser.add_argument(
         "--equivalent-kb-value",
         type=float,
         default=20.0,
         help="Fixed width-depth ratio used when no per-edge kb field is available.",
+    )
+    parser.add_argument(
+        "--equivalent-kb-model-path",
+        default=None,
+        help="Optional local path to the BASED model .ubj file when equivalent-kb-mode=based_reference_section.",
+    )
+    parser.add_argument(
+        "--equivalent-kb-width-sample-field",
+        default="width_wet",
+        help="Reference-section width sample field used when equivalent-kb-mode=based_reference_section.",
+    )
+    parser.add_argument(
+        "--equivalent-kb-width-percentile",
+        type=float,
+        default=90.0,
+        help="Reference-section width percentile used when equivalent-kb-mode=based_reference_section.",
     )
     parser.add_argument(
         "--equivalent-manning-n",
@@ -2105,6 +2305,52 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=22.0,
         help="Default Chezy Cz used when the links do not provide one.",
+    )
+    parser.add_argument(
+        "--equivalent-forcing-path",
+        default=None,
+        help="CSV or parquet file with time/discharge forcing used when equivalent-kb-mode=based_reference_section.",
+    )
+    parser.add_argument(
+        "--equivalent-forcing-station-key",
+        default=None,
+        help="Explicit station_key to extract from a multi-station forcing source for based_reference_section kb.",
+    )
+    parser.add_argument(
+        "--equivalent-station-key-column",
+        default="station_key",
+        help="Station-key column in the equivalent-resistance forcing file.",
+    )
+    parser.add_argument(
+        "--equivalent-forcing-start-time",
+        default=None,
+        help="Optional inclusive UTC truncation start for equivalent-resistance forcing normalization.",
+    )
+    parser.add_argument(
+        "--equivalent-forcing-end-time",
+        default=None,
+        help="Optional inclusive UTC truncation end for equivalent-resistance forcing normalization.",
+    )
+    parser.add_argument(
+        "--equivalent-forcing-resample-minutes",
+        type=int,
+        default=None,
+        help="Optional normalized forcing interval in minutes for equivalent-resistance kb preparation.",
+    )
+    parser.add_argument(
+        "--equivalent-forcing-output-cache-dir",
+        default=None,
+        help="Optional cache directory for normalized equivalent-resistance forcing tables.",
+    )
+    parser.add_argument(
+        "--equivalent-time-column",
+        default="time",
+        help="Timestamp column in the equivalent-resistance forcing file.",
+    )
+    parser.add_argument(
+        "--equivalent-discharge-column",
+        default="discharge",
+        help="Discharge column in the equivalent-resistance forcing file.",
     )
     parser.add_argument("--debug-hierarchy", action="store_true", help="Enable hierarchy/unit-detection debug output.")
     parser.add_argument("--preferred-width-field", default="wid_adj", help="Preferred reviewed-link width field for collapse-footprint buffering.")
@@ -2130,57 +2376,94 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     equivalent_resistance_config = None
+    equivalent_forcing_config = None
     if args.compute_equivalent_resistance:
         equivalent_resistance_config = BubbleEquivalentResistanceConfig(
             resistance_law=args.equivalent_resistance_law,
             geometry_method=args.equivalent_geometry_method,
-            kb_mode="fixed",
+            kb_mode=args.equivalent_kb_mode,
             kb_value=args.equivalent_kb_value,
             default_manning_n=args.equivalent_manning_n,
             default_chezy_cz=args.equivalent_chezy_cz,
         )
+        if args.equivalent_kb_mode == "based_reference_section":
+            equivalent_forcing_config = ForcingConfig(
+                time_column=args.equivalent_time_column,
+                discharge_column=args.equivalent_discharge_column,
+                station_key_column=args.equivalent_station_key_column,
+                station_key=args.equivalent_forcing_station_key,
+                start_time=args.equivalent_forcing_start_time,
+                end_time=args.equivalent_forcing_end_time,
+                resample_minutes=args.equivalent_forcing_resample_minutes,
+                output_cache_dir=args.equivalent_forcing_output_cache_dir,
+            )
 
-    results = run_collapse_experiment(
-        args.mode,
-        cleaned_mask_path=args.cleaned_mask,
-        reviewed_links_path=args.reviewed_links,
-        reviewed_nodes_path=args.reviewed_nodes,
-        exit_sides=args.exit_sides,
-        experiment_id=args.experiment_id,
-        output_dir=args.output_dir,
-        max_steps=args.max_steps,
-        max_path_cutoff=args.max_path_cutoff,
-        max_paths=args.max_paths,
-        pixel_width_fields=args.pixel_width_fields,
-        pixel_width_percentiles=args.pixel_width_percentiles,
-        use_pixel_widths_for_extremes=not args.disable_pixel_width_extremes,
-        debug_hierarchy=args.debug_hierarchy,
-        preferred_width_field=args.preferred_width_field,
-        footprint_buffer_scale=args.footprint_buffer_scale,
-        all_touched=not args.disable_all_touched,
-        allow_noop=args.allow_noop,
-        single_thread=args.single_thread,
-        export_sword=not args.disable_sword_export,
-        transect_scale=args.transect_scale,
-        min_transect_pixels=args.min_transect_pixels,
-        match_tolerance=args.match_tolerance,
-        sword_node_source_path=args.sword_node_source,
-        sword_wse_field=args.sword_wse_field,
-        sword_match_tolerance=args.sword_match_tolerance,
-        sword_example_station_source_path=args.sword_example_stations_source,
-        sword_station_match_source_path=args.sword_station_match_source,
-        sword_reach_buffer_steps=args.sword_reach_buffer_steps,
-        verbose_rivgraph=args.verbose_rivgraph,
-        equivalent_resistance_config=equivalent_resistance_config,
-    )
+    run_kwargs = {
+        "cleaned_mask_path": args.cleaned_mask,
+        "reviewed_links_path": args.reviewed_links,
+        "reviewed_nodes_path": args.reviewed_nodes,
+        "exit_sides": args.exit_sides,
+        "max_steps": args.max_steps,
+        "max_path_cutoff": args.max_path_cutoff,
+        "max_paths": args.max_paths,
+        "pixel_width_fields": args.pixel_width_fields,
+        "pixel_width_percentiles": args.pixel_width_percentiles,
+        "use_pixel_widths_for_extremes": not args.disable_pixel_width_extremes,
+        "debug_hierarchy": args.debug_hierarchy,
+        "preferred_width_field": args.preferred_width_field,
+        "footprint_buffer_scale": args.footprint_buffer_scale,
+        "all_touched": not args.disable_all_touched,
+        "allow_noop": args.allow_noop,
+        "single_thread": args.single_thread,
+        "export_sword": not args.disable_sword_export,
+        "transect_scale": args.transect_scale,
+        "min_transect_pixels": args.min_transect_pixels,
+        "match_tolerance": args.match_tolerance,
+        "sword_node_source_path": args.sword_node_source,
+        "sword_wse_field": args.sword_wse_field,
+        "sword_match_tolerance": args.sword_match_tolerance,
+        "sword_example_station_source_path": args.sword_example_stations_source,
+        "sword_station_match_source_path": args.sword_station_match_source,
+        "sword_reach_buffer_steps": args.sword_reach_buffer_steps,
+        "verbose_rivgraph": args.verbose_rivgraph,
+        "equivalent_resistance_config": equivalent_resistance_config,
+        "equivalent_forcing_path": args.equivalent_forcing_path,
+        "equivalent_forcing_config": equivalent_forcing_config,
+        "equivalent_kb_model_path": args.equivalent_kb_model_path,
+        "equivalent_kb_width_sample_field": args.equivalent_kb_width_sample_field,
+        "equivalent_kb_width_percentile": args.equivalent_kb_width_percentile,
+    }
 
-    print(f"Wrote experiment outputs to {results.output_dir}")
-    print(f"States: {len(results.state_registry)}")
-    print(f"Transitions: {len(results.transition_registry)}")
-    print(f"Equivalent transition rows: {len(results.equivalent_transition_registry)}")
-    print(f"Mode: {results.manifest.get('mode')}")
-    print(f"Stop reason: {results.manifest.get('stop_reason')}")
-    print(f"Terminal state: {results.manifest.get('terminal_state_id')}")
+    requested_modes = COLLAPSE_CORRIDOR_MODES if args.collapse_corridor_mode == "both" else (args.collapse_corridor_mode,)
+    for collapse_corridor_mode in requested_modes:
+        experiment_id = args.experiment_id
+        output_dir = args.output_dir
+        if args.collapse_corridor_mode == "both":
+            experiment_id = _suffix_experiment_id_for_collapse_mode(
+                experiment_id or _default_experiment_id(args.cleaned_mask, args.mode),
+                collapse_corridor_mode,
+            )
+            output_dir = (
+                _suffix_output_dir_for_collapse_mode(args.output_dir, collapse_corridor_mode)
+                if args.output_dir is not None
+                else None
+            )
+        results = run_collapse_experiment(
+            args.mode,
+            experiment_id=experiment_id,
+            output_dir=output_dir,
+            collapse_corridor_mode=collapse_corridor_mode,
+            **run_kwargs,
+        )
+
+        print(f"Wrote experiment outputs to {results.output_dir}")
+        print(f"Collapse corridor mode: {collapse_corridor_mode}")
+        print(f"States: {len(results.state_registry)}")
+        print(f"Transitions: {len(results.transition_registry)}")
+        print(f"Equivalent transition rows: {len(results.equivalent_transition_registry)}")
+        print(f"Mode: {results.manifest.get('mode')}")
+        print(f"Stop reason: {results.manifest.get('stop_reason')}")
+        print(f"Terminal state: {results.manifest.get('terminal_state_id')}")
     return 0
 
 

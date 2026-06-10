@@ -59,6 +59,7 @@ RIVGRAPH_WIDTH_TRIM_MULTIPLIER = 1.1
 DEFAULT_CORE_OVERLAP_FRACTION_THRESHOLD = 0.05
 DEFAULT_UNCHANGED_CORE_OVERLAP_FRACTION = 0.8
 MAX_LOCAL_DIRECTION_REPAIR_LINKS = 10
+COLLAPSE_CORRIDOR_MODES = ("realized", "anchored")
 
 
 def _sanitize_rivgraph_topology_metadata(links: dict[str, object], nodes: dict[str, object]) -> None:
@@ -1361,6 +1362,445 @@ def _resolve_link_lineage(
     return pd.DataFrame.from_records(records).sort_values("id_link", kind="mergesort").reset_index(drop=True)
 
 
+def _selection_anchor_nodes(
+    *,
+    resolved_unit_ids: Sequence[int],
+    units_by_id: Mapping[int, StructuralUnit],
+) -> tuple[int | None, int | None]:
+    selected_units = [units_by_id[int(unit_id)] for unit_id in resolved_unit_ids if int(unit_id) in units_by_id]
+    if not selected_units:
+        return None, None
+
+    selection_graph = nx.MultiDiGraph()
+    for unit in selected_units:
+        for upstream, downstream, edge_key in unit.edge_set:
+            selection_graph.add_edge(int(upstream), int(downstream), key=int(edge_key))
+
+    if selection_graph.number_of_edges() > 0:
+        source_nodes = sorted(
+            int(node_id)
+            for node_id in selection_graph.nodes
+            if selection_graph.in_degree(node_id) == 0 and selection_graph.out_degree(node_id) > 0
+        )
+        sink_nodes = sorted(
+            int(node_id)
+            for node_id in selection_graph.nodes
+            if selection_graph.out_degree(node_id) == 0 and selection_graph.in_degree(node_id) > 0
+        )
+        if len(source_nodes) == 1 and len(sink_nodes) == 1:
+            return source_nodes[0], sink_nodes[0]
+
+    if len(selected_units) == 1:
+        unit = selected_units[0]
+        return int(unit.bifurcation), int(unit.confluence)
+
+    upstream_candidates = sorted(int(unit.bifurcation) for unit in selected_units)
+    downstream_candidates = sorted(int(unit.confluence) for unit in selected_units)
+    if upstream_candidates and downstream_candidates:
+        return upstream_candidates[0], downstream_candidates[-1]
+    return None, None
+
+
+def _parent_interval_lengths(
+    parent_graph: nx.MultiDiGraph,
+    parent_node_path: Sequence[int],
+) -> list[float]:
+    lengths: list[float] = []
+    for upstream, downstream in zip(parent_node_path[:-1], parent_node_path[1:]):
+        if not parent_graph.has_edge(int(upstream), int(downstream)):
+            return []
+        edge_lengths: list[float] = []
+        for edge_key, attrs in parent_graph[int(upstream)][int(downstream)].items():
+            _ = edge_key
+            value = attrs.get("len_adj")
+            if value is None or pd.isna(value):
+                value = attrs.get("len")
+            if value is None or pd.isna(value):
+                geometry = attrs.get("geometry")
+                value = float(geometry.length) if geometry is not None else 0.0
+            edge_lengths.append(max(float(value), 0.0))
+        if not edge_lengths:
+            return []
+        lengths.append(float(np.mean(edge_lengths)))
+    return lengths
+
+
+def _split_line_geometry(
+    geometry: LineString,
+    cut_distances: Sequence[float],
+) -> tuple[list[LineString], list[Point]]:
+    ordered_distances = sorted(
+        {
+            max(0.0, min(float(distance), float(geometry.length)))
+            for distance in cut_distances
+            if float(distance) > 0.0 and float(distance) < float(geometry.length)
+        }
+    )
+    if not ordered_distances:
+        return [LineString(geometry)], []
+
+    points = [geometry.interpolate(distance) for distance in ordered_distances]
+    boundaries = [0.0] + ordered_distances + [float(geometry.length)]
+    segments: list[LineString] = []
+    for start_distance, end_distance in zip(boundaries[:-1], boundaries[1:]):
+        segment = substring(geometry, start_distance, end_distance)
+        if segment.is_empty:
+            continue
+        if isinstance(segment, LineString):
+            segments.append(segment)
+            continue
+        merged = linemerge(segment)
+        if isinstance(merged, LineString):
+            segments.append(merged)
+        elif isinstance(merged, MultiLineString):
+            coords: list[tuple[float, float]] = []
+            for part in merged.geoms:
+                part_coords = list(part.coords)
+                if not coords:
+                    coords.extend(part_coords)
+                elif coords[-1] == part_coords[0]:
+                    coords.extend(part_coords[1:])
+                else:
+                    coords.extend(part_coords)
+            segments.append(LineString(coords))
+        else:
+            raise TypeError(f"Unexpected split geometry type: {type(segment)!r}")
+    return segments, points
+
+
+def _segment_parent_paths(
+    parent_node_path: Sequence[int],
+    internal_cut_nodes: Sequence[int],
+) -> list[list[int]]:
+    if not parent_node_path:
+        return []
+    ordered_cuts = [int(node_id) for node_id in internal_cut_nodes if int(node_id) in parent_node_path[1:-1]]
+    if not ordered_cuts:
+        return [[int(node_id) for node_id in parent_node_path]]
+
+    segments: list[list[int]] = []
+    start_index = 0
+    for cut_node in ordered_cuts:
+        cut_index = parent_node_path.index(int(cut_node))
+        segments.append([int(node_id) for node_id in parent_node_path[start_index : cut_index + 1]])
+        start_index = cut_index
+    segments.append([int(node_id) for node_id in parent_node_path[start_index:]])
+    return segments
+
+
+def _segment_contains_nominal_interval(
+    *,
+    segment_parent_path: Sequence[int],
+    nominal_upstream_node: int,
+    nominal_downstream_node: int,
+) -> bool:
+    if not segment_parent_path:
+        return False
+    if nominal_upstream_node in segment_parent_path and nominal_downstream_node in segment_parent_path:
+        return (
+            segment_parent_path.index(int(nominal_upstream_node))
+            < segment_parent_path.index(int(nominal_downstream_node))
+        )
+    if nominal_upstream_node in segment_parent_path and nominal_upstream_node != int(segment_parent_path[-1]):
+        return True
+    if nominal_downstream_node in segment_parent_path and nominal_downstream_node != int(segment_parent_path[0]):
+        return True
+    return False
+
+
+def _line_length_fields_updated(
+    row_data: Mapping[str, Any],
+    geometry: LineString,
+) -> dict[str, Any]:
+    updated = dict(row_data)
+    segment_length = float(geometry.length)
+    chord = float(Point(geometry.coords[0]).distance(Point(geometry.coords[-1])))
+    for column in ("len", "len_adj", "link_length_m", "parent_link_length_m"):
+        if column in updated:
+            updated[column] = segment_length
+    if "sinuosity" in updated:
+        updated["sinuosity"] = segment_length / chord if chord > 0 else 1.0
+    if "n_nodes" in updated:
+        updated["n_nodes"] = 2
+    return updated
+
+
+def _refresh_explicit_directed_nodes(
+    *,
+    directed_links: gpd.GeoDataFrame,
+    directed_nodes: gpd.GeoDataFrame,
+    node_geometry_overrides: Mapping[int, Point] | None = None,
+) -> tuple[gpd.GeoDataFrame, dict[str, Any]]:
+    result = directed_nodes.copy()
+    geometry_lookup = {
+        int(row.id_node): row.geometry
+        for row in result.itertuples(index=False)
+    }
+    if node_geometry_overrides:
+        geometry_lookup.update({int(node_id): geometry for node_id, geometry in node_geometry_overrides.items()})
+
+    endpoint_node_ids = sorted(
+        {
+            int(node_id)
+            for node_id in pd.concat(
+                [
+                    pd.to_numeric(directed_links["id_us_node"], errors="coerce"),
+                    pd.to_numeric(directed_links["id_ds_node"], errors="coerce"),
+                ],
+                ignore_index=True,
+            ).dropna().astype(int).tolist()
+        }
+    )
+    result = result.loc[pd.to_numeric(result["id_node"], errors="coerce").isin(endpoint_node_ids)].copy()
+    existing_ids = set(pd.to_numeric(result["id_node"], errors="coerce").dropna().astype(int).tolist())
+    missing_ids = [node_id for node_id in endpoint_node_ids if node_id not in existing_ids]
+    if missing_ids:
+        template = {column: pd.NA for column in result.columns}
+        if result.empty:
+            template["schema_rg"] = "rg-v1"
+        elif "schema_rg" in result.columns:
+            non_null_schema = result["schema_rg"].dropna()
+            template["schema_rg"] = non_null_schema.iloc[0] if not non_null_schema.empty else "rg-v1"
+        missing_rows: list[dict[str, Any]] = []
+        for node_id in missing_ids:
+            row = dict(template)
+            row["id_node"] = int(node_id)
+            row["geometry"] = geometry_lookup[int(node_id)]
+            missing_rows.append(row)
+        result = pd.concat(
+            [result, gpd.GeoDataFrame(missing_rows, geometry="geometry", crs=directed_nodes.crs)],
+            ignore_index=True,
+        )
+
+    result["id_node"] = pd.to_numeric(result["id_node"], errors="coerce").astype(int)
+    result["geometry"] = [geometry_lookup[int(node_id)] for node_id in result["id_node"].tolist()]
+    result = result.sort_values("id_node", kind="mergesort").reset_index(drop=True)
+    if "idx_node" in result.columns:
+        result["idx_node"] = np.arange(len(result), dtype=int)
+
+    graph = build_directed_graph(directed_links, result, prefer_explicit_direction=True)
+    report = validate_single_inlet_single_outlet(graph, require_flag_match=False)
+    source_nodes = sorted(int(node_id) for node_id in report.source_nodes)
+    sink_nodes = sorted(int(node_id) for node_id in report.sink_nodes)
+    source_node_set = set(source_nodes)
+    sink_node_set = set(sink_nodes)
+
+    id_links_values: list[str] = []
+    n_links_values: list[int] = []
+    in_degree_values: list[int] = []
+    out_degree_values: list[int] = []
+    for node_id in result["id_node"].astype(int):
+        incident = sorted(int(link_id) for _, _, link_id in graph.in_edges(node_id, keys=True)) + sorted(
+            int(link_id) for _, _, link_id in graph.out_edges(node_id, keys=True)
+        )
+        id_links_values.append(_serialize_int_list(incident))
+        n_links_values.append(int(len(incident)))
+        in_degree_values.append(int(graph.in_degree(node_id)))
+        out_degree_values.append(int(graph.out_degree(node_id)))
+
+    result["id_links"] = id_links_values
+    result["n_links"] = n_links_values
+    result["in_degree"] = in_degree_values
+    result["out_degree"] = out_degree_values
+    result["is_inlet"] = result["id_node"].astype(int).isin(source_node_set)
+    result["is_outlet"] = result["id_node"].astype(int).isin(sink_node_set)
+    result["type_io"] = [
+        _type_io_label(is_inlet=bool(is_inlet), is_outlet=bool(is_outlet))
+        for is_inlet, is_outlet in zip(result["is_inlet"], result["is_outlet"])
+    ]
+
+    summary = {
+        "is_valid": bool(report.is_valid),
+        "source_nodes": source_nodes,
+        "sink_nodes": sink_nodes,
+        "validation_report": report.to_dict(),
+        "issues": list(report.issues),
+    }
+    return result, summary
+
+
+def _segment_collapsed_links_to_anchor_nodes(
+    *,
+    parent_graph: nx.MultiDiGraph,
+    parent_nodes: gpd.GeoDataFrame,
+    parent_node_order: Mapping[int, int],
+    directed_links: gpd.GeoDataFrame,
+    directed_nodes: gpd.GeoDataFrame,
+    node_match: pd.DataFrame,
+    link_lineage: pd.DataFrame,
+    nominal_upstream_node: int | None,
+    nominal_downstream_node: int | None,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, pd.DataFrame, dict[str, Any]]:
+    if nominal_upstream_node is None or nominal_downstream_node is None:
+        return directed_links, directed_nodes, node_match, {"n_anchor_splits": 0, "mode_applied": False}
+
+    lineage_by_link = link_lineage.set_index("id_link", drop=False) if not link_lineage.empty else pd.DataFrame()
+    parent_node_flags = (
+        parent_nodes.set_index("id_node", drop=False)[["is_inlet", "is_outlet"]].to_dict("index")
+        if not parent_nodes.empty and {"id_node", "is_inlet", "is_outlet"}.issubset(parent_nodes.columns)
+        else {}
+    )
+    geometry_overrides: dict[int, Point] = {}
+    updated_rows: list[dict[str, Any]] = []
+    next_link_id = int(pd.to_numeric(directed_links["id_link"], errors="coerce").dropna().astype(int).max()) + 1
+    next_node_id = int(pd.to_numeric(directed_nodes["id_node"], errors="coerce").dropna().astype(int).max()) + 1
+    node_match_rows = node_match.to_dict("records")
+    n_anchor_splits = 0
+    n_new_nodes = 0
+    n_new_links = 0
+
+    for row in directed_links.itertuples(index=False):
+        row_data = row._asdict()
+        link_id = int(row_data["id_link"])
+        if lineage_by_link.empty or link_id not in lineage_by_link.index:
+            updated_rows.append(dict(row_data))
+            continue
+
+        lineage_row = lineage_by_link.loc[link_id]
+        parent_node_path = _parse_int_list(lineage_row.get("matched_parent_node_path", ""))
+        if len(parent_node_path) < 3:
+            updated_rows.append(dict(row_data))
+            continue
+
+        internal_cut_nodes = [
+            int(node_id)
+            for node_id in (int(nominal_upstream_node), int(nominal_downstream_node))
+            if int(node_id) in parent_node_path[1:-1]
+        ]
+        internal_cut_nodes = [node_id for node_id in parent_node_path[1:-1] if int(node_id) in set(internal_cut_nodes)]
+        if not internal_cut_nodes:
+            updated_rows.append(dict(row_data))
+            continue
+
+        interval_lengths = _parent_interval_lengths(parent_graph, parent_node_path)
+        if not interval_lengths:
+            updated_rows.append(dict(row_data))
+            continue
+
+        cumulative_lengths = [0.0]
+        for interval_length in interval_lengths:
+            cumulative_lengths.append(cumulative_lengths[-1] + float(interval_length))
+        total_length = cumulative_lengths[-1]
+        if total_length <= 0:
+            updated_rows.append(dict(row_data))
+            continue
+
+        cut_distances: list[float] = []
+        cut_parent_nodes: list[int] = []
+        for node_id in internal_cut_nodes:
+            cut_index = parent_node_path.index(int(node_id))
+            fraction = cumulative_lengths[cut_index] / total_length
+            if fraction <= 0.0 or fraction >= 1.0:
+                continue
+            cut_distances.append(float(row.geometry.length) * fraction)
+            cut_parent_nodes.append(int(node_id))
+        if not cut_distances:
+            updated_rows.append(dict(row_data))
+            continue
+
+        segments, points = _split_line_geometry(row.geometry, cut_distances)
+        if len(segments) <= 1:
+            updated_rows.append(dict(row_data))
+            continue
+
+        parent_path_segments = _segment_parent_paths(parent_node_path, cut_parent_nodes)
+        if len(parent_path_segments) != len(segments):
+            updated_rows.append(dict(row_data))
+            continue
+
+        split_node_ids: list[int] = []
+        for point, parent_node_id in zip(points, cut_parent_nodes):
+            new_node_id = next_node_id
+            next_node_id += 1
+            geometry_overrides[new_node_id] = point
+            split_node_ids.append(new_node_id)
+            n_new_nodes += 1
+            flags = parent_node_flags.get(int(parent_node_id), {})
+            node_match_row = {column: pd.NA for column in node_match.columns}
+            node_match_row["child_id_node"] = int(new_node_id)
+            node_match_row["matched_parent_node_id"] = int(parent_node_id)
+            if "match_distance" in node_match_row:
+                node_match_row["match_distance"] = 0.0
+            if "match_within_tolerance" in node_match_row:
+                node_match_row["match_within_tolerance"] = True
+            if "parent_node_order" in node_match_row:
+                node_match_row["parent_node_order"] = parent_node_order.get(int(parent_node_id), pd.NA)
+            if "child_is_inlet_raw" in node_match_row:
+                node_match_row["child_is_inlet_raw"] = False
+            if "child_is_outlet_raw" in node_match_row:
+                node_match_row["child_is_outlet_raw"] = False
+            if "parent_is_inlet" in node_match_row:
+                node_match_row["parent_is_inlet"] = bool(flags.get("is_inlet", False))
+            if "parent_is_outlet" in node_match_row:
+                node_match_row["parent_is_outlet"] = bool(flags.get("is_outlet", False))
+            node_match_rows.append(node_match_row)
+
+        segment_node_ids = [int(row.id_us_node)] + split_node_ids + [int(row.id_ds_node)]
+        keep_index = 0
+        for index, segment_parent_path in enumerate(parent_path_segments):
+            if _segment_contains_nominal_interval(
+                segment_parent_path=segment_parent_path,
+                nominal_upstream_node=int(nominal_upstream_node),
+                nominal_downstream_node=int(nominal_downstream_node),
+            ):
+                keep_index = index
+                break
+
+        for index, (segment_geometry, segment_parent_path) in enumerate(zip(segments, parent_path_segments)):
+            new_row = _line_length_fields_updated(row_data, segment_geometry)
+            new_row["geometry"] = segment_geometry
+            new_row["id_us_node"] = int(segment_node_ids[index])
+            new_row["id_ds_node"] = int(segment_node_ids[index + 1])
+            new_row["id_nodes"] = f"{int(segment_node_ids[index])}, {int(segment_node_ids[index + 1])}"
+            if "raw_id_nodes" in new_row:
+                new_row["raw_id_nodes"] = new_row["id_nodes"]
+            new_row["id_link"] = int(link_id) if index == keep_index else int(next_link_id)
+            if index != keep_index:
+                next_link_id += 1
+                n_new_links += 1
+            updated_rows.append(new_row)
+        n_anchor_splits += 1
+
+    if n_anchor_splits == 0:
+        return directed_links, directed_nodes, node_match, {"n_anchor_splits": 0, "mode_applied": False}
+
+    updated_links = gpd.GeoDataFrame(updated_rows, geometry="geometry", crs=directed_links.crs)
+    updated_links["id_link"] = pd.to_numeric(updated_links["id_link"], errors="coerce").astype(int)
+    updated_links = updated_links.sort_values("id_link", kind="mergesort").reset_index(drop=True)
+    if "idx_link" in updated_links.columns:
+        updated_links["idx_link"] = np.arange(len(updated_links), dtype=int)
+
+    updated_node_match = pd.DataFrame.from_records(node_match_rows, columns=node_match.columns if not node_match.empty else None)
+    if not updated_node_match.empty and "child_id_node" in updated_node_match.columns:
+        updated_node_match["child_id_node"] = pd.to_numeric(updated_node_match["child_id_node"], errors="coerce").astype(int)
+        if "matched_parent_node_id" in updated_node_match.columns:
+            updated_node_match["matched_parent_node_id"] = pd.to_numeric(
+                updated_node_match["matched_parent_node_id"],
+                errors="coerce",
+            ).astype("Int64")
+        updated_node_match = updated_node_match.sort_values(
+            ["child_id_node", "matched_parent_node_id"],
+            kind="mergesort",
+        ).reset_index(drop=True)
+
+    updated_nodes, node_summary = _refresh_explicit_directed_nodes(
+        directed_links=updated_links,
+        directed_nodes=directed_nodes,
+        node_geometry_overrides=geometry_overrides,
+    )
+    summary = {
+        "mode_applied": True,
+        "n_anchor_splits": int(n_anchor_splits),
+        "n_new_nodes": int(n_new_nodes),
+        "n_new_links": int(n_new_links),
+        "nominal_upstream_node": int(nominal_upstream_node),
+        "nominal_downstream_node": int(nominal_downstream_node),
+        "validation_report": node_summary["validation_report"],
+        "issues": node_summary["issues"],
+    }
+    return updated_links, updated_nodes, updated_node_match, summary
+
+
 def _build_progression_distance_maps(
     *,
     child_links: gpd.GeoDataFrame,
@@ -2332,6 +2772,7 @@ def generate_network_variant(
     variant_id: str | None = None,
     example_id: str | None = None,
     output_dir: str | Path | None = None,
+    collapse_corridor_mode: str = "realized",
     wet_reference_mask_path: str | Path | None = None,
     preferred_width_field: str = DEFAULT_FOOTPRINT_WIDTH_FIELD,
     footprint_buffer_scale: float = DEFAULT_FOOTPRINT_BUFFER_SCALE,
@@ -2352,6 +2793,11 @@ def generate_network_variant(
     max_paths: int = 5000,
     verbose_rivgraph: bool = False,
 ) -> NetworkVariantOutputs:
+    if collapse_corridor_mode not in COLLAPSE_CORRIDOR_MODES:
+        raise ValueError(
+            f"Unsupported collapse_corridor_mode {collapse_corridor_mode!r}. "
+            f"Expected one of {COLLAPSE_CORRIDOR_MODES}."
+        )
     resolved_unit_ids = resolve_selected_unit_ids(
         workflow_output_dir=workflow_output_dir,
         group_label=group_label,
@@ -2435,6 +2881,7 @@ def generate_network_variant(
         "variant_id": variant_id,
         "group_label": group_label,
         "selected_unit_ids": _serialize_int_list(resolved_unit_ids),
+        "collapse_corridor_mode": collapse_corridor_mode,
     }
     rivgraph_name = f"{example_id}__{variant_id}"
     rivgraph_paths = _run_rivgraph(
@@ -2496,6 +2943,59 @@ def generate_network_variant(
         node_match=node_match,
         link_match=link_match,
     )
+    link_lineage = _resolve_link_lineage(
+        parent_graph=parent_graph,
+        directed_child_links=directed_links,
+        node_match=node_match,
+        link_match=link_match,
+        match_tolerance=float(match_tolerance),
+    )
+    anchor_segmentation_summary: dict[str, Any] | None = None
+    if collapse_corridor_mode == "anchored":
+        nominal_upstream_node, nominal_downstream_node = _selection_anchor_nodes(
+            resolved_unit_ids=resolved_unit_ids,
+            units_by_id=units_by_id,
+        )
+        directed_links, directed_nodes, node_match, anchor_segmentation_summary = _segment_collapsed_links_to_anchor_nodes(
+            parent_graph=parent_graph,
+            parent_nodes=reviewed_nodes,
+            parent_node_order=parent_node_order,
+            directed_links=directed_links,
+            directed_nodes=directed_nodes,
+            node_match=node_match,
+            link_lineage=link_lineage,
+            nominal_upstream_node=nominal_upstream_node,
+            nominal_downstream_node=nominal_downstream_node,
+        )
+        link_match = _match_child_links_to_parent_links(
+            reviewed_links,
+            directed_links,
+            match_tolerance=match_tolerance,
+        )
+        link_lineage = _resolve_link_lineage(
+            parent_graph=parent_graph,
+            directed_child_links=directed_links,
+            node_match=node_match,
+            link_match=link_match,
+            match_tolerance=float(match_tolerance),
+        )
+        direction_summary = {
+            "is_valid": bool(anchor_segmentation_summary.get("validation_report", {}).get("is_valid", direction_summary.get("is_valid", False))),
+            "source_node": anchor_segmentation_summary.get("validation_report", {}).get("source_nodes", [direction_summary.get("source_node")])[0]
+            if anchor_segmentation_summary.get("validation_report", {}).get("source_nodes")
+            else direction_summary.get("source_node"),
+            "sink_node": anchor_segmentation_summary.get("validation_report", {}).get("sink_nodes", [direction_summary.get("sink_node")])[0]
+            if anchor_segmentation_summary.get("validation_report", {}).get("sink_nodes")
+            else direction_summary.get("sink_node"),
+            "source_nodes": anchor_segmentation_summary.get("validation_report", {}).get("source_nodes", direction_summary.get("source_nodes", [])),
+            "sink_nodes": anchor_segmentation_summary.get("validation_report", {}).get("sink_nodes", direction_summary.get("sink_nodes", [])),
+            "n_oriented_links": int(len(directed_links)),
+            "n_node_matches": int(node_match["match_within_tolerance"].fillna(False).sum()) if "match_within_tolerance" in node_match.columns else 0,
+            "n_link_matches": int(link_match["child_id_link"].nunique()) if "child_id_link" in link_match.columns else 0,
+            "issues": list(anchor_segmentation_summary.get("issues", [])),
+            "validation_report": anchor_segmentation_summary.get("validation_report", direction_summary.get("validation_report", {})),
+        }
+
     directed_nodes, node_sword_match, sword_match_summary = match_variant_nodes_to_sword(
         directed_nodes=directed_nodes,
         parent_nodes=reviewed_nodes,
@@ -2533,13 +3033,6 @@ def generate_network_variant(
         unit_ids=resolved_unit_ids,
         group_label=group_label,
     )
-    link_lineage = _resolve_link_lineage(
-        parent_graph=parent_graph,
-        directed_child_links=directed_links,
-        node_match=node_match,
-        link_match=link_match,
-        match_tolerance=float(match_tolerance),
-    )
     link_lineage = _apply_collapsed_selection_metadata(
         link_lineage,
         unit_ids=resolved_unit_ids,
@@ -2550,23 +3043,50 @@ def generate_network_variant(
         errors="ignore",
     ).merge(link_lineage, on="id_link", how="left", validate="1:1")
 
+    if collapse_corridor_mode == "anchored":
+        anchored_enriched_links, anchored_link_width_samples = compute_width_families(
+            directed_links,
+            collapsed_mask_path=collapsed_mask_path,
+            wet_reference_mask_path=wet_reference_mask_path,
+            transect_scale=transect_scale,
+            min_transect_pixels=min_transect_pixels,
+        )
+        enriched_links = anchored_enriched_links
+        link_width_samples = _apply_collapsed_selection_metadata(
+            anchored_link_width_samples,
+            unit_ids=resolved_unit_ids,
+            group_label=group_label,
+        )
+
     width_columns = [column for column in enriched_links.columns if column not in raw_links.columns or column == enriched_links.geometry.name]
     directed_enriched_links = directed_links.copy()
-    for column in width_columns:
-        if column == enriched_links.geometry.name:
-            continue
-        directed_enriched_links[column] = enriched_links[column].values
-    if "geometry_reversed_to_match_flow" in directed_enriched_links.columns and directed_enriched_links["geometry_reversed_to_match_flow"].any():
-        for column in ("wid_pix_total", "wid_pix_wet", "wid_pix_dry"):
-            if column not in directed_enriched_links.columns:
+    if "id_link" in enriched_links.columns:
+        enriched_lookup = enriched_links.drop(columns=enriched_links.geometry.name, errors="ignore").copy()
+        directed_enriched_links = directed_enriched_links.merge(
+            enriched_lookup[[column for column in enriched_lookup.columns if column == "id_link" or column in width_columns]],
+            on="id_link",
+            how="left",
+            validate="1:1",
+            suffixes=("", "_width"),
+        )
+    else:
+        for column in width_columns:
+            if column == enriched_links.geometry.name:
                 continue
-            reversed_values = []
-            for value, reverse_flag in zip(directed_enriched_links[column], directed_enriched_links["geometry_reversed_to_match_flow"]):
-                samples = _parse_float_list(value)
-                if reverse_flag:
-                    samples = list(reversed(samples))
-                reversed_values.append(_serialize_float_array(samples))
-            directed_enriched_links[column] = reversed_values
+            if column in enriched_links.columns:
+                directed_enriched_links[column] = enriched_links[column].values
+    if collapse_corridor_mode != "anchored":
+        if "geometry_reversed_to_match_flow" in directed_enriched_links.columns and directed_enriched_links["geometry_reversed_to_match_flow"].any():
+            for column in ("wid_pix_total", "wid_pix_wet", "wid_pix_dry"):
+                if column not in directed_enriched_links.columns:
+                    continue
+                reversed_values = []
+                for value, reverse_flag in zip(directed_enriched_links[column], directed_enriched_links["geometry_reversed_to_match_flow"]):
+                    samples = _parse_float_list(value)
+                    if reverse_flag:
+                        samples = list(reversed(samples))
+                    reversed_values.append(_serialize_float_array(samples))
+                directed_enriched_links[column] = reversed_values
 
     link_width_families = pd.DataFrame(directed_enriched_links.drop(columns=directed_enriched_links.geometry.name))
     link_width_families.to_csv(width_dir / "link_width_families.csv", index=False)
@@ -2589,6 +3109,7 @@ def generate_network_variant(
         "selected_unit_ids": resolved_unit_ids,
         "group_label": group_label,
         "collapsed_selection": selection_metadata,
+        "collapse_corridor_mode": collapse_corridor_mode,
         "n_components": int(len(collapse_components)),
         "component_ids": collapse_components["component_id"].tolist(),
         "exit_sides": str(exit_sides),
@@ -2632,6 +3153,7 @@ def generate_network_variant(
             ),
         },
         "mask_summary": mask_summary,
+        "anchor_segmentation": anchor_segmentation_summary,
         "sword_matching": {
             "wse_field": sword_wse_field,
             "match_tolerance": sword_match_tolerance,
@@ -2722,6 +3244,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--variant-id", default=None, help="Optional output variant identifier.")
     parser.add_argument("--example-id", default=None, help="Optional stable example identifier used for regenerated file naming.")
     parser.add_argument("--output-dir", default=None, help="Optional output directory. Defaults to network_variants/outputs/<example>/<variant>/")
+    parser.add_argument(
+        "--collapse-corridor-mode",
+        choices=COLLAPSE_CORRIDOR_MODES,
+        default="realized",
+        help="Whether to keep the full realized collapsed corridor or split it back to the nominal selection anchors.",
+    )
     parser.add_argument("--wet-reference-mask", default=None, help="Optional mask used for wet-width sampling. Defaults to the parent cleaned mask.")
     parser.add_argument("--preferred-width-field", default=DEFAULT_FOOTPRINT_WIDTH_FIELD, help="Preferred reviewed-link width field for footprint buffering.")
     parser.add_argument("--footprint-buffer-scale", type=float, default=DEFAULT_FOOTPRINT_BUFFER_SCALE, help="Multiplier applied to footprint width / 2 buffering.")
@@ -2759,6 +3287,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         variant_id=args.variant_id,
         example_id=args.example_id,
         output_dir=args.output_dir,
+        collapse_corridor_mode=args.collapse_corridor_mode,
         wet_reference_mask_path=args.wet_reference_mask,
         preferred_width_field=args.preferred_width_field,
         footprint_buffer_scale=args.footprint_buffer_scale,

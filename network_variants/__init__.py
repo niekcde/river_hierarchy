@@ -4,6 +4,10 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .collapse_experiment import CollapseExperimentOutputs, run_collapse_experiment
+    from .equivalent_resistance_experiment import (
+        EquivalentResistanceExperimentOutputs,
+        run_equivalent_resistance_experiment,
+    )
     from .reference_context import ResolvedKbContext, resolve_kb_context
     from .variant_generation import (
         NetworkVariantOutputs,
@@ -15,11 +19,13 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CollapseExperimentOutputs",
+    "EquivalentResistanceExperimentOutputs",
     "NetworkVariantOutputs",
     "ResolvedKbContext",
     "compute_width_families",
     "generate_network_variant",
     "resolve_kb_context",
+    "run_equivalent_resistance_experiment",
     "run_collapse_experiment",
     "resolve_selected_unit_ids",
 ]
@@ -32,6 +38,17 @@ def __getattr__(name: str) -> Any:
         exports = {
             "CollapseExperimentOutputs": CollapseExperimentOutputs,
             "run_collapse_experiment": run_collapse_experiment,
+        }
+        return exports[name]
+    if name in {"EquivalentResistanceExperimentOutputs", "run_equivalent_resistance_experiment"}:
+        from .equivalent_resistance_experiment import (
+            EquivalentResistanceExperimentOutputs,
+            run_equivalent_resistance_experiment,
+        )
+
+        exports = {
+            "EquivalentResistanceExperimentOutputs": EquivalentResistanceExperimentOutputs,
+            "run_equivalent_resistance_experiment": run_equivalent_resistance_experiment,
         }
         return exports[name]
     if name in {"ResolvedKbContext", "resolve_kb_context"}:

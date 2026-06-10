@@ -66,6 +66,14 @@ def _resolve_exit_sides(experiment_dir: Path, registry: pd.DataFrame) -> str:
         exit_sides = str(manifest.get("exit_sides", "") or "").strip()
         if exit_sides:
             return exit_sides
+    experiment_manifest = _load_experiment_manifest(experiment_dir)
+    exit_sides = str(experiment_manifest.get("exit_sides", "") or "").strip()
+    if exit_sides:
+        return exit_sides
+    variant_options = (experiment_manifest.get("options", {}) or {}).get("variant", {}) or {}
+    exit_sides = str(variant_options.get("exit_sides", "") or "").strip()
+    if exit_sides:
+        return exit_sides
     raise ValueError(
         "Could not resolve exit_sides from existing variant manifests. "
         f"Inspect {experiment_dir / 'states'} for missing summary outputs."

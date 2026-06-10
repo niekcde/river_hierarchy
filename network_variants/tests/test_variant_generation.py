@@ -25,6 +25,7 @@ from network_variants.variant_generation import (
     _resolve_link_by_progression,
     _resolve_link_lineage,
     _resolve_single_remaining_link,
+    _segment_collapsed_links_to_anchor_nodes,
     _trim_slice,
 )
 from hierarchy_level_definition.graph_building.directed_network_checks import (
@@ -464,6 +465,157 @@ def test_resolved_lineage_uses_parent_node_path_and_keeps_parallel_edges() -> No
     assert lineage_row["secondary_parent_link_ids"] == ""
     assert lineage_row["lineage_type"] == "collapsed_many_to_one"
     assert np.isclose(lineage_row["matched_parent_overlap_fraction"], 1.0)
+
+
+def test_segment_collapsed_links_to_anchor_nodes_splits_link_at_nominal_parent_nodes() -> None:
+    parent_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 0, "is_inlet": True, "is_outlet": False, "geometry": Point(0, 0)},
+            {"id_node": 1, "is_inlet": False, "is_outlet": False, "geometry": Point(10, 0)},
+            {"id_node": 2, "is_inlet": False, "is_outlet": False, "geometry": Point(20, 0)},
+            {"id_node": 3, "is_inlet": False, "is_outlet": True, "geometry": Point(30, 0)},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    parent_nodes["idx_node"] = np.arange(len(parent_nodes))
+    parent_nodes["id_links"] = ["0", "0,1", "1,2", "2"]
+    parent_nodes["n_links"] = [1, 2, 2, 1]
+    parent_nodes["type_io"] = ["inlet", "neither", "neither", "outlet"]
+    parent_nodes["schema_rg"] = "rg-v1"
+
+    parent_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 0, "id_nodes": "0, 1", "id_us_node": 0, "id_ds_node": 1, "geometry": LineString([(0, 0), (10, 0)])},
+            {"id_link": 1, "id_nodes": "1, 2", "id_us_node": 1, "id_ds_node": 2, "geometry": LineString([(10, 0), (20, 0)])},
+            {"id_link": 2, "id_nodes": "2, 3", "id_us_node": 2, "id_ds_node": 3, "geometry": LineString([(20, 0), (30, 0)])},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    parent_links["idx_link"] = ""
+    parent_links["n_nodes"] = 2
+    parent_links["is_inlet"] = [True, False, False]
+    parent_links["is_outlet"] = [False, False, True]
+    parent_links["type_io"] = ["inlet", "neither", "outlet"]
+    parent_links["schema_rg"] = "rg-v1"
+    parent_links["link_conn"] = ""
+    parent_links["wid_pix"] = ""
+    parent_links["len"] = [10.0, 10.0, 10.0]
+    parent_links["wid"] = [4.0, 4.0, 4.0]
+    parent_links["wid_adj"] = [4.0, 4.0, 4.0]
+    parent_links["wid_med"] = [4.0, 4.0, 4.0]
+    parent_links["len_adj"] = [10.0, 10.0, 10.0]
+    parent_links["sinuosity"] = [1.0, 1.0, 1.0]
+
+    child_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 10, "idx_node": 0, "id_links": "20", "n_links": 1, "type_io": "inlet", "schema_rg": "rg-v1", "is_inlet": True, "is_outlet": False, "geometry": Point(0, 0)},
+            {"id_node": 11, "idx_node": 1, "id_links": "20", "n_links": 1, "type_io": "outlet", "schema_rg": "rg-v1", "is_inlet": False, "is_outlet": True, "geometry": Point(30, 0)},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    child_links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": 20,
+                "idx_link": 0,
+                "id_nodes": "10, 11",
+                "raw_id_nodes": "10, 11",
+                "id_us_node": 10,
+                "id_ds_node": 11,
+                "n_nodes": 2,
+                "is_inlet": True,
+                "is_outlet": True,
+                "type_io": "both",
+                "schema_rg": "rg-v1",
+                "link_conn": "",
+                "wid_pix": "",
+                "len": 30.0,
+                "wid": 4.0,
+                "wid_adj": 4.0,
+                "wid_med": 4.0,
+                "len_adj": 30.0,
+                "sinuosity": 1.0,
+                "geometry": LineString([(0, 0), (30, 0)]),
+            }
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+
+    node_match = pd.DataFrame(
+        [
+            {
+                "child_id_node": 10,
+                "matched_parent_node_id": 0,
+                "match_distance": 0.0,
+                "match_within_tolerance": True,
+                "parent_node_order": 0,
+                "child_is_inlet_raw": True,
+                "child_is_outlet_raw": False,
+                "parent_is_inlet": True,
+                "parent_is_outlet": False,
+            },
+            {
+                "child_id_node": 11,
+                "matched_parent_node_id": 3,
+                "match_distance": 0.0,
+                "match_within_tolerance": True,
+                "parent_node_order": 3,
+                "child_is_inlet_raw": False,
+                "child_is_outlet_raw": True,
+                "parent_is_inlet": False,
+                "parent_is_outlet": True,
+            },
+        ]
+    )
+    link_lineage = pd.DataFrame(
+        [
+            {
+                "id_link": 20,
+                "matched_parent_node_path": "0,1,2,3",
+            }
+        ]
+    )
+
+    parent_order, parent_graph, _ = _infer_parent_node_order(parent_links, parent_nodes)
+    updated_links, updated_nodes, updated_node_match, summary = _segment_collapsed_links_to_anchor_nodes(
+        parent_graph=parent_graph,
+        parent_nodes=parent_nodes,
+        parent_node_order=parent_order,
+        directed_links=child_links,
+        directed_nodes=child_nodes,
+        node_match=node_match,
+        link_lineage=link_lineage,
+        nominal_upstream_node=1,
+        nominal_downstream_node=2,
+    )
+
+    assert summary["mode_applied"] is True
+    assert summary["n_anchor_splits"] == 1
+    assert summary["n_new_nodes"] == 2
+    assert summary["n_new_links"] == 2
+    assert len(updated_links) == 3
+    assert len(updated_nodes) == 4
+    assert set(updated_links["id_link"].astype(int)) == {20, 21, 22}
+
+    kept = updated_links.loc[updated_links["id_link"] == 20].iloc[0]
+    assert np.isclose(float(kept["len"]), 10.0)
+    assert np.isclose(float(kept.geometry.length), 10.0)
+    assert int(kept["id_us_node"]) in set(updated_nodes["id_node"].astype(int))
+    assert int(kept["id_ds_node"]) in set(updated_nodes["id_node"].astype(int))
+
+    matched_pairs = {
+        (int(row.child_id_node), int(row.matched_parent_node_id))
+        for row in updated_node_match.itertuples(index=False)
+        if pd.notna(row.matched_parent_node_id)
+    }
+    assert (10, 0) in matched_pairs
+    assert (11, 3) in matched_pairs
+    assert any(parent_id == 1 for _, parent_id in matched_pairs)
+    assert any(parent_id == 2 for _, parent_id in matched_pairs)
 
 
 def test_repair_invalid_directionality_prefers_weaker_evidence_flip() -> None:

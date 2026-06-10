@@ -1,21 +1,25 @@
 from __future__ import annotations
-
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import geopandas as gpd
 import pandas as pd
 import pytest
 
+from hierarchy_level_definition.metrics import BubbleEquivalentResistanceConfig
 from hierarchy_level_definition.run_unit_workflow import UnitWorkflowOutputs, write_unit_workflow_outputs
+import network_variants.collapse_experiment as collapse_experiment_module
 from network_variants.collapse_experiment import (
     BaseStateVariantOutputs,
     _build_unit_link_membership,
     _normalize_numeric_id_columns,
+    main,
     run_collapse_experiment,
 )
 from network_variants.hydraulic_context import StateHydraulicContextOutputs
 from network_variants.variant_generation import NetworkVariantOutputs, VariantDirectionValidationError
+from rapid_tools.forcing import ForcingConfig
 
 
 def _workflow_outputs(
@@ -340,6 +344,58 @@ def _make_state_hydraulic_context_runner():
     return runner
 
 
+def _make_equivalent_forcing_table_runner():
+    calls: list[dict[str, Any]] = []
+
+    def runner(forcing_path: str | Path, **kwargs: Any) -> tuple[pd.DataFrame, dict[str, object]]:
+        calls.append({"forcing_path": str(forcing_path), **dict(kwargs)})
+        forcing = pd.DataFrame(
+            {
+                "time": pd.to_datetime(["2023-01-01T00:00:00Z", "2023-01-01T00:15:00Z"], utc=True),
+                "discharge_cms": [100.0, 125.0],
+            }
+        )
+        return forcing, {"selected_station_key": "TEST:1", "normalized_row_count": 2}
+
+    runner.calls = calls
+    return runner
+
+
+def _make_equivalent_reference_kb_summary_runner():
+    calls: list[dict[str, Any]] = []
+
+    def runner(
+        experiment_dir: str | Path,
+        *,
+        forcing: pd.DataFrame,
+        width_sample_field: str,
+        width_percentile: float,
+        model_path: str | Path | None = None,
+    ) -> dict[str, Any]:
+        calls.append(
+            {
+                "experiment_dir": str(experiment_dir),
+                "forcing_rows": int(len(forcing)),
+                "width_sample_field": width_sample_field,
+                "width_percentile": width_percentile,
+                "model_path": None if model_path is None else str(model_path),
+            }
+        )
+        return {
+            "kb_source_method": "based_reference_section",
+            "kb_value": 7.5,
+            "reference_discharge_cms": 125.0,
+            "reference_width_m": 40.0,
+            "reference_slope": 1e-4,
+            "reference_depth_m": 5.333333333333333,
+            "reference_section_summary_path": str(Path(experiment_dir) / "reference_section" / "reference_section_summary.json"),
+            "based_model_path": "" if model_path is None else str(model_path),
+        }
+
+    runner.calls = calls
+    return runner
+
+
 def test_sequential_units_recomputes_hierarchy_on_each_child_state(tmp_path: Path) -> None:
     workflow_runner = _make_workflow_runner(
         [
@@ -546,7 +602,176 @@ def test_base_state_is_materialized_as_local_variant_outputs(tmp_path: Path) -> 
     assert Path(base_row["directed_nodes_path"]).name == "S000_base_directed_nodes.gpkg"
     assert "states/S000_base/variant" in base_row["variant_output_dir"]
     assert base_state_materializer.calls
+    assert base_state_materializer.calls[0]["exit_sides"] == "NS"
     assert state_hydraulic_context_runner.calls
+
+
+def test_anchored_collapse_corridor_mode_is_passed_to_variant_generation(tmp_path: Path) -> None:
+    workflow_runner = _make_workflow_runner([_workflow_outputs([5]), _workflow_outputs([])])
+    variant_runner = _make_variant_runner()
+    base_state_materializer = _make_base_state_materializer()
+    state_hydraulic_context_runner = _make_state_hydraulic_context_runner()
+
+    results = run_collapse_experiment(
+        "independent-units",
+        cleaned_mask_path=tmp_path / "base_cleaned.tif",
+        reviewed_links_path=tmp_path / "base_links.gpkg",
+        reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=tmp_path / "experiment",
+        collapse_corridor_mode="anchored",
+        unit_workflow_runner=workflow_runner,
+        unit_workflow_writer=write_unit_workflow_outputs,
+        variant_runner=variant_runner,
+        base_state_variant_materializer=base_state_materializer,
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
+    )
+
+    assert results.manifest["options"]["variant"]["collapse_corridor_mode"] == "anchored"
+    assert base_state_materializer.calls[0]["collapse_corridor_mode"] == "anchored"
+    assert variant_runner.calls[0]["collapse_corridor_mode"] == "anchored"
+
+
+def test_based_reference_section_kb_is_resolved_for_equivalent_resistance(tmp_path: Path) -> None:
+    workflow_runner = _make_workflow_runner(
+        [
+            _workflow_outputs([5]),
+            _workflow_outputs(
+                [5],
+                bubble_equivalent_rows=[
+                    {
+                        "compound_bubble_id": 1,
+                        "bubble_root_unit_id": 5,
+                        "upstream_boundary_node": 1,
+                        "downstream_boundary_node": 2,
+                        "n_member_units": 1,
+                        "member_unit_ids": "5",
+                        "n_nodes": 2,
+                        "n_edges": 1,
+                        "solver_success": True,
+                        "solver_method": "boundary_only",
+                        "solver_message": "",
+                        "solver_nfev": 0,
+                        "K_eq": 7.5,
+                        "G_eq": 1.0 / 7.5,
+                        "Q_unit": 0.3651483717,
+                        "residual_norm": 0.0,
+                        "residual_relative": 0.0,
+                        "resistance_law": "manning",
+                        "geometry_method": "wide",
+                        "kb_mode": "based_reference_section",
+                        "kb_value": 7.5,
+                        "kb_source_method": "based_reference_section",
+                    }
+                ],
+            ),
+            _workflow_outputs([]),
+        ]
+    )
+    variant_runner = _make_variant_runner()
+    base_state_materializer = _make_base_state_materializer()
+    state_hydraulic_context_runner = _make_state_hydraulic_context_runner()
+    forcing_table_runner = _make_equivalent_forcing_table_runner()
+    reference_kb_summary_runner = _make_equivalent_reference_kb_summary_runner()
+
+    results = run_collapse_experiment(
+        "independent-units",
+        cleaned_mask_path=tmp_path / "base_cleaned.tif",
+        reviewed_links_path=tmp_path / "base_links.gpkg",
+        reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=tmp_path / "experiment",
+        unit_workflow_runner=workflow_runner,
+        unit_workflow_writer=write_unit_workflow_outputs,
+        variant_runner=variant_runner,
+        base_state_variant_materializer=base_state_materializer,
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
+        equivalent_resistance_config=BubbleEquivalentResistanceConfig(
+            resistance_law="manning",
+            geometry_method="wide",
+            kb_mode="based_reference_section",
+            kb_value=20.0,
+            default_manning_n=0.035,
+        ),
+        equivalent_forcing_path=tmp_path / "forcing.parquet",
+        equivalent_forcing_config=ForcingConfig(
+            time_column="time",
+            discharge_column="discharge",
+            station_key_column="station_key",
+            station_key="TEST:1",
+            start_time="2023-01-01T00:00:00Z",
+            end_time="2023-01-01T01:00:00Z",
+            resample_minutes=15,
+            output_cache_dir=str(tmp_path / "forcing_cache"),
+        ),
+        equivalent_kb_model_path=tmp_path / "based_model.ubj",
+        equivalent_kb_width_sample_field="width_wet",
+        equivalent_kb_width_percentile=90.0,
+        equivalent_forcing_table_runner=forcing_table_runner,
+        equivalent_reference_kb_summary_runner=reference_kb_summary_runner,
+    )
+
+    assert len(workflow_runner.calls) == 3
+    assert len(forcing_table_runner.calls) == 1
+    assert len(reference_kb_summary_runner.calls) == 1
+    assert reference_kb_summary_runner.calls[0]["width_sample_field"] == "width_wet"
+    assert reference_kb_summary_runner.calls[0]["width_percentile"] == pytest.approx(90.0)
+
+    manifest_config = results.manifest["options"]["hierarchy"]["equivalent_resistance_config"]
+    assert manifest_config["kb_mode"] == "based_reference_section"
+    assert manifest_config["reference_kb_summary"]["kb_value"] == pytest.approx(7.5)
+    assert results.manifest["options"]["hierarchy"]["equivalent_reference_kb_summary"]["kb_value"] == pytest.approx(7.5)
+
+    base_row = results.state_registry.loc[results.state_registry["state_id"] == "S000_base"].iloc[0]
+    assert int(base_row["n_equivalent_bubbles"]) == 1
+    bubble_metrics = pd.read_csv(Path(base_row["bubble_equivalent_metrics_path"]))
+    assert bubble_metrics["kb_mode"].iloc[0] == "based_reference_section"
+    assert bubble_metrics["kb_value"].iloc[0] == pytest.approx(7.5)
+
+
+def test_main_runs_both_collapse_corridor_modes_with_suffixed_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_collapse_experiment(mode: str, **kwargs: Any) -> SimpleNamespace:
+        calls.append({"mode": mode, **dict(kwargs)})
+        output_dir = Path(kwargs["output_dir"])
+        return SimpleNamespace(
+            output_dir=output_dir,
+            state_registry=pd.DataFrame([{"state_id": "S000_base"}]),
+            transition_registry=pd.DataFrame(),
+            equivalent_transition_registry=pd.DataFrame(),
+            manifest={"mode": mode, "stop_reason": "test_complete", "terminal_state_id": "S000_base"},
+        )
+
+    monkeypatch.setattr(collapse_experiment_module, "run_collapse_experiment", fake_run_collapse_experiment)
+
+    exit_code = main(
+        [
+            "independent-units",
+            "--cleaned-mask",
+            str(tmp_path / "base_cleaned.tif"),
+            "--reviewed-links",
+            str(tmp_path / "base_links.gpkg"),
+            "--reviewed-nodes",
+            str(tmp_path / "base_nodes.gpkg"),
+            "--exit-sides",
+            "NS",
+            "--experiment-id",
+            "demo",
+            "--output-dir",
+            str(tmp_path / "demo_output"),
+            "--collapse-corridor-mode",
+            "both",
+        ]
+    )
+
+    assert exit_code == 0
+    assert [call["collapse_corridor_mode"] for call in calls] == ["realized", "anchored"]
+    assert [call["experiment_id"] for call in calls] == ["demo__realized", "demo__anchored"]
+    assert [Path(call["output_dir"]).name for call in calls] == ["demo_output__realized", "demo_output__anchored"]
 
 
 def test_independent_units_writes_equivalent_transition_comparisons(tmp_path: Path) -> None:

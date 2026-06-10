@@ -6,8 +6,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
+REPO_ROOT = ROOT.parent
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from rapid_tools.forcing import ForcingConfig
 from rapid_tools.prep import RapidPrepConfig, prepare_experiment
