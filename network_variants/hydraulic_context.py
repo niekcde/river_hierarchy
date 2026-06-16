@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,8 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
+from shapely.geometry import LineString, Point
+from shapely.ops import linemerge, unary_union
 
 
 HYDRAULIC_CONTEXT_MANIFEST = "hydraulic_context_manifest.json"
@@ -21,6 +24,10 @@ class SlopeConfig:
     preferred_length_field: str = "len"
     interpolate_along_corridor: bool = True
     min_anchor_nodes_for_profile: int = 2
+    slope_profile_mode: str = "network_dist"
+    reference_section_summary_path: str | None = None
+    reference_section_use_parent_match: bool = True
+    reference_section_fallback_to_network_dist: bool = True
     fill_from_nearest_valid_link: bool = True
     max_slope_for_k: float | None = None
     section_slope_ratio_min: float | None = None
@@ -96,6 +103,19 @@ def _load_unit_summary_if_exists(hierarchy_output_dir: str | Path | None) -> pd.
     if not unit_summary_path.exists():
         return None
     return pd.read_csv(unit_summary_path)
+
+
+def _infer_reference_section_summary_path(*paths: Path) -> Path | None:
+    for path in paths:
+        try:
+            resolved = Path(path).expanduser().resolve()
+        except FileNotFoundError:
+            continue
+        for parent in (resolved.parent, *resolved.parents):
+            candidate = parent / "reference_section" / "reference_section_summary.json"
+            if candidate.exists():
+                return candidate.resolve()
+    return None
 
 
 def _select_variant_lengths(
@@ -260,6 +280,427 @@ def _interp_linear_extrapolation(
     return interpolated
 
 
+def _preferred_profile_coordinate_column(frame: pd.DataFrame) -> str | None:
+    for column in ("node_reference_section_dist_out_m", "node_network_dist_out_m", "node_sword_dist_out"):
+        if column in frame.columns:
+            series = pd.to_numeric(frame[column], errors="coerce")
+            if series.notna().any():
+                return column
+    return None
+
+
+def _normalize_slope_profile_mode(mode: str | None) -> str:
+    normalized = str(mode or "network_dist").strip().lower()
+    if normalized not in {"network_dist", "reference_section"}:
+        raise ValueError(
+            f"Unsupported slope_profile_mode '{mode}'. Expected one of: network_dist, reference_section."
+        )
+    return normalized
+
+
+def _single_reference_line(centerline: gpd.GeoDataFrame) -> LineString:
+    geometries = [geometry for geometry in centerline.geometry.tolist() if geometry is not None and not geometry.is_empty]
+    if not geometries:
+        raise ValueError("Reference-section centerline does not contain any valid geometry.")
+    if len(geometries) == 1 and isinstance(geometries[0], LineString):
+        line = geometries[0]
+    else:
+        merged = linemerge(unary_union(geometries))
+        if isinstance(merged, LineString):
+            line = merged
+        elif hasattr(merged, "geoms"):
+            line = max((geometry for geometry in merged.geoms if isinstance(geometry, LineString)), key=lambda geometry: geometry.length)
+        else:
+            raise ValueError("Could not resolve a LineString from the reference-section centerline geometry.")
+    if line.length <= 0:
+        raise ValueError("Reference-section centerline has zero length.")
+    return line
+
+
+def _resolve_reference_section_sword_nodes_path(
+    summary: dict[str, Any],
+    *,
+    centerline_path: Path,
+) -> Path | None:
+    paths = summary.get("paths", {}) or {}
+    direct_path = str(paths.get("sword_nodes_path", "") or "").strip()
+    if direct_path:
+        candidate = Path(direct_path).expanduser().resolve()
+        if candidate.exists():
+            return candidate
+
+    variant_manifest_path = str(paths.get("variant_manifest_path", "") or "").strip()
+    if variant_manifest_path:
+        manifest_candidate = Path(variant_manifest_path).expanduser().resolve()
+        if manifest_candidate.exists():
+            try:
+                variant_manifest = json.loads(manifest_candidate.read_text(encoding="utf-8"))
+            except Exception:
+                variant_manifest = {}
+            for container_key in ("output_paths", "paths"):
+                container = variant_manifest.get(container_key, {}) or {}
+                sword_nodes_path = str(container.get("sword_nodes", "") or container.get("sword_nodes_path", "") or "").strip()
+                if not sword_nodes_path:
+                    continue
+                candidate = Path(sword_nodes_path).expanduser().resolve()
+                if candidate.exists():
+                    return candidate
+
+    for pattern in ("*_SWORD_nodes.gpkg", "*SWORD_nodes.gpkg"):
+        matches = sorted(centerline_path.parent.glob(pattern))
+        if matches:
+            return matches[0].resolve()
+    return None
+
+
+def _point_like(geometry: Any) -> Point | None:
+    if geometry is None or getattr(geometry, "is_empty", True):
+        return None
+    if isinstance(geometry, Point):
+        return geometry
+    centroid = geometry.centroid
+    if centroid is None or centroid.is_empty:
+        return None
+    return centroid
+
+
+@lru_cache(maxsize=8)
+def _load_reference_section_support(summary_path_str: str) -> dict[str, Any]:
+    summary_path = Path(summary_path_str).expanduser().resolve()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    paths = summary.get("paths", {}) or {}
+    centerline_path = Path(str(paths.get("centerline_path", "") or "")).expanduser().resolve()
+    directed_nodes_path = Path(str(paths.get("directed_nodes_path", "") or "")).expanduser().resolve()
+    if not centerline_path.exists():
+        raise FileNotFoundError(f"Reference-section centerline was not found: {centerline_path}")
+    if not directed_nodes_path.exists():
+        raise FileNotFoundError(f"Reference-section directed nodes were not found: {directed_nodes_path}")
+
+    centerline = gpd.read_file(centerline_path)
+    line = _single_reference_line(centerline)
+    reference_nodes = gpd.read_file(directed_nodes_path)
+    if reference_nodes.empty:
+        raise ValueError(f"Reference-section directed nodes are empty: {directed_nodes_path}")
+    if "is_outlet" in reference_nodes.columns and reference_nodes["is_outlet"].fillna(False).any():
+        outlet_geometry = _point_like(reference_nodes.loc[reference_nodes["is_outlet"].fillna(False), reference_nodes.geometry.name].iloc[0])
+    else:
+        outlet_geometry = _point_like(reference_nodes.geometry.iloc[-1])
+    if outlet_geometry is None:
+        raise ValueError("Could not resolve an outlet geometry for the reference section.")
+    outlet_proj = float(line.project(outlet_geometry))
+    outlet_at_start = outlet_proj <= float(line.length - outlet_proj)
+    sword_nodes_path = _resolve_reference_section_sword_nodes_path(
+        summary,
+        centerline_path=centerline_path,
+    )
+    reference_sword_nodes = pd.DataFrame()
+    if sword_nodes_path is not None and sword_nodes_path.exists():
+        sword_nodes = gpd.read_file(sword_nodes_path)
+        if not sword_nodes.empty:
+            if sword_nodes.crs is not None and centerline.crs is not None and sword_nodes.crs != centerline.crs:
+                sword_nodes = sword_nodes.to_crs(centerline.crs)
+            sword_dist_out: list[float] = []
+            for geometry in sword_nodes.geometry.tolist():
+                point = _point_like(geometry)
+                if point is None:
+                    sword_dist_out.append(float("nan"))
+                    continue
+                station = float(line.project(point))
+                sword_dist_out.append(station if outlet_at_start else float(line.length - station))
+            reference_sword_nodes = pd.DataFrame(sword_nodes.drop(columns=sword_nodes.geometry.name, errors="ignore"))
+            reference_sword_nodes["reference_section_dist_out_m"] = pd.to_numeric(pd.Series(sword_dist_out), errors="coerce")
+
+    experiment_dir = summary_path.parent.parent
+    base_node_dist_out: dict[int, float] = {}
+    registry_path = experiment_dir / "state_registry.csv"
+    if registry_path.exists():
+        registry = pd.read_csv(registry_path)
+        if "state_role" in registry.columns and "directed_nodes_path" in registry.columns:
+            base_rows = registry.loc[registry["state_role"].astype(str).eq("base")]
+            if not base_rows.empty:
+                base_nodes_path = Path(str(base_rows.iloc[0]["directed_nodes_path"])).expanduser().resolve()
+                if base_nodes_path.exists():
+                    base_nodes = gpd.read_file(base_nodes_path)
+                    if base_nodes.crs is not None and centerline.crs is not None and base_nodes.crs != centerline.crs:
+                        base_nodes = base_nodes.to_crs(centerline.crs)
+                    for row in base_nodes.itertuples(index=False):
+                        point = _point_like(row.geometry)
+                        if point is None:
+                            continue
+                        station = float(line.project(point))
+                        dist_out = station if outlet_at_start else float(line.length - station)
+                        base_node_dist_out[int(row.id_node)] = dist_out
+
+    return {
+        "summary_path": str(summary_path),
+        "centerline_path": str(centerline_path),
+        "centerline_crs": centerline.crs.to_string() if centerline.crs is not None else "",
+        "line": line,
+        "line_length_m": float(line.length),
+        "outlet_at_start": bool(outlet_at_start),
+        "base_node_dist_out": base_node_dist_out,
+        "reference_sword_nodes_path": str(sword_nodes_path) if sword_nodes_path is not None else "",
+        "reference_sword_nodes": reference_sword_nodes,
+    }
+
+
+def _project_nodes_to_reference_section(
+    nodes: gpd.GeoDataFrame,
+    *,
+    support: dict[str, Any],
+    config: SlopeConfig,
+) -> tuple[pd.Series, pd.Series]:
+    node_dist_out = pd.Series(np.nan, index=nodes.index, dtype=float)
+    node_source = pd.Series("", index=nodes.index, dtype="object")
+    line: LineString = support["line"]
+    outlet_at_start = bool(support["outlet_at_start"])
+    centerline_crs = support.get("centerline_crs", "") or None
+    base_node_dist_out: dict[int, float] = support.get("base_node_dist_out", {}) or {}
+
+    if bool(config.reference_section_use_parent_match) and base_node_dist_out:
+        if "matched_parent_node_id" in nodes.columns:
+            matched_parent = pd.to_numeric(nodes["matched_parent_node_id"], errors="coerce")
+            match_valid = nodes["match_within_tolerance"].fillna(False).astype(bool) if "match_within_tolerance" in nodes.columns else matched_parent.notna()
+            for index, parent_value, is_valid in zip(nodes.index, matched_parent.tolist(), match_valid.tolist()):
+                if not is_valid or pd.isna(parent_value):
+                    continue
+                parent_id = int(parent_value)
+                if parent_id not in base_node_dist_out:
+                    continue
+                node_dist_out.at[index] = float(base_node_dist_out[parent_id])
+                node_source.at[index] = "matched_parent_reference_section"
+
+    nodes_for_projection = nodes
+    if centerline_crs and nodes.crs is not None and str(nodes.crs) != str(centerline_crs):
+        nodes_for_projection = nodes.to_crs(centerline_crs)
+
+    for index, geometry in zip(nodes_for_projection.index, nodes_for_projection.geometry.tolist()):
+        if pd.notna(node_dist_out.at[index]):
+            continue
+        point = _point_like(geometry)
+        if point is None:
+            continue
+        station = float(line.project(point))
+        node_dist_out.at[index] = station if outlet_at_start else float(line.length - station)
+        node_source.at[index] = "geometry_projection_reference_section"
+
+    unresolved = node_source.eq("")
+    node_source.loc[unresolved] = "missing_reference_section_projection"
+    return node_dist_out.astype(float), node_source
+
+
+def _requested_node_wse_field(node_attrs: pd.DataFrame) -> str:
+    requested_fields = [
+        str(value).strip()
+        for value in node_attrs.loc[
+            node_attrs["node_wse_fill_method"].eq("requested_field"),
+            "node_wse_field",
+        ].dropna().astype(str).tolist()
+        if str(value).strip()
+    ]
+    return requested_fields[0] if requested_fields else ""
+
+
+@lru_cache(maxsize=32)
+def _load_reference_section_profile(
+    summary_path_str: str,
+    requested_wse_field: str,
+    min_anchor_nodes: int,
+) -> dict[str, Any]:
+    support = _load_reference_section_support(summary_path_str)
+    reference_sword_nodes = support.get("reference_sword_nodes")
+    if not isinstance(reference_sword_nodes, pd.DataFrame) or reference_sword_nodes.empty:
+        return {}
+
+    candidate_columns = [
+        requested_wse_field,
+        "sword_wse",
+        "wse_obs_p50",
+        "wse",
+    ]
+    wse_column = next(
+        (
+            column
+            for column in candidate_columns
+            if column
+            and column in reference_sword_nodes.columns
+            and pd.to_numeric(reference_sword_nodes[column], errors="coerce").notna().any()
+        ),
+        "",
+    )
+    if not wse_column:
+        return {}
+
+    fill_method_column = next(
+        (
+            column
+            for column in ("sword_wse_fill_method", "wse_fill_method")
+            if column in reference_sword_nodes.columns
+        ),
+        "",
+    )
+
+    anchors = pd.DataFrame()
+    profile_method = ""
+    if fill_method_column:
+        requested_mask = reference_sword_nodes[fill_method_column].astype(str).eq("requested_field")
+        anchors = reference_sword_nodes.loc[
+            requested_mask,
+            ["reference_section_dist_out_m", wse_column],
+        ].copy()
+        profile_method = "reference_section_monotone_requested_field_sword_nodes"
+
+    anchors["reference_section_dist_out_m"] = pd.to_numeric(
+        anchors.get("reference_section_dist_out_m"),
+        errors="coerce",
+    )
+    anchors[wse_column] = pd.to_numeric(anchors.get(wse_column), errors="coerce")
+    anchors = anchors.dropna(subset=["reference_section_dist_out_m", wse_column]).copy()
+
+    if len(anchors) < int(min_anchor_nodes):
+        anchors = reference_sword_nodes.loc[
+            pd.to_numeric(reference_sword_nodes.get("reference_section_dist_out_m"), errors="coerce").notna()
+            & pd.to_numeric(reference_sword_nodes.get(wse_column), errors="coerce").notna(),
+            ["reference_section_dist_out_m", wse_column],
+        ].copy()
+        anchors["reference_section_dist_out_m"] = pd.to_numeric(
+            anchors["reference_section_dist_out_m"],
+            errors="coerce",
+        )
+        anchors[wse_column] = pd.to_numeric(anchors[wse_column], errors="coerce")
+        anchors = anchors.dropna(subset=["reference_section_dist_out_m", wse_column]).copy()
+        profile_method = "reference_section_monotone_all_sword_nodes"
+
+    if len(anchors) < int(min_anchor_nodes):
+        return {}
+
+    anchors = (
+        anchors.groupby("reference_section_dist_out_m", as_index=False)[wse_column]
+        .mean()
+        .sort_values("reference_section_dist_out_m")
+    )
+    xp = anchors["reference_section_dist_out_m"].to_numpy(dtype=float)
+    yp = anchors[wse_column].to_numpy(dtype=float)
+    fitted = _fit_monotone_increasing_profile(xp, yp)
+    return {
+        "xp": xp.tolist(),
+        "fitted": fitted.tolist(),
+        "profile_method": profile_method,
+        "anchor_count": int(len(xp)),
+        "wse_column": wse_column,
+    }
+
+
+def _apply_reference_section_profile(
+    node_attrs: pd.DataFrame,
+    *,
+    nodes: gpd.GeoDataFrame,
+    config: SlopeConfig,
+) -> pd.DataFrame:
+    if not config.reference_section_summary_path:
+        return node_attrs
+
+    support = _load_reference_section_support(str(config.reference_section_summary_path))
+    result = node_attrs.copy()
+    result["rapid_wse_for_slope_network_dist"] = result["rapid_wse_for_slope"].astype(float)
+    result["rapid_wse_source_method_network_dist"] = result["rapid_wse_source_method"].astype(str)
+    result["rapid_wse_interpolated_network_dist"] = result["rapid_wse_interpolated"].astype(bool)
+    result["rapid_wse_anchor_count_network_dist"] = pd.to_numeric(result["rapid_wse_anchor_count"], errors="coerce").fillna(0).astype(int)
+    result["rapid_wse_profile_residual_network_dist"] = pd.to_numeric(result["rapid_wse_profile_residual"], errors="coerce")
+
+    node_reference_dist_out, node_reference_source = _project_nodes_to_reference_section(
+        nodes,
+        support=support,
+        config=config,
+    )
+    result["node_reference_section_dist_out_m"] = node_reference_dist_out
+    result["node_reference_section_dist_source"] = node_reference_source
+
+    coord = pd.to_numeric(result["node_reference_section_dist_out_m"], errors="coerce")
+    requested_anchor_mask = pd.Series(False, index=result.index, dtype=bool)
+    anchors = pd.DataFrame()
+    profile_method = ""
+    profile = _load_reference_section_profile(
+        str(config.reference_section_summary_path),
+        _requested_node_wse_field(result),
+        int(config.min_anchor_nodes_for_profile),
+    )
+    if profile:
+        xp = np.asarray(profile["xp"], dtype=float)
+        fitted = np.asarray(profile["fitted"], dtype=float)
+        profile_method = str(profile["profile_method"])
+        target_mask = coord.notna()
+        eval_coord = coord.loc[target_mask].to_numpy(dtype=float)
+        profile_values = _interp_linear_extrapolation(xp, fitted, eval_coord)
+        result.loc[target_mask, "rapid_wse_for_slope"] = profile_values
+        result.loc[target_mask, "rapid_wse_source_method"] = profile_method
+        result.loc[target_mask, "rapid_wse_interpolated"] = True
+        result.loc[target_mask, "rapid_wse_anchor_count"] = int(profile["anchor_count"])
+        result.loc[target_mask, "rapid_wse_profile_residual"] = (
+            result.loc[target_mask, "node_wse_raw"].astype(float)
+            - result.loc[target_mask, "rapid_wse_for_slope"].astype(float)
+        )
+        return result
+
+    if anchors.empty:
+        requested_anchor_mask = (
+            result["node_wse_fill_method"].eq("requested_field")
+            & result["node_wse_raw"].notna()
+            & coord.notna()
+        )
+        anchors = result.loc[requested_anchor_mask, ["node_reference_section_dist_out_m", "node_wse_raw"]].copy()
+        anchors = anchors.rename(
+            columns={
+                "node_reference_section_dist_out_m": "reference_section_dist_out_m",
+                "node_wse_raw": "anchor_wse",
+            }
+        )
+        profile_method = "reference_section_monotone_requested_field_nodes"
+        if len(anchors) < int(config.min_anchor_nodes_for_profile):
+            available_mask = result["node_wse_raw"].notna() & coord.notna()
+            anchors = result.loc[available_mask, ["node_reference_section_dist_out_m", "node_wse_raw"]].copy()
+            anchors = anchors.rename(
+                columns={
+                    "node_reference_section_dist_out_m": "reference_section_dist_out_m",
+                    "node_wse_raw": "anchor_wse",
+                }
+            )
+            profile_method = "reference_section_monotone_all_available_nodes"
+
+    anchors["reference_section_dist_out_m"] = pd.to_numeric(anchors["reference_section_dist_out_m"], errors="coerce")
+    anchors["anchor_wse"] = pd.to_numeric(anchors["anchor_wse"], errors="coerce")
+    anchors = anchors.dropna(subset=["reference_section_dist_out_m", "anchor_wse"]).copy()
+    if anchors.empty:
+        return result
+
+    anchors = (
+        anchors.groupby("reference_section_dist_out_m", as_index=False)["anchor_wse"]
+        .mean()
+        .sort_values("reference_section_dist_out_m")
+    )
+    xp = anchors["reference_section_dist_out_m"].to_numpy(dtype=float)
+    yp = anchors["anchor_wse"].to_numpy(dtype=float)
+    if len(xp) < int(config.min_anchor_nodes_for_profile):
+        return result
+
+    fitted = _fit_monotone_increasing_profile(xp, yp)
+    target_mask = coord.notna()
+    eval_coord = coord.loc[target_mask].to_numpy(dtype=float)
+    profile_values = _interp_linear_extrapolation(xp, fitted, eval_coord)
+    result.loc[target_mask, "rapid_wse_for_slope"] = profile_values
+    result.loc[target_mask, "rapid_wse_source_method"] = profile_method
+    if "sword_nodes" in profile_method:
+        result.loc[target_mask, "rapid_wse_interpolated"] = True
+    else:
+        result.loc[target_mask, "rapid_wse_interpolated"] = ~requested_anchor_mask.loc[target_mask]
+    result.loc[target_mask, "rapid_wse_anchor_count"] = int(len(xp))
+    result.loc[target_mask, "rapid_wse_profile_residual"] = (
+        result.loc[target_mask, "node_wse_raw"].astype(float)
+        - result.loc[target_mask, "rapid_wse_for_slope"].astype(float)
+    )
+    return result
+
+
 def _load_corridor_profile_anchors(
     node_attrs: pd.DataFrame,
     *,
@@ -355,6 +796,101 @@ def _load_corridor_profile_anchors(
     return anchors, profile_method
 
 
+def _load_reference_section_corridor_sword_anchors(
+    node_attrs: pd.DataFrame,
+    *,
+    support: dict[str, Any],
+) -> pd.DataFrame:
+    source_col = "node_sword_source_file"
+    reach_col = "node_sword_reach_id"
+    region_col = "node_sword_region"
+    field_col = "node_wse_field"
+    fill_col = "node_wse_fill_method"
+    if source_col not in node_attrs.columns or reach_col not in node_attrs.columns:
+        return pd.DataFrame()
+
+    source_paths = [
+        str(value).strip()
+        for value in node_attrs[source_col].dropna().astype(str).tolist()
+        if str(value).strip()
+    ]
+    unique_source_paths = sorted(dict.fromkeys(source_paths))
+    unique_reach_ids = [
+        int(value)
+        for value in pd.to_numeric(node_attrs[reach_col], errors="coerce").dropna().astype(int).tolist()
+    ]
+    unique_reach_ids = sorted(dict.fromkeys(unique_reach_ids))
+    if not unique_source_paths or not unique_reach_ids:
+        return pd.DataFrame()
+
+    requested_fields = [
+        str(value).strip()
+        for value in node_attrs.loc[
+            node_attrs.get(fill_col, pd.Series("", index=node_attrs.index)).astype(str).eq("requested_field"),
+            field_col,
+        ].dropna().astype(str).tolist()
+        if str(value).strip()
+    ]
+    requested_wse_field = requested_fields[0] if requested_fields else None
+    regions = None
+    if region_col in node_attrs.columns:
+        region_values = [
+            str(value).strip().lower()
+            for value in node_attrs[region_col].dropna().astype(str).tolist()
+            if str(value).strip()
+        ]
+        unique_regions = sorted(dict.fromkeys(region_values))
+        if unique_regions:
+            regions = unique_regions
+
+    try:
+        from network_variants.sword_matching import load_sword_node_reference
+    except ModuleNotFoundError:
+        return pd.DataFrame()
+
+    loaded_frames: list[gpd.GeoDataFrame] = []
+    for source_path in unique_source_paths:
+        try:
+            source = load_sword_node_reference(
+                source_path,
+                sword_wse_field=requested_wse_field,
+                regions=regions,
+                reach_ids=unique_reach_ids,
+            )
+        except Exception:
+            continue
+        if source.empty:
+            continue
+        loaded_frames.append(source)
+    if not loaded_frames:
+        return pd.DataFrame()
+
+    anchors = pd.concat(loaded_frames, ignore_index=True)
+    if {"sword_source_file", "sword_node_id"}.issubset(anchors.columns):
+        anchors = anchors.drop_duplicates(subset=["sword_source_file", "sword_node_id"], keep="first").copy()
+    elif "sword_node_id" in anchors.columns:
+        anchors = anchors.drop_duplicates(subset=["sword_node_id"], keep="first").copy()
+    if anchors.empty:
+        return pd.DataFrame()
+
+    centerline_crs = support.get("centerline_crs", "") or None
+    if centerline_crs and getattr(anchors, "crs", None) is not None and str(anchors.crs) != str(centerline_crs):
+        anchors = anchors.to_crs(centerline_crs)
+    line: LineString = support["line"]
+    outlet_at_start = bool(support["outlet_at_start"])
+    dist_out: list[float] = []
+    for geometry in anchors.geometry.tolist():
+        point = _point_like(geometry)
+        if point is None:
+            dist_out.append(float("nan"))
+            continue
+        station = float(line.project(point))
+        dist_out.append(station if outlet_at_start else float(line.length - station))
+    anchors = anchors.copy()
+    anchors["reference_section_dist_out_m"] = pd.to_numeric(pd.Series(dist_out), errors="coerce")
+    return pd.DataFrame(anchors)
+
+
 def _resolve_rapid_wse_for_slope(
     nodes: gpd.GeoDataFrame,
     *,
@@ -416,6 +952,7 @@ def _resolve_rapid_wse_for_slope(
     node_attrs["rapid_wse_anchor_count"] = 0
     node_attrs["rapid_wse_profile_residual"] = np.nan
 
+    profile_mode = _normalize_slope_profile_mode(config.slope_profile_mode)
     if not config.interpolate_along_corridor or "node_network_dist_out_m" not in node_attrs.columns:
         return node_attrs
 
@@ -494,7 +1031,19 @@ def _resolve_rapid_wse_for_slope(
         - node_attrs.loc[target_mask, "rapid_wse_for_slope"].astype(float)
     )
 
-    return node_attrs
+    if profile_mode != "reference_section":
+        return node_attrs
+
+    try:
+        return _apply_reference_section_profile(
+            node_attrs,
+            nodes=nodes,
+            config=config,
+        )
+    except Exception:
+        if not bool(config.reference_section_fallback_to_network_dist):
+            raise
+        return node_attrs
 
 
 def _fill_invalid_slopes_from_neighbors(
@@ -623,8 +1172,8 @@ def _compute_section_slope_reference(
     *,
     config: SlopeConfig,
 ) -> tuple[float, str, int]:
-    coordinate_column = "node_network_dist_out_m" if "node_network_dist_out_m" in node_attrs.columns else "node_sword_dist_out"
-    if coordinate_column not in node_attrs.columns:
+    coordinate_column = _preferred_profile_coordinate_column(node_attrs)
+    if coordinate_column is None:
         return float("nan"), "missing_dist_out", 0
 
     anchors = node_attrs.loc[
@@ -649,7 +1198,12 @@ def _compute_section_slope_reference(
     if delta_dist <= 0 or delta_wse <= 0:
         return float("nan"), "invalid_anchor_profile", int(len(anchors))
 
-    source_method = "profile_network_dist_out" if coordinate_column == "node_network_dist_out_m" else "profile_sword_dist_out"
+    if coordinate_column == "node_reference_section_dist_out_m":
+        source_method = "profile_reference_section_dist_out"
+    elif coordinate_column == "node_network_dist_out_m":
+        source_method = "profile_network_dist_out"
+    else:
+        source_method = "profile_sword_dist_out"
     return float(delta_wse / delta_dist), source_method, int(len(anchors))
 
 
@@ -696,6 +1250,7 @@ def _build_bubble_linear_reference_profile(
     exit_wse: float,
     entry_dist: float,
     exit_dist: float,
+    coordinate_column: str,
 ) -> tuple[dict[int, float] | None, str]:
     reference_drop = float(entry_wse - exit_wse)
     reference_dist_span = float(entry_dist - exit_dist)
@@ -706,7 +1261,7 @@ def _build_bubble_linear_reference_profile(
     for node_id in sorted(internal_node_ids):
         if node_id not in node_lookup.index:
             return None, ""
-        node_dist = float(node_lookup.loc[node_id].get("node_network_dist_out_m", np.nan))
+        node_dist = float(node_lookup.loc[node_id].get(coordinate_column, np.nan))
         if not np.isfinite(node_dist):
             return None, ""
         fraction = (node_dist - exit_dist) / reference_dist_span
@@ -714,6 +1269,10 @@ def _build_bubble_linear_reference_profile(
 
     node_profile[int(entry_node)] = float(entry_wse)
     node_profile[int(exit_node)] = float(exit_wse)
+    if coordinate_column == "node_reference_section_dist_out_m":
+        return node_profile, "bubble_local_linear_reference_section_dist_out"
+    if coordinate_column == "node_sword_dist_out":
+        return node_profile, "bubble_local_linear_sword_dist_out"
     return node_profile, "bubble_local_linear_network_dist_out"
 
 
@@ -817,6 +1376,7 @@ def _apply_compound_bubble_qc(
     node_lookup = node_lookup.dropna(subset=["id_node"]).copy()
     node_lookup["id_node"] = node_lookup["id_node"].astype(int)
     node_lookup = node_lookup.set_index("id_node", drop=False)
+    profile_coordinate_column = _preferred_profile_coordinate_column(node_lookup.reset_index(drop=True))
 
     working = unit_summary.copy()
     working["compound_bubble_id"] = pd.to_numeric(working["compound_bubble_id"], errors="coerce").astype("Int64")
@@ -910,8 +1470,8 @@ def _apply_compound_bubble_qc(
         exit_meta = node_lookup.loc[exit_node]
         entry_wse = float(entry_meta.get("rapid_wse_for_slope", np.nan))
         exit_wse = float(exit_meta.get("rapid_wse_for_slope", np.nan))
-        entry_dist = float(entry_meta.get("node_network_dist_out_m", np.nan))
-        exit_dist = float(exit_meta.get("node_network_dist_out_m", np.nan))
+        entry_dist = float(entry_meta.get(profile_coordinate_column, np.nan)) if profile_coordinate_column is not None else float("nan")
+        exit_dist = float(exit_meta.get(profile_coordinate_column, np.nan)) if profile_coordinate_column is not None else float("nan")
         if not all(np.isfinite([entry_wse, exit_wse, entry_dist, exit_dist])):
             result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "missing_reference_profile"
             continue
@@ -956,7 +1516,12 @@ def _apply_compound_bubble_qc(
             bubble_links=bubble_links,
             node_profile=node_profile,
         )
-        reference_profile_method = "state_profile_network_dist_out"
+        if profile_coordinate_column == "node_reference_section_dist_out_m":
+            reference_profile_method = "state_profile_reference_section_dist_out"
+        elif profile_coordinate_column == "node_sword_dist_out":
+            reference_profile_method = "state_profile_sword_dist_out"
+        else:
+            reference_profile_method = "state_profile_network_dist_out"
         repair_candidate = False
         repair_method = ""
         if not valid_reference_slopes:
@@ -982,6 +1547,7 @@ def _apply_compound_bubble_qc(
                     exit_wse=exit_wse,
                     entry_dist=entry_dist,
                     exit_dist=exit_dist,
+                    coordinate_column=str(profile_coordinate_column or "node_network_dist_out_m"),
                 )
                 if linear_profile is None:
                     result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "invalid_reference_profile"
@@ -1072,6 +1638,7 @@ def compute_hydraulic_context(
 ) -> HydraulicContextResult:
     """Compute node profile context and link slope context for a realized network state."""
     config = config or SlopeConfig()
+    profile_mode = _normalize_slope_profile_mode(config.slope_profile_mode)
     if config.max_slope_for_k is not None and config.max_slope_for_k <= 0:
         raise ValueError("Slope outlier upper bound must be positive when provided.")
     if config.section_slope_ratio_min is not None and config.section_slope_ratio_min <= 0:
@@ -1090,6 +1657,11 @@ def compute_hydraulic_context(
         and config.section_slope_ratio_min > config.section_slope_ratio_max
     ):
         raise ValueError("Section-slope ratio minimum cannot exceed the maximum.")
+    if profile_mode == "reference_section" and not config.reference_section_summary_path and not bool(config.reference_section_fallback_to_network_dist):
+        raise ValueError(
+            "slope_profile_mode='reference_section' requires reference_section_summary_path "
+            "unless reference_section_fallback_to_network_dist is enabled."
+        )
     missing = sorted(REQUIRED_NODE_COLUMNS.difference(nodes.columns))
     if missing:
         raise ValueError(
@@ -1267,6 +1839,8 @@ def compute_hydraulic_context(
         "slope": float(section_slope_ref),
         "source_method": str(section_slope_source_method),
         "anchor_count": int(section_slope_anchor_count),
+        "profile_mode": profile_mode,
+        "reference_section_summary_path": str(config.reference_section_summary_path or ""),
     }
     return HydraulicContextResult(
         node_context=node_attrs,
@@ -1335,6 +1909,14 @@ def generate_state_hydraulic_context(
     nodes_path = Path(directed_nodes_path).expanduser().resolve()
     output_path = Path(output_dir).expanduser().resolve()
     output_path.mkdir(parents=True, exist_ok=True)
+    resolved_config = config or SlopeConfig()
+    if (
+        _normalize_slope_profile_mode(resolved_config.slope_profile_mode) == "reference_section"
+        and not resolved_config.reference_section_summary_path
+    ):
+        inferred = _infer_reference_section_summary_path(output_path, links_path, nodes_path)
+        if inferred is not None:
+            resolved_config = replace(resolved_config, reference_section_summary_path=str(inferred))
 
     links = gpd.read_file(links_path)
     nodes = gpd.read_file(nodes_path)
@@ -1343,7 +1925,7 @@ def generate_state_hydraulic_context(
         links,
         nodes,
         unit_summary=unit_summary,
-        config=config,
+        config=resolved_config,
     )
 
     link_context_path = output_path / "link_hydraulic_context.csv"
@@ -1372,6 +1954,10 @@ def generate_state_hydraulic_context(
             "observed_or_matched_node_wse": "sword_wse / node_wse_raw",
             "derived_profile_wse_for_slope": "rapid_wse_for_slope",
             "normalized_solver_heads": "not written here",
+        },
+        "slope_config": {
+            "slope_profile_mode": _normalize_slope_profile_mode(resolved_config.slope_profile_mode),
+            "reference_section_summary_path": str(resolved_config.reference_section_summary_path or ""),
         },
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

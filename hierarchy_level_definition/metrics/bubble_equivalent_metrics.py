@@ -30,6 +30,18 @@ CHEZY_CZ_FIELD_CANDIDATES = ("C_z", "Cz", "chezy_cz")
 NODE_HEAD_FIELD_CANDIDATES = ("sword_wse", "H", "head", "wse")
 
 
+def resolve_length_field_candidates(preferred_field: str | None) -> tuple[str, ...]:
+    if preferred_field is None:
+        return tuple(LENGTH_FIELD_CANDIDATES)
+    normalized = str(preferred_field).strip()
+    if normalized not in LENGTH_FIELD_CANDIDATES:
+        raise ValueError(
+            f"Unsupported equivalent-resistance length field {preferred_field!r}. "
+            f"Expected one of {list(LENGTH_FIELD_CANDIDATES)}."
+        )
+    return (normalized,) + tuple(candidate for candidate in LENGTH_FIELD_CANDIDATES if candidate != normalized)
+
+
 @dataclass(frozen=True, slots=True)
 class BubbleEquivalentResistanceConfig:
     resistance_law: str = "manning"

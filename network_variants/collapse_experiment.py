@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import traceback
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -29,8 +30,14 @@ from hierarchy_level_definition.run_unit_workflow import (
     run_unit_workflow,
     write_unit_workflow_outputs,
 )
-from hierarchy_level_definition.metrics import BubbleEquivalentResistanceConfig, compare_states
+from hierarchy_level_definition.metrics import (
+    BubbleEquivalentResistanceConfig,
+    LENGTH_FIELD_CANDIDATES,
+    compare_states,
+    resolve_length_field_candidates,
+)
 from network_variants.hydraulic_context import (
+    SlopeConfig,
     StateHydraulicContextOutputs,
     generate_state_hydraulic_context,
 )
@@ -42,6 +49,7 @@ from network_variants.variant_generation import (
     _apply_collapsed_selection_metadata,
     _collapsed_selection_metadata,
     compute_width_families,
+    derive_anchored_variant_from_realized,
     generate_network_variant,
 )
 from rapid_tools.forcing import ForcingConfig, prepare_forcing_table
@@ -166,6 +174,79 @@ def _suffix_output_dir_for_collapse_mode(output_dir: str | Path, collapse_corrid
     if path.name.endswith(suffix):
         return path
     return path.with_name(f"{path.name}{suffix}")
+
+
+def _supports_realized_reuse_speedup(mode: str) -> bool:
+    return mode in {"independent-units", "compound-bubbles"}
+
+
+def _make_realized_reuse_variant_runner(
+    *,
+    realized_experiment_output_dir: Path,
+    fallback_variant_runner: Callable[..., NetworkVariantOutputs],
+) -> Callable[..., NetworkVariantOutputs]:
+    def runner(**kwargs: Any) -> NetworkVariantOutputs:
+        source_output_dir = realized_experiment_output_dir / "states" / str(kwargs["variant_id"]) / "variant"
+        if not source_output_dir.exists():
+            return fallback_variant_runner(**kwargs)
+        return derive_anchored_variant_from_realized(
+            source_output_dir=source_output_dir,
+            reviewed_links_path=kwargs["reviewed_links_path"],
+            reviewed_nodes_path=kwargs["reviewed_nodes_path"],
+            output_dir=kwargs["output_dir"],
+            example_id=kwargs.get("example_id"),
+            variant_id=kwargs.get("variant_id"),
+            sword_node_source_path=kwargs.get("sword_node_source_path"),
+            sword_wse_field=kwargs.get("sword_wse_field"),
+            sword_match_tolerance=kwargs.get("sword_match_tolerance"),
+            sword_example_station_source_path=kwargs.get("sword_example_station_source_path"),
+            sword_station_match_source_path=kwargs.get("sword_station_match_source_path"),
+            sword_reach_buffer_steps=int(kwargs.get("sword_reach_buffer_steps", 2)),
+            max_path_cutoff=int(kwargs.get("max_path_cutoff", 100)),
+            max_paths=int(kwargs.get("max_paths", 5000)),
+            transect_scale=float(kwargs.get("transect_scale", 1.5)),
+            min_transect_pixels=float(kwargs.get("min_transect_pixels", 5.0)),
+            match_tolerance=kwargs.get("match_tolerance"),
+        )
+
+    return runner
+
+
+def _make_realized_seeded_anchored_variant_runner(
+    *,
+    fallback_variant_runner: Callable[..., NetworkVariantOutputs],
+) -> Callable[..., NetworkVariantOutputs]:
+    def runner(**kwargs: Any) -> NetworkVariantOutputs:
+        final_output_dir = Path(kwargs["output_dir"])
+        temp_parent = final_output_dir.parent
+        temp_parent.mkdir(parents=True, exist_ok=True)
+        prefix = f"{kwargs.get('variant_id', 'variant')}__realized_seed_"
+        with tempfile.TemporaryDirectory(prefix=prefix, dir=temp_parent) as temp_dir:
+            realized_kwargs = dict(kwargs)
+            realized_kwargs["collapse_corridor_mode"] = "realized"
+            realized_kwargs["output_dir"] = str(Path(temp_dir) / "variant")
+            realized_outputs = fallback_variant_runner(**realized_kwargs)
+            return derive_anchored_variant_from_realized(
+                source_output_dir=realized_outputs.output_dir,
+                reviewed_links_path=kwargs["reviewed_links_path"],
+                reviewed_nodes_path=kwargs["reviewed_nodes_path"],
+                output_dir=final_output_dir,
+                example_id=kwargs.get("example_id"),
+                variant_id=kwargs.get("variant_id"),
+                sword_node_source_path=kwargs.get("sword_node_source_path"),
+                sword_wse_field=kwargs.get("sword_wse_field"),
+                sword_match_tolerance=kwargs.get("sword_match_tolerance"),
+                sword_example_station_source_path=kwargs.get("sword_example_station_source_path"),
+                sword_station_match_source_path=kwargs.get("sword_station_match_source_path"),
+                sword_reach_buffer_steps=int(kwargs.get("sword_reach_buffer_steps", 2)),
+                max_path_cutoff=int(kwargs.get("max_path_cutoff", 100)),
+                max_paths=int(kwargs.get("max_paths", 5000)),
+                transect_scale=float(kwargs.get("transect_scale", 1.5)),
+                min_transect_pixels=float(kwargs.get("min_transect_pixels", 5.0)),
+                match_tolerance=kwargs.get("match_tolerance"),
+            )
+
+    return runner
 
 
 def _serialize_int_list(values: Sequence[int]) -> str:
@@ -296,42 +377,52 @@ def _match_equivalent_bubble_rows(
 
     parent["_parent_row_id"] = range(len(parent))
     child["_child_row_id"] = range(len(child))
-    candidate_keys = [
-        ("upstream_boundary_node", "downstream_boundary_node"),
-        ("bubble_root_unit_id",),
-        ("compound_bubble_id",),
+    candidate_keys: list[tuple[str, tuple[str, ...], tuple[str, ...]]] = [
+        (
+            "matched_parent_upstream_boundary_node__matched_parent_downstream_boundary_node",
+            ("upstream_boundary_node", "downstream_boundary_node"),
+            ("matched_parent_upstream_boundary_node", "matched_parent_downstream_boundary_node"),
+        ),
+        (
+            "upstream_boundary_node__downstream_boundary_node",
+            ("upstream_boundary_node", "downstream_boundary_node"),
+            ("upstream_boundary_node", "downstream_boundary_node"),
+        ),
+        ("bubble_root_unit_id", ("bubble_root_unit_id",), ("bubble_root_unit_id",)),
+        ("compound_bubble_id", ("compound_bubble_id",), ("compound_bubble_id",)),
     ]
 
     matched_frames: list[pd.DataFrame] = []
     parent_remaining = parent.copy()
     child_remaining = child.copy()
 
-    for key_columns in candidate_keys:
+    for match_method, parent_key_columns, child_key_columns in candidate_keys:
         if parent_remaining.empty or child_remaining.empty:
             break
-        if not set(key_columns).issubset(parent_remaining.columns) or not set(key_columns).issubset(child_remaining.columns):
+        if not set(parent_key_columns).issubset(parent_remaining.columns) or not set(child_key_columns).issubset(child_remaining.columns):
             continue
 
-        parent_unique = parent_remaining.dropna(subset=list(key_columns)).copy()
-        child_unique = child_remaining.dropna(subset=list(key_columns)).copy()
+        parent_unique = parent_remaining.dropna(subset=list(parent_key_columns)).copy()
+        child_unique = child_remaining.dropna(subset=list(child_key_columns)).copy()
         if parent_unique.empty or child_unique.empty:
             continue
 
-        parent_unique = parent_unique.loc[~parent_unique.duplicated(list(key_columns), keep=False)].copy()
-        child_unique = child_unique.loc[~child_unique.duplicated(list(key_columns), keep=False)].copy()
+        parent_unique = parent_unique.loc[~parent_unique.duplicated(list(parent_key_columns), keep=False)].copy()
+        child_unique = child_unique.loc[~child_unique.duplicated(list(child_key_columns), keep=False)].copy()
         if parent_unique.empty or child_unique.empty:
             continue
 
         matched = parent_unique.merge(
             child_unique,
-            on=list(key_columns),
+            left_on=list(parent_key_columns),
+            right_on=list(child_key_columns),
             how="inner",
             suffixes=("_before", "_after"),
         )
         if matched.empty:
             continue
 
-        matched["match_method"] = "__".join(key_columns)
+        matched["match_method"] = match_method
         matched_frames.append(matched)
         parent_remaining = parent_remaining.loc[~parent_remaining["_parent_row_id"].isin(matched["_parent_row_id"])].copy()
         child_remaining = child_remaining.loc[~child_remaining["_child_row_id"].isin(matched["_child_row_id"])].copy()
@@ -339,6 +430,48 @@ def _match_equivalent_bubble_rows(
     if not matched_frames:
         return pd.DataFrame()
     return pd.concat(matched_frames, ignore_index=True)
+
+
+def _load_child_to_parent_node_id_map(child_context: ExperimentStateContext) -> dict[int, int]:
+    variant_output_dir = child_context.variant_output_dir
+    if variant_output_dir is None:
+        return {}
+    node_match_path = Path(variant_output_dir) / "matching" / "node_match.csv"
+    if not node_match_path.exists():
+        return {}
+
+    node_match = pd.read_csv(node_match_path)
+    required = {"child_id_node", "matched_parent_node_id"}
+    if not required.issubset(node_match.columns):
+        return {}
+
+    child_ids = pd.to_numeric(node_match["child_id_node"], errors="coerce")
+    parent_ids = pd.to_numeric(node_match["matched_parent_node_id"], errors="coerce")
+    valid = child_ids.notna() & parent_ids.notna()
+    if "match_within_tolerance" in node_match.columns:
+        valid &= node_match["match_within_tolerance"].fillna(False).astype(bool)
+    if not valid.any():
+        return {}
+
+    return dict(zip(child_ids.loc[valid].astype(int), parent_ids.loc[valid].astype(int)))
+
+
+def _augment_child_equivalent_frame_for_parent_matching(
+    child_frame: pd.DataFrame,
+    child_context: ExperimentStateContext,
+) -> pd.DataFrame:
+    result = child_frame.copy()
+    node_id_map = _load_child_to_parent_node_id_map(child_context)
+    if not node_id_map:
+        return result
+
+    for boundary_column in ("upstream_boundary_node", "downstream_boundary_node"):
+        if boundary_column not in result.columns:
+            continue
+        mapped_column = f"matched_parent_{boundary_column}"
+        boundary_ids = pd.to_numeric(result[boundary_column], errors="coerce")
+        result[mapped_column] = boundary_ids.map(node_id_map)
+    return result
 
 
 def _empty_equivalent_transition_frame() -> pd.DataFrame:
@@ -391,7 +524,10 @@ def _write_equivalent_transition_outputs(
     child_context: ExperimentStateContext,
 ) -> pd.DataFrame:
     parent_frame = parent_context.workflow.bubble_equivalent_metrics.copy()
-    child_frame = child_context.workflow.bubble_equivalent_metrics.copy()
+    child_frame = _augment_child_equivalent_frame_for_parent_matching(
+        child_context.workflow.bubble_equivalent_metrics.copy(),
+        child_context,
+    )
     output_dir = child_context.state_dir / "equivalent_resistance"
     output_dir.mkdir(parents=True, exist_ok=True)
     comparison_path = output_dir / "bubble_equivalent_state_comparison.csv"
@@ -2295,6 +2431,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reference-section width percentile used when equivalent-kb-mode=based_reference_section.",
     )
     parser.add_argument(
+        "--equivalent-length-field",
+        choices=LENGTH_FIELD_CANDIDATES,
+        default=LENGTH_FIELD_CANDIDATES[0],
+        help="Preferred link-length field for equivalent-resistance solves.",
+    )
+    parser.add_argument(
         "--equivalent-manning-n",
         type=float,
         default=0.035,
@@ -2368,6 +2510,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sword-example-stations-source", default=None, help="Optional example-station source used to derive example-specific SWORD reach corridors. Defaults to the repo hierarchy_examples_filtered_subdaily_manual_updates_final.gpkg when present.")
     parser.add_argument("--sword-station-match-source", default=None, help="Optional station-to-SWORD match source used to derive example-specific SWORD reach corridors. Defaults to the repo selected_event_stations_same_main_path.gpkg when present.")
     parser.add_argument("--sword-reach-buffer-steps", type=int, default=2, help="Number of reach steps to extend upstream and downstream beyond the example corridor endpoints when constraining SWORD node candidates.")
+    parser.add_argument(
+        "--slope-profile-mode",
+        choices=("network_dist", "reference_section"),
+        default="network_dist",
+        help="How state hydraulic context should derive the monotone head profile during variant creation.",
+    )
+    parser.add_argument(
+        "--reference-section-summary-path",
+        default=None,
+        help="Optional explicit reference_section_summary.json path used during state hydraulic-context generation.",
+    )
+    parser.add_argument("--min-slope", type=float, default=1e-6, help="Minimum positive slope used in state hydraulic-context generation.")
+    parser.add_argument("--max-slope-for-k", type=float, default=None, help="Optional upper bound for local slopes used in state hydraulic-context generation.")
+    parser.add_argument("--section-slope-ratio-min", type=float, default=None, help="Optional lower bound on local_slope / section_slope for state hydraulic-context QC.")
+    parser.add_argument("--section-slope-ratio-max", type=float, default=None, help="Optional upper bound on local_slope / section_slope for state hydraulic-context QC.")
+    parser.add_argument("--disable-section-slope-fallback", action="store_true", help="Disable section-slope fallback during state hydraulic-context generation.")
+    parser.add_argument("--disable-compound-bubble-slope-qc", action="store_true", help="Disable compound-bubble path-drop QC during state hydraulic-context generation.")
+    parser.add_argument("--disable-compound-bubble-slope-repair", action="store_true", help="Disable compound-bubble slope repair during state hydraulic-context generation.")
     parser.add_argument("--verbose-rivgraph", action="store_true", help="Print RivGraph progress to stdout.")
     return parser
 
@@ -2383,6 +2543,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             geometry_method=args.equivalent_geometry_method,
             kb_mode=args.equivalent_kb_mode,
             kb_value=args.equivalent_kb_value,
+            length_field_candidates=resolve_length_field_candidates(args.equivalent_length_field),
             default_manning_n=args.equivalent_manning_n,
             default_chezy_cz=args.equivalent_chezy_cz,
         )
@@ -2426,6 +2587,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         "sword_station_match_source_path": args.sword_station_match_source,
         "sword_reach_buffer_steps": args.sword_reach_buffer_steps,
         "verbose_rivgraph": args.verbose_rivgraph,
+        "state_hydraulic_context_kwargs": {
+            "config": SlopeConfig(
+                min_slope=args.min_slope,
+                slope_profile_mode=args.slope_profile_mode,
+                reference_section_summary_path=args.reference_section_summary_path,
+                max_slope_for_k=args.max_slope_for_k,
+                section_slope_ratio_min=args.section_slope_ratio_min,
+                section_slope_ratio_max=args.section_slope_ratio_max,
+                use_section_slope_fallback=not args.disable_section_slope_fallback,
+                use_compound_bubble_slope_qc=not args.disable_compound_bubble_slope_qc,
+                use_compound_bubble_slope_repair=not args.disable_compound_bubble_slope_repair,
+            )
+        },
         "equivalent_resistance_config": equivalent_resistance_config,
         "equivalent_forcing_path": args.equivalent_forcing_path,
         "equivalent_forcing_config": equivalent_forcing_config,
@@ -2434,11 +2608,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "equivalent_kb_width_percentile": args.equivalent_kb_width_percentile,
     }
 
-    requested_modes = COLLAPSE_CORRIDOR_MODES if args.collapse_corridor_mode == "both" else (args.collapse_corridor_mode,)
+    persist_realized_and_anchored = args.collapse_corridor_mode in {"both", "anchored"}
+    requested_modes = COLLAPSE_CORRIDOR_MODES if persist_realized_and_anchored else (args.collapse_corridor_mode,)
+    realized_output_dir_for_reuse: Path | None = None
     for collapse_corridor_mode in requested_modes:
         experiment_id = args.experiment_id
         output_dir = args.output_dir
-        if args.collapse_corridor_mode == "both":
+        current_run_kwargs = dict(run_kwargs)
+        if persist_realized_and_anchored:
             experiment_id = _suffix_experiment_id_for_collapse_mode(
                 experiment_id or _default_experiment_id(args.cleaned_mask, args.mode),
                 collapse_corridor_mode,
@@ -2448,13 +2625,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.output_dir is not None
                 else None
             )
+        if (
+            collapse_corridor_mode == "anchored"
+            and realized_output_dir_for_reuse is not None
+            and _supports_realized_reuse_speedup(args.mode)
+        ):
+            current_run_kwargs["variant_runner"] = _make_realized_reuse_variant_runner(
+                realized_experiment_output_dir=realized_output_dir_for_reuse,
+                fallback_variant_runner=generate_network_variant,
+            )
         results = run_collapse_experiment(
             args.mode,
             experiment_id=experiment_id,
             output_dir=output_dir,
             collapse_corridor_mode=collapse_corridor_mode,
-            **run_kwargs,
+            **current_run_kwargs,
         )
+        if collapse_corridor_mode == "realized":
+            realized_output_dir_for_reuse = Path(results.output_dir)
 
         print(f"Wrote experiment outputs to {results.output_dir}")
         print(f"Collapse corridor mode: {collapse_corridor_mode}")

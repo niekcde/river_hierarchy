@@ -20,12 +20,54 @@ Current V1 scope:
   - `dry` width as `total - wet`
 - orchestrate full collapse experiments from one base state using:
   - independent base-unit variants
+  - independent compound-bubble variants
   - adaptive sequential unit collapse
   - adaptive sequential group collapse
+- write state-level hydraulic-context artifacts after each hierarchy state so
+  slope and profile-WSE derivation live in `network_variants` rather than in
+  RAPID prep
+- optionally compute geometry-informed equivalent-resistance predictors for
+  detected bubbles within each state hierarchy
+- optionally run one experiment-level equivalent-resistance comparison workflow
+  for `independent-units` and `compound-bubbles`
 
-Not yet in scope:
+Still intentionally separate from this module:
 
-- RAPID handoff packaging
+- running RAPID prep and RAPID routing themselves
+
+`network_variants` now writes state outputs in the layout consumed by the RAPID
+subproject, but the actual prep/run steps remain separate entry points under
+`RAPID/`.
+
+## Collapse Corridor Modes
+
+Collapsed variants can now be materialized in two scientifically distinct ways:
+
+- `realized`
+  Keep the full realized collapsed corridor produced by the regenerated child
+  network, even if the effective child object expands beyond the nominal unit
+  or bubble boundaries.
+- `anchored`
+  Split the realized collapsed corridor back at the nominal selection anchor
+  nodes before writing the final directed child graph. This preserves a more
+  local "replace only the selected interval" interpretation.
+
+These modes are selected with:
+
+- `--collapse-corridor-mode realized`
+- `--collapse-corridor-mode anchored`
+- `--collapse-corridor-mode both`
+
+`both` runs two sibling experiments and writes separate output roots suffixed
+with `__realized` and `__anchored`.
+
+Interpretation:
+
+- `realized` is the better description of what the regenerated child network
+  actually became after collapse.
+- `anchored` is the better description when you want to hold the replacement to
+  the nominal upstream/downstream selection anchors and avoid changing a longer
+  surrounding corridor more than necessary.
 
 ## Width Logic
 
@@ -111,6 +153,55 @@ lineage. In practice this means:
 
 After direction assignment, the regenerated link geometry is reversed when
 needed so the first coordinate is always the upstream endpoint.
+
+## Hydraulic Context
+
+After each state graph is materialized and the hierarchy workflow is rerun,
+`network_variants` now writes one state-level hydraulic-context bundle under:
+
+- `states/<state_id>/hydraulic_context/`
+
+Artifacts:
+
+- `link_hydraulic_context.csv`
+- `node_hydraulic_context.csv`
+- `hydraulic_context_manifest.json`
+
+This step owns the slope/profile derivation that used to live only in RAPID
+prep. RAPID prep now prefers these precomputed artifacts and only falls back to
+its internal slope routine when the state-level hydraulic context is missing.
+
+Target ownership:
+
+- all slope/profile construction for `network_variants` experiments should be
+  completed here during variant creation
+- RAPID prep should only consume `hydraulic_context/`
+- the RAPID-side slope path is transitional compatibility for older experiment
+  directories, not the intended normal workflow
+
+Planned implementation checklist:
+
+1. Build one smooth example-level `H_ref(s)` from trusted SWORD anchors on the
+   cached `reference_section/`.
+2. Save that fitted profile and its anchor metadata once at the experiment
+   root.
+3. Write full base-state hydraulic context in `states/S000_base/`.
+4. For each derived state, inherit unchanged node/profile values from the
+   parent through `matched_parent_node_id` and lineage where possible.
+5. Recompute only the affected corridor and intersecting compound bubbles for
+   each variant.
+6. Enforce exact compound-bubble boundary drop here, before RAPID prep.
+7. Write final `rapid_wse_for_slope`, `slope_used`, and diagnostics per state.
+8. Leave RAPID prep as a consumer of cached hydraulic context only.
+
+Three head concepts are intentionally kept separate:
+
+- observed or matched node WSE:
+  `sword_wse` / raw node WSE context
+- derived profile WSE for slope:
+  `rapid_wse_for_slope`
+- normalized solver heads for equivalent-resistance solves:
+  not stored in `hydraulic_context/`; written separately by the solver workflow
 
 ## First-Step Collapse Rule
 
@@ -257,6 +348,10 @@ Important:
   stable across all variants
 - when SWORD node matching is enabled, propagated SWORD attributes are carried
   forward through the directed node layers of successive states
+- every state now also writes `hydraulic_context/` after hierarchy outputs are
+  available
+- collapse experiments can be run in `realized`, `anchored`, or `both`
+  corridor modes using `--collapse-corridor-mode`
 
 ### Routing Interpretation
 
@@ -297,7 +392,8 @@ Example: independent base-unit variants
   --reviewed-links hierarchy_level_definition/manual_review/outputs/sarl_03/directed_links.gpkg \
   --reviewed-nodes hierarchy_level_definition/manual_review/outputs/sarl_03/reviewed_nodes.gpkg \
   --exit-sides NS \
-  --experiment-id sarl_03_independent_units
+  --experiment-id sarl_03_independent_units \
+  --collapse-corridor-mode realized
 ```
 
 Example: independent compound-bubble variants
@@ -310,7 +406,8 @@ Example: independent compound-bubble variants
   --reviewed-links hierarchy_level_definition/manual_review/outputs/sarl_03/directed_links.gpkg \
   --reviewed-nodes hierarchy_level_definition/manual_review/outputs/sarl_03/reviewed_nodes.gpkg \
   --exit-sides NS \
-  --experiment-id sarl_03_compound_bubbles
+  --experiment-id sarl_03_compound_bubbles \
+  --collapse-corridor-mode realized
 ```
 
 Example: adaptive sequential unit collapse
@@ -323,7 +420,8 @@ Example: adaptive sequential unit collapse
   --reviewed-links hierarchy_level_definition/manual_review/outputs/sarl_03/directed_links.gpkg \
   --reviewed-nodes hierarchy_level_definition/manual_review/outputs/sarl_03/reviewed_nodes.gpkg \
   --exit-sides NS \
-  --experiment-id sarl_03_sequential_units
+  --experiment-id sarl_03_sequential_units \
+  --collapse-corridor-mode realized
 ```
 
 Example: adaptive sequential group collapse
@@ -336,23 +434,90 @@ Example: adaptive sequential group collapse
   --reviewed-links hierarchy_level_definition/manual_review/outputs/sarl_03/directed_links.gpkg \
   --reviewed-nodes hierarchy_level_definition/manual_review/outputs/sarl_03/reviewed_nodes.gpkg \
   --exit-sides NS \
-  --experiment-id sarl_03_sequential_groups
+  --experiment-id sarl_03_sequential_groups \
+  --collapse-corridor-mode realized
 ```
+
+Example: run both realized and anchored experiment families at once
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python \
+  network_variants/run_collapse_experiment.py \
+  independent-units \
+  --cleaned-mask rivgraph_centerline/outputs/smoke_tests/sarl_03/masks_cleaned/sarl_03_cleaned.tif \
+  --reviewed-links hierarchy_level_definition/manual_review/outputs/sarl_03/directed_links.gpkg \
+  --reviewed-nodes hierarchy_level_definition/manual_review/outputs/sarl_03/reviewed_nodes.gpkg \
+  --exit-sides NS \
+  --experiment-id sarl_03_independent_units \
+  --output-dir network_variants/output/sarl_03_independent_units \
+  --collapse-corridor-mode both
+```
+
+This writes:
+
+- `network_variants/output/sarl_03_independent_units__realized/`
+- `network_variants/output/sarl_03_independent_units__anchored/`
 
 The experiment runner writes:
 
 - `state_registry.csv`
 - `transition_registry.csv`
+- `equivalent_transition_registry.csv`
 - `experiment_manifest.json`
 
 and creates one `states/<state_id>/` folder per hierarchy state. Each state
 contains:
 
 - `hierarchy/`
-  fresh unit metrics, collapse ranking, and selected groups for that state
+  fresh unit metrics, collapse ranking, selected groups, and optional
+  bubble-level equivalent-resistance outputs for that state
 - `variant/`
   only for derived states; collapsed mask, regenerated RivGraph outputs,
   directed graph, matching, and width families
+- `hydraulic_context/`
+  state-level slope/profile artifacts derived from the directed graph plus node
+  WSE context
+- `equivalent_resistance/`
+  state-to-parent bubble-comparison outputs written by the collapse experiment
+  workflow when per-state equivalent resistance is enabled
+
+### Geometry-Informed Equivalent Resistance
+
+Two related workflows now exist:
+
+1. State-level bubble reduction inside the hierarchy workflow
+   Enabled with `--compute-equivalent-resistance` on
+   `run_collapse_experiment.py` or `hierarchy_level_definition/run_unit_workflow.py`.
+   This writes, per state:
+   - `bubble_equivalent_metrics.csv`
+   - `bubble_edge_resistance.csv`
+   - `bubble_node_heads.csv`
+
+2. Experiment-level matched comparison workflow
+   Run separately with:
+   - `network_variants/run_equivalent_resistance_experiment.py`
+
+   This is currently intended for:
+   - `independent-units`
+   - `compound-bubbles`
+
+   It writes one experiment-level folder:
+   - `equivalent_resistance/`
+
+   with:
+   - `base_nominal_targets.csv`
+   - `child_realized_objects.csv`
+   - `matched_base_corridors.csv`
+   - `equivalent_resistance_comparison.csv`
+   - `equivalent_resistance_manifest.json`
+
+The comparison workflow is important because the realized child corridor does
+not always share the same outer boundaries as the nominal base unit or bubble.
+The main physically consistent comparison field is therefore usually:
+
+- `Lambda_matched = K_variant_realized / K_eq_matched_base`
+
+rather than the nominal-boundary comparison.
 
 ## Output Layout
 
@@ -385,3 +550,16 @@ Inside it:
   - `link_width_families.csv`
   - `link_width_samples.csv`
   - `links_with_width_families.gpkg`
+
+Inside a collapse experiment root:
+
+- `state_registry.csv`
+- `transition_registry.csv`
+- `equivalent_transition_registry.csv`
+- `experiment_manifest.json`
+- `states/<state_id>/variant/`
+- `states/<state_id>/hierarchy/`
+- `states/<state_id>/hydraulic_context/`
+- optionally `states/<state_id>/equivalent_resistance/`
+- optionally `<experiment>/equivalent_resistance/` when the standalone
+  experiment-level comparison runner is used

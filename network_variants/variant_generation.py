@@ -6,13 +6,14 @@ import itertools
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Collection, Iterable, Mapping, Sequence
 
 import geopandas as gpd
 import networkx as nx
@@ -58,6 +59,8 @@ DEFAULT_WIDTH_QUANTILES = (0.05, 0.5, 0.95)
 RIVGRAPH_WIDTH_TRIM_MULTIPLIER = 1.1
 DEFAULT_CORE_OVERLAP_FRACTION_THRESHOLD = 0.05
 DEFAULT_UNCHANGED_CORE_OVERLAP_FRACTION = 0.8
+WIDTH_SCOPE_BASE_LABEL = 1
+WIDTH_SCOPE_COMPONENT_LABEL_START = 101
 MAX_LOCAL_DIRECTION_REPAIR_LINKS = 10
 COLLAPSE_CORRIDOR_MODES = ("realized", "anchored")
 
@@ -110,6 +113,7 @@ class NetworkVariantOutputs:
     directed_nodes: gpd.GeoDataFrame
     output_dir: Path
     collapsed_mask_path: Path
+    width_scope_mask_path: Path | None
     rivgraph_links_path: Path
     rivgraph_nodes_path: Path
     directed_links_path: Path | None
@@ -127,6 +131,22 @@ class VariantDirectionValidationError(RuntimeError):
         self.outputs = outputs
         self.issues = [str(issue) for issue in issues]
         super().__init__(f"Directed regenerated graph failed validation: {self.issues}")
+
+
+def _remap_copied_output_path(
+    value: str | Path | None,
+    *,
+    source_output_dir: Path,
+    target_output_dir: Path,
+) -> Path | None:
+    if value is None:
+        return None
+    path = Path(value)
+    try:
+        relative = path.resolve().relative_to(source_output_dir.resolve())
+    except ValueError:
+        return None
+    return target_output_dir / relative
 
 
 def _git_revision() -> str | None:
@@ -214,13 +234,18 @@ def _apply_collapsed_selection_metadata(
 def _parse_int_list(value: Any) -> list[int]:
     if value is None:
         return []
+    try:
+        if pd.isna(value):
+            return []
+    except TypeError:
+        pass
     if isinstance(value, (list, tuple, set, np.ndarray, pd.Series)):
         result: list[int] = []
         for item in value:
             result.extend(_parse_int_list(item))
         return result
     text = str(value).strip()
-    if not text:
+    if not text or text.lower() in {"<na>", "nan", "none"}:
         return []
     return [int(part.strip()) for part in text.split(",") if part.strip()]
 
@@ -490,10 +515,99 @@ def _segment_length_and_count(geometry: Any) -> tuple[float, int]:
     return float(sum(segment.length for segment in segments)), len(segments)
 
 
-def _unravel_link_pixels(flat_indices: Sequence[int], shape: tuple[int, int], transform: Any) -> tuple[np.ndarray, np.ndarray]:
+def _segment_projection_bounds(segment: LineString, transect: LineString) -> tuple[float, float]:
+    distances = [float(transect.project(Point(x, y))) for x, y in segment.coords]
+    return min(distances), max(distances)
+
+
+def _interval_distance_to_point(start: float, end: float, point_distance: float) -> float:
+    if point_distance < start:
+        return start - point_distance
+    if point_distance > end:
+        return point_distance - end
+    return 0.0
+
+
+def _cap_wet_thread_geometry(
+    wet_geometry: Any,
+    *,
+    transect: LineString,
+    center_point: Point,
+    max_threads: int,
+) -> tuple[float, float, int, int, bool]:
+    segments = _iter_linear_segments(wet_geometry)
+    raw_threads = len(segments)
+    raw_width = float(sum(segment.length for segment in segments))
+
+    if max_threads <= 0 or raw_threads <= max_threads:
+        return raw_width, raw_width, raw_threads, raw_threads, False
+
+    center_distance = float(transect.project(center_point))
+    ranked: list[tuple[float, float, float, LineString]] = []
+    for segment in segments:
+        start, end = _segment_projection_bounds(segment, transect)
+        midpoint = 0.5 * (start + end)
+        ranked.append(
+            (
+                _interval_distance_to_point(start, end, center_distance),
+                abs(midpoint - center_distance),
+                midpoint,
+                segment,
+            )
+        )
+
+    selected = sorted(ranked, key=lambda item: (item[0], item[1], item[2]))[:max_threads]
+    selected_segments = [item[3] for item in selected]
+    selected_bounds = [_segment_projection_bounds(segment, transect) for segment in selected_segments]
+    wet_width = float(sum(segment.length for segment in selected_segments))
+    total_width = float(max(end for _, end in selected_bounds) - min(start for start, _ in selected_bounds))
+    total_width = max(total_width, wet_width)
+    return total_width, wet_width, max_threads, raw_threads, True
+
+
+def _select_segment_containing_point(
+    geometry: Any,
+    point: Point,
+    *,
+    tolerance: float = 1e-6,
+) -> tuple[Any, float]:
+    segments = _iter_linear_segments(geometry)
+    if not segments:
+        return GeometryCollection(), 0.0
+
+    containing = [segment for segment in segments if segment.distance(point) <= tolerance]
+    if containing:
+        chosen = max(containing, key=lambda segment: float(segment.length))
+        return chosen, float(chosen.length)
+
+    chosen = min(segments, key=lambda segment: float(segment.distance(point)))
+    return chosen, float(chosen.length)
+
+
+def _mask_value_geometries(mask: np.ndarray, transform: Any) -> dict[int, Any]:
+    grouped: dict[int, list[Any]] = {}
+    for geometry, value in shapes(mask.astype(np.int32), mask=(mask > 0), transform=transform):
+        label = int(value)
+        if label <= 0:
+            continue
+        grouped.setdefault(label, []).append(shapely_shape(geometry))
+
+    return {label: unary_union(geometries) for label, geometries in grouped.items()}
+
+
+def _unravel_link_pixels(
+    flat_indices: Sequence[int],
+    shape: tuple[int, int],
+    transform: Any,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     rows, cols = np.unravel_index(np.asarray(flat_indices, dtype=int), shape)
     xs, ys = raster_xy(transform, rows, cols, offset="center")
-    return np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)
+    return (
+        np.asarray(rows, dtype=int),
+        np.asarray(cols, dtype=int),
+        np.asarray(xs, dtype=float),
+        np.asarray(ys, dtype=float),
+    )
 
 
 def _distances_along_link(xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
@@ -578,6 +692,79 @@ def _build_transect(
     )
 
 
+def _selection_uses_full_width_transects(regenerated_links: gpd.GeoDataFrame) -> bool:
+    if "collapsed_unit_count" not in regenerated_links.columns:
+        return False
+    counts = pd.to_numeric(regenerated_links["collapsed_unit_count"], errors="coerce").fillna(0)
+    return bool((counts > 1).any())
+
+
+def _units_require_full_width_transects(
+    *,
+    resolved_unit_ids: Sequence[int],
+    units_by_id: Mapping[int, StructuralUnit],
+) -> bool:
+    unique_unit_ids = _ensure_unique_preserve_order(int(unit_id) for unit_id in resolved_unit_ids)
+    if len(unique_unit_ids) > 1:
+        return True
+
+    for unit_id in unique_unit_ids:
+        unit = units_by_id[int(unit_id)]
+        if bool(unit.is_compound):
+            return True
+        if str(unit.unit_class) == "compound_or_nested_complex":
+            return True
+    return False
+
+
+def _build_width_scope_thread_caps(
+    *,
+    collapse_components: pd.DataFrame | None,
+    units_by_id: Mapping[int, StructuralUnit],
+) -> dict[int, int]:
+    caps: dict[int, int] = {WIDTH_SCOPE_BASE_LABEL: 1}
+    if collapse_components is None or collapse_components.empty:
+        return caps
+
+    if "width_scope_label" not in collapse_components.columns or "unit_ids" not in collapse_components.columns:
+        return caps
+
+    for row in collapse_components.itertuples(index=False):
+        scope_label = int(getattr(row, "width_scope_label", 0) or 0)
+        if scope_label <= 0:
+            continue
+        unit_ids = _parse_int_list(getattr(row, "unit_ids", ""))
+        if len(unit_ids) != 1:
+            continue
+        unit = units_by_id.get(int(unit_ids[0]))
+        if unit is None:
+            continue
+        if bool(unit.is_compound):
+            continue
+        if str(unit.unit_class) != "simple_bifurcation_confluence_pair":
+            continue
+        if int(getattr(unit, "n_paths", 0) or 0) != 2:
+            continue
+        caps[scope_label] = 2
+    return caps
+
+
+def _local_width_corridor(
+    row: Mapping[str, Any],
+    *,
+    pixel_length: float,
+) -> Any:
+    geometry = row.get("geometry")
+    if geometry is None or geometry.is_empty:
+        return GeometryCollection()
+
+    local_width = _width_from_row(row, preferred_field="wid_adj")
+    radius = max(float(local_width) * DEFAULT_FOOTPRINT_BUFFER_SCALE, pixel_length)
+    if not math.isfinite(radius) or radius <= 0:
+        radius = pixel_length
+    return geometry.buffer(radius)
+
+
 def compute_width_families(
     regenerated_links: gpd.GeoDataFrame,
     *,
@@ -585,6 +772,9 @@ def compute_width_families(
     wet_reference_mask_path: str | Path,
     transect_scale: float = DEFAULT_TRANSECT_SCALE,
     min_transect_pixels: float = DEFAULT_MIN_TRANSECT_PIXELS,
+    use_full_width_transects: bool | None = None,
+    width_scope_mask_path: str | Path | None = None,
+    width_scope_thread_caps: Mapping[int, int] | None = None,
 ) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
     with rasterio.open(collapsed_mask_path) as collapsed_ds:
         collapsed_mask = collapsed_ds.read(1) > 0
@@ -601,10 +791,22 @@ def compute_width_families(
 
     collapsed_water = _mask_to_union_geometry(collapsed_mask, collapsed_transform)
     wet_reference_water = _mask_to_union_geometry(wet_mask, wet_transform)
+    width_scope_mask: np.ndarray | None = None
+    width_scope_geometries: dict[int, Any] = {}
+    if width_scope_mask_path is not None:
+        with rasterio.open(width_scope_mask_path) as scope_ds:
+            width_scope_mask = scope_ds.read(1)
+            scope_transform = scope_ds.transform
+            scope_shape = scope_ds.shape
+        if collapsed_shape != scope_shape or collapsed_transform != scope_transform:
+            raise ValueError("width_scope_mask_path must share shape and transform with collapsed_mask_path.")
+        width_scope_geometries = _mask_value_geometries(np.asarray(width_scope_mask, dtype=np.int32), collapsed_transform)
 
     enriched = regenerated_links.copy()
     sample_records: list[dict[str, Any]] = []
     summary_records: list[dict[str, Any]] = []
+    if use_full_width_transects is None:
+        use_full_width_transects = _selection_uses_full_width_transects(regenerated_links)
 
     for row in regenerated_links.itertuples(index=False):
         attrs = row._asdict()
@@ -617,12 +819,30 @@ def compute_width_families(
         if total_widths.size == 0:
             continue
 
-        xs, ys = _unravel_link_pixels(flat_indices, collapsed_shape, collapsed_transform)
+        rows, cols, xs, ys = _unravel_link_pixels(flat_indices, collapsed_shape, collapsed_transform)
         distances = _distances_along_link(xs, ys)
+        local_corridor = _local_width_corridor(attrs, pixel_length=collapsed_pixlen)
+        if width_scope_mask is not None:
+            sample_scope_labels = np.asarray(width_scope_mask[rows, cols], dtype=int)
+            sample_scope_labels = np.where((sample_scope_labels <= 0) & collapsed_mask[rows, cols], 1, sample_scope_labels)
+            width_scope = "label_mask"
+        else:
+            sample_scope_labels = np.zeros(len(flat_indices), dtype=int)
+            width_scope = "full_mask" if use_full_width_transects else "local_corridor"
+            if use_full_width_transects:
+                collapsed_water_local = collapsed_water
+                wet_reference_water_local = wet_reference_water
+            else:
+                corridor = _local_width_corridor(attrs, pixel_length=collapsed_pixlen)
+                collapsed_water_local = collapsed_water.intersection(corridor)
+                wet_reference_water_local = wet_reference_water.intersection(corridor)
         wet_widths: list[float] = []
         total_sampled_widths: list[float] = []
         dry_widths: list[float] = []
         n_wet_threads_values: list[int] = []
+        n_wet_threads_raw_values: list[int] = []
+        n_wet_threads_cap_values: list[int] = []
+        n_wet_threads_capped_values: list[bool] = []
 
         for index in range(len(flat_indices)):
             transect = _build_transect(
@@ -634,10 +854,44 @@ def compute_width_families(
                 transect_scale=transect_scale,
                 min_transect_pixels=min_transect_pixels,
             )
-            total_intersection = collapsed_water.intersection(transect)
-            wet_intersection = wet_reference_water.intersection(transect)
-            total_width, _ = _segment_length_and_count(total_intersection)
-            wet_width, wet_threads = _segment_length_and_count(wet_intersection)
+            if width_scope_mask is not None:
+                scope_label = int(sample_scope_labels[index])
+                allowed_geometry = width_scope_geometries.get(scope_label, GeometryCollection())
+                if scope_label == WIDTH_SCOPE_BASE_LABEL:
+                    allowed_geometry = allowed_geometry.intersection(local_corridor)
+                center_point = Point(float(xs[index]), float(ys[index]))
+                total_intersection = allowed_geometry.intersection(transect)
+                total_segment, total_width = _select_segment_containing_point(total_intersection, center_point)
+                wet_intersection = wet_reference_water.intersection(total_segment)
+                wet_width, wet_threads = _segment_length_and_count(wet_intersection)
+                wet_threads_raw = int(wet_threads)
+                wet_threads_cap = (
+                    int(width_scope_thread_caps.get(scope_label))
+                    if width_scope_thread_caps is not None and scope_label in width_scope_thread_caps
+                    else 0
+                )
+                wet_threads_capped = False
+                if wet_threads_cap > 0:
+                    capped_total_width, capped_wet_width, capped_threads, capped_raw_threads, wet_threads_capped = _cap_wet_thread_geometry(
+                        wet_intersection,
+                        transect=transect,
+                        center_point=center_point,
+                        max_threads=wet_threads_cap,
+                    )
+                    wet_threads_raw = int(capped_raw_threads)
+                    if wet_threads_capped:
+                        total_width = capped_total_width
+                        wet_width = capped_wet_width
+                        wet_threads = capped_threads
+            else:
+                scope_label = 0
+                total_intersection = collapsed_water_local.intersection(transect)
+                wet_intersection = wet_reference_water_local.intersection(transect)
+                total_width, _ = _segment_length_and_count(total_intersection)
+                wet_width, wet_threads = _segment_length_and_count(wet_intersection)
+                wet_threads_raw = int(wet_threads)
+                wet_threads_cap = 0
+                wet_threads_capped = False
             total_width = max(total_width, 0.0)
             wet_width = max(wet_width, 0.0)
             dry_width = max(total_width - wet_width, 0.0)
@@ -646,6 +900,9 @@ def compute_width_families(
             wet_widths.append(wet_width)
             dry_widths.append(dry_width)
             n_wet_threads_values.append(int(wet_threads))
+            n_wet_threads_raw_values.append(int(wet_threads_raw))
+            n_wet_threads_cap_values.append(int(wet_threads_cap))
+            n_wet_threads_capped_values.append(bool(wet_threads_capped))
 
             sample_records.append(
                 {
@@ -659,6 +916,11 @@ def compute_width_families(
                     "wet_fraction": float(wet_width / total_width) if total_width > 0 else float("nan"),
                     "dry_fraction": float(dry_width / total_width) if total_width > 0 else float("nan"),
                     "n_wet_threads": int(wet_threads),
+                    "n_wet_threads_raw": int(wet_threads_raw),
+                    "n_wet_threads_cap": int(wet_threads_cap),
+                    "n_wet_threads_capped": bool(wet_threads_capped),
+                    "width_scope": width_scope,
+                    "width_scope_label": int(scope_label),
                 }
             )
 
@@ -666,6 +928,9 @@ def compute_width_families(
         wet_array = np.asarray(wet_widths, dtype=float)
         dry_array = np.asarray(dry_widths, dtype=float)
         threads_array = np.asarray(n_wet_threads_values, dtype=int)
+        threads_raw_array = np.asarray(n_wet_threads_raw_values, dtype=int)
+        threads_capped_array = np.asarray(n_wet_threads_capped_values, dtype=bool)
+        threads_cap_array = np.asarray(n_wet_threads_cap_values, dtype=int)
         trim_slice = _trim_slice(total_array, distances)
 
         total_stats = _compute_family_stats(total_array, trim_slice)
@@ -673,11 +938,20 @@ def compute_width_families(
         dry_stats = _compute_family_stats(dry_array, trim_slice)
 
         trimmed_threads = threads_array[trim_slice] if threads_array[trim_slice].size else threads_array
+        trimmed_threads_raw = threads_raw_array[trim_slice] if threads_raw_array[trim_slice].size else threads_raw_array
+        trimmed_threads_capped = threads_capped_array[trim_slice] if threads_capped_array[trim_slice].size else threads_capped_array
+        trimmed_threads_cap = threads_cap_array[trim_slice] if threads_cap_array[trim_slice].size else threads_cap_array
         n_wet_threads_mean = float(np.mean(trimmed_threads)) if trimmed_threads.size else float("nan")
         n_wet_threads_max = int(np.max(trimmed_threads)) if trimmed_threads.size else 0
+        n_wet_threads_mean_raw = float(np.mean(trimmed_threads_raw)) if trimmed_threads_raw.size else float("nan")
+        n_wet_threads_max_raw = int(np.max(trimmed_threads_raw)) if trimmed_threads_raw.size else 0
+        n_wet_threads_capped_samples = int(np.count_nonzero(trimmed_threads_capped)) if trimmed_threads_capped.size else 0
+        n_wet_threads_cap = int(np.max(trimmed_threads_cap)) if trimmed_threads_cap.size else 0
 
         wet_fraction_adj = float(wet_stats["adj"] / total_stats["adj"]) if total_stats["adj"] > 0 else float("nan")
         dry_fraction_adj = float(dry_stats["adj"] / total_stats["adj"]) if total_stats["adj"] > 0 else float("nan")
+        unique_scope_labels = sorted({int(value) for value in sample_scope_labels if int(value) > 0})
+        width_scope_label = int(unique_scope_labels[0]) if len(unique_scope_labels) == 1 else (int(pd.Series(sample_scope_labels).mode().iloc[0]) if len(sample_scope_labels) else 0)
 
         summary_records.append(
             {
@@ -707,6 +981,13 @@ def compute_width_families(
                 "dry_fraction_adj": dry_fraction_adj,
                 "n_wet_threads_mean": n_wet_threads_mean,
                 "n_wet_threads_max": n_wet_threads_max,
+                "n_wet_threads_mean_raw": n_wet_threads_mean_raw,
+                "n_wet_threads_max_raw": n_wet_threads_max_raw,
+                "n_wet_threads_cap": n_wet_threads_cap,
+                "n_wet_threads_capped_samples": n_wet_threads_capped_samples,
+                "width_scope": width_scope,
+                "width_scope_label": int(width_scope_label),
+                "width_scope_labels": _serialize_int_list(unique_scope_labels),
             }
         )
 
@@ -757,7 +1038,7 @@ def _apply_collapse_components_to_mask(
     buffer_scale: float,
     all_touched: bool = True,
     allow_noop: bool = False,
-) -> tuple[np.ndarray, Mapping[str, Any], pd.DataFrame, gpd.GeoDataFrame]:
+) -> tuple[np.ndarray, np.ndarray, Mapping[str, Any], pd.DataFrame, gpd.GeoDataFrame]:
     with rasterio.open(parent_mask_path) as src:
         parent_mask = src.read(1) > 0
         profile = src.profile.copy()
@@ -765,11 +1046,28 @@ def _apply_collapse_components_to_mask(
         crs = src.crs
         pixel_area = abs(transform.a * transform.e)
 
+    width_scope_mask = np.where(parent_mask, WIDTH_SCOPE_BASE_LABEL, 0).astype(np.uint16)
     add_union = np.zeros(parent_mask.shape, dtype=bool)
     geometry_records: list[dict[str, Any]] = []
     component_records: list[dict[str, Any]] = []
 
-    for component in components:
+    if not components:
+        collapsed_mask = parent_mask.astype(bool)
+        summary = {
+            "base_water_pixels": int(parent_mask.sum()),
+            "collapsed_water_pixels": int(collapsed_mask.sum()),
+            "pixels_added": 0,
+            "pixels_removed": 0,
+            "changed_pixels": 0,
+            "pixel_area": float(pixel_area),
+            "width_scope_labels": [WIDTH_SCOPE_BASE_LABEL],
+        }
+        component_frame = pd.DataFrame.from_records(component_records)
+        edit_geometries = gpd.GeoDataFrame(geometry_records, geometry="geometry", crs=crs)
+        return collapsed_mask, width_scope_mask, summary, component_frame, edit_geometries
+
+    for index, component in enumerate(components, start=1):
+        scope_label = int(WIDTH_SCOPE_COMPONENT_LABEL_START + index - 1)
         footprint = _component_footprint_geometry(
             reviewed_links,
             component["link_ids"],
@@ -788,14 +1086,18 @@ def _apply_collapse_components_to_mask(
         component_filled = binary_fill_holes(component_water)
         component_add = component_filled & (~component_water)
         add_union |= component_add
+        width_scope_mask[component_filled] = scope_label
 
         footprint_area = float(footprint.area) if not footprint.is_empty else 0.0
         added_pixels = int(component_add.sum())
         added_area = float(added_pixels * pixel_area)
+        scope_pixels = int(component_filled.sum())
+        scope_area = float(scope_pixels * pixel_area)
 
         component_records.append(
             {
                 "component_id": component["component_id"],
+                "width_scope_label": scope_label,
                 "unit_ids": _serialize_int_list(component["unit_ids"]),
                 "link_ids": _serialize_int_list(component["link_ids"]),
                 "node_ids": _serialize_int_list(component["node_ids"]),
@@ -804,6 +1106,8 @@ def _apply_collapse_components_to_mask(
                 "n_links": int(component["n_links"]),
                 "n_nodes": int(component["n_nodes"]),
                 "footprint_area": footprint_area,
+                "width_scope_pixels": scope_pixels,
+                "width_scope_area": scope_area,
                 "added_pixels": added_pixels,
                 "added_area": added_area,
             }
@@ -815,8 +1119,21 @@ def _apply_collapse_components_to_mask(
                     "component_id": component["component_id"],
                     "geometry_role": "footprint",
                     "action": None,
+                    "width_scope_label": scope_label,
                     "unit_ids": _serialize_int_list(component["unit_ids"]),
                     "geometry": footprint,
+                }
+            )
+
+        for geometry in _vectorize_mask(component_filled, transform):
+            geometry_records.append(
+                {
+                    "component_id": component["component_id"],
+                    "geometry_role": "width_scope_domain",
+                    "action": "label",
+                    "width_scope_label": scope_label,
+                    "unit_ids": _serialize_int_list(component["unit_ids"]),
+                    "geometry": geometry,
                 }
             )
 
@@ -826,6 +1143,7 @@ def _apply_collapse_components_to_mask(
                     "component_id": component["component_id"],
                     "geometry_role": "edit",
                     "action": "add",
+                    "width_scope_label": scope_label,
                     "unit_ids": _serialize_int_list(component["unit_ids"]),
                     "geometry": geometry,
                 }
@@ -846,20 +1164,107 @@ def _apply_collapse_components_to_mask(
         "pixels_removed": 0,
         "changed_pixels": total_added_pixels,
         "pixel_area": float(pixel_area),
+        "width_scope_labels": [int(WIDTH_SCOPE_BASE_LABEL)] + [int(record["width_scope_label"]) for record in component_records],
     }
     component_frame = pd.DataFrame.from_records(component_records).sort_values("component_id", kind="mergesort").reset_index(drop=True)
     edit_geometries = gpd.GeoDataFrame(geometry_records, geometry="geometry", crs=crs)
-    return collapsed_mask, summary, component_frame, edit_geometries
+    return collapsed_mask, width_scope_mask, summary, component_frame, edit_geometries
 
 
 def _write_mask(path: str | Path, mask: np.ndarray, profile: Mapping[str, Any]) -> Path:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_profile = dict(profile)
-    write_profile.update(dtype="uint8", count=1, compress="lzw")
+    write_dtype = "uint8" if mask.dtype == np.bool_ else np.dtype(mask.dtype).name
+    write_profile.update(dtype=write_dtype, count=1, compress="lzw")
     with rasterio.open(output_path, "w", **write_profile) as dst:
-        dst.write(mask.astype(np.uint8), 1)
+        dst.write(mask.astype(write_dtype), 1)
     return output_path
+
+
+def _build_selection_masks(
+    *,
+    cleaned_mask_path: str | Path,
+    reviewed_links: gpd.GeoDataFrame,
+    resolved_unit_ids: Sequence[int],
+    units_by_id: Mapping[int, StructuralUnit],
+    preferred_width_field: str,
+    footprint_buffer_scale: float,
+    all_touched: bool = True,
+    allow_noop: bool = False,
+) -> tuple[np.ndarray, np.ndarray, Mapping[str, Any], pd.DataFrame, gpd.GeoDataFrame]:
+    components = _componentize_units(resolved_unit_ids, units_by_id) if resolved_unit_ids else []
+    return _apply_collapse_components_to_mask(
+        cleaned_mask_path,
+        components,
+        reviewed_links,
+        preferred_width_field=preferred_width_field,
+        buffer_scale=footprint_buffer_scale,
+        all_touched=all_touched,
+        allow_noop=allow_noop,
+    )
+
+
+def _merge_width_families_onto_links(
+    base_links: gpd.GeoDataFrame,
+    enriched_links: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    width_columns = [column for column in enriched_links.columns if column not in base_links.columns or column == enriched_links.geometry.name]
+    merged = base_links.copy()
+    if "id_link" in enriched_links.columns:
+        enriched_lookup = enriched_links.drop(columns=enriched_links.geometry.name, errors="ignore").copy()
+        merged = merged.merge(
+            enriched_lookup[[column for column in enriched_lookup.columns if column == "id_link" or column in width_columns]],
+            on="id_link",
+            how="left",
+            validate="1:1",
+            suffixes=("", "_width"),
+        )
+    else:
+        for column in width_columns:
+            if column == enriched_links.geometry.name:
+                continue
+            if column in enriched_links.columns:
+                merged[column] = enriched_links[column].values
+    return merged
+
+
+def _write_width_family_outputs(
+    *,
+    width_dir: Path,
+    link_width_samples: pd.DataFrame,
+    directed_enriched_links: gpd.GeoDataFrame,
+) -> pd.DataFrame:
+    link_width_families = pd.DataFrame(directed_enriched_links.drop(columns=directed_enriched_links.geometry.name))
+    width_dir.mkdir(parents=True, exist_ok=True)
+    link_width_families.to_csv(width_dir / "link_width_families.csv", index=False)
+    link_width_samples.to_csv(width_dir / "link_width_samples.csv", index=False)
+    directed_enriched_links.to_file(width_dir / "links_with_width_families.gpkg", driver="GPKG")
+    return link_width_families
+
+
+def _apply_width_sample_flow_alignment(
+    directed_enriched_links: gpd.GeoDataFrame,
+    *,
+    collapse_corridor_mode: str,
+) -> gpd.GeoDataFrame:
+    aligned = directed_enriched_links.copy()
+    if collapse_corridor_mode == "anchored":
+        return aligned
+    if "geometry_reversed_to_match_flow" not in aligned.columns or not aligned["geometry_reversed_to_match_flow"].any():
+        return aligned
+
+    for column in ("wid_pix_total", "wid_pix_wet", "wid_pix_dry"):
+        if column not in aligned.columns:
+            continue
+        reversed_values = []
+        for value, reverse_flag in zip(aligned[column], aligned["geometry_reversed_to_match_flow"]):
+            samples = _parse_float_list(value)
+            if reverse_flag:
+                samples = list(reversed(samples))
+            reversed_values.append(_serialize_float_array(samples))
+        aligned[column] = reversed_values
+    return aligned
 
 
 def _pixel_length_from_transform(transform: Any) -> float:
@@ -1401,6 +1806,22 @@ def _selection_anchor_nodes(
     return None, None
 
 
+def _selection_edge_pairs(
+    *,
+    resolved_unit_ids: Sequence[int],
+    units_by_id: Mapping[int, StructuralUnit],
+) -> set[tuple[int, int]]:
+    edge_pairs: set[tuple[int, int]] = set()
+    for unit_id in resolved_unit_ids:
+        unit = units_by_id.get(int(unit_id))
+        if unit is None:
+            continue
+        for upstream, downstream, edge_key in unit.edge_set:
+            _ = edge_key
+            edge_pairs.add((int(upstream), int(downstream)))
+    return edge_pairs
+
+
 def _parent_interval_lengths(
     parent_graph: nx.MultiDiGraph,
     parent_node_path: Sequence[int],
@@ -1466,6 +1887,193 @@ def _split_line_geometry(
         else:
             raise TypeError(f"Unexpected split geometry type: {type(segment)!r}")
     return segments, points
+
+
+def _split_ordered_samples(
+    values: Sequence[Any],
+    *,
+    cut_fractions: Sequence[float],
+) -> list[list[Any]]:
+    n_segments = len(cut_fractions) + 1
+    if n_segments <= 1:
+        return [list(values)]
+    if not values:
+        return [[] for _ in range(n_segments)]
+    if len(values) == 1:
+        sample = list(values)
+        return [sample.copy() for _ in range(n_segments)]
+
+    max_point_index = len(values) - 1
+    cut_indices: list[int] = []
+    previous_index = 0
+    for position, fraction in enumerate(cut_fractions, start=1):
+        raw_index = int(round(float(fraction) * max_point_index))
+        remaining_cuts = len(cut_fractions) - position
+        lower_bound = previous_index + 1
+        upper_bound = max_point_index - max(remaining_cuts, 0)
+        cut_index = max(lower_bound, min(raw_index, upper_bound))
+        cut_indices.append(cut_index)
+        previous_index = cut_index
+
+    segments: list[list[Any]] = []
+    start_index = 0
+    for cut_index in cut_indices:
+        segments.append(list(values[start_index : cut_index + 1]))
+        start_index = cut_index
+    segments.append(list(values[start_index:]))
+    return segments
+
+
+def _split_serialized_link_samples(
+    row_data: Mapping[str, Any],
+    *,
+    cut_distances: Sequence[float],
+    total_geometry_length: float,
+) -> dict[str, list[str]]:
+    if total_geometry_length <= 0:
+        cut_fractions = [0.5 for _ in cut_distances]
+    else:
+        cut_fractions = [
+            max(0.0, min(float(distance) / float(total_geometry_length), 1.0))
+            for distance in cut_distances
+        ]
+
+    idx_link_segments = _split_ordered_samples(
+        _parse_int_list(row_data.get("idx_link")),
+        cut_fractions=cut_fractions,
+    )
+    wid_pix_segments = _split_ordered_samples(
+        _parse_float_list(row_data.get("wid_pix")),
+        cut_fractions=cut_fractions,
+    )
+    return {
+        "idx_link": [_serialize_int_list(segment) for segment in idx_link_segments],
+        "wid_pix": [_serialize_float_array(segment) for segment in wid_pix_segments],
+    }
+
+
+def _selected_parent_subpaths(
+    parent_node_path: Sequence[int],
+    *,
+    selection_edge_pairs: Collection[tuple[int, int]],
+) -> list[list[int]]:
+    if len(parent_node_path) < 2 or not selection_edge_pairs:
+        return []
+
+    runs: list[list[int]] = []
+    current_run: list[int] = []
+    for upstream, downstream in zip(parent_node_path[:-1], parent_node_path[1:]):
+        if (int(upstream), int(downstream)) in selection_edge_pairs:
+            if not current_run:
+                current_run = [int(upstream), int(downstream)]
+            elif int(current_run[-1]) == int(upstream):
+                current_run.append(int(downstream))
+            else:
+                runs.append(current_run)
+                current_run = [int(upstream), int(downstream)]
+        elif current_run:
+            runs.append(current_run)
+            current_run = []
+    if current_run:
+        runs.append(current_run)
+    return runs
+
+
+def _boundary_overlap_cut_targets(
+    *,
+    parent_graph: nx.MultiDiGraph,
+    parent_node_geometries: Mapping[int, Point],
+    directed_links: gpd.GeoDataFrame,
+    node_match: pd.DataFrame,
+    link_match: pd.DataFrame,
+    selection_edge_pairs: Collection[tuple[int, int]],
+    nominal_upstream_node: int,
+    nominal_downstream_node: int,
+    parent_overlap_threshold: float = 0.999999,
+) -> dict[int, list[dict[str, Any]]]:
+    if link_match.empty or not selection_edge_pairs:
+        return {}
+
+    matched_parent_node_ids = set(
+        pd.to_numeric(node_match.get("matched_parent_node_id"), errors="coerce").dropna().astype(int).tolist()
+    )
+    child_geometries = {
+        int(row.id_link): row.geometry
+        for row in directed_links.itertuples(index=False)
+    }
+
+    selected_node_ids = {
+        int(node_id)
+        for upstream, downstream in selection_edge_pairs
+        for node_id in (int(upstream), int(downstream))
+    }
+
+    boundary_specs: list[tuple[str, int, list[int]]] = []
+    seen_specs: set[tuple[str, int, tuple[int, ...]]] = set()
+    for upstream, downstream, key in parent_graph.edges(keys=True):
+        parent_edge = (int(upstream), int(downstream))
+        if parent_edge in selection_edge_pairs:
+            continue
+        upstream_in = int(upstream) in selected_node_ids
+        downstream_in = int(downstream) in selected_node_ids
+        if upstream_in == downstream_in:
+            continue
+        if upstream_in:
+            role = "selected_upstream"
+            boundary_node_id = int(upstream)
+        else:
+            role = "selected_downstream"
+            boundary_node_id = int(downstream)
+        spec_key = (role, boundary_node_id, (int(key),))
+        if spec_key in seen_specs:
+            continue
+        seen_specs.add(spec_key)
+        boundary_specs.append((role, boundary_node_id, [int(key)]))
+
+    targets: dict[int, list[dict[str, Any]]] = {}
+    for role, boundary_node_id, candidate_parent_links in boundary_specs:
+        if boundary_node_id in matched_parent_node_ids:
+            continue
+        if not candidate_parent_links:
+            continue
+        boundary_point = parent_node_geometries.get(int(boundary_node_id))
+        if boundary_point is None or boundary_point.is_empty:
+            continue
+
+        rows = link_match.loc[
+            pd.to_numeric(link_match["parent_id_link"], errors="coerce").isin(candidate_parent_links)
+            & pd.to_numeric(link_match["parent_overlap_fraction"], errors="coerce").ge(parent_overlap_threshold)
+        ].copy()
+        if rows.empty:
+            continue
+
+        rows["candidate_rank"] = pd.to_numeric(rows["candidate_rank"], errors="coerce")
+        rows["child_overlap_fraction"] = pd.to_numeric(rows["child_overlap_fraction"], errors="coerce")
+        rows["boundary_point_distance"] = [
+            float(boundary_point.distance(child_geometries[int(child_id)]))
+            for child_id in rows["child_id_link"]
+        ]
+        rows = rows.sort_values(
+            ["boundary_point_distance", "candidate_rank", "child_overlap_fraction", "parent_id_link"],
+            ascending=[True, True, False, True],
+            kind="mergesort",
+        ).reset_index(drop=True)
+        selected = rows.iloc[0]
+        child_id_link = int(selected["child_id_link"])
+        child_geometry = child_geometries[child_id_link]
+        cut_distance = float(child_geometry.project(boundary_point))
+        if cut_distance <= 0.0 or cut_distance >= float(child_geometry.length):
+            continue
+        targets.setdefault(child_id_link, []).append(
+            {
+                "parent_node_id": int(boundary_node_id),
+                "cut_distance": cut_distance,
+                "role": role,
+                "source_parent_link_id": int(selected["parent_id_link"]),
+            }
+        )
+
+    return targets
 
 
 def _segment_parent_paths(
@@ -1627,17 +2235,24 @@ def _segment_collapsed_links_to_anchor_nodes(
     directed_links: gpd.GeoDataFrame,
     directed_nodes: gpd.GeoDataFrame,
     node_match: pd.DataFrame,
+    link_match: pd.DataFrame,
     link_lineage: pd.DataFrame,
+    selection_edge_pairs: Collection[tuple[int, int]],
     nominal_upstream_node: int | None,
     nominal_downstream_node: int | None,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, pd.DataFrame, dict[str, Any]]:
-    if nominal_upstream_node is None or nominal_downstream_node is None:
+    if nominal_upstream_node is None or nominal_downstream_node is None or not selection_edge_pairs:
         return directed_links, directed_nodes, node_match, {"n_anchor_splits": 0, "mode_applied": False}
 
     lineage_by_link = link_lineage.set_index("id_link", drop=False) if not link_lineage.empty else pd.DataFrame()
     parent_node_flags = (
         parent_nodes.set_index("id_node", drop=False)[["is_inlet", "is_outlet"]].to_dict("index")
         if not parent_nodes.empty and {"id_node", "is_inlet", "is_outlet"}.issubset(parent_nodes.columns)
+        else {}
+    )
+    parent_node_geometries = (
+        parent_nodes.set_index("id_node", drop=False)["geometry"].to_dict()
+        if not parent_nodes.empty and {"id_node", "geometry"}.issubset(parent_nodes.columns)
         else {}
     )
     geometry_overrides: dict[int, Point] = {}
@@ -1648,65 +2263,134 @@ def _segment_collapsed_links_to_anchor_nodes(
     n_anchor_splits = 0
     n_new_nodes = 0
     n_new_links = 0
+    boundary_cut_targets = _boundary_overlap_cut_targets(
+        parent_graph=parent_graph,
+        parent_node_geometries=parent_node_geometries,
+        directed_links=directed_links,
+        node_match=node_match,
+        link_match=link_match,
+        selection_edge_pairs=selection_edge_pairs,
+        nominal_upstream_node=int(nominal_upstream_node),
+        nominal_downstream_node=int(nominal_downstream_node),
+    )
 
     for row in directed_links.itertuples(index=False):
         row_data = row._asdict()
         link_id = int(row_data["id_link"])
-        if lineage_by_link.empty or link_id not in lineage_by_link.index:
+        boundary_specs = sorted(
+            boundary_cut_targets.get(link_id, []),
+            key=lambda item: float(item["cut_distance"]),
+        )
+        if (lineage_by_link.empty or link_id not in lineage_by_link.index) and not boundary_specs:
             updated_rows.append(dict(row_data))
             continue
 
-        lineage_row = lineage_by_link.loc[link_id]
-        parent_node_path = _parse_int_list(lineage_row.get("matched_parent_node_path", ""))
-        if len(parent_node_path) < 3:
+        lineage_row = lineage_by_link.loc[link_id] if not lineage_by_link.empty and link_id in lineage_by_link.index else None
+        parent_node_path = _parse_int_list(lineage_row.get("matched_parent_node_path", "")) if lineage_row is not None else []
+        if len(parent_node_path) < 3 and not boundary_specs:
             updated_rows.append(dict(row_data))
             continue
 
-        internal_cut_nodes = [
-            int(node_id)
-            for node_id in (int(nominal_upstream_node), int(nominal_downstream_node))
-            if int(node_id) in parent_node_path[1:-1]
-        ]
-        internal_cut_nodes = [node_id for node_id in parent_node_path[1:-1] if int(node_id) in set(internal_cut_nodes)]
-        if not internal_cut_nodes:
+        candidate_parent_runs = _selected_parent_subpaths(
+            parent_node_path,
+            selection_edge_pairs=selection_edge_pairs,
+        )
+
+        selected_parent_path: list[int] | None = None
+        internal_cut_nodes: list[int] = []
+        use_boundary_overlap_fallback = False
+        if candidate_parent_runs:
+            selected_parent_path = max(
+                candidate_parent_runs,
+                key=lambda path: (
+                    nominal_upstream_node in path and nominal_downstream_node in path,
+                    nominal_upstream_node in path or nominal_downstream_node in path,
+                    len(path),
+                ),
+            )
+            if len(selected_parent_path) >= 2:
+                internal_cut_nodes = [
+                    int(node_id)
+                    for node_id in (int(selected_parent_path[0]), int(selected_parent_path[-1]))
+                    if int(node_id) in parent_node_path[1:-1]
+                ]
+                internal_cut_nodes = [
+                    node_id for node_id in parent_node_path[1:-1] if int(node_id) in set(internal_cut_nodes)
+                ]
+        if not internal_cut_nodes and boundary_specs:
+            use_boundary_overlap_fallback = True
+        elif not internal_cut_nodes:
             updated_rows.append(dict(row_data))
             continue
 
-        interval_lengths = _parent_interval_lengths(parent_graph, parent_node_path)
-        if not interval_lengths:
-            updated_rows.append(dict(row_data))
-            continue
-
-        cumulative_lengths = [0.0]
-        for interval_length in interval_lengths:
-            cumulative_lengths.append(cumulative_lengths[-1] + float(interval_length))
-        total_length = cumulative_lengths[-1]
-        if total_length <= 0:
-            updated_rows.append(dict(row_data))
-            continue
-
-        cut_distances: list[float] = []
+        projected_cut_distances: list[float] = []
+        fallback_cut_distances: list[float] = []
         cut_parent_nodes: list[int] = []
-        for node_id in internal_cut_nodes:
-            cut_index = parent_node_path.index(int(node_id))
-            fraction = cumulative_lengths[cut_index] / total_length
-            if fraction <= 0.0 or fraction >= 1.0:
+        cut_roles: list[str] = []
+        if use_boundary_overlap_fallback:
+            cut_distances = [float(spec["cut_distance"]) for spec in boundary_specs]
+            cut_parent_nodes = [int(spec["parent_node_id"]) for spec in boundary_specs]
+            cut_roles = [str(spec["role"]) for spec in boundary_specs]
+        else:
+            interval_lengths = _parent_interval_lengths(parent_graph, parent_node_path)
+            if not interval_lengths:
+                updated_rows.append(dict(row_data))
                 continue
-            cut_distances.append(float(row.geometry.length) * fraction)
-            cut_parent_nodes.append(int(node_id))
-        if not cut_distances:
-            updated_rows.append(dict(row_data))
-            continue
+
+            cumulative_lengths = [0.0]
+            for interval_length in interval_lengths:
+                cumulative_lengths.append(cumulative_lengths[-1] + float(interval_length))
+            total_length = cumulative_lengths[-1]
+            if total_length <= 0:
+                updated_rows.append(dict(row_data))
+                continue
+
+            for node_id in internal_cut_nodes:
+                cut_index = parent_node_path.index(int(node_id))
+                fraction = cumulative_lengths[cut_index] / total_length
+                if fraction <= 0.0 or fraction >= 1.0:
+                    continue
+                fallback_cut_distances.append(float(row.geometry.length) * fraction)
+                parent_geometry = parent_node_geometries.get(int(node_id))
+                if parent_geometry is None or parent_geometry.is_empty:
+                    projected_cut_distances.append(float(row.geometry.length) * fraction)
+                else:
+                    projected_cut_distances.append(float(row.geometry.project(parent_geometry)))
+                cut_parent_nodes.append(int(node_id))
+            if not fallback_cut_distances:
+                updated_rows.append(dict(row_data))
+                continue
+
+            cut_distances = projected_cut_distances
+            if any(
+                distance <= 0.0 or distance >= float(row.geometry.length)
+                for distance in cut_distances
+            ) or any(
+                next_distance <= current_distance
+                for current_distance, next_distance in zip(cut_distances[:-1], cut_distances[1:])
+            ):
+                cut_distances = fallback_cut_distances
 
         segments, points = _split_line_geometry(row.geometry, cut_distances)
         if len(segments) <= 1:
             updated_rows.append(dict(row_data))
             continue
 
-        parent_path_segments = _segment_parent_paths(parent_node_path, cut_parent_nodes)
-        if len(parent_path_segments) != len(segments):
-            updated_rows.append(dict(row_data))
-            continue
+        if use_boundary_overlap_fallback:
+            parent_path_segments = [[] for _ in segments]
+        else:
+            parent_path_segments = _segment_parent_paths(parent_node_path, cut_parent_nodes)
+            if len(parent_path_segments) != len(segments):
+                updated_rows.append(dict(row_data))
+                continue
+
+        split_samples = _split_serialized_link_samples(
+            row_data,
+            cut_distances=cut_distances,
+            total_geometry_length=float(row.geometry.length),
+        )
+        idx_link_segments = split_samples["idx_link"]
+        wid_pix_segments = split_samples["wid_pix"]
 
         split_node_ids: list[int] = []
         for point, parent_node_id in zip(points, cut_parent_nodes):
@@ -1736,19 +2420,31 @@ def _segment_collapsed_links_to_anchor_nodes(
             node_match_rows.append(node_match_row)
 
         segment_node_ids = [int(row.id_us_node)] + split_node_ids + [int(row.id_ds_node)]
-        keep_index = 0
-        for index, segment_parent_path in enumerate(parent_path_segments):
-            if _segment_contains_nominal_interval(
-                segment_parent_path=segment_parent_path,
-                nominal_upstream_node=int(nominal_upstream_node),
-                nominal_downstream_node=int(nominal_downstream_node),
-            ):
-                keep_index = index
-                break
+        keep_index: int | None = None
+        if use_boundary_overlap_fallback:
+            roles = cut_roles
+            if roles == ["selected_upstream"]:
+                keep_index = 0
+            elif roles == ["selected_downstream"]:
+                keep_index = 1
+            elif len(roles) == 2:
+                keep_index = 1
+        else:
+            for index, segment_parent_path in enumerate(parent_path_segments):
+                if [int(node_id) for node_id in segment_parent_path] == [int(node_id) for node_id in selected_parent_path]:
+                    keep_index = index
+                    break
+        if keep_index is None:
+            updated_rows.append(dict(row_data))
+            continue
 
         for index, (segment_geometry, segment_parent_path) in enumerate(zip(segments, parent_path_segments)):
             new_row = _line_length_fields_updated(row_data, segment_geometry)
             new_row["geometry"] = segment_geometry
+            if "idx_link" in new_row and index < len(idx_link_segments):
+                new_row["idx_link"] = idx_link_segments[index]
+            if "wid_pix" in new_row and index < len(wid_pix_segments):
+                new_row["wid_pix"] = wid_pix_segments[index]
             new_row["id_us_node"] = int(segment_node_ids[index])
             new_row["id_ds_node"] = int(segment_node_ids[index + 1])
             new_row["id_nodes"] = f"{int(segment_node_ids[index])}, {int(segment_node_ids[index + 1])}"
@@ -1767,8 +2463,6 @@ def _segment_collapsed_links_to_anchor_nodes(
     updated_links = gpd.GeoDataFrame(updated_rows, geometry="geometry", crs=directed_links.crs)
     updated_links["id_link"] = pd.to_numeric(updated_links["id_link"], errors="coerce").astype(int)
     updated_links = updated_links.sort_values("id_link", kind="mergesort").reset_index(drop=True)
-    if "idx_link" in updated_links.columns:
-        updated_links["idx_link"] = np.arange(len(updated_links), dtype=int)
 
     updated_node_match = pd.DataFrame.from_records(node_match_rows, columns=node_match.columns if not node_match.empty else None)
     if not updated_node_match.empty and "child_id_node" in updated_node_match.columns:
@@ -2835,7 +3529,6 @@ def generate_network_variant(
     if missing_unit_ids:
         raise ValueError(f"The following selected unit_ids were not found in the reviewed graph: {missing_unit_ids}")
 
-    components = _componentize_units(resolved_unit_ids, units_by_id)
     reviewed_links = gpd.read_file(reviewed_links_path)
     reviewed_nodes = gpd.read_file(reviewed_nodes_path)
     with rasterio.open(cleaned_mask_path) as src:
@@ -2845,12 +3538,13 @@ def generate_network_variant(
     if match_tolerance is None:
         match_tolerance = pixel_length * 1.25
 
-    collapsed_mask, mask_summary, collapse_components, edit_geometries = _apply_collapse_components_to_mask(
-        cleaned_mask_path,
-        components,
-        reviewed_links,
+    collapsed_mask, width_scope_mask, mask_summary, collapse_components, edit_geometries = _build_selection_masks(
+        cleaned_mask_path=cleaned_mask_path,
+        reviewed_links=reviewed_links,
+        resolved_unit_ids=resolved_unit_ids,
+        units_by_id=units_by_id,
         preferred_width_field=preferred_width_field,
-        buffer_scale=footprint_buffer_scale,
+        footprint_buffer_scale=footprint_buffer_scale,
         all_touched=all_touched,
         allow_noop=allow_noop,
     )
@@ -2873,8 +3567,13 @@ def generate_network_variant(
     edit_geometries["variant_id"] = variant_id
 
     collapsed_mask_path = _write_mask(mask_dir / f"{example_id}__{variant_id}_collapsed.tif", collapsed_mask, parent_profile)
+    width_scope_mask_path = _write_mask(mask_dir / "width_scope_mask.tif", width_scope_mask, parent_profile)
     edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
     collapse_components.to_csv(summary_dir / "collapse_components.csv", index=False)
+    width_scope_thread_caps = _build_width_scope_thread_caps(
+        collapse_components=collapse_components,
+        units_by_id=units_by_id,
+    )
 
     metadata = {
         "example_id": example_id,
@@ -2916,6 +3615,8 @@ def generate_network_variant(
         wet_reference_mask_path=wet_reference_mask_path,
         transect_scale=transect_scale,
         min_transect_pixels=min_transect_pixels,
+        width_scope_mask_path=width_scope_mask_path,
+        width_scope_thread_caps=width_scope_thread_caps,
     )
     link_width_samples = _apply_collapsed_selection_metadata(
         link_width_samples,
@@ -2956,6 +3657,10 @@ def generate_network_variant(
             resolved_unit_ids=resolved_unit_ids,
             units_by_id=units_by_id,
         )
+        selection_edge_pairs = _selection_edge_pairs(
+            resolved_unit_ids=resolved_unit_ids,
+            units_by_id=units_by_id,
+        )
         directed_links, directed_nodes, node_match, anchor_segmentation_summary = _segment_collapsed_links_to_anchor_nodes(
             parent_graph=parent_graph,
             parent_nodes=reviewed_nodes,
@@ -2963,7 +3668,9 @@ def generate_network_variant(
             directed_links=directed_links,
             directed_nodes=directed_nodes,
             node_match=node_match,
+            link_match=link_match,
             link_lineage=link_lineage,
+            selection_edge_pairs=selection_edge_pairs,
             nominal_upstream_node=nominal_upstream_node,
             nominal_downstream_node=nominal_downstream_node,
         )
@@ -3050,6 +3757,7 @@ def generate_network_variant(
             wet_reference_mask_path=wet_reference_mask_path,
             transect_scale=transect_scale,
             min_transect_pixels=min_transect_pixels,
+            width_scope_mask_path=width_scope_mask_path,
         )
         enriched_links = anchored_enriched_links
         link_width_samples = _apply_collapsed_selection_metadata(
@@ -3058,40 +3766,17 @@ def generate_network_variant(
             group_label=group_label,
         )
 
-    width_columns = [column for column in enriched_links.columns if column not in raw_links.columns or column == enriched_links.geometry.name]
-    directed_enriched_links = directed_links.copy()
-    if "id_link" in enriched_links.columns:
-        enriched_lookup = enriched_links.drop(columns=enriched_links.geometry.name, errors="ignore").copy()
-        directed_enriched_links = directed_enriched_links.merge(
-            enriched_lookup[[column for column in enriched_lookup.columns if column == "id_link" or column in width_columns]],
-            on="id_link",
-            how="left",
-            validate="1:1",
-            suffixes=("", "_width"),
-        )
-    else:
-        for column in width_columns:
-            if column == enriched_links.geometry.name:
-                continue
-            if column in enriched_links.columns:
-                directed_enriched_links[column] = enriched_links[column].values
-    if collapse_corridor_mode != "anchored":
-        if "geometry_reversed_to_match_flow" in directed_enriched_links.columns and directed_enriched_links["geometry_reversed_to_match_flow"].any():
-            for column in ("wid_pix_total", "wid_pix_wet", "wid_pix_dry"):
-                if column not in directed_enriched_links.columns:
-                    continue
-                reversed_values = []
-                for value, reverse_flag in zip(directed_enriched_links[column], directed_enriched_links["geometry_reversed_to_match_flow"]):
-                    samples = _parse_float_list(value)
-                    if reverse_flag:
-                        samples = list(reversed(samples))
-                    reversed_values.append(_serialize_float_array(samples))
-                directed_enriched_links[column] = reversed_values
+    directed_enriched_links = _merge_width_families_onto_links(directed_links, enriched_links)
+    directed_enriched_links = _apply_width_sample_flow_alignment(
+        directed_enriched_links,
+        collapse_corridor_mode=collapse_corridor_mode,
+    )
 
-    link_width_families = pd.DataFrame(directed_enriched_links.drop(columns=directed_enriched_links.geometry.name))
-    link_width_families.to_csv(width_dir / "link_width_families.csv", index=False)
-    link_width_samples.to_csv(width_dir / "link_width_samples.csv", index=False)
-    directed_enriched_links.to_file(width_dir / "links_with_width_families.gpkg", driver="GPKG")
+    link_width_families = _write_width_family_outputs(
+        width_dir=width_dir,
+        link_width_samples=link_width_samples,
+        directed_enriched_links=directed_enriched_links,
+    )
 
     link_match.to_csv(matching_dir / "link_match.csv", index=False)
     link_lineage.to_csv(matching_dir / "link_lineage.csv", index=False)
@@ -3173,6 +3858,7 @@ def generate_network_variant(
         "output_paths": {
             "output_dir": str(output_path.resolve()),
             "collapsed_mask": str(collapsed_mask_path.resolve()),
+            "width_scope_mask": str(width_scope_mask_path.resolve()),
             "collapse_components": str((summary_dir / "collapse_components.csv").resolve()),
             "edit_geometries": str((mask_dir / "collapse_edit_geometries.gpkg").resolve()),
             "link_width_families": str((width_dir / "link_width_families.csv").resolve()),
@@ -3212,6 +3898,7 @@ def generate_network_variant(
         directed_nodes=directed_nodes,
         output_dir=output_path,
         collapsed_mask_path=collapsed_mask_path,
+        width_scope_mask_path=width_scope_mask_path,
         rivgraph_links_path=Path(rivgraph_paths["links"]),
         rivgraph_nodes_path=Path(rivgraph_paths["nodes"]),
         directed_links_path=directed_dir / f"{rivgraph_name}_directed_links.gpkg",
@@ -3224,6 +3911,483 @@ def generate_network_variant(
     if not bool(direction_summary.get("is_valid", False)):
         raise VariantDirectionValidationError(results, direction_summary.get("issues", []))
     return results
+
+
+def derive_anchored_variant_from_realized(
+    *,
+    source_output_dir: str | Path,
+    reviewed_links_path: str | Path,
+    reviewed_nodes_path: str | Path,
+    output_dir: str | Path,
+    example_id: str | None = None,
+    variant_id: str | None = None,
+    wet_reference_mask_path: str | Path | None = None,
+    sword_node_source_path: str | Path | None = None,
+    sword_wse_field: str | None = None,
+    sword_match_tolerance: float | None = None,
+    sword_example_station_source_path: str | Path | None = None,
+    sword_station_match_source_path: str | Path | None = None,
+    sword_reach_buffer_steps: int = 2,
+    max_path_cutoff: int = 100,
+    max_paths: int = 5000,
+    transect_scale: float = DEFAULT_TRANSECT_SCALE,
+    min_transect_pixels: float = DEFAULT_MIN_TRANSECT_PIXELS,
+    match_tolerance: float | None = None,
+) -> NetworkVariantOutputs:
+    source_output_path = Path(source_output_dir)
+    output_path = Path(output_dir)
+    source_manifest_path = source_output_path / "summary" / "variant_manifest.json"
+    if not source_manifest_path.exists():
+        raise FileNotFoundError(f"Realized variant manifest not found: {source_manifest_path}")
+
+    source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    selected_unit_ids = [int(unit_id) for unit_id in source_manifest.get("selected_unit_ids", [])]
+    if not selected_unit_ids:
+        raise ValueError("Realized variant manifest does not contain selected_unit_ids for anchored derivation.")
+
+    example_id = str(example_id) if example_id is not None else str(source_manifest.get("example_id"))
+    variant_id = str(variant_id) if variant_id is not None else str(source_manifest.get("variant_id"))
+
+    if output_path.exists():
+        shutil.rmtree(output_path)
+    shutil.copytree(source_output_path, output_path)
+
+    output_paths = {
+        key: _remap_copied_output_path(
+            value,
+            source_output_dir=source_output_path,
+            target_output_dir=output_path,
+        )
+        for key, value in dict(source_manifest.get("output_paths", {})).items()
+    }
+
+    collapsed_mask_path = output_paths.get("collapsed_mask")
+    if collapsed_mask_path is None or not collapsed_mask_path.exists():
+        raise FileNotFoundError("Could not resolve copied collapsed mask path for anchored derivation.")
+    if wet_reference_mask_path is None:
+        source_wet_reference = source_manifest.get("source_paths", {}).get("wet_reference_mask")
+        wet_reference_mask_path = source_wet_reference if source_wet_reference is not None else collapsed_mask_path
+    width_scope_mask_path = output_paths.get("width_scope_mask")
+
+    directed_links_path = output_paths.get("directed_links")
+    directed_nodes_path = output_paths.get("directed_nodes")
+    if directed_links_path is None or directed_nodes_path is None:
+        raise FileNotFoundError("Could not resolve copied directed graph paths for anchored derivation.")
+
+    matching_dir = output_path / "matching"
+    width_dir = output_path / "widths"
+    summary_dir = output_path / "summary"
+    directed_dir = output_path / "directed"
+    mask_dir = output_path / "mask"
+
+    node_match_path = output_paths.get("node_match")
+    link_match_path = output_paths.get("link_match")
+    link_lineage_path = output_paths.get("link_lineage")
+    if node_match_path is None or link_match_path is None or link_lineage_path is None:
+        raise FileNotFoundError("Could not resolve copied matching paths for anchored derivation.")
+
+    directed_links = gpd.read_file(directed_links_path)
+    directed_nodes = gpd.read_file(directed_nodes_path)
+    node_match = pd.read_csv(node_match_path)
+    link_match = pd.read_csv(link_match_path)
+    link_lineage = pd.read_csv(link_lineage_path)
+    collapse_components = pd.read_csv(summary_dir / "collapse_components.csv")
+    edit_geometries = gpd.read_file(mask_dir / "collapse_edit_geometries.gpkg")
+
+    reviewed_links = gpd.read_file(reviewed_links_path)
+    reviewed_nodes = gpd.read_file(reviewed_nodes_path)
+    with rasterio.open(collapsed_mask_path) as src:
+        pixel_length = _pixel_length_from_transform(src.transform)
+        collapsed_profile = src.profile.copy()
+    if match_tolerance is None:
+        match_tolerance = pixel_length * 1.25
+
+    _, units, _ = analyze_network(
+        reviewed_links_path,
+        reviewed_nodes_path,
+        max_path_cutoff=max_path_cutoff,
+        max_paths=max_paths,
+    )
+    units_by_id = {unit.unit_id: unit for unit in units}
+    missing_unit_ids = sorted(unit_id for unit_id in selected_unit_ids if unit_id not in units_by_id)
+    if missing_unit_ids:
+        raise ValueError(f"The following selected unit_ids were not found in the reviewed graph: {missing_unit_ids}")
+    if width_scope_mask_path is None or not width_scope_mask_path.exists():
+        source_cleaned_mask = source_manifest.get("source_paths", {}).get("cleaned_mask")
+        if source_cleaned_mask is None:
+            raise FileNotFoundError("Could not resolve source cleaned mask path to rebuild width_scope_mask.")
+        _, width_scope_mask, _, collapse_components, edit_geometries = _build_selection_masks(
+            cleaned_mask_path=source_cleaned_mask,
+            reviewed_links=reviewed_links,
+            resolved_unit_ids=selected_unit_ids,
+            units_by_id=units_by_id,
+            preferred_width_field=str(source_manifest.get("preferred_width_field", DEFAULT_FOOTPRINT_WIDTH_FIELD)),
+            footprint_buffer_scale=float(source_manifest.get("footprint_buffer_scale", DEFAULT_FOOTPRINT_BUFFER_SCALE)),
+            all_touched=bool(source_manifest.get("all_touched", True)),
+            allow_noop=True,
+        )
+        width_scope_mask_path = _write_mask(mask_dir / "width_scope_mask.tif", width_scope_mask, collapsed_profile)
+        collapse_components.to_csv(summary_dir / "collapse_components.csv", index=False)
+        edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
+    width_scope_thread_caps = _build_width_scope_thread_caps(
+        collapse_components=collapse_components,
+        units_by_id=units_by_id,
+    )
+
+    parent_node_order, _, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
+    _, parent_graph, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
+    nominal_upstream_node, nominal_downstream_node = _selection_anchor_nodes(
+        resolved_unit_ids=selected_unit_ids,
+        units_by_id=units_by_id,
+    )
+    selection_edge_pairs = _selection_edge_pairs(
+        resolved_unit_ids=selected_unit_ids,
+        units_by_id=units_by_id,
+    )
+    directed_links, directed_nodes, node_match, anchor_segmentation_summary = _segment_collapsed_links_to_anchor_nodes(
+        parent_graph=parent_graph,
+        parent_nodes=reviewed_nodes,
+        parent_node_order=parent_node_order,
+        directed_links=directed_links,
+        directed_nodes=directed_nodes,
+        node_match=node_match,
+        link_match=link_match,
+        link_lineage=link_lineage,
+        selection_edge_pairs=selection_edge_pairs,
+        nominal_upstream_node=nominal_upstream_node,
+        nominal_downstream_node=nominal_downstream_node,
+    )
+    link_match = _match_child_links_to_parent_links(
+        reviewed_links,
+        directed_links,
+        match_tolerance=float(match_tolerance),
+    )
+    link_lineage = _resolve_link_lineage(
+        parent_graph=parent_graph,
+        directed_child_links=directed_links,
+        node_match=node_match,
+        link_match=link_match,
+        match_tolerance=float(match_tolerance),
+    )
+    direction_summary = {
+        "is_valid": bool(anchor_segmentation_summary.get("validation_report", {}).get("is_valid", False)),
+        "source_node": anchor_segmentation_summary.get("validation_report", {}).get("source_nodes", [None])[0],
+        "sink_node": anchor_segmentation_summary.get("validation_report", {}).get("sink_nodes", [None])[0],
+        "source_nodes": anchor_segmentation_summary.get("validation_report", {}).get("source_nodes", []),
+        "sink_nodes": anchor_segmentation_summary.get("validation_report", {}).get("sink_nodes", []),
+        "n_oriented_links": int(len(directed_links)),
+        "n_node_matches": int(node_match["match_within_tolerance"].fillna(False).sum()) if "match_within_tolerance" in node_match.columns else 0,
+        "n_link_matches": int(link_match["child_id_link"].nunique()) if "child_id_link" in link_match.columns else 0,
+        "issues": list(anchor_segmentation_summary.get("issues", [])),
+        "validation_report": anchor_segmentation_summary.get("validation_report", {}),
+    }
+
+    effective_sword_wse_field = sword_wse_field or source_manifest.get("sword_matching", {}).get("wse_field")
+    directed_nodes, node_sword_match, sword_match_summary = match_variant_nodes_to_sword(
+        directed_nodes=directed_nodes,
+        parent_nodes=reviewed_nodes,
+        node_match=node_match,
+        sword_node_source_path=sword_node_source_path,
+        sword_wse_field=effective_sword_wse_field,
+        sword_match_tolerance=sword_match_tolerance,
+        example_id=example_id,
+        sword_example_station_source_path=sword_example_station_source_path,
+        sword_station_match_source_path=sword_station_match_source_path,
+        sword_reach_buffer_steps=sword_reach_buffer_steps,
+    )
+
+    group_label = source_manifest.get("group_label")
+    node_match = _apply_collapsed_selection_metadata(
+        node_match,
+        unit_ids=selected_unit_ids,
+        group_label=group_label,
+    )
+    link_match = _apply_collapsed_selection_metadata(
+        link_match,
+        unit_ids=selected_unit_ids,
+        group_label=group_label,
+    )
+    directed_links = _apply_collapsed_selection_metadata(
+        directed_links,
+        unit_ids=selected_unit_ids,
+        group_label=group_label,
+    )
+    directed_nodes = _apply_collapsed_selection_metadata(
+        directed_nodes,
+        unit_ids=selected_unit_ids,
+        group_label=group_label,
+    )
+    node_sword_match = _apply_collapsed_selection_metadata(
+        node_sword_match,
+        unit_ids=selected_unit_ids,
+        group_label=group_label,
+    )
+    link_lineage = _apply_collapsed_selection_metadata(
+        link_lineage,
+        unit_ids=selected_unit_ids,
+        group_label=group_label,
+    )
+    directed_links = directed_links.drop(
+        columns=[column for column in link_lineage.columns if column in directed_links.columns and column != "id_link"],
+        errors="ignore",
+    ).merge(link_lineage, on="id_link", how="left", validate="1:1")
+
+    enriched_links, anchored_link_width_samples = compute_width_families(
+        directed_links,
+        collapsed_mask_path=collapsed_mask_path,
+        wet_reference_mask_path=wet_reference_mask_path,
+        transect_scale=transect_scale,
+        min_transect_pixels=min_transect_pixels,
+        width_scope_mask_path=width_scope_mask_path,
+        width_scope_thread_caps=width_scope_thread_caps,
+    )
+    link_width_samples = _apply_collapsed_selection_metadata(
+        anchored_link_width_samples,
+        unit_ids=selected_unit_ids,
+        group_label=group_label,
+    )
+
+    directed_enriched_links = _merge_width_families_onto_links(directed_links, enriched_links)
+    link_width_families = _write_width_family_outputs(
+        width_dir=width_dir,
+        link_width_samples=link_width_samples,
+        directed_enriched_links=directed_enriched_links,
+    )
+
+    link_match.to_csv(matching_dir / "link_match.csv", index=False)
+    link_lineage.to_csv(matching_dir / "link_lineage.csv", index=False)
+    node_match.to_csv(matching_dir / "node_match.csv", index=False)
+    node_sword_match.to_csv(matching_dir / "node_sword_match.csv", index=False)
+    directed_links.to_file(directed_links_path, driver="GPKG")
+    directed_nodes.to_file(directed_nodes_path, driver="GPKG")
+    with (directed_dir / "direction_validation_report.json").open("w", encoding="utf-8") as handle:
+        json.dump(direction_summary["validation_report"], handle, indent=2)
+
+    manifest = dict(source_manifest)
+    manifest["collapse_corridor_mode"] = "anchored"
+    manifest["anchor_segmentation"] = anchor_segmentation_summary
+    manifest["scope"] = [
+        "collapsed mask reuse from realized variant",
+        "anchored corridor segmentation",
+        "parent-child graph rematching",
+        "total/wet/dry width-family recomputation",
+        "SWORD node matching/propagation",
+    ]
+    manifest["ready_for_rapid"] = bool(direction_summary.get("is_valid", False))
+    manifest["source_paths"] = dict(manifest.get("source_paths", {}))
+    manifest["source_paths"]["reviewed_links"] = str(Path(reviewed_links_path).resolve())
+    manifest["source_paths"]["reviewed_nodes"] = str(Path(reviewed_nodes_path).resolve())
+    manifest["source_paths"]["wet_reference_mask"] = str(Path(wet_reference_mask_path).resolve())
+    manifest["source_paths"]["realized_variant_output_dir"] = str(source_output_path.resolve())
+    manifest["sword_matching"] = {
+        "wse_field": effective_sword_wse_field,
+        "match_tolerance": sword_match_tolerance,
+        "reach_buffer_steps": int(sword_reach_buffer_steps),
+        "n_matched_nodes": int(node_sword_match["sword_node_id"].notna().sum()) if not node_sword_match.empty else 0,
+        "n_propagated_matches": int(node_sword_match["sword_match_from_parent"].fillna(False).sum()) if not node_sword_match.empty else 0,
+        "candidate_scope": sword_match_summary.get("scope"),
+        "candidate_region": sword_match_summary.get("candidate_region"),
+        "candidate_reach_count": sword_match_summary.get("candidate_reach_count"),
+        "candidate_reach_ids": sword_match_summary.get("candidate_reach_ids", []),
+        "upstream_station_key": sword_match_summary.get("upstream_station_key"),
+        "downstream_station_key": sword_match_summary.get("downstream_station_key"),
+        "upstream_reach_id": sword_match_summary.get("upstream_reach_id"),
+        "downstream_reach_id": sword_match_summary.get("downstream_reach_id"),
+        "filter_reason": sword_match_summary.get("reason"),
+    }
+    manifest["output_paths"] = {
+        key: str(path.resolve()) if path is not None else None
+        for key, path in output_paths.items()
+    }
+    manifest["output_paths"]["width_scope_mask"] = str(Path(width_scope_mask_path).resolve()) if width_scope_mask_path is not None else None
+    manifest["direction_summary"] = direction_summary
+    manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
+    manifest["code_version"] = _git_revision()
+    with (summary_dir / "variant_manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+
+    rivgraph_links_path = output_paths.get("rivgraph_links")
+    rivgraph_nodes_path = output_paths.get("rivgraph_nodes")
+    if rivgraph_links_path is None or rivgraph_nodes_path is None:
+        raise FileNotFoundError("Could not resolve copied RivGraph link/node paths for anchored derivation.")
+
+    results = NetworkVariantOutputs(
+        collapse_components=collapse_components,
+        edit_geometries=edit_geometries,
+        node_match=node_match,
+        node_sword_match=node_sword_match,
+        link_match=link_match,
+        link_lineage=link_lineage,
+        link_width_families=link_width_families,
+        link_width_samples=link_width_samples,
+        enriched_links=directed_enriched_links,
+        directed_links=directed_links,
+        directed_nodes=directed_nodes,
+        output_dir=output_path,
+        collapsed_mask_path=collapsed_mask_path,
+        width_scope_mask_path=width_scope_mask_path,
+        rivgraph_links_path=rivgraph_links_path,
+        rivgraph_nodes_path=rivgraph_nodes_path,
+        directed_links_path=directed_links_path,
+        directed_nodes_path=directed_nodes_path,
+        rivgraph_centerline_path=output_paths.get("rivgraph_centerline"),
+        sword_reaches_path=output_paths.get("sword_reaches"),
+        sword_nodes_path=output_paths.get("sword_nodes"),
+        manifest=manifest,
+    )
+    if not bool(direction_summary.get("is_valid", False)):
+        raise VariantDirectionValidationError(results, direction_summary.get("issues", []))
+    return results
+
+
+def refresh_variant_width_scope_and_families(
+    *,
+    variant_output_dir: str | Path,
+    reviewed_links_path: str | Path | None = None,
+    reviewed_nodes_path: str | Path | None = None,
+    cleaned_mask_path: str | Path | None = None,
+    wet_reference_mask_path: str | Path | None = None,
+    preferred_width_field: str | None = None,
+    footprint_buffer_scale: float | None = None,
+    transect_scale: float = DEFAULT_TRANSECT_SCALE,
+    min_transect_pixels: float = DEFAULT_MIN_TRANSECT_PIXELS,
+    max_path_cutoff: int = 100,
+    max_paths: int = 5000,
+) -> dict[str, Path]:
+    output_path = Path(variant_output_dir)
+    manifest_path = output_path / "summary" / "variant_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Variant manifest not found: {manifest_path}")
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    source_paths = dict(manifest.get("source_paths", {}))
+    output_paths = dict(manifest.get("output_paths", {}))
+    selected_unit_ids = [int(unit_id) for unit_id in manifest.get("selected_unit_ids", [])]
+    group_label = manifest.get("group_label")
+    collapse_corridor_mode = str(manifest.get("collapse_corridor_mode", "realized"))
+
+    resolved_reviewed_links = Path(reviewed_links_path) if reviewed_links_path is not None else Path(source_paths["reviewed_links"])
+    resolved_reviewed_nodes = Path(reviewed_nodes_path) if reviewed_nodes_path is not None else Path(source_paths["reviewed_nodes"])
+    resolved_cleaned_mask = Path(cleaned_mask_path) if cleaned_mask_path is not None else Path(source_paths["cleaned_mask"])
+    resolved_wet_reference_mask = (
+        Path(wet_reference_mask_path)
+        if wet_reference_mask_path is not None
+        else Path(source_paths.get("wet_reference_mask") or output_paths["collapsed_mask"])
+    )
+    collapsed_mask_path = Path(output_paths["collapsed_mask"])
+    directed_links_path = Path(output_paths["directed_links"])
+    width_dir = output_path / "widths"
+    mask_dir = output_path / "mask"
+    summary_dir = output_path / "summary"
+
+    reviewed_links = gpd.read_file(resolved_reviewed_links)
+    reviewed_nodes = gpd.read_file(resolved_reviewed_nodes)
+    directed_links = gpd.read_file(directed_links_path)
+
+    _, units, _ = analyze_network(
+        resolved_reviewed_links,
+        resolved_reviewed_nodes,
+        max_path_cutoff=max_path_cutoff,
+        max_paths=max_paths,
+    )
+    units_by_id = {unit.unit_id: unit for unit in units}
+    missing_unit_ids = sorted(unit_id for unit_id in selected_unit_ids if unit_id not in units_by_id)
+    if missing_unit_ids:
+        raise ValueError(f"The following selected unit_ids were not found in the reviewed graph: {missing_unit_ids}")
+
+    collapsed_mask, width_scope_mask, mask_summary, collapse_components, edit_geometries = _build_selection_masks(
+        cleaned_mask_path=resolved_cleaned_mask,
+        reviewed_links=reviewed_links,
+        resolved_unit_ids=selected_unit_ids,
+        units_by_id=units_by_id,
+        preferred_width_field=str(preferred_width_field or manifest.get("preferred_width_field", DEFAULT_FOOTPRINT_WIDTH_FIELD)),
+        footprint_buffer_scale=float(
+            footprint_buffer_scale if footprint_buffer_scale is not None else manifest.get("footprint_buffer_scale", DEFAULT_FOOTPRINT_BUFFER_SCALE)
+        ),
+        all_touched=bool(manifest.get("all_touched", True)),
+        allow_noop=bool(manifest.get("allow_noop", False) or not selected_unit_ids),
+    )
+
+    with rasterio.open(collapsed_mask_path) as src:
+        collapsed_profile = src.profile.copy()
+    width_scope_mask_path = _write_mask(mask_dir / "width_scope_mask.tif", width_scope_mask, collapsed_profile)
+
+    collapse_components = _apply_collapsed_selection_metadata(
+        collapse_components,
+        unit_ids=selected_unit_ids,
+        group_label=group_label,
+    )
+    edit_geometries = _apply_collapsed_selection_metadata(
+        edit_geometries,
+        unit_ids=selected_unit_ids,
+        group_label=group_label,
+    )
+    collapse_components.to_csv(summary_dir / "collapse_components.csv", index=False)
+    edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
+    width_scope_thread_caps = _build_width_scope_thread_caps(
+        collapse_components=collapse_components,
+        units_by_id=units_by_id,
+    )
+
+    enriched_links, link_width_samples = compute_width_families(
+        directed_links,
+        collapsed_mask_path=collapsed_mask_path,
+        wet_reference_mask_path=resolved_wet_reference_mask,
+        transect_scale=transect_scale,
+        min_transect_pixels=min_transect_pixels,
+        width_scope_mask_path=width_scope_mask_path,
+        width_scope_thread_caps=width_scope_thread_caps,
+    )
+    link_width_samples = _apply_collapsed_selection_metadata(
+        link_width_samples,
+        unit_ids=selected_unit_ids,
+        group_label=group_label,
+    )
+    directed_enriched_links = _merge_width_families_onto_links(directed_links, enriched_links)
+    directed_enriched_links = _apply_width_sample_flow_alignment(
+        directed_enriched_links,
+        collapse_corridor_mode=collapse_corridor_mode,
+    )
+    _write_width_family_outputs(
+        width_dir=width_dir,
+        link_width_samples=link_width_samples,
+        directed_enriched_links=directed_enriched_links,
+    )
+
+    manifest["preferred_width_field"] = str(preferred_width_field or manifest.get("preferred_width_field", DEFAULT_FOOTPRINT_WIDTH_FIELD))
+    manifest["footprint_buffer_scale"] = float(
+        footprint_buffer_scale if footprint_buffer_scale is not None else manifest.get("footprint_buffer_scale", DEFAULT_FOOTPRINT_BUFFER_SCALE)
+    )
+    manifest["transect_scale"] = float(transect_scale)
+    manifest["min_transect_pixels"] = float(min_transect_pixels)
+    manifest["mask_summary"] = mask_summary
+    manifest["source_paths"] = source_paths
+    manifest["source_paths"]["cleaned_mask"] = str(resolved_cleaned_mask.resolve())
+    manifest["source_paths"]["wet_reference_mask"] = str(resolved_wet_reference_mask.resolve())
+    manifest["source_paths"]["reviewed_links"] = str(resolved_reviewed_links.resolve())
+    manifest["source_paths"]["reviewed_nodes"] = str(resolved_reviewed_nodes.resolve())
+    manifest["output_paths"] = output_paths
+    manifest["output_paths"]["width_scope_mask"] = str(width_scope_mask_path.resolve())
+    manifest["output_paths"]["collapse_components"] = str((summary_dir / "collapse_components.csv").resolve())
+    manifest["output_paths"]["edit_geometries"] = str((mask_dir / "collapse_edit_geometries.gpkg").resolve())
+    manifest["output_paths"]["link_width_families"] = str((width_dir / "link_width_families.csv").resolve())
+    manifest["output_paths"]["link_width_samples"] = str((width_dir / "link_width_samples.csv").resolve())
+    manifest["output_paths"]["links_with_width_families"] = str((width_dir / "links_with_width_families.gpkg").resolve())
+    manifest["width_scope_patch"] = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "component_domain_label_mask",
+    }
+    manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
+    manifest["code_version"] = _git_revision()
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    return {
+        "variant_output_dir": output_path.resolve(),
+        "width_scope_mask": width_scope_mask_path.resolve(),
+        "link_width_families": (width_dir / "link_width_families.csv").resolve(),
+        "link_width_samples": (width_dir / "link_width_samples.csv").resolve(),
+        "links_with_width_families": (width_dir / "links_with_width_families.gpkg").resolve(),
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:

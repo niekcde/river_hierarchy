@@ -97,6 +97,8 @@ def run_rivgraph_for_run(
     vector_format: str = "gpkg",
     assign_flow: bool = False,
     verbose: bool = True,
+    clean_target: bool = True,
+    flow_mesh_mode: str = "auto",
 ) -> tuple[SmokePaths, dict[str, object]]:
     _, summary = _run_rivgraph_for_run(
         name=name,
@@ -108,6 +110,8 @@ def run_rivgraph_for_run(
         vector_format=vector_format,
         assign_flow=assign_flow,
         verbose=verbose,
+        clean_target=clean_target,
+        flow_mesh_mode=flow_mesh_mode,
     )
     paths = SmokePaths.from_name(name, run_dir)
     _write_legacy_smoke_summary(paths, summary)
@@ -127,6 +131,8 @@ def run_all_for_run(
     assign_flow: bool = False,
     force_prepare: bool = False,
     verbose: bool = True,
+    clean_target: bool = True,
+    flow_mesh_mode: str = "auto",
 ) -> dict[str, object]:
     summary = _run_all_for_run(
         name=name,
@@ -141,6 +147,8 @@ def run_all_for_run(
         assign_flow=assign_flow,
         force_prepare=force_prepare,
         verbose=verbose,
+        clean_target=clean_target,
+        flow_mesh_mode=flow_mesh_mode,
     )
     paths = SmokePaths.from_name(name, run_dir)
     _write_legacy_smoke_summary(paths, summary["rivgraph"])

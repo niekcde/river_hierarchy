@@ -78,6 +78,17 @@ def parse_args() -> argparse.Namespace:
         type=parse_optional_bool,
         help="Also run RivGraph's native flow-direction assignment. Accepts optional true/false.",
     )
+    run_parser.add_argument(
+        "--flow-mesh-mode",
+        choices=("auto", "valley", "centerline"),
+        default="auto",
+        help="Mesh mode for RivGraph flow assignment. 'auto' tries valley mesh first, then falls back to centerline mesh if needed.",
+    )
+    run_parser.add_argument(
+        "--keep-existing-rivgraph-files",
+        action="store_true",
+        help="Do not clear stale run-specific files from the rivgraph output folder before rerunning.",
+    )
     run_parser.add_argument("--quiet", action="store_true", help="Disable verbose RivGraph logging.")
 
     all_parser = subparsers.add_parser(
@@ -98,6 +109,17 @@ def parse_args() -> argparse.Namespace:
         default=False,
         type=parse_optional_bool,
         help="Also run RivGraph's native flow-direction assignment. Accepts optional true/false.",
+    )
+    all_parser.add_argument(
+        "--flow-mesh-mode",
+        choices=("auto", "valley", "centerline"),
+        default="auto",
+        help="Mesh mode for RivGraph flow assignment. 'auto' tries valley mesh first, then falls back to centerline mesh if needed.",
+    )
+    all_parser.add_argument(
+        "--keep-existing-rivgraph-files",
+        action="store_true",
+        help="Do not clear stale run-specific files from the rivgraph output folder before rerunning.",
     )
     all_parser.add_argument("--force-prepare", action="store_true", help="Rebuild the prepared mask even if it exists.")
     all_parser.add_argument("--quiet", action="store_true", help="Disable verbose RivGraph logging.")
@@ -150,6 +172,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, object]:
             vector_format=args.vector_format,
             assign_flow=args.assign_flow,
             verbose=not args.quiet,
+            clean_target=not args.keep_existing_rivgraph_files,
+            flow_mesh_mode=args.flow_mesh_mode,
         )
         return {"command": args.command, "run_paths": paths_to_dict(paths), "summary": summary}
 
@@ -167,6 +191,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, object]:
             assign_flow=args.assign_flow,
             force_prepare=args.force_prepare,
             verbose=not args.quiet,
+            clean_target=not args.keep_existing_rivgraph_files,
+            flow_mesh_mode=args.flow_mesh_mode,
         )
         return {"command": args.command, "run_paths": paths_to_dict(paths), "summary": summary}
 

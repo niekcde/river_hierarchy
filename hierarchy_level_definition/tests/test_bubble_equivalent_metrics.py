@@ -8,8 +8,10 @@ import pytest
 
 from hierarchy_level_definition.metrics import (
     BubbleEquivalentResistanceConfig,
+    LENGTH_FIELD_CANDIDATES,
     compute_bubble_equivalent_metrics_from_units,
     compute_K_manning,
+    resolve_length_field_candidates,
 )
 from hierarchy_level_definition.run_unit_workflow import UnitWorkflowOutputs, write_unit_workflow_outputs
 from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import StructuralUnit, UnitPath
@@ -187,3 +189,10 @@ def test_write_unit_workflow_outputs_writes_equivalent_resistance_files(tmp_path
     assert "bubble_equivalent_metrics.csv" in manifest["files"]
     assert manifest["n_equivalent_bubbles"] == 1
     assert manifest["resolved_kb_context"]["kb_value"] == 20.0
+
+
+def test_resolve_length_field_candidates_prioritizes_requested_field() -> None:
+    assert resolve_length_field_candidates(None) == LENGTH_FIELD_CANDIDATES
+    assert resolve_length_field_candidates("len") == ("len", "len_adj", "link_length_m")
+    with pytest.raises(ValueError, match="Unsupported equivalent-resistance length field"):
+        resolve_length_field_candidates("not_a_length_field")

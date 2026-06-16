@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -216,6 +217,79 @@ def resolve_input_mask(
     raise ValueError("mask_stage must be one of: auto, prepared, cleaned")
 
 
+def _clear_rivgraph_outputs(paths: WorkflowPaths) -> list[str]:
+    """Remove stale RivGraph artifacts for this run before regenerating outputs.
+
+    Only files and directories with the current run-name prefix are removed so
+    unrelated helper files in the results folder are preserved.
+    """
+
+    if not paths.rivgraph_dir.exists():
+        return []
+
+    deleted: list[str] = []
+    prefix = f"{paths.name}_"
+    for candidate in sorted(paths.rivgraph_dir.iterdir()):
+        if not candidate.name.startswith(prefix):
+            continue
+        if candidate.is_dir():
+            shutil.rmtree(candidate)
+        else:
+            candidate.unlink()
+        deleted.append(str(candidate))
+    return deleted
+
+
+def _clear_partial_mesh(network: object) -> None:
+    for attr in ("meshlines", "meshpolys", "centerline_smooth"):
+        if hasattr(network, attr):
+            delattr(network, attr)
+
+
+def _assign_flow_directions_with_mesh_mode(
+    network: object,
+    *,
+    flow_mesh_mode: str,
+) -> dict[str, object]:
+    if flow_mesh_mode not in {"auto", "valley", "centerline"}:
+        raise ValueError("flow_mesh_mode must be one of: auto, valley, centerline")
+
+    if flow_mesh_mode == "centerline":
+        network.single_thread = True
+        network.compute_mesh(single_thread=True)
+        network.assign_flow_directions()
+        return {
+            "requested": flow_mesh_mode,
+            "used": "centerline",
+            "fallback_applied": False,
+            "primary_error": None,
+        }
+
+    try:
+        network.single_thread = False
+        network.assign_flow_directions()
+        return {
+            "requested": flow_mesh_mode,
+            "used": "valley",
+            "fallback_applied": False,
+            "primary_error": None,
+        }
+    except Exception as exc:
+        if flow_mesh_mode != "auto":
+            raise
+
+        _clear_partial_mesh(network)
+        network.single_thread = True
+        network.compute_mesh(single_thread=True)
+        network.assign_flow_directions()
+        return {
+            "requested": flow_mesh_mode,
+            "used": "centerline",
+            "fallback_applied": True,
+            "primary_error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def run_rivgraph_for_run(
     *,
     name: str,
@@ -227,13 +301,16 @@ def run_rivgraph_for_run(
     vector_format: str = "gpkg",
     assign_flow: bool = False,
     verbose: bool = True,
-    ) -> tuple[WorkflowPaths, dict[str, object]]:
+    clean_target: bool = True,
+    flow_mesh_mode: str = "auto",
+) -> tuple[WorkflowPaths, dict[str, object]]:
     from rivgraph.classes import river
     import rivgraph.rivers.river_utils as ru
 
     paths = WorkflowPaths.from_name(name, run_dir, output_root=output_root)
     paths.ensure_dirs()
     input_mask, input_stage = resolve_input_mask(paths=paths, explicit_mask=mask, mask_stage=mask_stage)
+    deleted_rivgraph_outputs = _clear_rivgraph_outputs(paths) if clean_target else []
 
     network = river(
         name=paths.name,
@@ -250,8 +327,12 @@ def run_rivgraph_for_run(
     network.finalize_ids()
     network.compute_link_width_and_length()
     network.compute_centerline()
+    flow_mesh_summary: dict[str, object] | None = None
     if assign_flow:
-        network.assign_flow_directions()
+        flow_mesh_summary = _assign_flow_directions_with_mesh_mode(
+            network,
+            flow_mesh_mode=flow_mesh_mode,
+        )
         network.to_geotiff("directions")
     network.to_geovectors("network", ftype=vector_format)
     network.to_geovectors("centerline", ftype=vector_format)
@@ -271,7 +352,13 @@ def run_rivgraph_for_run(
         "vector_format": vector_format,
         "flow_directions_assigned": assign_flow,
         "flow_direction_backend": "rivgraph" if assign_flow else None,
+        "flow_mesh_mode_requested": flow_mesh_mode if assign_flow else None,
+        "flow_mesh_mode_used": None if flow_mesh_summary is None else flow_mesh_summary["used"],
+        "flow_mesh_fallback_applied": False if flow_mesh_summary is None else flow_mesh_summary["fallback_applied"],
+        "flow_mesh_primary_error": None if flow_mesh_summary is None else flow_mesh_summary["primary_error"],
         "rivgraph_results_dir": str(paths.rivgraph_dir),
+        "cleaned_rivgraph_target": clean_target,
+        "deleted_rivgraph_outputs": deleted_rivgraph_outputs,
         "n_links": len(network.links.get("id", [])),
         "n_nodes": len(network.nodes.get("id", [])),
         "inlets": network.nodes.get("inlets", []),
@@ -308,6 +395,8 @@ def run_all_for_run(
     assign_flow: bool = False,
     force_prepare: bool = False,
     verbose: bool = True,
+    clean_target: bool = True,
+    flow_mesh_mode: str = "auto",
 ) -> dict[str, object]:
     paths, prepare_summary = prepare_mask_for_run(
         name=name,
@@ -338,6 +427,8 @@ def run_all_for_run(
         vector_format=vector_format,
         assign_flow=assign_flow,
         verbose=verbose,
+        clean_target=clean_target,
+        flow_mesh_mode=flow_mesh_mode,
     )
     return {
         "prepare": prepare_summary,

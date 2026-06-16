@@ -2,9 +2,11 @@
 
 from .bubble_equivalent_metrics import (
     BubbleEquivalentResistanceConfig,
+    LENGTH_FIELD_CANDIDATES,
     compute_bubble_equivalent_metrics,
     compute_bubble_equivalent_metrics_from_units,
     prepare_bubble_resistance_edges,
+    resolve_length_field_candidates,
 )
 from .equivalent_resistance import (
     compare_states,
@@ -26,6 +28,7 @@ from .unit_metrics import (
 
 __all__ = [
     "BubbleEquivalentResistanceConfig",
+    "LENGTH_FIELD_CANDIDATES",
     "compare_states",
     "compute_bubble_equivalent_metrics",
     "compute_bubble_equivalent_metrics_from_units",
@@ -39,6 +42,7 @@ __all__ = [
     "prepare_bubble_resistance_edges",
     "reduce_simple_parallel",
     "reduce_simple_series",
+    "resolve_length_field_candidates",
     "solve_bubble_equivalent_K",
     "summarize_by_hierarchy_level",
     "write_metrics_outputs",

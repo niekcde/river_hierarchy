@@ -25,8 +25,10 @@ if __package__ is None or __package__ == "":
 
 from hierarchy_level_definition.metrics import (
     BubbleEquivalentResistanceConfig,
+    LENGTH_FIELD_CANDIDATES,
     compare_states,
     prepare_bubble_resistance_edges,
+    resolve_length_field_candidates,
     solve_bubble_equivalent_K,
 )
 from rapid_tools.forcing import ForcingConfig, prepare_forcing_table
@@ -239,6 +241,37 @@ def _normalize_numeric_id_columns(
     return result
 
 
+def _load_variant_links(
+    *,
+    directed_links_path: Path,
+    variant_output_dir: Path,
+) -> gpd.GeoDataFrame:
+    widths_links_path = variant_output_dir / "widths" / "links_with_width_families.gpkg"
+    width_families_csv_path = variant_output_dir / "widths" / "link_width_families.csv"
+
+    if widths_links_path.exists():
+        return _normalize_numeric_id_columns(gpd.read_file(widths_links_path))
+
+    directed_links = _normalize_numeric_id_columns(gpd.read_file(directed_links_path))
+    if not width_families_csv_path.exists():
+        return directed_links
+
+    width_families = pd.read_csv(width_families_csv_path)
+    width_families = _normalize_numeric_id_columns(width_families)
+    if "id_link" not in width_families.columns:
+        return directed_links
+
+    geometry_name = directed_links.geometry.name
+    merge_columns = [column for column in width_families.columns if column != geometry_name]
+    base_columns = set(directed_links.columns)
+    width_lookup = width_families[merge_columns].copy()
+    override_columns = [column for column in merge_columns if column != "id_link" and column in base_columns]
+    if override_columns:
+        directed_links = directed_links.drop(columns=override_columns, errors="ignore")
+    merged = directed_links.merge(width_lookup, on="id_link", how="left", validate="1:1")
+    return _normalize_numeric_id_columns(merged)
+
+
 def _load_base_state_context(
     base_row: pd.Series,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, pd.DataFrame, pd.DataFrame]:
@@ -256,7 +289,10 @@ def _load_base_state_context(
     if not unit_link_membership_path.exists():
         raise FileNotFoundError(f"Base unit-link membership was not found: {unit_link_membership_path}")
 
-    base_links = _normalize_numeric_id_columns(gpd.read_file(directed_links_path))
+    base_links = _load_variant_links(
+        directed_links_path=directed_links_path,
+        variant_output_dir=variant_output_dir,
+    )
     base_nodes = _normalize_numeric_id_columns(gpd.read_file(directed_nodes_path))
     unit_summary = pd.read_csv(unit_summary_path)
     unit_link_membership = pd.read_csv(unit_link_membership_path)
@@ -936,7 +972,10 @@ def _resolve_child_objects(
         if not lineage_path.exists():
             continue
 
-        child_links = _normalize_numeric_id_columns(gpd.read_file(child_links_path))
+        child_links = _load_variant_links(
+            directed_links_path=child_links_path,
+            variant_output_dir=variant_output_dir,
+        )
         child_nodes = _normalize_numeric_id_columns(gpd.read_file(child_nodes_path))
         lineage = _parse_lineage_lists(pd.read_csv(lineage_path))
         node_match = _parse_node_match(pd.read_csv(node_match_path)) if node_match_path.exists() else pd.DataFrame()
@@ -1493,6 +1532,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--equivalent-forcing-output-cache-dir", default=None, help="Optional forcing cache directory.")
     parser.add_argument("--equivalent-time-column", default="time", help="Timestamp column in the forcing file.")
     parser.add_argument("--equivalent-discharge-column", default="discharge", help="Discharge column in the forcing file.")
+    parser.add_argument(
+        "--equivalent-length-field",
+        choices=LENGTH_FIELD_CANDIDATES,
+        default=LENGTH_FIELD_CANDIDATES[0],
+        help="Preferred link-length field for equivalent-resistance solves.",
+    )
     return parser
 
 
@@ -1519,6 +1564,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             geometry_method=args.equivalent_geometry_method,
             kb_mode=args.equivalent_kb_mode,
             kb_value=args.equivalent_kb_value,
+            length_field_candidates=resolve_length_field_candidates(args.equivalent_length_field),
             default_manning_n=args.equivalent_manning_n,
             default_chezy_cz=args.equivalent_chezy_cz,
         ),

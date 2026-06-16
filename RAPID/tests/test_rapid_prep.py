@@ -30,6 +30,7 @@ def _write_state(
     link_id: int = 11,
     link_length: float = 1000.0,
     width_samples_wet: list[float] | None = None,
+    write_hydraulic_context: bool = True,
 ) -> Path:
     experiment_dir = tmp_path / "experiment"
     state_dir = experiment_dir / "states" / "S001_unit_1"
@@ -109,6 +110,23 @@ def _write_state(
         ]
     ).to_csv(hierarchy_dir / "unit_summary.csv", index=False)
 
+    if write_hydraulic_context:
+        hydraulic_context_dir = state_dir / "hydraulic_context"
+        hydraulic_context_dir.mkdir(parents=True, exist_ok=True)
+        unit_summary = pd.read_csv(hierarchy_dir / "unit_summary.csv")
+        link_context = compute_link_slopes(links, nodes, unit_summary=unit_summary, config=SlopeConfig())
+        link_context.to_csv(hydraulic_context_dir / "link_hydraulic_context.csv", index=False)
+        pd.DataFrame(
+            {
+                "id_node": nodes["id_node"],
+                "rapid_wse_for_slope": nodes["sword_wse"],
+            }
+        ).to_csv(hydraulic_context_dir / "node_hydraulic_context.csv", index=False)
+        (hydraulic_context_dir / "hydraulic_context_manifest.json").write_text(
+            json.dumps({"state_id": "S001_unit_1"}),
+            encoding="utf-8",
+        )
+
     registry = pd.DataFrame(
         [
             {
@@ -140,6 +158,49 @@ def _write_state(
     )
     forcing.to_csv(experiment_dir / "forcing.csv", index=False)
     return experiment_dir
+
+
+def _write_reference_section_summary(experiment_dir: Path) -> Path:
+    reference_dir = experiment_dir / "reference_section" / "variant"
+    directed_dir = reference_dir / "directed"
+    rivgraph_dir = reference_dir / "rivgraph"
+    directed_dir.mkdir(parents=True, exist_ok=True)
+    rivgraph_dir.mkdir(parents=True, exist_ok=True)
+
+    centerline_path = rivgraph_dir / "reference_centerline.gpkg"
+    directed_nodes_path = directed_dir / "reference_directed_nodes.gpkg"
+
+    centerline = gpd.GeoDataFrame(
+        [{"geometry": LineString([(0.0, 0.0), (1000.0, 0.0)])}],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    centerline.to_file(centerline_path, driver="GPKG")
+
+    reference_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 100, "is_inlet": True, "is_outlet": False, "geometry": Point(0.0, 0.0)},
+            {"id_node": 101, "is_inlet": False, "is_outlet": True, "geometry": Point(1000.0, 0.0)},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    reference_nodes.to_file(directed_nodes_path, driver="GPKG")
+
+    summary_path = experiment_dir / "reference_section" / "reference_section_summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "paths": {
+                    "centerline_path": str(centerline_path.resolve()),
+                    "directed_nodes_path": str(directed_nodes_path.resolve()),
+                    "reference_section_dir": str((experiment_dir / "reference_section").resolve()),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return summary_path
 
 
 def _write_multistation_forcing_csv(experiment_dir: Path) -> Path:
@@ -186,13 +247,12 @@ def test_prepare_experiment_writes_state_outputs(tmp_path: Path) -> None:
     assert (prep_dir / "inflow.nc").exists()
 
 
-def test_prepare_experiment_prefers_precomputed_hydraulic_context(tmp_path: Path, monkeypatch) -> None:
+def test_prepare_experiment_prefers_precomputed_hydraulic_context(tmp_path: Path) -> None:
     experiment_dir = _write_state(tmp_path)
     state_dir = experiment_dir / "states" / "S001_unit_1"
     variant_dir = state_dir / "variant"
     hierarchy_dir = state_dir / "hierarchy"
     hydraulic_context_dir = state_dir / "hydraulic_context"
-    hydraulic_context_dir.mkdir(parents=True)
 
     links = gpd.read_file(variant_dir / "widths" / "links_with_width_families.gpkg")
     nodes = gpd.read_file(variant_dir / "directed" / "test_directed_nodes.gpkg")
@@ -208,11 +268,6 @@ def test_prepare_experiment_prefers_precomputed_hydraulic_context(tmp_path: Path
         json.dumps({"state_id": "S001_unit_1"}),
         encoding="utf-8",
     )
-
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("compute_link_slopes should not run when precomputed hydraulic context exists")
-
-    monkeypatch.setattr("rapid_tools.prep.compute_link_slopes", fail_if_called)
 
     registry = prepare_experiment(
         experiment_dir,
@@ -231,6 +286,55 @@ def test_prepare_experiment_prefers_precomputed_hydraulic_context(tmp_path: Path
     manifest = json.loads((prep_dir / "rapid_prep_manifest.json").read_text())
     assert manifest["hydraulic_context"]["source"] == "precomputed_state_hydraulic_context"
     assert Path(manifest["hydraulic_context"]["link_context_csv"]).exists()
+
+
+def test_prepare_experiment_uses_precomputed_hydraulic_context_for_reference_section_mode(
+    tmp_path: Path,
+) -> None:
+    experiment_dir = _write_state(tmp_path)
+    summary_path = _write_reference_section_summary(experiment_dir)
+    state_dir = experiment_dir / "states" / "S001_unit_1"
+    hydraulic_context_dir = state_dir / "hydraulic_context"
+    pd.DataFrame(
+        [
+            {
+                "id_link": 11,
+                "id_us_node": 1,
+                "id_ds_node": 2,
+                "link_length_m": 1000.0,
+                "slope_used": 0.123456,
+                "slope_adjusted": False,
+            }
+        ]
+    ).to_csv(hydraulic_context_dir / "link_hydraulic_context.csv", index=False)
+
+    registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=experiment_dir / "forcing.csv",
+        prep_config=RapidPrepConfig(
+            slope_profile_mode="reference_section",
+            reference_section_summary_path=str(summary_path),
+        ),
+    )
+
+    assert registry.loc[0, "status"] == "prepared"
+    assert registry.loc[0, "hydraulic_context_source"] == "precomputed_state_hydraulic_context"
+    prep_dir = state_dir / "rapid" / "prep"
+    rapid_links = pd.read_csv(prep_dir / "rapid_link_attributes.csv")
+    assert set(np.round(rapid_links["slope_used"], 6)) == {0.123456}
+
+
+def test_prepare_experiment_requires_state_hydraulic_context(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path, write_hydraulic_context=False)
+
+    registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=experiment_dir / "forcing.csv",
+        prep_config=RapidPrepConfig(),
+    )
+
+    assert registry.loc[0, "status"] == "failed"
+    assert "link_hydraulic_context.csv" in str(registry.loc[0, "error"])
 
 
 def test_prepare_experiment_normalizes_station_key_forcing(tmp_path: Path) -> None:

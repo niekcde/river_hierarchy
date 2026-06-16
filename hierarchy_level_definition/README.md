@@ -44,6 +44,13 @@ The metrics module writes:
 - `hierarchy_level_metrics.csv`
 - `metrics_manifest.json`
 
+When geometry-informed equivalent resistance is enabled, the full workflow also
+writes:
+
+- `bubble_equivalent_metrics.csv`
+- `bubble_edge_resistance.csv`
+- `bubble_node_heads.csv`
+
 Metric definitions:
 
 - See `metrics/metrics_definition.md` for the full metric reference, including equations, width definitions, and a shorter "important metrics" overview.
@@ -140,6 +147,9 @@ The full runner writes:
 - `ordered_group_partitions.csv`
 - `group_count_summary.csv`
 - `bubble_summary.csv`
+- `bubble_equivalent_metrics.csv`
+- `bubble_edge_resistance.csv`
+- `bubble_node_heads.csv`
 - `selected_groups.csv`
 - `unit_workflow_manifest.json`
 
@@ -171,3 +181,53 @@ So the final selected groups are:
 - non-overlapping within the selected partition
 
 This runner should work for any reviewed graph-like files that follow the same links/nodes schema used here.
+
+## Geometry-Informed Equivalent Resistance
+
+The hierarchy workflow can now optionally compute a geometry-informed
+equivalent-resistance predictor for standalone and compound bubble subgraphs.
+
+Important constraints:
+
+- this is intended as a predictor derived from geometry, not from modeled RAPID
+  discharge or hydrograph outputs
+- the main solve uses a normalized unit-head boundary condition rather than
+  calibrated hydraulic heads
+- observed node WSE values are used only for boundary orientation and optional
+  initial guesses
+
+The workflow computes:
+
+- one edge-level resistance `K_e` and conductance `G_e = 1 / K_e` per bubble edge
+- one equivalent bubble resistance `K_eq`
+- one equivalent bubble conductance `G_eq = 1 / K_eq`
+- normalized internal solver heads and unit-head edge flows
+
+CLI entry point:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python \
+  hierarchy_level_definition/run_unit_workflow.py \
+  <links.gpkg> \
+  <nodes.gpkg> \
+  --compute-equivalent-resistance \
+  --equivalent-resistance-law manning \
+  --equivalent-geometry-method wide \
+  --equivalent-kb-value 20
+```
+
+This workflow currently uses a fixed `kb` from the CLI. The experiment-level
+`based_reference_section` `kb` path is handled downstream in
+`network_variants/`.
+
+The output files mean:
+
+- `bubble_equivalent_metrics.csv`
+  One row per reduced bubble object with `K_eq`, `G_eq`, solver status, and
+  resolved `kb` metadata.
+- `bubble_edge_resistance.csv`
+  Edge-level geometry, hydraulic-geometry terms, `K_e`, `G_e`, and unit-head
+  flow diagnostics.
+- `bubble_node_heads.csv`
+  Normalized internal node heads from the solve, including boundary flags and
+  continuity residuals.

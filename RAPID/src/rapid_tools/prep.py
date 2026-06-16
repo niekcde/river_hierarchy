@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import warnings
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -26,7 +26,6 @@ from .forcing import ForcingConfig, infer_forcing_dt_seconds, prepare_forcing_ta
 from .k_values import KValueConfig, compute_k_values, compute_routing_dt_seconds, resolve_width_field
 from .reference_section import compute_reference_section_kb
 from .registry import RapidStateContext, iter_preparable_states, load_state_registry
-from .slope import SlopeConfig, compute_link_slopes
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +33,8 @@ class RapidPrepConfig:
     width_field: str = "wid_adj_wet"
     vary_width_by_subreach: bool = False
     subreach_width_sample_field: str = "width_wet"
+    slope_profile_mode: str = "network_dist"
+    reference_section_summary_path: str | None = None
     x_value: float = 0.1
     kb_value: float = 20.0
     kb_mode: str = "fixed"
@@ -93,15 +94,6 @@ def _apply_branch_widths(
 
 def _normalize_dir_path(raw: str | Path) -> Path:
     return Path(raw).expanduser().resolve()
-
-
-def _load_unit_summary_if_exists(hierarchy_output_dir: Path | None) -> pd.DataFrame | None:
-    if hierarchy_output_dir is None:
-        return None
-    unit_summary_path = hierarchy_output_dir / "unit_summary.csv"
-    if not unit_summary_path.exists():
-        return None
-    return pd.read_csv(unit_summary_path)
 
 
 def _load_link_hydraulic_context_if_exists(
@@ -873,31 +865,17 @@ def prepare_state(
                 f"State {context.state_id} is missing required SWORD node columns for strict RAPID prep: {missing}"
             )
 
-    unit_summary = _load_unit_summary_if_exists(context.hierarchy_output_dir)
-    hydraulic_context_source = "computed_in_rapid_prep_fallback"
-    hydraulic_context_link_path: Path | None = None
     slope_frame, hydraulic_context_link_path = _load_link_hydraulic_context_if_exists(context)
     if slope_frame is None:
-        slope_frame = compute_link_slopes(
-            links,
-            nodes,
-            unit_summary=unit_summary,
-            config=SlopeConfig(
-                min_slope=prep_config.min_slope,
-                max_slope_for_k=prep_config.max_slope_for_k,
-                section_slope_ratio_min=prep_config.section_slope_ratio_min,
-                section_slope_ratio_max=prep_config.section_slope_ratio_max,
-                use_section_slope_fallback=prep_config.use_section_slope_fallback,
-                use_compound_bubble_slope_qc=prep_config.use_compound_bubble_slope_qc,
-                use_compound_bubble_slope_repair=prep_config.use_compound_bubble_slope_repair,
-                compound_bubble_max_paths_for_qc=prep_config.compound_bubble_max_paths_for_qc,
-                compound_bubble_path_drop_rel_tol=prep_config.compound_bubble_path_drop_rel_tol,
-                compound_bubble_path_drop_abs_tol_m=prep_config.compound_bubble_path_drop_abs_tol_m,
-                preferred_length_field=prep_config.preferred_length_field,
-            ),
+        requested_mode = str(prep_config.slope_profile_mode or "network_dist").strip().lower()
+        raise FileNotFoundError(
+            "State hydraulic context is required before RAPID prep. "
+            f"Missing link_hydraulic_context.csv for state {context.state_id} under "
+            f"{context.hydraulic_context_output_dir or (context.state_dir / 'hydraulic_context')}. "
+            "Generate slope/profile outputs during variant creation "
+            f"(requested slope_profile_mode={requested_mode!r}) and rerun prep."
         )
-    else:
-        hydraulic_context_source = "precomputed_state_hydraulic_context"
+    hydraulic_context_source = "precomputed_state_hydraulic_context"
     prepared_links = links.merge(slope_frame, on=["id_link", "id_us_node", "id_ds_node"], how="left")
     prepared_links["link_length_m"] = pd.to_numeric(prepared_links["link_length_m"], errors="coerce").astype(float)
     prepared_links = _apply_branch_widths(
@@ -1138,6 +1116,7 @@ def prepare_experiment(
     prep_rows: list[dict[str, object]] = []
     prep_config = prep_config or RapidPrepConfig()
     forcing_config = forcing_config or ForcingConfig()
+    resolved_prep_config = prep_config
 
     forcing_table: pd.DataFrame | None = None
     forcing_metadata: dict[str, object] | None = None
@@ -1148,19 +1127,19 @@ def prepare_experiment(
     try:
         if forcing_path is not None:
             forcing_table, forcing_metadata = prepare_forcing_table(forcing_path, config=forcing_config)
-        if str(prep_config.kb_mode or "fixed") == "based_reference_section":
+        if str(resolved_prep_config.kb_mode or "fixed") == "based_reference_section":
             if forcing_table is None:
                 raise ValueError("based_reference_section kb mode requires forcing_path to be provided.")
             reference_kb_summary = compute_reference_section_kb(
                 experiment_path,
                 forcing=forcing_table,
-                width_sample_field=prep_config.kb_width_sample_field,
-                width_percentile=prep_config.kb_width_percentile,
-                model_path=prep_config.kb_model_path,
+                width_sample_field=resolved_prep_config.kb_width_sample_field,
+                width_percentile=resolved_prep_config.kb_width_percentile,
+                model_path=resolved_prep_config.kb_model_path,
             )
         resolved_kb_summary = resolve_kb_context(
-            kb_mode=prep_config.kb_mode,
-            kb_value=prep_config.kb_value,
+            kb_mode=resolved_prep_config.kb_mode,
+            kb_value=resolved_prep_config.kb_value,
             reference_kb_summary=reference_kb_summary,
         ).to_dict()
     except Exception as exc:  # pragma: no cover
@@ -1187,7 +1166,7 @@ def prepare_experiment(
                 context,
                 forcing_path=forcing_path,
                 forcing_config=forcing_config,
-                prep_config=prep_config,
+                prep_config=resolved_prep_config,
                 forcing_table=forcing_table,
                 forcing_metadata=forcing_metadata,
                 reference_kb_summary=reference_kb_summary,
@@ -1213,7 +1192,7 @@ def prepare_experiment(
                 "experiment_dir": str(experiment_path),
                 "forcing_path": str(Path(forcing_path).expanduser().resolve()) if forcing_path is not None else None,
                 "forcing_config": asdict(forcing_config) if forcing_config is not None else None,
-                "prep_config": asdict(prep_config),
+                "prep_config": asdict(resolved_prep_config),
                 "reference_kb_summary": reference_kb_summary,
                 "resolved_kb_summary": resolved_kb_summary,
                 "experiment_prepass_error": experiment_prepass_error,

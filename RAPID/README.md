@@ -57,10 +57,13 @@ The state-based prep expects a `network_variants` experiment directory with:
 - `state_registry.csv`
 - per-state directed nodes
 - per-state width-enriched links
+- per-state `hydraulic_context/` artifacts when available
 
 Prep writes RAPID inputs under `states/<state_id>/rapid/prep/` and can:
 
-- compute link slope from matched SWORD WSE
+- prefer precomputed state-level hydraulic context from `network_variants`
+- fall back to internal slope derivation from matched SWORD WSE when that
+  hydraulic context is missing
 - optionally guard local link slopes against section-scale outliers
 - compute RAPID `K` and `X`
 - optionally derive one example-level `kb` from a cached reference section
@@ -71,6 +74,39 @@ Prep writes RAPID inputs under `states/<state_id>/rapid/prep/` and can:
 - normalize forcing and write `inflow.nc`
 - export geometry-preserving RAPID reach and node GeoPackages for downstream
   visualization
+
+### Hydraulic Context Ownership
+
+Slope/profile derivation is now treated primarily as a `network_variants`
+responsibility rather than a RAPID-only preprocessing step.
+
+The target workflow is:
+
+1. `network_variants` writes `states/<state_id>/hydraulic_context/`
+2. RAPID prep reads `link_hydraulic_context.csv` and
+   `node_hydraulic_context.csv`
+3. RAPID prep uses those precomputed state-level slope/profile fields when
+   building routing parameters
+
+The old RAPID-internal slope path still exists as a transitional fallback for
+incomplete older experiment directories, but it is not the intended long-term
+owner of that logic. The desired end state is:
+
+- all slope/profile construction happens in `network_variants`
+- RAPID prep performs no reference-section fitting and no slope derivation
+- RAPID prep only consumes cached hydraulic-context outputs
+- this keeps hydraulic assumptions with the state geometry that created them
+- this also keeps RAPID prep fast
+
+The node-side hydraulic-context manifest also keeps three head concepts
+separate:
+
+- observed or matched node WSE:
+  `sword_wse` / raw node WSE context
+- derived profile WSE for slope:
+  `rapid_wse_for_slope`
+- normalized equivalent-resistance solver heads:
+  not written in RAPID prep
 
 ### Forcing Normalization In Prep
 
@@ -253,6 +289,60 @@ python RAPID/run_prepare_experiment.py /path/to/experiment \
 
 Routing then writes per-state RAPID outputs under `states/<state_id>/rapid/run/`
 and can export outlet hydrograph summaries.
+
+#### Planned Refactor: Move All Slope Construction To `network_variants`
+
+The current `--slope-profile-mode reference_section` behavior in RAPID prep is
+only a transitional bridge. The intended end state is that slope/profile
+construction is done entirely during variant creation and cached with the state.
+
+Implementation checklist:
+
+1. Example-level reference profile in `network_variants`
+   Build the smooth example-level `H_ref(s)` once from trusted SWORD anchors on
+   the cached `reference_section/`.
+
+2. Experiment-level cache artifacts
+   Save the fitted `H_ref(s)` profile, anchor metadata, and reference-section
+   stationing once at the experiment root so they can be reused by every state.
+
+3. Base-state hydraulic context in `network_variants`
+   Write the base-state node/profile heads and final link slopes into
+   `states/S000_base/hydraulic_context/`.
+
+4. Variant-state inheritance in `network_variants`
+   For each derived state, inherit unchanged node stations and slope/profile
+   values through `matched_parent_node_id` and link lineage where possible.
+
+5. Local recomputation only on affected corridors
+   Reproject only truly new child nodes and recompute only the corridor between
+   the relevant anchor nodes instead of rebuilding the entire slope field for
+   every state.
+
+6. Compound-bubble enforcement stays in `network_variants`
+   Apply the exact bubble boundary-drop enforcement during state hydraulic
+   context generation, only on bubbles intersecting the affected corridor.
+
+7. Final slope outputs written per state
+   Write final `rapid_wse_for_slope`, `slope_used`, source-method fields, and
+   diagnostics into each state's `hydraulic_context/` bundle before RAPID prep.
+
+8. RAPID prep becomes a pure consumer
+   `run_prepare_experiment.py` should read precomputed hydraulic context only.
+   It should not fit `reference_section` profiles, derive slopes, or own any
+   slope-related scientific choices for `network_variants` experiments.
+
+9. Compatibility path becomes explicitly legacy-only
+   Any RAPID-internal slope derivation should remain only as a fallback for old
+   experiment folders that predate `hydraulic_context/`, not as the normal path
+   for current workflows.
+
+Expected result:
+
+- slope assumptions live with the generated state geometry
+- RAPID prep becomes much faster
+- RAPID prep only handles routing parameter assembly, forcing normalization, and
+  input writing
 
 ### Analysis Utilities
 

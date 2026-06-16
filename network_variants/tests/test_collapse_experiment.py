@@ -12,8 +12,10 @@ from hierarchy_level_definition.run_unit_workflow import UnitWorkflowOutputs, wr
 import network_variants.collapse_experiment as collapse_experiment_module
 from network_variants.collapse_experiment import (
     BaseStateVariantOutputs,
+    ExperimentStateContext,
     _build_unit_link_membership,
     _normalize_numeric_id_columns,
+    _write_equivalent_transition_outputs,
     main,
     run_collapse_experiment,
 )
@@ -189,6 +191,7 @@ def _make_variant_runner():
 
         variant_id = str(kwargs["variant_id"])
         collapsed_mask_path = output_dir / "mask" / f"{variant_id}_collapsed.tif"
+        width_scope_mask_path = output_dir / "mask" / "width_scope_mask.tif"
         directed_links_path = output_dir / "directed" / f"{variant_id}_directed_links.gpkg"
         directed_nodes_path = output_dir / "directed" / f"{variant_id}_directed_nodes.gpkg"
         rivgraph_links_path = output_dir / "rivgraph" / f"{variant_id}_links.gpkg"
@@ -196,6 +199,7 @@ def _make_variant_runner():
 
         for path in (
             collapsed_mask_path,
+            width_scope_mask_path,
             directed_links_path,
             directed_nodes_path,
             rivgraph_links_path,
@@ -219,6 +223,7 @@ def _make_variant_runner():
             directed_nodes=empty_gdf,
             output_dir=output_dir,
             collapsed_mask_path=collapsed_mask_path,
+            width_scope_mask_path=width_scope_mask_path,
             rivgraph_links_path=rivgraph_links_path,
             rivgraph_nodes_path=rivgraph_nodes_path,
             directed_links_path=directed_links_path,
@@ -243,6 +248,7 @@ def _make_variant_outputs(output_dir: Path, variant_id: str, *, direction_valid:
     (output_dir / "summary").mkdir(exist_ok=True)
 
     collapsed_mask_path = output_dir / "mask" / f"{variant_id}_collapsed.tif"
+    width_scope_mask_path = output_dir / "mask" / "width_scope_mask.tif"
     directed_links_path = output_dir / "directed" / f"{variant_id}_directed_links.gpkg"
     directed_nodes_path = output_dir / "directed" / f"{variant_id}_directed_nodes.gpkg"
     rivgraph_links_path = output_dir / "rivgraph" / f"{variant_id}_links.gpkg"
@@ -251,6 +257,7 @@ def _make_variant_outputs(output_dir: Path, variant_id: str, *, direction_valid:
 
     for path in (
         collapsed_mask_path,
+        width_scope_mask_path,
         directed_links_path,
         directed_nodes_path,
         rivgraph_links_path,
@@ -275,6 +282,7 @@ def _make_variant_outputs(output_dir: Path, variant_id: str, *, direction_valid:
         directed_nodes=empty_gdf,
         output_dir=output_dir,
         collapsed_mask_path=collapsed_mask_path,
+        width_scope_mask_path=width_scope_mask_path,
         rivgraph_links_path=rivgraph_links_path,
         rivgraph_nodes_path=rivgraph_nodes_path,
         directed_links_path=directed_links_path,
@@ -772,6 +780,130 @@ def test_main_runs_both_collapse_corridor_modes_with_suffixed_outputs(
     assert [call["collapse_corridor_mode"] for call in calls] == ["realized", "anchored"]
     assert [call["experiment_id"] for call in calls] == ["demo__realized", "demo__anchored"]
     assert [Path(call["output_dir"]).name for call in calls] == ["demo_output__realized", "demo_output__anchored"]
+    assert "variant_runner" not in calls[0]
+    assert callable(calls[1]["variant_runner"])
+
+
+def test_main_anchored_runs_realized_and_anchored_with_suffixed_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_collapse_experiment(mode: str, **kwargs: Any) -> SimpleNamespace:
+        calls.append({"mode": mode, **dict(kwargs)})
+        output_dir = Path(kwargs["output_dir"])
+        return SimpleNamespace(
+            output_dir=output_dir,
+            state_registry=pd.DataFrame([{"state_id": "S000_base"}]),
+            transition_registry=pd.DataFrame(),
+            equivalent_transition_registry=pd.DataFrame(),
+            manifest={"mode": mode, "stop_reason": "test_complete", "terminal_state_id": "S000_base"},
+        )
+
+    monkeypatch.setattr(collapse_experiment_module, "run_collapse_experiment", fake_run_collapse_experiment)
+
+    exit_code = main(
+        [
+            "independent-units",
+            "--cleaned-mask",
+            str(tmp_path / "base_cleaned.tif"),
+            "--reviewed-links",
+            str(tmp_path / "base_links.gpkg"),
+            "--reviewed-nodes",
+            str(tmp_path / "base_nodes.gpkg"),
+            "--exit-sides",
+            "NS",
+            "--experiment-id",
+            "demo",
+            "--output-dir",
+            str(tmp_path / "demo_output"),
+            "--collapse-corridor-mode",
+            "anchored",
+            "--slope-profile-mode",
+            "reference_section",
+            "--reference-section-summary-path",
+            str(tmp_path / "reference_section" / "reference_section_summary.json"),
+            "--min-slope",
+            "1e-5",
+            "--max-slope-for-k",
+            "0.004",
+            "--section-slope-ratio-min",
+            "0.5",
+            "--section-slope-ratio-max",
+            "4.0",
+            "--disable-section-slope-fallback",
+            "--disable-compound-bubble-slope-qc",
+            "--disable-compound-bubble-slope-repair",
+        ]
+    )
+
+    assert exit_code == 0
+    assert [call["collapse_corridor_mode"] for call in calls] == ["realized", "anchored"]
+    assert [call["experiment_id"] for call in calls] == ["demo__realized", "demo__anchored"]
+    assert [Path(call["output_dir"]).name for call in calls] == ["demo_output__realized", "demo_output__anchored"]
+    assert "variant_runner" not in calls[0]
+    assert callable(calls[1]["variant_runner"])
+    for call in calls:
+        config = call["state_hydraulic_context_kwargs"]["config"]
+        assert config.slope_profile_mode == "reference_section"
+        assert config.reference_section_summary_path == str(
+            tmp_path / "reference_section" / "reference_section_summary.json"
+        )
+        assert config.min_slope == pytest.approx(1e-5)
+        assert config.max_slope_for_k == pytest.approx(0.004)
+        assert config.section_slope_ratio_min == pytest.approx(0.5)
+        assert config.section_slope_ratio_max == pytest.approx(4.0)
+        assert config.use_section_slope_fallback is False
+        assert config.use_compound_bubble_slope_qc is False
+        assert config.use_compound_bubble_slope_repair is False
+
+
+def test_main_passes_equivalent_length_field_into_equivalent_resistance_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_collapse_experiment(mode: str, **kwargs: Any) -> SimpleNamespace:
+        calls.append({"mode": mode, **dict(kwargs)})
+        output_dir = Path(kwargs["output_dir"])
+        return SimpleNamespace(
+            output_dir=output_dir,
+            state_registry=pd.DataFrame([{"state_id": "S000_base"}]),
+            transition_registry=pd.DataFrame(),
+            equivalent_transition_registry=pd.DataFrame(),
+            manifest={"mode": mode, "stop_reason": "test_complete", "terminal_state_id": "S000_base"},
+        )
+
+    monkeypatch.setattr(collapse_experiment_module, "run_collapse_experiment", fake_run_collapse_experiment)
+
+    exit_code = main(
+        [
+            "independent-units",
+            "--cleaned-mask",
+            str(tmp_path / "base_cleaned.tif"),
+            "--reviewed-links",
+            str(tmp_path / "base_links.gpkg"),
+            "--reviewed-nodes",
+            str(tmp_path / "base_nodes.gpkg"),
+            "--exit-sides",
+            "NS",
+            "--experiment-id",
+            "demo",
+            "--output-dir",
+            str(tmp_path / "demo_output"),
+            "--compute-equivalent-resistance",
+            "--equivalent-length-field",
+            "len",
+        ]
+    )
+
+    assert exit_code == 0
+    assert len(calls) == 1
+    config = calls[0]["equivalent_resistance_config"]
+    assert config is not None
+    assert config.length_field_candidates == ("len", "len_adj", "link_length_m")
 
 
 def test_independent_units_writes_equivalent_transition_comparisons(tmp_path: Path) -> None:
@@ -870,6 +1002,144 @@ def test_independent_units_writes_equivalent_transition_comparisons(tmp_path: Pa
     assert int(derived_row["n_equivalent_bubbles_matched_to_parent"]) == 1
     assert Path(derived_row["equivalent_transition_comparison_csv"]).exists()
     assert (tmp_path / "experiment" / "equivalent_transition_registry.csv").exists()
+
+
+def test_equivalent_transition_matching_uses_parent_mapped_child_boundary_nodes(tmp_path: Path) -> None:
+    parent_workflow = _workflow_outputs(
+        [13, 15],
+        bubble_equivalent_rows=[
+            {
+                "compound_bubble_id": 3,
+                "bubble_root_unit_id": 13,
+                "upstream_boundary_node": 26,
+                "downstream_boundary_node": 25,
+                "n_member_units": 1,
+                "member_unit_ids": "13",
+                "n_nodes": 2,
+                "n_edges": 2,
+                "solver_success": True,
+                "solver_method": "boundary_only",
+                "solver_message": "",
+                "solver_nfev": 0,
+                "K_eq": 1.0,
+                "G_eq": 1.0,
+                "Q_unit": 1.0,
+                "residual_norm": 0.0,
+                "residual_relative": 0.0,
+                "resistance_law": "manning",
+                "geometry_method": "wide",
+                "kb_mode": "fixed",
+                "kb_value": 20.0,
+                "kb_source_method": "fixed_scalar",
+            },
+            {
+                "compound_bubble_id": 1,
+                "bubble_root_unit_id": 15,
+                "upstream_boundary_node": 30,
+                "downstream_boundary_node": 29,
+                "n_member_units": 1,
+                "member_unit_ids": "15",
+                "n_nodes": 2,
+                "n_edges": 2,
+                "solver_success": True,
+                "solver_method": "boundary_only",
+                "solver_message": "",
+                "solver_nfev": 0,
+                "K_eq": 10.0,
+                "G_eq": 0.1,
+                "Q_unit": 0.3162277660,
+                "residual_norm": 0.0,
+                "residual_relative": 0.0,
+                "resistance_law": "manning",
+                "geometry_method": "wide",
+                "kb_mode": "fixed",
+                "kb_value": 20.0,
+                "kb_source_method": "fixed_scalar",
+            },
+        ],
+    )
+    child_workflow = _workflow_outputs(
+        [13],
+        bubble_equivalent_rows=[
+            {
+                "compound_bubble_id": 1,
+                "bubble_root_unit_id": 13,
+                "upstream_boundary_node": 26,
+                "downstream_boundary_node": 25,
+                "n_member_units": 1,
+                "member_unit_ids": "13",
+                "n_nodes": 2,
+                "n_edges": 2,
+                "solver_success": True,
+                "solver_method": "boundary_only",
+                "solver_message": "",
+                "solver_nfev": 0,
+                "K_eq": 10.0,
+                "G_eq": 0.1,
+                "Q_unit": 0.3162277660,
+                "residual_norm": 0.0,
+                "residual_relative": 0.0,
+                "resistance_law": "manning",
+                "geometry_method": "wide",
+                "kb_mode": "fixed",
+                "kb_value": 20.0,
+                "kb_source_method": "fixed_scalar",
+            }
+        ],
+    )
+
+    parent_state_dir = tmp_path / "parent_state"
+    child_state_dir = tmp_path / "child_state"
+    child_variant_dir = child_state_dir / "variant"
+    (child_variant_dir / "matching").mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {"child_id_node": 25, "matched_parent_node_id": 29, "match_within_tolerance": True},
+            {"child_id_node": 26, "matched_parent_node_id": 30, "match_within_tolerance": True},
+        ]
+    ).to_csv(child_variant_dir / "matching" / "node_match.csv", index=False)
+
+    parent_context = ExperimentStateContext(
+        state_id="S000_base",
+        parent_state_id=None,
+        depth=0,
+        state_dir=parent_state_dir,
+        hierarchy_output_dir=parent_state_dir / "hierarchy",
+        cleaned_mask_path=parent_state_dir / "mask.tif",
+        reviewed_links_path=parent_state_dir / "links.gpkg",
+        reviewed_nodes_path=parent_state_dir / "nodes.gpkg",
+        workflow=parent_workflow,
+        variant_output_dir=parent_state_dir / "variant",
+    )
+    child_context = ExperimentStateContext(
+        state_id="S001_unit_13",
+        parent_state_id="S000_base",
+        depth=1,
+        state_dir=child_state_dir,
+        hierarchy_output_dir=child_state_dir / "hierarchy",
+        cleaned_mask_path=child_state_dir / "mask.tif",
+        reviewed_links_path=child_state_dir / "links.gpkg",
+        reviewed_nodes_path=child_state_dir / "nodes.gpkg",
+        workflow=child_workflow,
+        variant_output_dir=child_variant_dir,
+    )
+
+    comparison = _write_equivalent_transition_outputs(
+        transition_id="T001",
+        parent_context=parent_context,
+        child_context=child_context,
+    )
+
+    assert len(comparison) == 1
+    row = comparison.iloc[0]
+    assert row["match_method"] == "matched_parent_upstream_boundary_node__matched_parent_downstream_boundary_node"
+    assert row["parent_upstream_boundary_node"] == 30
+    assert row["parent_downstream_boundary_node"] == 29
+    assert row["child_upstream_boundary_node"] == 26
+    assert row["child_downstream_boundary_node"] == 25
+    assert row["K_before"] == pytest.approx(10.0)
+    assert row["K_after"] == pytest.approx(10.0)
+    assert row["Lambda_K"] == pytest.approx(1.0)
 
 
 def test_independent_units_records_failed_variant_and_continues(tmp_path: Path) -> None:

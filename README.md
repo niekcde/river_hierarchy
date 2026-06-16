@@ -9,6 +9,8 @@ subproject folders for related river-network workflows.
 river-hierarchy/
   RAPID/
   SWORD_gauge_match/
+  hierarchy_level_definition/
+  network_variants/
   rivgraph_centerline/
   synthetic_runs/
 ```
@@ -35,6 +37,15 @@ into a cleaner `src/` layout with explicit provenance tracking.
 `RAPID/` is the shared routing subproject. It will hold the reusable RAPID
 engine and RAPID input-preparation code used by synthetic runs first and by
 RivGraph-derived networks later.
+
+`hierarchy_level_definition/` contains the directed-graph unit-detection,
+metric, and collapse-decision workflow used to define candidate reductions on
+real river networks.
+
+`network_variants/` materializes collapsed variants from those hierarchy
+outputs, writes state-level hydraulic context used by RAPID prep, and now also
+supports experiment-level equivalent-resistance comparisons between realized
+variant corridors and their matched base corridors.
 
 These subprojects are currently separate stages. They can each keep their own
 README and implementation details for now, and will be merged into a single

@@ -7,8 +7,9 @@ import pandas as pd
 import pytest
 from shapely.geometry import LineString, Point
 
-from hierarchy_level_definition.metrics import BubbleEquivalentResistanceConfig
-from network_variants.equivalent_resistance_experiment import run_equivalent_resistance_experiment
+from hierarchy_level_definition.metrics import BubbleEquivalentResistanceConfig, compute_K_manning
+import network_variants.equivalent_resistance_experiment as equivalent_resistance_experiment_module
+from network_variants.equivalent_resistance_experiment import main, run_equivalent_resistance_experiment
 
 
 def _write_links(path: Path, rows: list[dict[str, object]]) -> None:
@@ -36,8 +37,10 @@ def _build_synthetic_experiment(tmp_path: Path) -> Path:
     for directory in (
         base_variant_dir / "summary",
         base_variant_dir / "directed",
+        base_variant_dir / "widths",
         child_variant_dir / "matching",
         child_variant_dir / "directed",
+        child_variant_dir / "widths",
         base_hierarchy_dir,
         child_hierarchy_dir,
     ):
@@ -116,6 +119,22 @@ def _build_synthetic_experiment(tmp_path: Path) -> Path:
             {"child_id_node": 101, "matched_parent_node_id": 4, "match_within_tolerance": True, "parent_node_order": 4},
         ]
     ).to_csv(child_variant_dir / "matching" / "node_match.csv", index=False)
+
+    _write_links(
+        base_variant_dir / "widths" / "links_with_width_families.gpkg",
+        [
+            {"id_link": 10, "id_us_node": 1, "id_ds_node": 2, "len": 1.0, "wid_adj": 10.0, "wid_adj_wet": 10.0, "geometry": LineString([(0.0, 0.0), (1.0, 0.0)])},
+            {"id_link": 11, "id_us_node": 2, "id_ds_node": 3, "len": 1.0, "wid_adj": 8.0, "wid_adj_wet": 8.0, "geometry": LineString([(1.0, 0.0), (2.0, 0.05)])},
+            {"id_link": 12, "id_us_node": 2, "id_ds_node": 3, "len": 1.0, "wid_adj": 4.0, "wid_adj_wet": 4.0, "geometry": LineString([(1.0, 0.0), (2.0, -0.05)])},
+            {"id_link": 13, "id_us_node": 3, "id_ds_node": 4, "len": 1.0, "wid_adj": 10.0, "wid_adj_wet": 10.0, "geometry": LineString([(2.0, 0.0), (3.0, 0.0)])},
+        ],
+    )
+    _write_links(
+        child_variant_dir / "widths" / "links_with_width_families.gpkg",
+        [
+            {"id_link": 20, "id_us_node": 100, "id_ds_node": 101, "len": 3.0, "wid_adj": 6.0, "wid_adj_wet": 6.0, "geometry": LineString([(0.0, 0.0), (3.0, 0.0)])},
+        ],
+    )
 
     pd.DataFrame(
         [
@@ -378,3 +397,76 @@ def test_run_equivalent_resistance_experiment_recovers_component_from_unstable_n
     comparison = results.comparison.iloc[0]
     assert bool(comparison["comparison_valid_for_matched"]) is True
     assert comparison["Lambda_matched"] > 0
+
+
+def test_main_passes_equivalent_length_field_into_equivalent_resistance_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_run_equivalent_resistance_experiment(experiment_dir: str | Path, **kwargs: object):
+        calls.append({"experiment_dir": experiment_dir, **dict(kwargs)})
+        output_dir = Path(kwargs.get("output_dir") or Path(experiment_dir) / "equivalent_resistance")
+        return equivalent_resistance_experiment_module.EquivalentResistanceExperimentOutputs(
+            base_nominal_targets=pd.DataFrame(),
+            child_realized_objects=pd.DataFrame(),
+            matched_base_corridors=pd.DataFrame(),
+            comparison=pd.DataFrame(),
+            output_dir=output_dir,
+            manifest={},
+        )
+
+    monkeypatch.setattr(
+        equivalent_resistance_experiment_module,
+        "run_equivalent_resistance_experiment",
+        fake_run_equivalent_resistance_experiment,
+    )
+
+    exit_code = main(
+        [
+            str(tmp_path / "experiment"),
+            "--equivalent-length-field",
+            "len",
+        ]
+    )
+
+    assert exit_code == 0
+    assert len(calls) == 1
+    config = calls[0]["equivalent_resistance_config"]
+    assert isinstance(config, BubbleEquivalentResistanceConfig)
+    assert config.length_field_candidates == ("len", "len_adj", "link_length_m")
+
+
+def test_equivalent_resistance_prefers_width_family_link_source(tmp_path: Path) -> None:
+    experiment_dir = _build_synthetic_experiment(tmp_path)
+
+    child_widths_path = (
+        experiment_dir
+        / "states"
+        / "S001_unit_99"
+        / "variant"
+        / "widths"
+        / "links_with_width_families.gpkg"
+    )
+    _write_links(
+        child_widths_path,
+        [
+            {"id_link": 20, "id_us_node": 100, "id_ds_node": 101, "len": 3.0, "wid_adj": 6.0, "wid_adj_wet": 12.0, "geometry": LineString([(0.0, 0.0), (3.0, 0.0)])},
+        ],
+    )
+
+    results = run_equivalent_resistance_experiment(
+        experiment_dir,
+        equivalent_resistance_config=BubbleEquivalentResistanceConfig(
+            resistance_law="manning",
+            geometry_method="wide",
+            kb_mode="fixed",
+            kb_value=20.0,
+            default_manning_n=0.035,
+        ),
+    )
+
+    child = results.child_realized_objects.iloc[0]
+    expected_k = compute_K_manning(3.0, 12.0, 0.035, 20.0)
+    assert child["K_variant_realized"] == pytest.approx(expected_k)

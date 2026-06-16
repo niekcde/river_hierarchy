@@ -36,6 +36,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width-field", default="wid_adj_wet", help="Preferred link width field for RAPID K preparation.")
     parser.add_argument("--vary-width-by-subreach", action="store_true", help="Derive a width for each RAPID subreach from variant link_width_samples.csv instead of copying one parent-link width across all segments.")
     parser.add_argument("--subreach-width-sample-field", default="width_wet", help="Width sample field from link_width_samples.csv used when --vary-width-by-subreach is enabled.")
+    parser.add_argument(
+        "--slope-profile-mode",
+        choices=["network_dist", "reference_section"],
+        default="network_dist",
+        help="Legacy metadata only. Slope/profile construction must already be written to state hydraulic_context outputs during variant creation.",
+    )
+    parser.add_argument(
+        "--reference-section-summary-path",
+        help="Legacy compatibility option. Reference-section slope inputs must already be resolved upstream in network_variants.",
+    )
     parser.add_argument("--x-value", type=float, default=0.1, help="Muskingum X parameter.")
     parser.add_argument("--kb-value", type=float, default=20.0, help="K-value helper parameter kb.")
     parser.add_argument("--kb-mode", choices=["fixed", "based_reference_section"], default="fixed", help="How to select kb for RAPID K preparation.")
@@ -49,11 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-celerity-mps", type=float, default=0.28, help="Minimum celerity bound in m/s when celerity capping is enabled.")
     parser.add_argument("--max-celerity-mps", type=float, default=1.524, help="Maximum celerity bound in m/s when celerity capping is enabled.")
     parser.add_argument("--target-subreach-length-m", type=float, help="Target RAPID-only subreach length in meters. Long links are split using max(1, round(L / target)).")
-    parser.add_argument("--min-slope", type=float, default=1e-6, help="Minimum positive slope used when slope is missing or invalid.")
-    parser.add_argument("--max-slope-for-k", type=float, help="Optional upper bound for local slopes used in RAPID K preparation.")
-    parser.add_argument("--section-slope-ratio-min", type=float, help="Optional lower bound on local_slope / section_slope before a local slope is flagged as an outlier.")
-    parser.add_argument("--section-slope-ratio-max", type=float, help="Optional upper bound on local_slope / section_slope before a local slope is flagged as an outlier.")
-    parser.add_argument("--disable-section-slope-fallback", action="store_true", help="If a local slope is flagged and no valid neighboring slope is found, fall back to the minimum slope instead of the section reference slope.")
+    parser.add_argument("--min-slope", type=float, default=1e-6, help="Legacy metadata only. Effective slope limits should be applied during variant hydraulic-context generation, not RAPID prep.")
+    parser.add_argument("--max-slope-for-k", type=float, help="Legacy metadata only. Effective slope limits should be applied during variant hydraulic-context generation, not RAPID prep.")
+    parser.add_argument("--section-slope-ratio-min", type=float, help="Legacy metadata only. Section-slope outlier rules should be applied during variant hydraulic-context generation, not RAPID prep.")
+    parser.add_argument("--section-slope-ratio-max", type=float, help="Legacy metadata only. Section-slope outlier rules should be applied during variant hydraulic-context generation, not RAPID prep.")
+    parser.add_argument("--disable-section-slope-fallback", action="store_true", help="Legacy metadata only. Section-slope fallback is expected to be resolved upstream in network_variants.")
     parser.add_argument("--preferred-length-field", default="len", help="Fallback link-length field if geometry length is unavailable.")
     parser.add_argument("--exclude-base-state", action="store_true", help="Skip the base state and prepare only derived states.")
     parser.add_argument("--allow-missing-sword", action="store_true", help="Allow prep to continue when SWORD WSE columns are missing on directed nodes.")
@@ -81,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
             width_field=args.width_field,
             vary_width_by_subreach=args.vary_width_by_subreach,
             subreach_width_sample_field=args.subreach_width_sample_field,
+            slope_profile_mode=args.slope_profile_mode,
+            reference_section_summary_path=args.reference_section_summary_path,
             x_value=args.x_value,
             kb_value=args.kb_value,
             kb_mode=args.kb_mode,
