@@ -20,7 +20,7 @@ from network_variants.variant_generation import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Rebuild width_scope_mask.tif and width-family outputs for an existing variant state "
+            "Rebuild origin_mask.tif and width-family outputs for an existing variant state "
             "without rerunning collapse/RivGraph."
         )
     )
@@ -56,8 +56,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_paths=args.max_paths,
     )
 
-    print(f"Patched width scope for {Path(args.variant_output_dir).resolve()}")
-    print(f"width_scope_mask: {results['width_scope_mask']}")
+    print(f"Patched two-bank width inputs for {Path(args.variant_output_dir).resolve()}")
+    print(f"origin_mask: {results['origin_mask']}")
     print(f"link_width_families: {results['link_width_families']}")
     print(f"link_width_samples: {results['link_width_samples']}")
     return 0

@@ -48,6 +48,7 @@ from hierarchy_level_definition.unit_detection.bifurcation_confluence_units impo
     analyze_network,
 )
 from network_variants.sword_matching import match_variant_nodes_to_sword
+from network_variants.width_two_bank import compute_two_bank_width_families
 
 
 DEFAULT_FOOTPRINT_WIDTH_FIELD = "wid_adj"
@@ -122,6 +123,8 @@ class NetworkVariantOutputs:
     sword_reaches_path: Path | None
     sword_nodes_path: Path | None
     manifest: dict[str, Any]
+    origin_mask_path: Path | None = None
+    rivgraph_distance_path: Path | None = None
 
 
 class VariantDirectionValidationError(RuntimeError):
@@ -775,225 +778,17 @@ def compute_width_families(
     use_full_width_transects: bool | None = None,
     width_scope_mask_path: str | Path | None = None,
     width_scope_thread_caps: Mapping[int, int] | None = None,
+    origin_mask_path: str | Path | None = None,
+    rivgraph_distance_path: str | Path | None = None,
 ) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
-    with rasterio.open(collapsed_mask_path) as collapsed_ds:
-        collapsed_mask = collapsed_ds.read(1) > 0
-        collapsed_transform = collapsed_ds.transform
-        collapsed_shape = collapsed_ds.shape
-        collapsed_pixlen = float(abs(collapsed_transform.a))
-
-    with rasterio.open(wet_reference_mask_path) as wet_ds:
-        wet_mask = wet_ds.read(1) > 0
-        wet_transform = wet_ds.transform
-
-    if collapsed_shape != wet_mask.shape or collapsed_transform != wet_transform:
-        raise ValueError("collapsed_mask_path and wet_reference_mask_path must share shape and transform.")
-
-    collapsed_water = _mask_to_union_geometry(collapsed_mask, collapsed_transform)
-    wet_reference_water = _mask_to_union_geometry(wet_mask, wet_transform)
-    width_scope_mask: np.ndarray | None = None
-    width_scope_geometries: dict[int, Any] = {}
-    if width_scope_mask_path is not None:
-        with rasterio.open(width_scope_mask_path) as scope_ds:
-            width_scope_mask = scope_ds.read(1)
-            scope_transform = scope_ds.transform
-            scope_shape = scope_ds.shape
-        if collapsed_shape != scope_shape or collapsed_transform != scope_transform:
-            raise ValueError("width_scope_mask_path must share shape and transform with collapsed_mask_path.")
-        width_scope_geometries = _mask_value_geometries(np.asarray(width_scope_mask, dtype=np.int32), collapsed_transform)
-
-    enriched = regenerated_links.copy()
-    sample_records: list[dict[str, Any]] = []
-    summary_records: list[dict[str, Any]] = []
-    if use_full_width_transects is None:
-        use_full_width_transects = _selection_uses_full_width_transects(regenerated_links)
-
-    for row in regenerated_links.itertuples(index=False):
-        attrs = row._asdict()
-        link_id = int(attrs["id_link"])
-        flat_indices = _parse_int_list(attrs.get("idx_link"))
-        if not flat_indices:
-            continue
-
-        total_widths = edge_width_samples_from_attrs({"wid_pix": attrs.get("wid_pix")}, pixel_width_fields=["wid_pix"])
-        if total_widths.size == 0:
-            continue
-
-        rows, cols, xs, ys = _unravel_link_pixels(flat_indices, collapsed_shape, collapsed_transform)
-        distances = _distances_along_link(xs, ys)
-        local_corridor = _local_width_corridor(attrs, pixel_length=collapsed_pixlen)
-        if width_scope_mask is not None:
-            sample_scope_labels = np.asarray(width_scope_mask[rows, cols], dtype=int)
-            sample_scope_labels = np.where((sample_scope_labels <= 0) & collapsed_mask[rows, cols], 1, sample_scope_labels)
-            width_scope = "label_mask"
-        else:
-            sample_scope_labels = np.zeros(len(flat_indices), dtype=int)
-            width_scope = "full_mask" if use_full_width_transects else "local_corridor"
-            if use_full_width_transects:
-                collapsed_water_local = collapsed_water
-                wet_reference_water_local = wet_reference_water
-            else:
-                corridor = _local_width_corridor(attrs, pixel_length=collapsed_pixlen)
-                collapsed_water_local = collapsed_water.intersection(corridor)
-                wet_reference_water_local = wet_reference_water.intersection(corridor)
-        wet_widths: list[float] = []
-        total_sampled_widths: list[float] = []
-        dry_widths: list[float] = []
-        n_wet_threads_values: list[int] = []
-        n_wet_threads_raw_values: list[int] = []
-        n_wet_threads_cap_values: list[int] = []
-        n_wet_threads_capped_values: list[bool] = []
-
-        for index in range(len(flat_indices)):
-            transect = _build_transect(
-                xs,
-                ys,
-                total_widths,
-                index=index,
-                pixel_length=collapsed_pixlen,
-                transect_scale=transect_scale,
-                min_transect_pixels=min_transect_pixels,
-            )
-            if width_scope_mask is not None:
-                scope_label = int(sample_scope_labels[index])
-                allowed_geometry = width_scope_geometries.get(scope_label, GeometryCollection())
-                if scope_label == WIDTH_SCOPE_BASE_LABEL:
-                    allowed_geometry = allowed_geometry.intersection(local_corridor)
-                center_point = Point(float(xs[index]), float(ys[index]))
-                total_intersection = allowed_geometry.intersection(transect)
-                total_segment, total_width = _select_segment_containing_point(total_intersection, center_point)
-                wet_intersection = wet_reference_water.intersection(total_segment)
-                wet_width, wet_threads = _segment_length_and_count(wet_intersection)
-                wet_threads_raw = int(wet_threads)
-                wet_threads_cap = (
-                    int(width_scope_thread_caps.get(scope_label))
-                    if width_scope_thread_caps is not None and scope_label in width_scope_thread_caps
-                    else 0
-                )
-                wet_threads_capped = False
-                if wet_threads_cap > 0:
-                    capped_total_width, capped_wet_width, capped_threads, capped_raw_threads, wet_threads_capped = _cap_wet_thread_geometry(
-                        wet_intersection,
-                        transect=transect,
-                        center_point=center_point,
-                        max_threads=wet_threads_cap,
-                    )
-                    wet_threads_raw = int(capped_raw_threads)
-                    if wet_threads_capped:
-                        total_width = capped_total_width
-                        wet_width = capped_wet_width
-                        wet_threads = capped_threads
-            else:
-                scope_label = 0
-                total_intersection = collapsed_water_local.intersection(transect)
-                wet_intersection = wet_reference_water_local.intersection(transect)
-                total_width, _ = _segment_length_and_count(total_intersection)
-                wet_width, wet_threads = _segment_length_and_count(wet_intersection)
-                wet_threads_raw = int(wet_threads)
-                wet_threads_cap = 0
-                wet_threads_capped = False
-            total_width = max(total_width, 0.0)
-            wet_width = max(wet_width, 0.0)
-            dry_width = max(total_width - wet_width, 0.0)
-
-            total_sampled_widths.append(total_width)
-            wet_widths.append(wet_width)
-            dry_widths.append(dry_width)
-            n_wet_threads_values.append(int(wet_threads))
-            n_wet_threads_raw_values.append(int(wet_threads_raw))
-            n_wet_threads_cap_values.append(int(wet_threads_cap))
-            n_wet_threads_capped_values.append(bool(wet_threads_capped))
-
-            sample_records.append(
-                {
-                    "id_link": link_id,
-                    "sample_index": index,
-                    "x": float(xs[index]),
-                    "y": float(ys[index]),
-                    "width_total": total_width,
-                    "width_wet": wet_width,
-                    "width_dry": dry_width,
-                    "wet_fraction": float(wet_width / total_width) if total_width > 0 else float("nan"),
-                    "dry_fraction": float(dry_width / total_width) if total_width > 0 else float("nan"),
-                    "n_wet_threads": int(wet_threads),
-                    "n_wet_threads_raw": int(wet_threads_raw),
-                    "n_wet_threads_cap": int(wet_threads_cap),
-                    "n_wet_threads_capped": bool(wet_threads_capped),
-                    "width_scope": width_scope,
-                    "width_scope_label": int(scope_label),
-                }
-            )
-
-        total_array = np.asarray(total_sampled_widths, dtype=float)
-        wet_array = np.asarray(wet_widths, dtype=float)
-        dry_array = np.asarray(dry_widths, dtype=float)
-        threads_array = np.asarray(n_wet_threads_values, dtype=int)
-        threads_raw_array = np.asarray(n_wet_threads_raw_values, dtype=int)
-        threads_capped_array = np.asarray(n_wet_threads_capped_values, dtype=bool)
-        threads_cap_array = np.asarray(n_wet_threads_cap_values, dtype=int)
-        trim_slice = _trim_slice(total_array, distances)
-
-        total_stats = _compute_family_stats(total_array, trim_slice)
-        wet_stats = _compute_family_stats(wet_array, trim_slice)
-        dry_stats = _compute_family_stats(dry_array, trim_slice)
-
-        trimmed_threads = threads_array[trim_slice] if threads_array[trim_slice].size else threads_array
-        trimmed_threads_raw = threads_raw_array[trim_slice] if threads_raw_array[trim_slice].size else threads_raw_array
-        trimmed_threads_capped = threads_capped_array[trim_slice] if threads_capped_array[trim_slice].size else threads_capped_array
-        trimmed_threads_cap = threads_cap_array[trim_slice] if threads_cap_array[trim_slice].size else threads_cap_array
-        n_wet_threads_mean = float(np.mean(trimmed_threads)) if trimmed_threads.size else float("nan")
-        n_wet_threads_max = int(np.max(trimmed_threads)) if trimmed_threads.size else 0
-        n_wet_threads_mean_raw = float(np.mean(trimmed_threads_raw)) if trimmed_threads_raw.size else float("nan")
-        n_wet_threads_max_raw = int(np.max(trimmed_threads_raw)) if trimmed_threads_raw.size else 0
-        n_wet_threads_capped_samples = int(np.count_nonzero(trimmed_threads_capped)) if trimmed_threads_capped.size else 0
-        n_wet_threads_cap = int(np.max(trimmed_threads_cap)) if trimmed_threads_cap.size else 0
-
-        wet_fraction_adj = float(wet_stats["adj"] / total_stats["adj"]) if total_stats["adj"] > 0 else float("nan")
-        dry_fraction_adj = float(dry_stats["adj"] / total_stats["adj"]) if total_stats["adj"] > 0 else float("nan")
-        unique_scope_labels = sorted({int(value) for value in sample_scope_labels if int(value) > 0})
-        width_scope_label = int(unique_scope_labels[0]) if len(unique_scope_labels) == 1 else (int(pd.Series(sample_scope_labels).mode().iloc[0]) if len(sample_scope_labels) else 0)
-
-        summary_records.append(
-            {
-                "id_link": link_id,
-                "wid_pix_total": _serialize_float_array(total_sampled_widths),
-                "wid_pix_wet": _serialize_float_array(wet_widths),
-                "wid_pix_dry": _serialize_float_array(dry_widths),
-                "wid_adj_total": total_stats["adj"],
-                "wid_med_total": total_stats["med"],
-                "wid_p05_total": total_stats["p05"],
-                "wid_p50_total": total_stats["p50"],
-                "wid_p95_total": total_stats["p95"],
-                "wid_mean_total": total_stats["mean"],
-                "wid_adj_wet": wet_stats["adj"],
-                "wid_med_wet": wet_stats["med"],
-                "wid_p05_wet": wet_stats["p05"],
-                "wid_p50_wet": wet_stats["p50"],
-                "wid_p95_wet": wet_stats["p95"],
-                "wid_mean_wet": wet_stats["mean"],
-                "wid_adj_dry": dry_stats["adj"],
-                "wid_med_dry": dry_stats["med"],
-                "wid_p05_dry": dry_stats["p05"],
-                "wid_p50_dry": dry_stats["p50"],
-                "wid_p95_dry": dry_stats["p95"],
-                "wid_mean_dry": dry_stats["mean"],
-                "wet_fraction_adj": wet_fraction_adj,
-                "dry_fraction_adj": dry_fraction_adj,
-                "n_wet_threads_mean": n_wet_threads_mean,
-                "n_wet_threads_max": n_wet_threads_max,
-                "n_wet_threads_mean_raw": n_wet_threads_mean_raw,
-                "n_wet_threads_max_raw": n_wet_threads_max_raw,
-                "n_wet_threads_cap": n_wet_threads_cap,
-                "n_wet_threads_capped_samples": n_wet_threads_capped_samples,
-                "width_scope": width_scope,
-                "width_scope_label": int(width_scope_label),
-                "width_scope_labels": _serialize_int_list(unique_scope_labels),
-            }
-        )
-
-    summary = pd.DataFrame.from_records(summary_records).sort_values("id_link", kind="mergesort").reset_index(drop=True)
-    samples = pd.DataFrame.from_records(sample_records).sort_values(["id_link", "sample_index"], kind="mergesort").reset_index(drop=True)
-    enriched = enriched.merge(summary, on="id_link", how="left", validate="1:1")
+    resolved_origin_mask = origin_mask_path or width_scope_mask_path
+    enriched, samples = compute_two_bank_width_families(
+        regenerated_links,
+        collapsed_mask_path=collapsed_mask_path,
+        wet_reference_mask_path=wet_reference_mask_path,
+        origin_mask_path=resolved_origin_mask,
+        rivgraph_distance_path=rivgraph_distance_path,
+    )
     return enriched, samples
 
 
@@ -1046,7 +841,7 @@ def _apply_collapse_components_to_mask(
         crs = src.crs
         pixel_area = abs(transform.a * transform.e)
 
-    width_scope_mask = np.where(parent_mask, WIDTH_SCOPE_BASE_LABEL, 0).astype(np.uint16)
+    origin_mask = np.where(parent_mask, WIDTH_SCOPE_BASE_LABEL, 0).astype(np.uint16)
     add_union = np.zeros(parent_mask.shape, dtype=bool)
     geometry_records: list[dict[str, Any]] = []
     component_records: list[dict[str, Any]] = []
@@ -1064,7 +859,8 @@ def _apply_collapse_components_to_mask(
         }
         component_frame = pd.DataFrame.from_records(component_records)
         edit_geometries = gpd.GeoDataFrame(geometry_records, geometry="geometry", crs=crs)
-        return collapsed_mask, width_scope_mask, summary, component_frame, edit_geometries
+        summary["origin_labels"] = [WIDTH_SCOPE_BASE_LABEL]
+        return collapsed_mask, origin_mask, summary, component_frame, edit_geometries
 
     for index, component in enumerate(components, start=1):
         scope_label = int(WIDTH_SCOPE_COMPONENT_LABEL_START + index - 1)
@@ -1086,7 +882,7 @@ def _apply_collapse_components_to_mask(
         component_filled = binary_fill_holes(component_water)
         component_add = component_filled & (~component_water)
         add_union |= component_add
-        width_scope_mask[component_filled] = scope_label
+        origin_mask[component_add] = scope_label
 
         footprint_area = float(footprint.area) if not footprint.is_empty else 0.0
         added_pixels = int(component_add.sum())
@@ -1097,6 +893,7 @@ def _apply_collapse_components_to_mask(
         component_records.append(
             {
                 "component_id": component["component_id"],
+                "origin_label": scope_label,
                 "width_scope_label": scope_label,
                 "unit_ids": _serialize_int_list(component["unit_ids"]),
                 "link_ids": _serialize_int_list(component["link_ids"]),
@@ -1106,6 +903,8 @@ def _apply_collapse_components_to_mask(
                 "n_links": int(component["n_links"]),
                 "n_nodes": int(component["n_nodes"]),
                 "footprint_area": footprint_area,
+                "origin_scope_pixels": scope_pixels,
+                "origin_scope_area": scope_area,
                 "width_scope_pixels": scope_pixels,
                 "width_scope_area": scope_area,
                 "added_pixels": added_pixels,
@@ -1129,7 +928,7 @@ def _apply_collapse_components_to_mask(
             geometry_records.append(
                 {
                     "component_id": component["component_id"],
-                    "geometry_role": "width_scope_domain",
+                    "geometry_role": "collapse_domain",
                     "action": "label",
                     "width_scope_label": scope_label,
                     "unit_ids": _serialize_int_list(component["unit_ids"]),
@@ -1165,10 +964,11 @@ def _apply_collapse_components_to_mask(
         "changed_pixels": total_added_pixels,
         "pixel_area": float(pixel_area),
         "width_scope_labels": [int(WIDTH_SCOPE_BASE_LABEL)] + [int(record["width_scope_label"]) for record in component_records],
+        "origin_labels": [int(WIDTH_SCOPE_BASE_LABEL)] + [int(record["origin_label"]) for record in component_records],
     }
     component_frame = pd.DataFrame.from_records(component_records).sort_values("component_id", kind="mergesort").reset_index(drop=True)
     edit_geometries = gpd.GeoDataFrame(geometry_records, geometry="geometry", crs=crs)
-    return collapsed_mask, width_scope_mask, summary, component_frame, edit_geometries
+    return collapsed_mask, origin_mask, summary, component_frame, edit_geometries
 
 
 def _write_mask(path: str | Path, mask: np.ndarray, profile: Mapping[str, Any]) -> Path:
@@ -3538,7 +3338,7 @@ def generate_network_variant(
     if match_tolerance is None:
         match_tolerance = pixel_length * 1.25
 
-    collapsed_mask, width_scope_mask, mask_summary, collapse_components, edit_geometries = _build_selection_masks(
+    collapsed_mask, origin_mask, mask_summary, collapse_components, edit_geometries = _build_selection_masks(
         cleaned_mask_path=cleaned_mask_path,
         reviewed_links=reviewed_links,
         resolved_unit_ids=resolved_unit_ids,
@@ -3567,13 +3367,9 @@ def generate_network_variant(
     edit_geometries["variant_id"] = variant_id
 
     collapsed_mask_path = _write_mask(mask_dir / f"{example_id}__{variant_id}_collapsed.tif", collapsed_mask, parent_profile)
-    width_scope_mask_path = _write_mask(mask_dir / "width_scope_mask.tif", width_scope_mask, parent_profile)
+    origin_mask_path = _write_mask(mask_dir / "origin_mask.tif", origin_mask, parent_profile)
     edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
     collapse_components.to_csv(summary_dir / "collapse_components.csv", index=False)
-    width_scope_thread_caps = _build_width_scope_thread_caps(
-        collapse_components=collapse_components,
-        units_by_id=units_by_id,
-    )
 
     metadata = {
         "example_id": example_id,
@@ -3613,10 +3409,8 @@ def generate_network_variant(
         raw_links,
         collapsed_mask_path=collapsed_mask_path,
         wet_reference_mask_path=wet_reference_mask_path,
-        transect_scale=transect_scale,
-        min_transect_pixels=min_transect_pixels,
-        width_scope_mask_path=width_scope_mask_path,
-        width_scope_thread_caps=width_scope_thread_caps,
+        origin_mask_path=origin_mask_path,
+        rivgraph_distance_path=rivgraph_paths.get("distance"),
     )
     link_width_samples = _apply_collapsed_selection_metadata(
         link_width_samples,
@@ -3755,9 +3549,8 @@ def generate_network_variant(
             directed_links,
             collapsed_mask_path=collapsed_mask_path,
             wet_reference_mask_path=wet_reference_mask_path,
-            transect_scale=transect_scale,
-            min_transect_pixels=min_transect_pixels,
-            width_scope_mask_path=width_scope_mask_path,
+            origin_mask_path=origin_mask_path,
+            rivgraph_distance_path=rivgraph_paths.get("distance"),
         )
         enriched_links = anchored_enriched_links
         link_width_samples = _apply_collapsed_selection_metadata(
@@ -3858,7 +3651,8 @@ def generate_network_variant(
         "output_paths": {
             "output_dir": str(output_path.resolve()),
             "collapsed_mask": str(collapsed_mask_path.resolve()),
-            "width_scope_mask": str(width_scope_mask_path.resolve()),
+            "origin_mask": str(origin_mask_path.resolve()),
+            "width_scope_mask": str(origin_mask_path.resolve()),
             "collapse_components": str((summary_dir / "collapse_components.csv").resolve()),
             "edit_geometries": str((mask_dir / "collapse_edit_geometries.gpkg").resolve()),
             "link_width_families": str((width_dir / "link_width_families.csv").resolve()),
@@ -3874,6 +3668,7 @@ def generate_network_variant(
             "rivgraph_links": str(rivgraph_paths["links"].resolve()) if rivgraph_paths["links"] is not None else None,
             "rivgraph_nodes": str(rivgraph_paths["nodes"].resolve()) if rivgraph_paths["nodes"] is not None else None,
             "rivgraph_centerline": str(rivgraph_paths["centerline"].resolve()) if rivgraph_paths["centerline"] is not None else None,
+            "rivgraph_distance": str(rivgraph_paths["distance"].resolve()) if rivgraph_paths["distance"] is not None else None,
             "sword_reaches": str(rivgraph_paths["sword_reaches"].resolve()) if rivgraph_paths["sword_reaches"] is not None else None,
             "sword_nodes": str(rivgraph_paths["sword_nodes"].resolve()) if rivgraph_paths["sword_nodes"] is not None else None,
         },
@@ -3898,7 +3693,7 @@ def generate_network_variant(
         directed_nodes=directed_nodes,
         output_dir=output_path,
         collapsed_mask_path=collapsed_mask_path,
-        width_scope_mask_path=width_scope_mask_path,
+        width_scope_mask_path=origin_mask_path,
         rivgraph_links_path=Path(rivgraph_paths["links"]),
         rivgraph_nodes_path=Path(rivgraph_paths["nodes"]),
         directed_links_path=directed_dir / f"{rivgraph_name}_directed_links.gpkg",
@@ -3907,6 +3702,8 @@ def generate_network_variant(
         sword_reaches_path=Path(rivgraph_paths["sword_reaches"]) if rivgraph_paths["sword_reaches"] is not None else None,
         sword_nodes_path=Path(rivgraph_paths["sword_nodes"]) if rivgraph_paths["sword_nodes"] is not None else None,
         manifest=manifest,
+        origin_mask_path=origin_mask_path,
+        rivgraph_distance_path=Path(rivgraph_paths["distance"]) if rivgraph_paths["distance"] is not None else None,
     )
     if not bool(direction_summary.get("is_valid", False)):
         raise VariantDirectionValidationError(results, direction_summary.get("issues", []))
@@ -3967,7 +3764,8 @@ def derive_anchored_variant_from_realized(
     if wet_reference_mask_path is None:
         source_wet_reference = source_manifest.get("source_paths", {}).get("wet_reference_mask")
         wet_reference_mask_path = source_wet_reference if source_wet_reference is not None else collapsed_mask_path
-    width_scope_mask_path = output_paths.get("width_scope_mask")
+    origin_mask_path = output_paths.get("origin_mask") or output_paths.get("width_scope_mask")
+    rivgraph_distance_path = output_paths.get("rivgraph_distance")
 
     directed_links_path = output_paths.get("directed_links")
     directed_nodes_path = output_paths.get("directed_nodes")
@@ -4012,11 +3810,11 @@ def derive_anchored_variant_from_realized(
     missing_unit_ids = sorted(unit_id for unit_id in selected_unit_ids if unit_id not in units_by_id)
     if missing_unit_ids:
         raise ValueError(f"The following selected unit_ids were not found in the reviewed graph: {missing_unit_ids}")
-    if width_scope_mask_path is None or not width_scope_mask_path.exists():
+    if origin_mask_path is None or not origin_mask_path.exists():
         source_cleaned_mask = source_manifest.get("source_paths", {}).get("cleaned_mask")
         if source_cleaned_mask is None:
-            raise FileNotFoundError("Could not resolve source cleaned mask path to rebuild width_scope_mask.")
-        _, width_scope_mask, _, collapse_components, edit_geometries = _build_selection_masks(
+            raise FileNotFoundError("Could not resolve source cleaned mask path to rebuild origin_mask.")
+        _, origin_mask, _, collapse_components, edit_geometries = _build_selection_masks(
             cleaned_mask_path=source_cleaned_mask,
             reviewed_links=reviewed_links,
             resolved_unit_ids=selected_unit_ids,
@@ -4026,13 +3824,9 @@ def derive_anchored_variant_from_realized(
             all_touched=bool(source_manifest.get("all_touched", True)),
             allow_noop=True,
         )
-        width_scope_mask_path = _write_mask(mask_dir / "width_scope_mask.tif", width_scope_mask, collapsed_profile)
+        origin_mask_path = _write_mask(mask_dir / "origin_mask.tif", origin_mask, collapsed_profile)
         collapse_components.to_csv(summary_dir / "collapse_components.csv", index=False)
         edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
-    width_scope_thread_caps = _build_width_scope_thread_caps(
-        collapse_components=collapse_components,
-        units_by_id=units_by_id,
-    )
 
     parent_node_order, _, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
     _, parent_graph, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
@@ -4136,10 +3930,8 @@ def derive_anchored_variant_from_realized(
         directed_links,
         collapsed_mask_path=collapsed_mask_path,
         wet_reference_mask_path=wet_reference_mask_path,
-        transect_scale=transect_scale,
-        min_transect_pixels=min_transect_pixels,
-        width_scope_mask_path=width_scope_mask_path,
-        width_scope_thread_caps=width_scope_thread_caps,
+        origin_mask_path=origin_mask_path,
+        rivgraph_distance_path=rivgraph_distance_path,
     )
     link_width_samples = _apply_collapsed_selection_metadata(
         anchored_link_width_samples,
@@ -4199,7 +3991,8 @@ def derive_anchored_variant_from_realized(
         key: str(path.resolve()) if path is not None else None
         for key, path in output_paths.items()
     }
-    manifest["output_paths"]["width_scope_mask"] = str(Path(width_scope_mask_path).resolve()) if width_scope_mask_path is not None else None
+    manifest["output_paths"]["origin_mask"] = str(Path(origin_mask_path).resolve()) if origin_mask_path is not None else None
+    manifest["output_paths"]["width_scope_mask"] = str(Path(origin_mask_path).resolve()) if origin_mask_path is not None else None
     manifest["direction_summary"] = direction_summary
     manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
     manifest["code_version"] = _git_revision()
@@ -4225,7 +4018,7 @@ def derive_anchored_variant_from_realized(
         directed_nodes=directed_nodes,
         output_dir=output_path,
         collapsed_mask_path=collapsed_mask_path,
-        width_scope_mask_path=width_scope_mask_path,
+        width_scope_mask_path=origin_mask_path,
         rivgraph_links_path=rivgraph_links_path,
         rivgraph_nodes_path=rivgraph_nodes_path,
         directed_links_path=directed_links_path,
@@ -4234,6 +4027,8 @@ def derive_anchored_variant_from_realized(
         sword_reaches_path=output_paths.get("sword_reaches"),
         sword_nodes_path=output_paths.get("sword_nodes"),
         manifest=manifest,
+        origin_mask_path=origin_mask_path,
+        rivgraph_distance_path=rivgraph_distance_path,
     )
     if not bool(direction_summary.get("is_valid", False)):
         raise VariantDirectionValidationError(results, direction_summary.get("issues", []))
@@ -4295,7 +4090,7 @@ def refresh_variant_width_scope_and_families(
     if missing_unit_ids:
         raise ValueError(f"The following selected unit_ids were not found in the reviewed graph: {missing_unit_ids}")
 
-    collapsed_mask, width_scope_mask, mask_summary, collapse_components, edit_geometries = _build_selection_masks(
+    collapsed_mask, origin_mask, mask_summary, collapse_components, edit_geometries = _build_selection_masks(
         cleaned_mask_path=resolved_cleaned_mask,
         reviewed_links=reviewed_links,
         resolved_unit_ids=selected_unit_ids,
@@ -4310,7 +4105,7 @@ def refresh_variant_width_scope_and_families(
 
     with rasterio.open(collapsed_mask_path) as src:
         collapsed_profile = src.profile.copy()
-    width_scope_mask_path = _write_mask(mask_dir / "width_scope_mask.tif", width_scope_mask, collapsed_profile)
+    origin_mask_path = _write_mask(mask_dir / "origin_mask.tif", origin_mask, collapsed_profile)
 
     collapse_components = _apply_collapsed_selection_metadata(
         collapse_components,
@@ -4324,19 +4119,12 @@ def refresh_variant_width_scope_and_families(
     )
     collapse_components.to_csv(summary_dir / "collapse_components.csv", index=False)
     edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
-    width_scope_thread_caps = _build_width_scope_thread_caps(
-        collapse_components=collapse_components,
-        units_by_id=units_by_id,
-    )
-
     enriched_links, link_width_samples = compute_width_families(
         directed_links,
         collapsed_mask_path=collapsed_mask_path,
         wet_reference_mask_path=resolved_wet_reference_mask,
-        transect_scale=transect_scale,
-        min_transect_pixels=min_transect_pixels,
-        width_scope_mask_path=width_scope_mask_path,
-        width_scope_thread_caps=width_scope_thread_caps,
+        origin_mask_path=origin_mask_path,
+        rivgraph_distance_path=output_paths.get("rivgraph_distance"),
     )
     link_width_samples = _apply_collapsed_selection_metadata(
         link_width_samples,
@@ -4367,7 +4155,8 @@ def refresh_variant_width_scope_and_families(
     manifest["source_paths"]["reviewed_links"] = str(resolved_reviewed_links.resolve())
     manifest["source_paths"]["reviewed_nodes"] = str(resolved_reviewed_nodes.resolve())
     manifest["output_paths"] = output_paths
-    manifest["output_paths"]["width_scope_mask"] = str(width_scope_mask_path.resolve())
+    manifest["output_paths"]["origin_mask"] = str(origin_mask_path.resolve())
+    manifest["output_paths"]["width_scope_mask"] = str(origin_mask_path.resolve())
     manifest["output_paths"]["collapse_components"] = str((summary_dir / "collapse_components.csv").resolve())
     manifest["output_paths"]["edit_geometries"] = str((mask_dir / "collapse_edit_geometries.gpkg").resolve())
     manifest["output_paths"]["link_width_families"] = str((width_dir / "link_width_families.csv").resolve())
@@ -4375,7 +4164,7 @@ def refresh_variant_width_scope_and_families(
     manifest["output_paths"]["links_with_width_families"] = str((width_dir / "links_with_width_families.gpkg").resolve())
     manifest["width_scope_patch"] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "component_domain_label_mask",
+        "mode": "two_bank_dt_origin_mask",
     }
     manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
     manifest["code_version"] = _git_revision()
@@ -4383,7 +4172,8 @@ def refresh_variant_width_scope_and_families(
 
     return {
         "variant_output_dir": output_path.resolve(),
-        "width_scope_mask": width_scope_mask_path.resolve(),
+        "origin_mask": origin_mask_path.resolve(),
+        "width_scope_mask": origin_mask_path.resolve(),
         "link_width_families": (width_dir / "link_width_families.csv").resolve(),
         "link_width_samples": (width_dir / "link_width_samples.csv").resolve(),
         "links_with_width_families": (width_dir / "links_with_width_families.gpkg").resolve(),

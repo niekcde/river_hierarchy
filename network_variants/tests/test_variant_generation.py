@@ -83,11 +83,9 @@ def test_compute_family_stats_uses_trimmed_values() -> None:
     assert np.isclose(stats["p50"], 6.0)
 
 
-def test_compute_width_families_respects_width_scope_mask_domains(tmp_path: Path) -> None:
+def test_compute_width_families_base_channel_preserves_single_thread_width(tmp_path: Path) -> None:
     mask = np.zeros((20, 20), dtype=np.uint8)
-    mask[:, 5] = 1
-    mask[:, 10] = 1
-    mask[:, 15] = 1
+    mask[:, 6:14] = 1
 
     mask_path = tmp_path / "mask.tif"
     transform = from_origin(0, 20, 1, 1)
@@ -104,252 +102,82 @@ def test_compute_width_families_respects_width_scope_mask_domains(tmp_path: Path
     ) as dst:
         dst.write(mask, 1)
 
-    width_scope_mask = np.zeros_like(mask, dtype=np.uint16)
-    width_scope_mask[:, 5:11] = 101
-    width_scope_mask[:, 15] = 1
-
-    width_scope_mask_path = tmp_path / "width_scope_mask.tif"
-    with rasterio.open(
-        width_scope_mask_path,
-        "w",
-        driver="GTiff",
-        height=width_scope_mask.shape[0],
-        width=width_scope_mask.shape[1],
-        count=1,
-        dtype="uint16",
-        crs="EPSG:3857",
-        transform=transform,
-    ) as dst:
-        dst.write(width_scope_mask, 1)
-
     rows = np.arange(2, 18, dtype=int)
-    cols = np.full_like(rows, 10)
+    cols = np.full_like(rows, 9)
     idx_link = ",".join(str(int(index)) for index in np.ravel_multi_index((rows, cols), mask.shape))
-    wid_pix = ",".join("2.0" for _ in rows)
-    geometry = LineString([(10.5, 17.5), (10.5, 2.5)])
-
-    base_links = gpd.GeoDataFrame(
-        [
-            {
-                "id_link": 1,
-                "idx_link": idx_link,
-                "wid_pix": wid_pix,
-                "wid_adj": 2.0,
-                "collapsed_selection_type": "base",
-                "collapsed_unit_count": 0,
-                "geometry": geometry,
-            }
-        ],
-        geometry="geometry",
-        crs="EPSG:3857",
-    )
-    local_enriched, local_samples = compute_width_families(
-        base_links,
-        collapsed_mask_path=mask_path,
-        wet_reference_mask_path=mask_path,
-        use_full_width_transects=False,
-    )
-    scoped_enriched, scoped_samples = compute_width_families(
-        base_links,
-        collapsed_mask_path=mask_path,
-        wet_reference_mask_path=mask_path,
-        width_scope_mask_path=width_scope_mask_path,
-    )
-    full_enriched, full_samples = compute_width_families(
-        base_links,
-        collapsed_mask_path=mask_path,
-        wet_reference_mask_path=mask_path,
-        use_full_width_transects=True,
-    )
-
-    local_row = local_enriched.iloc[0]
-    scoped_row = scoped_enriched.iloc[0]
-    full_row = full_enriched.iloc[0]
-
-    assert local_row["width_scope"] == "local_corridor"
-    assert scoped_row["width_scope"] == "label_mask"
-    assert full_row["width_scope"] == "full_mask"
-    assert local_samples["width_scope"].eq("local_corridor").all()
-    assert scoped_samples["width_scope"].eq("label_mask").all()
-    assert scoped_samples["width_scope_label"].eq(101).all()
-    assert full_samples["width_scope"].eq("full_mask").all()
-    assert float(local_row["wid_adj_wet"]) < float(scoped_row["wid_adj_wet"]) < float(full_row["wid_adj_wet"])
-    assert int(local_row["n_wet_threads_max"]) == 1
-    assert int(scoped_row["n_wet_threads_max"]) == 2
-    assert int(full_row["n_wet_threads_max"]) >= 3
-    assert scoped_row["width_scope_labels"] == "101"
-
-
-def test_compute_width_families_caps_simple_component_to_two_wet_threads(tmp_path: Path) -> None:
-    mask = np.zeros((20, 20), dtype=np.uint8)
-    mask[:, 5] = 1
-    mask[:, 10] = 1
-    mask[:, 15] = 1
-
-    mask_path = tmp_path / "mask.tif"
-    transform = from_origin(0, 20, 1, 1)
-    with rasterio.open(
-        mask_path,
-        "w",
-        driver="GTiff",
-        height=mask.shape[0],
-        width=mask.shape[1],
-        count=1,
-        dtype="uint8",
-        crs="EPSG:3857",
-        transform=transform,
-    ) as dst:
-        dst.write(mask, 1)
-
-    width_scope_mask = np.zeros_like(mask, dtype=np.uint16)
-    width_scope_mask[:, 5:16] = 101
-
-    width_scope_mask_path = tmp_path / "width_scope_mask.tif"
-    with rasterio.open(
-        width_scope_mask_path,
-        "w",
-        driver="GTiff",
-        height=width_scope_mask.shape[0],
-        width=width_scope_mask.shape[1],
-        count=1,
-        dtype="uint16",
-        crs="EPSG:3857",
-        transform=transform,
-    ) as dst:
-        dst.write(width_scope_mask, 1)
-
-    rows = np.arange(2, 18, dtype=int)
-    cols = np.full_like(rows, 10)
-    idx_link = ",".join(str(int(index)) for index in np.ravel_multi_index((rows, cols), mask.shape))
-    wid_pix = ",".join("2.0" for _ in rows)
-    geometry = LineString([(10.5, 17.5), (10.5, 2.5)])
+    wid_pix = ",".join("8.0" for _ in rows)
+    geometry = LineString([(9.5, 17.5), (9.5, 2.5)])
 
     links = gpd.GeoDataFrame(
-        [
-            {
-                "id_link": 1,
-                "idx_link": idx_link,
-                "wid_pix": wid_pix,
-                "wid_adj": 2.0,
-                "collapsed_selection_type": "unit",
-                "collapsed_unit_count": 1,
-                "geometry": geometry,
-            }
-        ],
+        [{"id_link": 1, "idx_link": idx_link, "wid_pix": wid_pix, "wid_adj": 8.0, "geometry": geometry}],
         geometry="geometry",
         crs="EPSG:3857",
     )
 
-    uncapped_enriched, uncapped_samples = compute_width_families(
+    enriched, samples = compute_width_families(
         links,
         collapsed_mask_path=mask_path,
         wet_reference_mask_path=mask_path,
-        width_scope_mask_path=width_scope_mask_path,
-    )
-    capped_enriched, capped_samples = compute_width_families(
-        links,
-        collapsed_mask_path=mask_path,
-        wet_reference_mask_path=mask_path,
-        width_scope_mask_path=width_scope_mask_path,
-        width_scope_thread_caps={1: 1, 101: 2},
     )
 
-    assert int(uncapped_enriched.iloc[0]["n_wet_threads_max"]) == 3
-    assert int(capped_enriched.iloc[0]["n_wet_threads_max"]) == 2
-    assert int(capped_enriched.iloc[0]["n_wet_threads_max_raw"]) == 3
-    assert int(capped_enriched.iloc[0]["n_wet_threads_cap"]) == 2
-    assert int(capped_enriched.iloc[0]["n_wet_threads_capped_samples"]) > 0
-    assert capped_samples["n_wet_threads_raw"].max() == 3
-    assert capped_samples["n_wet_threads"].max() == 2
-    assert capped_samples["n_wet_threads_capped"].any()
+    assert enriched.loc[0, "width_method"] == "two_bank_dt"
+    assert np.isclose(float(enriched.loc[0, "wid_adj_total"]), float(enriched.loc[0, "wid_adj_wet"]), rtol=0.15)
+    assert float(enriched.loc[0, "wid_adj_dry"]) < 1.0
+    assert int(enriched.loc[0, "n_wet_threads_max"]) == 1
+    assert int(enriched.loc[0, "n_channels_max"]) == 1
+    assert set(samples["width_method"]) == {"two_bank_dt"}
+    assert int(samples["n_channels"].max()) == 1
 
 
-def test_compute_width_families_uses_local_corridor_for_base_scope_label(tmp_path: Path) -> None:
-    mask = np.zeros((20, 20), dtype=np.uint8)
-    mask[:, 5] = 1
-    mask[:, 10] = 1
-    mask[:, 15] = 1
+def test_compute_width_families_collapsed_fill_separates_wet_and_dry_width(tmp_path: Path) -> None:
+    collapsed_mask = np.zeros((20, 20), dtype=np.uint8)
+    collapsed_mask[:, 6:14] = 1
+    wet_mask = np.zeros((20, 20), dtype=np.uint8)
+    wet_mask[:, 6:8] = 1
+    wet_mask[:, 12:14] = 1
 
-    mask_path = tmp_path / "mask.tif"
     transform = from_origin(0, 20, 1, 1)
-    with rasterio.open(
-        mask_path,
-        "w",
-        driver="GTiff",
-        height=mask.shape[0],
-        width=mask.shape[1],
-        count=1,
-        dtype="uint8",
-        crs="EPSG:3857",
-        transform=transform,
-    ) as dst:
-        dst.write(mask, 1)
-
-    width_scope_mask = np.where(mask > 0, 1, 0).astype(np.uint16)
-    width_scope_mask_path = tmp_path / "width_scope_mask.tif"
-    with rasterio.open(
-        width_scope_mask_path,
-        "w",
-        driver="GTiff",
-        height=width_scope_mask.shape[0],
-        width=width_scope_mask.shape[1],
-        count=1,
-        dtype="uint16",
-        crs="EPSG:3857",
-        transform=transform,
-    ) as dst:
-        dst.write(width_scope_mask, 1)
+    collapsed_mask_path = tmp_path / "collapsed_mask.tif"
+    wet_mask_path = tmp_path / "wet_mask.tif"
+    for path, array in ((collapsed_mask_path, collapsed_mask), (wet_mask_path, wet_mask)):
+        with rasterio.open(
+            path,
+            "w",
+            driver="GTiff",
+            height=array.shape[0],
+            width=array.shape[1],
+            count=1,
+            dtype="uint8",
+            crs="EPSG:3857",
+            transform=transform,
+        ) as dst:
+            dst.write(array, 1)
 
     rows = np.arange(2, 18, dtype=int)
-    cols = np.full_like(rows, 10)
-    idx_link = ",".join(str(int(index)) for index in np.ravel_multi_index((rows, cols), mask.shape))
-    wid_pix = ",".join("2.0" for _ in rows)
-    geometry = LineString([(10.5, 17.5), (10.5, 2.5)])
+    cols = np.full_like(rows, 9)
+    idx_link = ",".join(str(int(index)) for index in np.ravel_multi_index((rows, cols), collapsed_mask.shape))
+    wid_pix = ",".join("8.0" for _ in rows)
+    geometry = LineString([(9.5, 17.5), (9.5, 2.5)])
 
     links = gpd.GeoDataFrame(
-        [
-            {
-                "id_link": 1,
-                "idx_link": idx_link,
-                "wid_pix": wid_pix,
-                "wid_adj": 2.0,
-                "collapsed_selection_type": "base",
-                "collapsed_unit_count": 0,
-                "geometry": geometry,
-            }
-        ],
+        [{"id_link": 1, "idx_link": idx_link, "wid_pix": wid_pix, "wid_adj": 8.0, "geometry": geometry}],
         geometry="geometry",
         crs="EPSG:3857",
     )
 
-    local_enriched, _ = compute_width_families(
+    enriched, samples = compute_width_families(
         links,
-        collapsed_mask_path=mask_path,
-        wet_reference_mask_path=mask_path,
-        use_full_width_transects=False,
-    )
-    scoped_enriched, scoped_samples = compute_width_families(
-        links,
-        collapsed_mask_path=mask_path,
-        wet_reference_mask_path=mask_path,
-        width_scope_mask_path=width_scope_mask_path,
-    )
-    full_enriched, _ = compute_width_families(
-        links,
-        collapsed_mask_path=mask_path,
-        wet_reference_mask_path=mask_path,
-        use_full_width_transects=True,
+        collapsed_mask_path=collapsed_mask_path,
+        wet_reference_mask_path=wet_mask_path,
     )
 
-    local_row = local_enriched.iloc[0]
-    scoped_row = scoped_enriched.iloc[0]
-    full_row = full_enriched.iloc[0]
-
-    assert scoped_row["width_scope"] == "label_mask"
-    assert scoped_samples["width_scope_label"].eq(1).all()
-    assert int(scoped_row["n_wet_threads_max"]) == 1
-    assert np.isclose(float(scoped_row["wid_adj_wet"]), float(local_row["wid_adj_wet"]))
-    assert float(scoped_row["wid_adj_wet"]) < float(full_row["wid_adj_wet"])
+    assert float(enriched.loc[0, "wid_adj_total"]) > float(enriched.loc[0, "wid_adj_wet"])
+    assert float(enriched.loc[0, "wid_adj_dry"]) > 0
+    assert int(enriched.loc[0, "n_wet_threads_max"]) == 2
+    assert int(enriched.loc[0, "n_channels_max"]) == 2
+    assert samples["left_component_id"].notna().any()
+    assert samples["right_component_id"].notna().any()
+    assert (samples["width_dry"] > 0).any()
 
 
 def test_apply_collapsed_selection_metadata_adds_collapsed_unit_columns() -> None:
@@ -362,7 +190,7 @@ def test_apply_collapsed_selection_metadata_adds_collapsed_unit_columns() -> Non
     assert result["collapsed_selection_type"].tolist() == ["unit", "unit"]
 
 
-def test_apply_collapse_components_to_mask_adds_pixels(tmp_path: Path) -> None:
+def test_apply_collapse_components_to_mask_labels_only_added_pixels(tmp_path: Path) -> None:
     mask = np.zeros((20, 20), dtype=np.uint8)
     mask[4, 4:16] = 1
     mask[15, 4:16] = 1
@@ -408,7 +236,7 @@ def test_apply_collapse_components_to_mask_adds_pixels(tmp_path: Path) -> None:
             }
         ]
 
-    collapsed_mask, width_scope_mask, summary, component_frame, edit_geometries = _apply_collapse_components_to_mask(
+    collapsed_mask, origin_mask, summary, component_frame, edit_geometries = _apply_collapse_components_to_mask(
         mask_path,
         components,
         reviewed_links,
@@ -419,9 +247,12 @@ def test_apply_collapse_components_to_mask_adds_pixels(tmp_path: Path) -> None:
     assert summary["pixels_added"] > 0
     assert int(collapsed_mask.sum()) > int(mask.sum())
     assert int(component_frame.loc[0, "added_pixels"]) == summary["pixels_added"]
+    assert int(component_frame.loc[0, "origin_label"]) == 101
     assert int(component_frame.loc[0, "width_scope_label"]) == 101
-    assert 101 in np.unique(width_scope_mask)
-    assert set(edit_geometries["geometry_role"]) == {"footprint", "edit", "width_scope_domain"}
+    assert 101 in np.unique(origin_mask)
+    assert int(origin_mask[10, 10]) == 101
+    assert int(origin_mask[4, 4]) == 1
+    assert set(edit_geometries["geometry_role"]) == {"footprint", "edit", "collapse_domain"}
 
 
 def test_resolve_link_by_progression_prefers_upstream_source_distance() -> None:

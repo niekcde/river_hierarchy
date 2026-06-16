@@ -1497,6 +1497,8 @@ def _materialize_base_state_variant(
     base_run_name = f"{example_id}__{base_variant_id}"
     collapsed_mask_path = mask_dir / f"{base_run_name}_collapsed.tif"
     shutil.copy2(context.cleaned_mask_path, collapsed_mask_path)
+    origin_mask_path = mask_dir / "origin_mask.tif"
+    shutil.copy2(collapsed_mask_path, origin_mask_path)
 
     reviewed_links = gpd.read_file(context.reviewed_links_path)
     reviewed_nodes = gpd.read_file(context.reviewed_nodes_path)
@@ -1552,8 +1554,7 @@ def _materialize_base_state_variant(
         directed_links,
         collapsed_mask_path=collapsed_mask_path,
         wet_reference_mask_path=collapsed_mask_path,
-        transect_scale=transect_scale,
-        min_transect_pixels=min_transect_pixels,
+        origin_mask_path=origin_mask_path,
     )
     enriched_links = _apply_collapsed_selection_metadata(enriched_links, unit_ids=[], group_label=None)
     enriched_links = _normalize_numeric_id_columns(enriched_links)
@@ -1695,6 +1696,8 @@ def _materialize_base_state_variant(
         "output_paths": {
             "output_dir": str(variant_dir.resolve()),
             "collapsed_mask": str(collapsed_mask_path.resolve()),
+            "origin_mask": str(origin_mask_path.resolve()),
+            "width_scope_mask": str(origin_mask_path.resolve()),
             "collapse_components": str((summary_dir / "collapse_components.csv").resolve()),
             "unit_link_membership": str((summary_dir / "unit_link_membership.csv").resolve()),
             "edit_geometries": str((mask_dir / "collapse_edit_geometries.gpkg").resolve()),
