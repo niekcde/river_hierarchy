@@ -845,6 +845,7 @@ def compute_width_families(
     origin_mask_path: str | Path | None = None,
     rivgraph_distance_path: str | Path | None = None,
     bank_labels_path: str | Path | None = None,
+    bank_candidate_neighbors_max: int = 2048,
 ) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
     resolved_origin_mask = origin_mask_path or width_scope_mask_path
     enriched, samples = compute_two_bank_width_families(
@@ -854,6 +855,7 @@ def compute_width_families(
         origin_mask_path=resolved_origin_mask,
         rivgraph_distance_path=rivgraph_distance_path,
         bank_labels_path=bank_labels_path,
+        bank_candidate_neighbors_max=bank_candidate_neighbors_max,
     )
     return enriched, samples
 
@@ -3358,6 +3360,7 @@ def generate_network_variant(
     wet_reference_mask_path: str | Path | None = None,
     boundary_component_labels_path: str | Path | None = None,
     boundary_component_output_dir: str | Path | None = None,
+    bank_candidate_neighbors_max: int = 2048,
     preferred_width_field: str = DEFAULT_FOOTPRINT_WIDTH_FIELD,
     footprint_buffer_scale: float = DEFAULT_FOOTPRINT_BUFFER_SCALE,
     all_touched: bool = True,
@@ -3516,6 +3519,7 @@ def generate_network_variant(
         origin_mask_path=origin_mask_path,
         rivgraph_distance_path=rivgraph_paths.get("distance"),
         bank_labels_path=bank_labels_path,
+        bank_candidate_neighbors_max=bank_candidate_neighbors_max,
     )
     link_width_samples = _apply_collapsed_selection_metadata(
         link_width_samples,
@@ -3657,6 +3661,7 @@ def generate_network_variant(
             origin_mask_path=origin_mask_path,
             rivgraph_distance_path=rivgraph_paths.get("distance"),
             bank_labels_path=bank_labels_path,
+            bank_candidate_neighbors_max=bank_candidate_neighbors_max,
         )
         enriched_links = anchored_enriched_links
         link_width_samples = _apply_collapsed_selection_metadata(
@@ -3702,6 +3707,7 @@ def generate_network_variant(
         "transect_scale": float(transect_scale),
         "min_transect_pixels": float(min_transect_pixels),
         "match_tolerance": float(match_tolerance),
+        "bank_candidate_neighbors_max": int(bank_candidate_neighbors_max),
         "all_touched": bool(all_touched),
         "allow_noop": bool(allow_noop),
         "export_sword": bool(export_sword),
@@ -3836,6 +3842,7 @@ def derive_anchored_variant_from_realized(
     wet_reference_mask_path: str | Path | None = None,
     boundary_component_labels_path: str | Path | None = None,
     boundary_component_output_dir: str | Path | None = None,
+    bank_candidate_neighbors_max: int = 2048,
     sword_node_source_path: str | Path | None = None,
     sword_wse_field: str | None = None,
     sword_match_tolerance: float | None = None,
@@ -4071,6 +4078,7 @@ def derive_anchored_variant_from_realized(
         origin_mask_path=origin_mask_path,
         rivgraph_distance_path=rivgraph_distance_path,
         bank_labels_path=bank_labels_path,
+        bank_candidate_neighbors_max=bank_candidate_neighbors_max,
     )
     link_width_samples = _apply_collapsed_selection_metadata(
         anchored_link_width_samples,
@@ -4105,6 +4113,7 @@ def derive_anchored_variant_from_realized(
         "SWORD node matching/propagation",
     ]
     manifest["ready_for_rapid"] = bool(direction_summary.get("is_valid", False))
+    manifest["bank_candidate_neighbors_max"] = int(bank_candidate_neighbors_max)
     manifest["source_paths"] = dict(manifest.get("source_paths", {}))
     manifest["source_paths"]["reviewed_links"] = str(Path(reviewed_links_path).resolve())
     manifest["source_paths"]["reviewed_nodes"] = str(Path(reviewed_nodes_path).resolve())
@@ -4192,6 +4201,7 @@ def refresh_variant_width_scope_and_families(
     wet_reference_mask_path: str | Path | None = None,
     boundary_component_labels_path: str | Path | None = None,
     boundary_component_output_dir: str | Path | None = None,
+    bank_candidate_neighbors_max: int | None = None,
     preferred_width_field: str | None = None,
     footprint_buffer_scale: float | None = None,
     transect_scale: float = DEFAULT_TRANSECT_SCALE,
@@ -4295,6 +4305,7 @@ def refresh_variant_width_scope_and_families(
         origin_mask_path=origin_mask_path,
         rivgraph_distance_path=output_paths.get("rivgraph_distance"),
         bank_labels_path=bank_labels_path,
+        bank_candidate_neighbors_max=int(bank_candidate_neighbors_max or manifest.get("bank_candidate_neighbors_max", 2048)),
     )
     link_width_samples = _apply_collapsed_selection_metadata(
         link_width_samples,
@@ -4318,6 +4329,7 @@ def refresh_variant_width_scope_and_families(
     )
     manifest["transect_scale"] = float(transect_scale)
     manifest["min_transect_pixels"] = float(min_transect_pixels)
+    manifest["bank_candidate_neighbors_max"] = int(bank_candidate_neighbors_max or manifest.get("bank_candidate_neighbors_max", 2048))
     manifest["mask_summary"] = mask_summary
     manifest["source_paths"] = source_paths
     manifest["source_paths"]["cleaned_mask"] = str(resolved_cleaned_mask.resolve())
@@ -4388,6 +4400,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-sword-export", action="store_true", help="Skip SWORD-style RivGraph exports.")
     parser.add_argument("--transect-scale", type=float, default=DEFAULT_TRANSECT_SCALE, help="Multiplier for transect half-length relative to local total width.")
     parser.add_argument("--min-transect-pixels", type=float, default=DEFAULT_MIN_TRANSECT_PIXELS, help="Minimum transect half-length in raster pixels.")
+    parser.add_argument(
+        "--bank-candidate-neighbors-max",
+        type=int,
+        default=2048,
+        help="Maximum number of nearest boundary pixels to query adaptively when seeking left/right bank candidates.",
+    )
     parser.add_argument("--match-tolerance", type=float, default=None, help="Optional spatial tolerance for parent-child graph matching. Defaults to 1.25 raster pixels.")
     parser.add_argument("--sword-node-source", default=None, help="Optional SWORD node source file or parquet directory used for node matching.")
     parser.add_argument("--sword-wse-field", default=None, help="Optional WSE field name in the SWORD node source. Defaults to automatic detection.")
@@ -4426,6 +4444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         export_sword=not args.disable_sword_export,
         transect_scale=args.transect_scale,
         min_transect_pixels=args.min_transect_pixels,
+        bank_candidate_neighbors_max=args.bank_candidate_neighbors_max,
         match_tolerance=args.match_tolerance,
         sword_node_source_path=args.sword_node_source,
         sword_wse_field=args.sword_wse_field,

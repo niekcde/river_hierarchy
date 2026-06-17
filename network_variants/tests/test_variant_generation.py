@@ -6,6 +6,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
+from scipy.spatial import cKDTree
 from rasterio.transform import from_origin
 from shapely.geometry import LineString, Point
 
@@ -29,7 +30,7 @@ from network_variants.variant_generation import (
     _trim_slice,
     compute_width_families,
 )
-from network_variants.width_two_bank import build_state_bank_labels
+from network_variants.width_two_bank import BoundaryComponentIndex, _find_local_controlling_pair, build_state_bank_labels
 from hierarchy_level_definition.graph_building.directed_network_checks import (
     validate_single_inlet_single_outlet,
 )
@@ -198,6 +199,45 @@ def test_build_state_bank_labels_turns_selected_fill_land_into_water() -> None:
     assert np.all(bank_labels[:, 4:6] == 1)
     assert int(bank_labels[0, 0]) == 2
     assert int(bank_labels[0, -1]) == 3
+
+
+def test_find_local_controlling_pair_expands_candidate_neighbors() -> None:
+    left_xs = np.asarray([-float(i) for i in range(1, 151)], dtype=float)
+    left_ys = np.zeros_like(left_xs)
+    right_xs = np.asarray([120.0], dtype=float)
+    right_ys = np.asarray([0.0], dtype=float)
+    xs = np.concatenate([left_xs, right_xs])
+    ys = np.concatenate([left_ys, right_ys])
+    component_ids = np.concatenate([np.full(len(left_xs), 3, dtype=int), np.asarray([2], dtype=int)])
+    index = BoundaryComponentIndex(
+        tree=cKDTree(np.column_stack([xs, ys])),
+        xs=xs,
+        ys=ys,
+        component_ids=component_ids,
+        n_components=2,
+    )
+    center_xy = np.asarray([0.0, 0.0], dtype=float)
+    normal = np.asarray([1.0, 0.0], dtype=float)
+
+    no_pair = _find_local_controlling_pair(
+        center_xy,
+        normal,
+        boundary_index=index,
+        search_radius=500.0,
+        candidate_neighbors_max=96,
+    )
+    assert no_pair is None
+
+    pair = _find_local_controlling_pair(
+        center_xy,
+        normal,
+        boundary_index=index,
+        search_radius=500.0,
+        candidate_neighbors_max=256,
+    )
+    assert pair is not None
+    assert int(pair["left_component_id"]) == 3
+    assert int(pair["right_component_id"]) == 2
 
 
 def test_apply_collapsed_selection_metadata_adds_collapsed_unit_columns() -> None:

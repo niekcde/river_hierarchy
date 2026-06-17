@@ -22,6 +22,7 @@ DEFAULT_SEARCH_RADIUS_MULTIPLIER = 4.0
 DEFAULT_MIN_SEARCH_PIXELS = 6.0
 DEFAULT_MAX_SEARCH_MULTIPLIER = 16.0
 DEFAULT_CANDIDATE_NEIGHBORS = 96
+DEFAULT_CANDIDATE_NEIGHBORS_MAX = 2048
 DEFAULT_LINE_SAMPLE_SPACING_FACTOR = 0.5
 ORIGIN_WET_LABEL = 1
 ORIGIN_FILL_LABEL_START = 101
@@ -327,6 +328,35 @@ def _select_local_controlling_pair(
     }
 
 
+def _find_local_controlling_pair(
+    center_xy: np.ndarray,
+    normal: np.ndarray,
+    *,
+    boundary_index: BoundaryComponentIndex | None,
+    search_radius: float,
+    candidate_neighbors_max: int,
+) -> dict[str, Any] | None:
+    if boundary_index is None:
+        return None
+    max_neighbors = max(int(candidate_neighbors_max), int(DEFAULT_CANDIDATE_NEIGHBORS), 16)
+    for factor in (1.0, 2.0, 4.0, DEFAULT_MAX_SEARCH_MULTIPLIER / DEFAULT_SEARCH_RADIUS_MULTIPLIER):
+        neighbor_count = max(DEFAULT_CANDIDATE_NEIGHBORS, 16)
+        while True:
+            candidates = _query_candidate_components(
+                center_xy,
+                boundary_index=boundary_index,
+                radius=search_radius * float(factor),
+                max_neighbors=neighbor_count,
+            )
+            pair = _select_local_controlling_pair(center_xy, normal, candidates)
+            if pair is not None:
+                return pair
+            if neighbor_count >= max_neighbors:
+                break
+            neighbor_count = min(neighbor_count * 2, max_neighbors)
+    return None
+
+
 def _sample_segment_labels(
     start_xy: np.ndarray,
     end_xy: np.ndarray,
@@ -423,6 +453,7 @@ def compute_two_bank_width_families(
     origin_mask_path: str | Path | None = None,
     rivgraph_distance_path: str | Path | None = None,
     bank_labels_path: str | Path | None = None,
+    bank_candidate_neighbors_max: int = DEFAULT_CANDIDATE_NEIGHBORS_MAX,
 ) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
     with rasterio.open(collapsed_mask_path) as collapsed_ds:
         collapsed_mask = collapsed_ds.read(1) > 0
@@ -490,19 +521,14 @@ def compute_two_bank_width_families(
             _, normal = _local_tangent_normal(xs, ys, index)
             dt_width = max(float(2.0 * dt_map[rows[index], cols[index]]), float(pixel_length))
 
-            pair: dict[str, Any] | None = None
             search_radius = max(dt_width * DEFAULT_SEARCH_RADIUS_MULTIPLIER, pixel_length * DEFAULT_MIN_SEARCH_PIXELS)
-            if boundary_index is not None:
-                for factor in (1.0, 2.0, 4.0, DEFAULT_MAX_SEARCH_MULTIPLIER / DEFAULT_SEARCH_RADIUS_MULTIPLIER):
-                    candidates = _query_candidate_components(
-                        center_xy,
-                        boundary_index=boundary_index,
-                        radius=search_radius * float(factor),
-                        max_neighbors=max(DEFAULT_CANDIDATE_NEIGHBORS, 16),
-                    )
-                    pair = _select_local_controlling_pair(center_xy, normal, candidates)
-                    if pair is not None:
-                        break
+            pair = _find_local_controlling_pair(
+                center_xy,
+                normal,
+                boundary_index=boundary_index,
+                search_radius=search_radius,
+                candidate_neighbors_max=bank_candidate_neighbors_max,
+            )
 
             if pair is None:
                 width_total_values.append(float("nan"))

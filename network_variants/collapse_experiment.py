@@ -213,6 +213,7 @@ def _make_realized_reuse_variant_runner(
             max_paths=int(kwargs.get("max_paths", 5000)),
             transect_scale=float(kwargs.get("transect_scale", 1.5)),
             min_transect_pixels=float(kwargs.get("min_transect_pixels", 5.0)),
+            bank_candidate_neighbors_max=int(kwargs.get("bank_candidate_neighbors_max", 2048)),
             match_tolerance=kwargs.get("match_tolerance"),
         )
 
@@ -252,6 +253,7 @@ def _make_realized_seeded_anchored_variant_runner(
                 max_paths=int(kwargs.get("max_paths", 5000)),
                 transect_scale=float(kwargs.get("transect_scale", 1.5)),
                 min_transect_pixels=float(kwargs.get("min_transect_pixels", 5.0)),
+                bank_candidate_neighbors_max=int(kwargs.get("bank_candidate_neighbors_max", 2048)),
                 match_tolerance=kwargs.get("match_tolerance"),
             )
 
@@ -1485,6 +1487,7 @@ def _materialize_base_state_variant(
     preferred_width_field: str,
     transect_scale: float,
     min_transect_pixels: float,
+    bank_candidate_neighbors_max: int = 2048,
     sword_node_source_path: str | Path | None,
     sword_wse_field: str | None,
     sword_match_tolerance: float | None,
@@ -1589,6 +1592,7 @@ def _materialize_base_state_variant(
         wet_reference_mask_path=collapsed_mask_path,
         origin_mask_path=origin_mask_path,
         bank_labels_path=bank_labels_path,
+        bank_candidate_neighbors_max=bank_candidate_neighbors_max,
     )
     enriched_links = _apply_collapsed_selection_metadata(enriched_links, unit_ids=[], group_label=None)
     enriched_links = _normalize_numeric_id_columns(enriched_links)
@@ -1758,6 +1762,7 @@ def _materialize_base_state_variant(
             "removed_land_labels": removed_bank_labels,
             "n_removed_land_labels": int(len(removed_bank_labels)),
         },
+        "bank_candidate_neighbors_max": int(bank_candidate_neighbors_max),
     }
     with (summary_dir / "variant_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
@@ -1863,6 +1868,7 @@ def run_collapse_experiment(
     export_sword: bool = True,
     transect_scale: float = 1.5,
     min_transect_pixels: float = 5.0,
+    bank_candidate_neighbors_max: int = 2048,
     match_tolerance: float | None = None,
     sword_node_source_path: str | Path | None = None,
     sword_wse_field: str | None = None,
@@ -1924,6 +1930,7 @@ def run_collapse_experiment(
         "export_sword": export_sword,
         "transect_scale": transect_scale,
         "min_transect_pixels": min_transect_pixels,
+        "bank_candidate_neighbors_max": bank_candidate_neighbors_max,
         "match_tolerance": match_tolerance,
         "sword_node_source_path": sword_node_source_path,
         "sword_wse_field": sword_wse_field,
@@ -1967,6 +1974,7 @@ def run_collapse_experiment(
         sword_reach_buffer_steps=sword_reach_buffer_steps,
         boundary_component_labels_path=boundary_component_labels_path,
         boundary_component_output_dir=boundary_component_output_dir,
+        bank_candidate_neighbors_max=bank_candidate_neighbors_max,
     )
     if base_variant_outputs.boundary_component_labels_path is not None:
         boundary_component_labels_path = base_variant_outputs.boundary_component_labels_path
@@ -2076,6 +2084,7 @@ def run_collapse_experiment(
                     "export_sword": bool(export_sword),
                     "transect_scale": float(transect_scale),
                     "min_transect_pixels": float(min_transect_pixels),
+                    "bank_candidate_neighbors_max": int(bank_candidate_neighbors_max),
                     "match_tolerance": match_tolerance,
                     "sword_node_source_path": str(Path(sword_node_source_path).resolve()) if sword_node_source_path is not None else None,
                     "sword_wse_field": sword_wse_field,
@@ -2568,6 +2577,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-sword-export", action="store_true", help="Skip SWORD-style RivGraph exports.")
     parser.add_argument("--transect-scale", type=float, default=1.5, help="Multiplier for transect half-length relative to local total width.")
     parser.add_argument("--min-transect-pixels", type=float, default=5.0, help="Minimum transect half-length in raster pixels.")
+    parser.add_argument(
+        "--bank-candidate-neighbors-max",
+        type=int,
+        default=2048,
+        help="Maximum number of nearest boundary pixels to query adaptively when seeking left/right bank candidates.",
+    )
     parser.add_argument("--match-tolerance", type=float, default=None, help="Optional spatial tolerance for parent-child graph matching.")
     parser.add_argument("--sword-node-source", default=None, help="Optional SWORD node source file or parquet directory used for node matching.")
     parser.add_argument("--sword-wse-field", default=None, help="Optional WSE field name in the SWORD node source. Defaults to automatic detection.")
@@ -2644,6 +2659,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "export_sword": not args.disable_sword_export,
         "transect_scale": args.transect_scale,
         "min_transect_pixels": args.min_transect_pixels,
+        "bank_candidate_neighbors_max": args.bank_candidate_neighbors_max,
         "match_tolerance": args.match_tolerance,
         "sword_node_source_path": args.sword_node_source,
         "sword_wse_field": args.sword_wse_field,
