@@ -43,12 +43,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    prepare_parser = subparsers.add_parser("prepare-mask", help="Create the binary/projected mask once.")
+    prepare_parser = subparsers.add_parser("prepare-mask", help="Create or rebuild the binary/projected mask.")
     add_run_identity_args(prepare_parser)
     prepare_parser.add_argument("--source-mask", type=Path, required=True, help="Source river mask GeoTIFF.")
     prepare_parser.add_argument("--threshold", type=float, default=0.5, help="Water threshold for the binary mask.")
     prepare_parser.add_argument("--dst-crs", default=None, help="Projected CRS override.")
-    prepare_parser.add_argument("--force", action="store_true", help="Rebuild the prepared mask even if it exists.")
+    prepare_parser.add_argument("--force", action="store_true", help="Deprecated compatibility flag. The prepared mask is rebuilt on every run.")
 
     edits_parser = subparsers.add_parser("apply-edits", help="Apply manual polygon edits to the prepared mask.")
     add_run_identity_args(edits_parser)

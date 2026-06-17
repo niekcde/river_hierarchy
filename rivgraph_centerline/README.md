@@ -101,7 +101,7 @@ lives in `run_workflow.py`.
 
 For a new mask named `my_test_01`, the normal steps are:
 
-1. Prepare the binary/projected mask once:
+1. Prepare or rebuild the binary/projected mask:
 
 ```bash
 /opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
@@ -115,7 +115,7 @@ This creates:
 ```text
 rivgraph_centerline/outputs/runs/my_test_01/
   masks_prepared/my_test_01_binary_projected.tif
-  manual_edits/my_test_01_manual_edits.gpkg   # expected QGIS edit path
+  manual_edits/my_test_01_manual_edits.gpkg   # auto-created empty polygon layer with `action`
   prepare_summary.json
 ```
 

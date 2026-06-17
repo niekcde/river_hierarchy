@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
+import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import calculate_default_transform, reproject
+from shapely.geometry import Polygon
 
 from rivgraph_centerline.manual_edits import apply_manual_edits
 
@@ -125,16 +129,15 @@ def prepare_mask_for_run(
     paths.ensure_dirs()
     source_mask = Path(source_mask).expanduser().resolve()
 
-    if paths.prepared_mask.exists() and force is False and paths.prepare_summary.exists():
-        summary = load_json(paths.prepare_summary)
-        summary["reused_existing"] = True
-        return paths, summary
-
     summary = prepare_binary_projected_mask(
         src_path=source_mask,
         dst_path=paths.prepared_mask,
         threshold=threshold,
         dst_crs=dst_crs,
+    )
+    ensure_manual_edits_gpkg(
+        gpkg_path=paths.manual_edits_path,
+        target_crs=summary["target_crs"],
     )
     summary.update(
         {
@@ -507,6 +510,53 @@ def prepare_binary_projected_mask(
             "source_water_fraction": source_water_pixels / source_total_pixels,
             "prepared_water_fraction": dst_water_pixels / dst_total_pixels,
         }
+
+
+def ensure_manual_edits_gpkg(
+    *,
+    gpkg_path: Path,
+    target_crs: str | rasterio.crs.CRS,
+    action_field: str = "action",
+) -> None:
+    if gpkg_path.exists() and _manual_edits_gpkg_is_valid(gpkg_path, action_field=action_field):
+        return
+
+    if gpkg_path.exists():
+        gpkg_path.unlink()
+
+    gpkg_path.parent.mkdir(parents=True, exist_ok=True)
+    placeholder = Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])
+    empty = gpd.GeoDataFrame(
+        data={action_field: pd.Series(["remove"], dtype="string")},
+        geometry=[placeholder],
+        crs=target_crs,
+    )
+    empty.to_file(gpkg_path, driver="GPKG", geometry_type="Polygon")
+    layer_name = gpkg_path.stem
+    with sqlite3.connect(gpkg_path) as con:
+        con.execute(f'DELETE FROM "{layer_name}"')
+        con.commit()
+
+
+def _manual_edits_gpkg_is_valid(gpkg_path: Path, *, action_field: str) -> bool:
+    try:
+        layer_name = gpkg_path.stem
+        with sqlite3.connect(gpkg_path) as con:
+            geometry_row = con.execute(
+                "SELECT geometry_type_name FROM gpkg_geometry_columns WHERE table_name = ?",
+                (layer_name,),
+            ).fetchone()
+            field_row = con.execute(f'PRAGMA table_info("{layer_name}")').fetchall()
+        if geometry_row is None or geometry_row[0].upper() != "POLYGON":
+            return False
+        field_types = {row[1]: (row[2] or "") for row in field_row}
+        action_type = field_types.get(action_field, "").upper()
+        if action_type not in {"TEXT", "VARCHAR(10)", "STRING"}:
+            return False
+        visible_columns = set(gpd.read_file(gpkg_path).columns)
+        return action_field in visible_columns
+    except Exception:
+        return False
 
 
 def choose_projected_crs(src: rasterio.io.DatasetReader) -> str:
