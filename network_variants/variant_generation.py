@@ -47,8 +47,9 @@ from hierarchy_level_definition.unit_detection.bifurcation_confluence_units impo
     StructuralUnit,
     analyze_network,
 )
+from network_variants.build_boundary_component_mask import build_boundary_component_mask
 from network_variants.sword_matching import match_variant_nodes_to_sword
-from network_variants.width_two_bank import compute_two_bank_width_families
+from network_variants.width_two_bank import build_state_bank_labels, compute_two_bank_width_families
 
 
 DEFAULT_FOOTPRINT_WIDTH_FIELD = "wid_adj"
@@ -123,6 +124,8 @@ class NetworkVariantOutputs:
     sword_reaches_path: Path | None
     sword_nodes_path: Path | None
     manifest: dict[str, Any]
+    bank_labels_path: Path | None = None
+    boundary_component_labels_path: Path | None = None
     origin_mask_path: Path | None = None
     rivgraph_distance_path: Path | None = None
 
@@ -196,6 +199,67 @@ def _default_variant_id(group_label: str | None, unit_ids: Sequence[int] | None)
 def _default_output_dir(cleaned_mask_path: str | Path, variant_id: str, example_id: str | None = None) -> Path:
     example_id = str(example_id) if example_id is not None else _infer_example_id(cleaned_mask_path)
     return Path(__file__).resolve().parent / "outputs" / example_id / variant_id
+
+
+def _infer_reference_centerline_path(
+    *,
+    cleaned_mask_path: str | Path,
+    reviewed_links_path: str | Path,
+) -> Path:
+    cleaned_mask_path = Path(cleaned_mask_path)
+    reviewed_links_path = Path(reviewed_links_path)
+    example_id = _infer_example_id(cleaned_mask_path)
+    candidate_paths = [
+        reviewed_links_path.with_name(f"{_infer_example_id(reviewed_links_path)}_centerline.gpkg"),
+        cleaned_mask_path.parent.parent / "rivgraph" / f"{example_id}_centerline.gpkg",
+    ]
+    for path in candidate_paths:
+        if path.exists():
+            return path
+    raise FileNotFoundError(
+        "Could not resolve the reference single-edge centerline needed for boundary-mask creation. "
+        f"Tried: {[str(path) for path in candidate_paths]}"
+    )
+
+
+def _ensure_boundary_component_mask(
+    *,
+    cleaned_mask_path: str | Path,
+    reviewed_links_path: str | Path,
+    output_dir: str | Path,
+    boundary_component_labels_path: str | Path | None = None,
+) -> dict[str, str]:
+    cleaned_mask_path = Path(cleaned_mask_path)
+    output_dir = Path(output_dir)
+    if boundary_component_labels_path is not None:
+        path = Path(boundary_component_labels_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Boundary component label mask not found: {path}")
+        prefix = _infer_example_id(cleaned_mask_path)
+        return {
+            "labels": str(path.resolve()),
+            "summary": str((output_dir / f"{prefix}_full_extent_land_component_summary_with_snapped_buffered_border_cut.csv").resolve()),
+        }
+
+    prefix = _infer_example_id(cleaned_mask_path)
+    expected_labels_path = output_dir / f"{prefix}_full_extent_land_water_labels_with_snapped_buffered_border_cut.tif"
+    expected_summary_path = output_dir / f"{prefix}_full_extent_land_component_summary_with_snapped_buffered_border_cut.csv"
+    if expected_labels_path.exists():
+        return {
+            "labels": str(expected_labels_path.resolve()),
+            "summary": str(expected_summary_path.resolve()),
+        }
+
+    centerline_path = _infer_reference_centerline_path(
+        cleaned_mask_path=cleaned_mask_path,
+        reviewed_links_path=reviewed_links_path,
+    )
+    return build_boundary_component_mask(
+        cleaned_mask_path=cleaned_mask_path,
+        centerline_path=centerline_path,
+        output_dir=output_dir,
+        extension_buffer_pixels=1,
+    )
 
 
 def _collapsed_selection_label(unit_ids: Sequence[int] | None, group_label: str | None) -> str:
@@ -780,6 +844,7 @@ def compute_width_families(
     width_scope_thread_caps: Mapping[int, int] | None = None,
     origin_mask_path: str | Path | None = None,
     rivgraph_distance_path: str | Path | None = None,
+    bank_labels_path: str | Path | None = None,
 ) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
     resolved_origin_mask = origin_mask_path or width_scope_mask_path
     enriched, samples = compute_two_bank_width_families(
@@ -788,6 +853,7 @@ def compute_width_families(
         wet_reference_mask_path=wet_reference_mask_path,
         origin_mask_path=resolved_origin_mask,
         rivgraph_distance_path=rivgraph_distance_path,
+        bank_labels_path=bank_labels_path,
     )
     return enriched, samples
 
@@ -980,6 +1046,28 @@ def _write_mask(path: str | Path, mask: np.ndarray, profile: Mapping[str, Any]) 
     with rasterio.open(output_path, "w", **write_profile) as dst:
         dst.write(mask.astype(write_dtype), 1)
     return output_path
+
+
+def _write_state_bank_labels(
+    *,
+    boundary_component_labels_path: str | Path,
+    origin_mask: np.ndarray,
+    output_path: str | Path,
+    profile: Mapping[str, Any],
+) -> tuple[Path, list[int]]:
+    with rasterio.open(boundary_component_labels_path) as src:
+        boundary_component_labels = src.read(1).astype(np.int32)
+        boundary_transform = src.transform
+        boundary_shape = src.shape
+
+    expected_shape = (int(profile["height"]), int(profile["width"]))
+    expected_transform = profile["transform"]
+    if boundary_shape != expected_shape or boundary_transform != expected_transform:
+        raise ValueError("Boundary component label mask must share shape and transform with the state masks.")
+
+    bank_labels, removed_labels = build_state_bank_labels(boundary_component_labels, origin_mask)
+    bank_labels_path = _write_mask(output_path, bank_labels.astype(np.int32), profile)
+    return bank_labels_path, removed_labels
 
 
 def _build_selection_masks(
@@ -3268,6 +3356,8 @@ def generate_network_variant(
     output_dir: str | Path | None = None,
     collapse_corridor_mode: str = "realized",
     wet_reference_mask_path: str | Path | None = None,
+    boundary_component_labels_path: str | Path | None = None,
+    boundary_component_output_dir: str | Path | None = None,
     preferred_width_field: str = DEFAULT_FOOTPRINT_WIDTH_FIELD,
     footprint_buffer_scale: float = DEFAULT_FOOTPRINT_BUFFER_SCALE,
     all_touched: bool = True,
@@ -3317,6 +3407,14 @@ def generate_network_variant(
         directory.mkdir(parents=True, exist_ok=True)
 
     wet_reference_mask_path = Path(wet_reference_mask_path) if wet_reference_mask_path is not None else Path(cleaned_mask_path)
+    boundary_output_dir = Path(boundary_component_output_dir) if boundary_component_output_dir is not None else (output_path / "boundary_components")
+    boundary_outputs = _ensure_boundary_component_mask(
+        cleaned_mask_path=cleaned_mask_path,
+        reviewed_links_path=reviewed_links_path,
+        output_dir=boundary_output_dir,
+        boundary_component_labels_path=boundary_component_labels_path,
+    )
+    resolved_boundary_component_labels_path = Path(boundary_outputs["labels"])
 
     _, units, _ = analyze_network(
         reviewed_links_path,
@@ -3368,6 +3466,12 @@ def generate_network_variant(
 
     collapsed_mask_path = _write_mask(mask_dir / f"{example_id}__{variant_id}_collapsed.tif", collapsed_mask, parent_profile)
     origin_mask_path = _write_mask(mask_dir / "origin_mask.tif", origin_mask, parent_profile)
+    bank_labels_path, removed_bank_labels = _write_state_bank_labels(
+        boundary_component_labels_path=resolved_boundary_component_labels_path,
+        origin_mask=origin_mask,
+        output_path=mask_dir / "bank_labels.tif",
+        profile=parent_profile,
+    )
     edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
     collapse_components.to_csv(summary_dir / "collapse_components.csv", index=False)
 
@@ -3411,6 +3515,7 @@ def generate_network_variant(
         wet_reference_mask_path=wet_reference_mask_path,
         origin_mask_path=origin_mask_path,
         rivgraph_distance_path=rivgraph_paths.get("distance"),
+        bank_labels_path=bank_labels_path,
     )
     link_width_samples = _apply_collapsed_selection_metadata(
         link_width_samples,
@@ -3551,6 +3656,7 @@ def generate_network_variant(
             wet_reference_mask_path=wet_reference_mask_path,
             origin_mask_path=origin_mask_path,
             rivgraph_distance_path=rivgraph_paths.get("distance"),
+            bank_labels_path=bank_labels_path,
         )
         enriched_links = anchored_enriched_links
         link_width_samples = _apply_collapsed_selection_metadata(
@@ -3615,6 +3721,7 @@ def generate_network_variant(
         "source_paths": {
             "cleaned_mask": str(Path(cleaned_mask_path).resolve()),
             "wet_reference_mask": str(Path(wet_reference_mask_path).resolve()),
+            "boundary_component_labels": str(resolved_boundary_component_labels_path.resolve()),
             "reviewed_links": str(Path(reviewed_links_path).resolve()),
             "reviewed_nodes": str(Path(reviewed_nodes_path).resolve()),
             "workflow_output_dir": str(Path(workflow_output_dir).resolve()) if workflow_output_dir is not None else None,
@@ -3631,6 +3738,10 @@ def generate_network_variant(
             ),
         },
         "mask_summary": mask_summary,
+        "bank_label_summary": {
+            "removed_land_labels": removed_bank_labels,
+            "n_removed_land_labels": int(len(removed_bank_labels)),
+        },
         "anchor_segmentation": anchor_segmentation_summary,
         "sword_matching": {
             "wse_field": sword_wse_field,
@@ -3653,6 +3764,8 @@ def generate_network_variant(
             "collapsed_mask": str(collapsed_mask_path.resolve()),
             "origin_mask": str(origin_mask_path.resolve()),
             "width_scope_mask": str(origin_mask_path.resolve()),
+            "bank_labels": str(bank_labels_path.resolve()),
+            "boundary_component_labels": str(resolved_boundary_component_labels_path.resolve()),
             "collapse_components": str((summary_dir / "collapse_components.csv").resolve()),
             "edit_geometries": str((mask_dir / "collapse_edit_geometries.gpkg").resolve()),
             "link_width_families": str((width_dir / "link_width_families.csv").resolve()),
@@ -3694,6 +3807,8 @@ def generate_network_variant(
         output_dir=output_path,
         collapsed_mask_path=collapsed_mask_path,
         width_scope_mask_path=origin_mask_path,
+        bank_labels_path=bank_labels_path,
+        boundary_component_labels_path=resolved_boundary_component_labels_path,
         rivgraph_links_path=Path(rivgraph_paths["links"]),
         rivgraph_nodes_path=Path(rivgraph_paths["nodes"]),
         directed_links_path=directed_dir / f"{rivgraph_name}_directed_links.gpkg",
@@ -3719,6 +3834,8 @@ def derive_anchored_variant_from_realized(
     example_id: str | None = None,
     variant_id: str | None = None,
     wet_reference_mask_path: str | Path | None = None,
+    boundary_component_labels_path: str | Path | None = None,
+    boundary_component_output_dir: str | Path | None = None,
     sword_node_source_path: str | Path | None = None,
     sword_wse_field: str | None = None,
     sword_match_tolerance: float | None = None,
@@ -3766,6 +3883,22 @@ def derive_anchored_variant_from_realized(
         wet_reference_mask_path = source_wet_reference if source_wet_reference is not None else collapsed_mask_path
     origin_mask_path = output_paths.get("origin_mask") or output_paths.get("width_scope_mask")
     rivgraph_distance_path = output_paths.get("rivgraph_distance")
+    source_cleaned_mask = source_manifest.get("source_paths", {}).get("cleaned_mask")
+    if source_cleaned_mask is None:
+        raise FileNotFoundError("Could not resolve source cleaned mask path for anchored derivation.")
+    boundary_output_dir = Path(boundary_component_output_dir) if boundary_component_output_dir is not None else (output_path / "boundary_components")
+    resolved_boundary_component_labels = (
+        boundary_component_labels_path
+        or source_manifest.get("output_paths", {}).get("boundary_component_labels")
+        or source_manifest.get("source_paths", {}).get("boundary_component_labels")
+    )
+    boundary_outputs = _ensure_boundary_component_mask(
+        cleaned_mask_path=source_cleaned_mask,
+        reviewed_links_path=reviewed_links_path,
+        output_dir=boundary_output_dir,
+        boundary_component_labels_path=resolved_boundary_component_labels,
+    )
+    resolved_boundary_component_labels_path = Path(boundary_outputs["labels"])
 
     directed_links_path = output_paths.get("directed_links")
     directed_nodes_path = output_paths.get("directed_nodes")
@@ -3811,9 +3944,6 @@ def derive_anchored_variant_from_realized(
     if missing_unit_ids:
         raise ValueError(f"The following selected unit_ids were not found in the reviewed graph: {missing_unit_ids}")
     if origin_mask_path is None or not origin_mask_path.exists():
-        source_cleaned_mask = source_manifest.get("source_paths", {}).get("cleaned_mask")
-        if source_cleaned_mask is None:
-            raise FileNotFoundError("Could not resolve source cleaned mask path to rebuild origin_mask.")
         _, origin_mask, _, collapse_components, edit_geometries = _build_selection_masks(
             cleaned_mask_path=source_cleaned_mask,
             reviewed_links=reviewed_links,
@@ -3827,6 +3957,14 @@ def derive_anchored_variant_from_realized(
         origin_mask_path = _write_mask(mask_dir / "origin_mask.tif", origin_mask, collapsed_profile)
         collapse_components.to_csv(summary_dir / "collapse_components.csv", index=False)
         edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
+    with rasterio.open(origin_mask_path) as origin_src:
+        origin_mask_array = origin_src.read(1).astype(np.uint16)
+    bank_labels_path, removed_bank_labels = _write_state_bank_labels(
+        boundary_component_labels_path=resolved_boundary_component_labels_path,
+        origin_mask=origin_mask_array,
+        output_path=mask_dir / "bank_labels.tif",
+        profile=collapsed_profile,
+    )
 
     parent_node_order, _, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
     _, parent_graph, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
@@ -3932,6 +4070,7 @@ def derive_anchored_variant_from_realized(
         wet_reference_mask_path=wet_reference_mask_path,
         origin_mask_path=origin_mask_path,
         rivgraph_distance_path=rivgraph_distance_path,
+        bank_labels_path=bank_labels_path,
     )
     link_width_samples = _apply_collapsed_selection_metadata(
         anchored_link_width_samples,
@@ -3971,6 +4110,11 @@ def derive_anchored_variant_from_realized(
     manifest["source_paths"]["reviewed_nodes"] = str(Path(reviewed_nodes_path).resolve())
     manifest["source_paths"]["wet_reference_mask"] = str(Path(wet_reference_mask_path).resolve())
     manifest["source_paths"]["realized_variant_output_dir"] = str(source_output_path.resolve())
+    manifest["source_paths"]["boundary_component_labels"] = str(resolved_boundary_component_labels_path.resolve())
+    manifest["bank_label_summary"] = {
+        "removed_land_labels": removed_bank_labels,
+        "n_removed_land_labels": int(len(removed_bank_labels)),
+    }
     manifest["sword_matching"] = {
         "wse_field": effective_sword_wse_field,
         "match_tolerance": sword_match_tolerance,
@@ -3993,6 +4137,8 @@ def derive_anchored_variant_from_realized(
     }
     manifest["output_paths"]["origin_mask"] = str(Path(origin_mask_path).resolve()) if origin_mask_path is not None else None
     manifest["output_paths"]["width_scope_mask"] = str(Path(origin_mask_path).resolve()) if origin_mask_path is not None else None
+    manifest["output_paths"]["bank_labels"] = str(bank_labels_path.resolve())
+    manifest["output_paths"]["boundary_component_labels"] = str(resolved_boundary_component_labels_path.resolve())
     manifest["direction_summary"] = direction_summary
     manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
     manifest["code_version"] = _git_revision()
@@ -4019,6 +4165,8 @@ def derive_anchored_variant_from_realized(
         output_dir=output_path,
         collapsed_mask_path=collapsed_mask_path,
         width_scope_mask_path=origin_mask_path,
+        bank_labels_path=bank_labels_path,
+        boundary_component_labels_path=resolved_boundary_component_labels_path,
         rivgraph_links_path=rivgraph_links_path,
         rivgraph_nodes_path=rivgraph_nodes_path,
         directed_links_path=directed_links_path,
@@ -4042,6 +4190,8 @@ def refresh_variant_width_scope_and_families(
     reviewed_nodes_path: str | Path | None = None,
     cleaned_mask_path: str | Path | None = None,
     wet_reference_mask_path: str | Path | None = None,
+    boundary_component_labels_path: str | Path | None = None,
+    boundary_component_output_dir: str | Path | None = None,
     preferred_width_field: str | None = None,
     footprint_buffer_scale: float | None = None,
     transect_scale: float = DEFAULT_TRANSECT_SCALE,
@@ -4069,6 +4219,19 @@ def refresh_variant_width_scope_and_families(
         if wet_reference_mask_path is not None
         else Path(source_paths.get("wet_reference_mask") or output_paths["collapsed_mask"])
     )
+    boundary_output_dir = Path(boundary_component_output_dir) if boundary_component_output_dir is not None else (output_path / "boundary_components")
+    resolved_boundary_component_labels = (
+        boundary_component_labels_path
+        or output_paths.get("boundary_component_labels")
+        or source_paths.get("boundary_component_labels")
+    )
+    boundary_outputs = _ensure_boundary_component_mask(
+        cleaned_mask_path=resolved_cleaned_mask,
+        reviewed_links_path=resolved_reviewed_links,
+        output_dir=boundary_output_dir,
+        boundary_component_labels_path=resolved_boundary_component_labels,
+    )
+    resolved_boundary_component_labels_path = Path(boundary_outputs["labels"])
     collapsed_mask_path = Path(output_paths["collapsed_mask"])
     directed_links_path = Path(output_paths["directed_links"])
     width_dir = output_path / "widths"
@@ -4106,6 +4269,12 @@ def refresh_variant_width_scope_and_families(
     with rasterio.open(collapsed_mask_path) as src:
         collapsed_profile = src.profile.copy()
     origin_mask_path = _write_mask(mask_dir / "origin_mask.tif", origin_mask, collapsed_profile)
+    bank_labels_path, removed_bank_labels = _write_state_bank_labels(
+        boundary_component_labels_path=resolved_boundary_component_labels_path,
+        origin_mask=origin_mask,
+        output_path=mask_dir / "bank_labels.tif",
+        profile=collapsed_profile,
+    )
 
     collapse_components = _apply_collapsed_selection_metadata(
         collapse_components,
@@ -4125,6 +4294,7 @@ def refresh_variant_width_scope_and_families(
         wet_reference_mask_path=resolved_wet_reference_mask,
         origin_mask_path=origin_mask_path,
         rivgraph_distance_path=output_paths.get("rivgraph_distance"),
+        bank_labels_path=bank_labels_path,
     )
     link_width_samples = _apply_collapsed_selection_metadata(
         link_width_samples,
@@ -4154,9 +4324,12 @@ def refresh_variant_width_scope_and_families(
     manifest["source_paths"]["wet_reference_mask"] = str(resolved_wet_reference_mask.resolve())
     manifest["source_paths"]["reviewed_links"] = str(resolved_reviewed_links.resolve())
     manifest["source_paths"]["reviewed_nodes"] = str(resolved_reviewed_nodes.resolve())
+    manifest["source_paths"]["boundary_component_labels"] = str(resolved_boundary_component_labels_path.resolve())
     manifest["output_paths"] = output_paths
     manifest["output_paths"]["origin_mask"] = str(origin_mask_path.resolve())
     manifest["output_paths"]["width_scope_mask"] = str(origin_mask_path.resolve())
+    manifest["output_paths"]["bank_labels"] = str(bank_labels_path.resolve())
+    manifest["output_paths"]["boundary_component_labels"] = str(resolved_boundary_component_labels_path.resolve())
     manifest["output_paths"]["collapse_components"] = str((summary_dir / "collapse_components.csv").resolve())
     manifest["output_paths"]["edit_geometries"] = str((mask_dir / "collapse_edit_geometries.gpkg").resolve())
     manifest["output_paths"]["link_width_families"] = str((width_dir / "link_width_families.csv").resolve())
@@ -4164,7 +4337,8 @@ def refresh_variant_width_scope_and_families(
     manifest["output_paths"]["links_with_width_families"] = str((width_dir / "links_with_width_families.gpkg").resolve())
     manifest["width_scope_patch"] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "two_bank_dt_origin_mask",
+        "mode": "two_bank_dt_origin_mask_bank_labels",
+        "removed_land_labels": removed_bank_labels,
     }
     manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
     manifest["code_version"] = _git_revision()
@@ -4174,6 +4348,7 @@ def refresh_variant_width_scope_and_families(
         "variant_output_dir": output_path.resolve(),
         "origin_mask": origin_mask_path.resolve(),
         "width_scope_mask": origin_mask_path.resolve(),
+        "bank_labels": bank_labels_path.resolve(),
         "link_width_families": (width_dir / "link_width_families.csv").resolve(),
         "link_width_samples": (width_dir / "link_width_samples.csv").resolve(),
         "links_with_width_families": (width_dir / "links_with_width_families.gpkg").resolve(),

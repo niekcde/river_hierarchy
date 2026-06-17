@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping, Sequence
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import rasterio
 
 repo_root = Path(__file__).resolve().parents[1]
 rapid_src = repo_root / "RAPID" / "src"
@@ -48,6 +49,8 @@ from network_variants.variant_generation import (
     VariantDirectionValidationError,
     _apply_collapsed_selection_metadata,
     _collapsed_selection_metadata,
+    _ensure_boundary_component_mask,
+    _write_state_bank_labels,
     compute_width_families,
     derive_anchored_variant_from_realized,
     generate_network_variant,
@@ -120,6 +123,8 @@ class BaseStateVariantOutputs:
     collapsed_mask_path: Path
     directed_links_path: Path
     directed_nodes_path: Path
+    bank_labels_path: Path | None = None
+    boundary_component_labels_path: Path | None = None
 
 
 def _git_revision() -> str | None:
@@ -196,6 +201,8 @@ def _make_realized_reuse_variant_runner(
             output_dir=kwargs["output_dir"],
             example_id=kwargs.get("example_id"),
             variant_id=kwargs.get("variant_id"),
+            boundary_component_labels_path=kwargs.get("boundary_component_labels_path"),
+            boundary_component_output_dir=kwargs.get("boundary_component_output_dir"),
             sword_node_source_path=kwargs.get("sword_node_source_path"),
             sword_wse_field=kwargs.get("sword_wse_field"),
             sword_match_tolerance=kwargs.get("sword_match_tolerance"),
@@ -233,6 +240,8 @@ def _make_realized_seeded_anchored_variant_runner(
                 output_dir=final_output_dir,
                 example_id=kwargs.get("example_id"),
                 variant_id=kwargs.get("variant_id"),
+                boundary_component_labels_path=kwargs.get("boundary_component_labels_path"),
+                boundary_component_output_dir=kwargs.get("boundary_component_output_dir"),
                 sword_node_source_path=kwargs.get("sword_node_source_path"),
                 sword_wse_field=kwargs.get("sword_wse_field"),
                 sword_match_tolerance=kwargs.get("sword_match_tolerance"),
@@ -1482,6 +1491,8 @@ def _materialize_base_state_variant(
     sword_example_station_source_path: str | Path | None,
     sword_station_match_source_path: str | Path | None,
     sword_reach_buffer_steps: int,
+    boundary_component_labels_path: str | Path | None = None,
+    boundary_component_output_dir: str | Path | None = None,
 ) -> BaseStateVariantOutputs:
     variant_dir = context.state_dir / "variant"
     summary_dir = variant_dir / "summary"
@@ -1499,6 +1510,18 @@ def _materialize_base_state_variant(
     shutil.copy2(context.cleaned_mask_path, collapsed_mask_path)
     origin_mask_path = mask_dir / "origin_mask.tif"
     shutil.copy2(collapsed_mask_path, origin_mask_path)
+    boundary_output_dir = (
+        Path(boundary_component_output_dir)
+        if boundary_component_output_dir is not None
+        else (variant_dir / "boundary_components")
+    )
+    boundary_outputs = _ensure_boundary_component_mask(
+        cleaned_mask_path=context.cleaned_mask_path,
+        reviewed_links_path=context.reviewed_links_path,
+        output_dir=boundary_output_dir,
+        boundary_component_labels_path=boundary_component_labels_path,
+    )
+    resolved_boundary_component_labels_path = Path(boundary_outputs["labels"])
 
     reviewed_links = gpd.read_file(context.reviewed_links_path)
     reviewed_nodes = gpd.read_file(context.reviewed_nodes_path)
@@ -1550,11 +1573,22 @@ def _materialize_base_state_variant(
     directed_links["n_units"] = pd.to_numeric(directed_links["n_units"], errors="coerce").fillna(0).astype(int)
     directed_links = _normalize_numeric_id_columns(directed_links)
 
+    with rasterio.open(collapsed_mask_path) as src:
+        collapsed_profile = src.profile.copy()
+        origin_mask = src.read(1).astype(np.uint16)
+    bank_labels_path, removed_bank_labels = _write_state_bank_labels(
+        boundary_component_labels_path=resolved_boundary_component_labels_path,
+        origin_mask=origin_mask,
+        output_path=mask_dir / "bank_labels.tif",
+        profile=collapsed_profile,
+    )
+
     enriched_links, link_width_samples = compute_width_families(
         directed_links,
         collapsed_mask_path=collapsed_mask_path,
         wet_reference_mask_path=collapsed_mask_path,
         origin_mask_path=origin_mask_path,
+        bank_labels_path=bank_labels_path,
     )
     enriched_links = _apply_collapsed_selection_metadata(enriched_links, unit_ids=[], group_label=None)
     enriched_links = _normalize_numeric_id_columns(enriched_links)
@@ -1698,6 +1732,8 @@ def _materialize_base_state_variant(
             "collapsed_mask": str(collapsed_mask_path.resolve()),
             "origin_mask": str(origin_mask_path.resolve()),
             "width_scope_mask": str(origin_mask_path.resolve()),
+            "bank_labels": str(bank_labels_path.resolve()),
+            "boundary_component_labels": str(resolved_boundary_component_labels_path.resolve()),
             "collapse_components": str((summary_dir / "collapse_components.csv").resolve()),
             "unit_link_membership": str((summary_dir / "unit_link_membership.csv").resolve()),
             "edit_geometries": str((mask_dir / "collapse_edit_geometries.gpkg").resolve()),
@@ -1712,6 +1748,16 @@ def _materialize_base_state_variant(
             "directed_nodes": str(directed_nodes_path.resolve()),
             "direction_validation_report": str((directed_dir / "direction_validation_report.json").resolve()),
         },
+        "source_paths": {
+            "cleaned_mask": str(context.cleaned_mask_path.resolve()),
+            "reviewed_links": str(context.reviewed_links_path.resolve()),
+            "reviewed_nodes": str(context.reviewed_nodes_path.resolve()),
+            "boundary_component_labels": str(resolved_boundary_component_labels_path.resolve()),
+        },
+        "bank_label_summary": {
+            "removed_land_labels": removed_bank_labels,
+            "n_removed_land_labels": int(len(removed_bank_labels)),
+        },
     }
     with (summary_dir / "variant_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
@@ -1721,6 +1767,8 @@ def _materialize_base_state_variant(
         collapsed_mask_path=collapsed_mask_path,
         directed_links_path=directed_links_path,
         directed_nodes_path=directed_nodes_path,
+        bank_labels_path=bank_labels_path,
+        boundary_component_labels_path=resolved_boundary_component_labels_path,
     )
 
 
@@ -1846,6 +1894,8 @@ def run_collapse_experiment(
     output_path = Path(output_dir) if output_dir is not None else _default_output_dir(cleaned_mask_path, experiment_id)
     states_dir = output_path / "states"
     states_dir.mkdir(parents=True, exist_ok=True)
+    boundary_component_output_dir = output_path / "boundary_components"
+    boundary_component_labels_path: Path | None = None
 
     active_equivalent_resistance_config = equivalent_resistance_config
     base_equivalent_resistance_config = active_equivalent_resistance_config
@@ -1864,6 +1914,8 @@ def run_collapse_experiment(
     variant_kwargs = {
         "example_id": root_example_id,
         "collapse_corridor_mode": collapse_corridor_mode,
+        "boundary_component_labels_path": boundary_component_labels_path,
+        "boundary_component_output_dir": boundary_component_output_dir,
         "preferred_width_field": preferred_width_field,
         "footprint_buffer_scale": footprint_buffer_scale,
         "all_touched": all_touched,
@@ -1913,7 +1965,12 @@ def run_collapse_experiment(
         sword_example_station_source_path=sword_example_station_source_path,
         sword_station_match_source_path=sword_station_match_source_path,
         sword_reach_buffer_steps=sword_reach_buffer_steps,
+        boundary_component_labels_path=boundary_component_labels_path,
+        boundary_component_output_dir=boundary_component_output_dir,
     )
+    if base_variant_outputs.boundary_component_labels_path is not None:
+        boundary_component_labels_path = base_variant_outputs.boundary_component_labels_path
+        variant_kwargs["boundary_component_labels_path"] = boundary_component_labels_path
     base_context.variant_output_dir = base_variant_outputs.output_dir
     base_context.cleaned_mask_path = base_variant_outputs.collapsed_mask_path
     base_context.reviewed_links_path = base_variant_outputs.directed_links_path
@@ -1959,6 +2016,11 @@ def run_collapse_experiment(
                 "cleaned_mask": str(Path(cleaned_mask_path).resolve()),
                 "reviewed_links": str(Path(reviewed_links_path).resolve()),
                 "reviewed_nodes": str(Path(reviewed_nodes_path).resolve()),
+                "boundary_component_labels": (
+                    str(boundary_component_labels_path.resolve())
+                    if boundary_component_labels_path is not None
+                    else None
+                ),
             },
             "max_steps": max_steps,
             "n_states": len(state_records),

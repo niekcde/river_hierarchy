@@ -174,6 +174,33 @@ def build_boundary_component_index(boundary_labels: np.ndarray, transform: Any) 
     )
 
 
+def build_boundary_component_index_from_label_mask(
+    label_mask: np.ndarray,
+    transform: Any,
+) -> BoundaryComponentIndex | None:
+    water_mask = label_mask == ORIGIN_WET_LABEL
+    obstacle_mask = label_mask > ORIGIN_WET_LABEL
+    if not obstacle_mask.any():
+        return None
+    structure = np.ones((3, 3), dtype=bool)
+    obstacle_boundary = obstacle_mask & binary_dilation(water_mask, structure=structure)
+    rows, cols = np.nonzero(obstacle_boundary)
+    if len(rows) == 0:
+        return None
+    xs, ys = raster_xy(transform, rows, cols, offset="center")
+    xs_array = np.asarray(xs, dtype=float)
+    ys_array = np.asarray(ys, dtype=float)
+    component_ids = label_mask[rows, cols].astype(int)
+    tree = cKDTree(np.column_stack([xs_array, ys_array]))
+    return BoundaryComponentIndex(
+        tree=tree,
+        xs=xs_array,
+        ys=ys_array,
+        component_ids=component_ids,
+        n_components=int(np.unique(component_ids).size),
+    )
+
+
 def build_origin_mask(
     collapsed_mask: np.ndarray,
     wet_mask: np.ndarray,
@@ -186,6 +213,26 @@ def build_origin_mask(
     for index in range(1, int(n_added) + 1):
         origin_mask[added_labels == index] = int(ORIGIN_FILL_LABEL_START + index - 1)
     return origin_mask
+
+
+def build_state_bank_labels(
+    boundary_component_labels: np.ndarray,
+    origin_mask: np.ndarray,
+) -> tuple[np.ndarray, list[int]]:
+    if boundary_component_labels.shape != origin_mask.shape:
+        raise ValueError("boundary_component_labels and origin_mask must share shape.")
+
+    bank_labels = np.asarray(boundary_component_labels, dtype=np.int32).copy()
+    removed_labels: list[int] = []
+    fill_mask = origin_mask > ORIGIN_WET_LABEL
+    if not fill_mask.any():
+        return bank_labels, removed_labels
+
+    overlapped = np.unique(bank_labels[fill_mask & (bank_labels > ORIGIN_WET_LABEL)])
+    removed_labels = [int(value) for value in overlapped.tolist() if int(value) > ORIGIN_WET_LABEL]
+    for label_value in removed_labels:
+        bank_labels[bank_labels == int(label_value)] = ORIGIN_WET_LABEL
+    return bank_labels, removed_labels
 
 
 def _compute_state_distance_transform(
@@ -375,6 +422,7 @@ def compute_two_bank_width_families(
     wet_reference_mask_path: str | Path,
     origin_mask_path: str | Path | None = None,
     rivgraph_distance_path: str | Path | None = None,
+    bank_labels_path: str | Path | None = None,
 ) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
     with rasterio.open(collapsed_mask_path) as collapsed_ds:
         collapsed_mask = collapsed_ds.read(1) > 0
@@ -399,8 +447,17 @@ def compute_two_bank_width_families(
         pixel_length=pixel_length,
         rivgraph_distance_path=rivgraph_distance_path,
     )
-    _, boundary_labels = label_obstacle_boundary_components(collapsed_mask)
-    boundary_index = build_boundary_component_index(boundary_labels, collapsed_transform)
+    if bank_labels_path is not None and Path(bank_labels_path).exists():
+        with rasterio.open(bank_labels_path) as bank_ds:
+            bank_labels = bank_ds.read(1).astype(np.int32)
+            bank_transform = bank_ds.transform
+            bank_shape = bank_ds.shape
+        if bank_shape != collapsed_shape or bank_transform != collapsed_transform:
+            raise ValueError("bank_labels_path must share shape and transform with collapsed_mask_path.")
+        boundary_index = build_boundary_component_index_from_label_mask(bank_labels, collapsed_transform)
+    else:
+        _, boundary_labels = label_obstacle_boundary_components(collapsed_mask)
+        boundary_index = build_boundary_component_index(boundary_labels, collapsed_transform)
 
     enriched = regenerated_links.copy()
     sample_records: list[dict[str, Any]] = []

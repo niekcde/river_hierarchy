@@ -29,6 +29,7 @@ from network_variants.variant_generation import (
     _trim_slice,
     compute_width_families,
 )
+from network_variants.width_two_bank import build_state_bank_labels
 from hierarchy_level_definition.graph_building.directed_network_checks import (
     validate_single_inlet_single_outlet,
 )
@@ -178,6 +179,25 @@ def test_compute_width_families_collapsed_fill_separates_wet_and_dry_width(tmp_p
     assert samples["left_component_id"].notna().any()
     assert samples["right_component_id"].notna().any()
     assert (samples["width_dry"] > 0).any()
+
+
+def test_build_state_bank_labels_turns_selected_fill_land_into_water() -> None:
+    boundary_labels = np.full((8, 10), 2, dtype=np.int32)
+    boundary_labels[:, 5:] = 3
+    boundary_labels[:, 3:7] = 1
+    boundary_labels[:, 4:6] = 12
+
+    origin_mask = np.zeros_like(boundary_labels, dtype=np.uint16)
+    origin_mask[:, 3] = 1
+    origin_mask[:, 6] = 1
+    origin_mask[:, 4:6] = 101
+
+    bank_labels, removed_labels = build_state_bank_labels(boundary_labels, origin_mask)
+
+    assert removed_labels == [12]
+    assert np.all(bank_labels[:, 4:6] == 1)
+    assert int(bank_labels[0, 0]) == 2
+    assert int(bank_labels[0, -1]) == 3
 
 
 def test_apply_collapsed_selection_metadata_adds_collapsed_unit_columns() -> None:
