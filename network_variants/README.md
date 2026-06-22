@@ -71,16 +71,46 @@ Interpretation:
 
 ## Width Logic
 
-For each regenerated link, width families are measured from the same transects
-on the regenerated link geometry.
+The current implemented width method is `two_bank_dt`.
+
+For each regenerated link, width families are measured from the regenerated
+link geometry using one centerline-sample-based left/right bank search rather
+than a legacy explicit transect-intersection workflow.
 
 - `total width`
   Measured on the collapsed mask.
 - `wet width`
-  Measured on the wet-reference mask, which defaults to the parent cleaned
-  mask.
+  Measured by decomposing the selected bank-pair section against the state
+  `origin_mask`.
 - `dry width`
   `dry width = total width - wet width`
+
+State mask semantics:
+
+- `collapsed mask`
+  Binary traversable mask for the regenerated state.
+- `origin_mask.tif`
+  - `0` = blocking land/background
+  - `1` = original wet water
+  - `101+` = collapse-added fill for the selected state object
+- `bank_labels.tif`
+  Example-level boundary-component labels rewritten for the current state so
+  collapsed target-island labels are treated as water during bank
+  identification.
+
+Sample-level bank selection currently does all of the following:
+
+- builds one global DT on the collapsed mask
+- finds nearby boundary candidates from `bank_labels.tif`
+- smooths the local tangent/normal used for left/right side classification
+- adaptively expands the number of queried candidate boundary pixels up to
+  `bank_candidate_neighbors_max`
+- rejects candidate bank points whose center-to-bank segment re-intersects the
+  centerline
+- requires the final left/right pair to come from distinct boundary-component
+  IDs
+
+This method writes both raw sample diagnostics and final link summaries.
 
 The module stores:
 
@@ -96,6 +126,45 @@ The module stores:
   - `wet_fraction_adj`, `dry_fraction_adj`
   - `n_wet_threads_mean`, `n_wet_threads_max`
 
+The raw sample table also stores:
+
+- center sample coordinates
+- chosen left/right component IDs
+- chosen left/right bank coordinates
+- `width_total`, `width_wet`, `width_dry`
+- `dt_width_global`
+- `qc_relative_dt_diff`
+- `qc_opposition_cos`
+- `qc_width_chord_diff`
+- `width_invalid`
+
+Important distinction:
+
+- `link_width_samples.csv`
+  Raw per-sample measurement and QC record. This is the debug surface and is
+  not rewritten when final family inheritance is applied.
+- `link_width_families.csv`
+  Final authoritative per-link width summary.
+- `links_with_width_families.gpkg`
+  Same final width summary attached to geometry.
+
+If a link is an anchored segmented stub with poor sample-level opposition QC
+and inflated width relative to a clean family representative, the final width
+summary can inherit from that representative. This inheritance is applied only
+to the final link-family outputs, not to the raw sample table.
+
+Audit columns for this logic include:
+
+- `family_width_inheritance_candidate`
+- `family_width_inheritance_applied`
+- `family_representative_link_id`
+- `family_width_inherited_from_link`
+- `family_width_inheritance_reason`
+- `family_stub_bad_opposition_fraction`
+- `family_representative_bad_opposition_fraction`
+- `family_stub_to_representative_wet_ratio`
+- `family_stub_to_representative_total_ratio`
+
 The `links_with_width_families.gpkg` output is the directed version of the
 regenerated link layer. It now includes:
 
@@ -109,6 +178,8 @@ regenerated link layer. It now includes:
 - `matched_parent_node_path`
 - `direction_assignment_method`
 - `geometry_reversed_to_match_flow`
+- final width-family attributes
+- width-family inheritance audit fields when inheritance is applied
 
 The directed node layer can now also carry standardized SWORD node attributes:
 
@@ -202,6 +273,24 @@ Three head concepts are intentionally kept separate:
   `rapid_wse_for_slope`
 - normalized solver heads for equivalent-resistance solves:
   not stored in `hydraulic_context/`; written separately by the solver workflow
+
+The hydraulic context can also inherit slope from a family representative when
+width inheritance was applied to an anchored segmented stub. This affects only
+the final link hydraulic context and is recorded with:
+
+- `family_slope_inheritance_applied`
+- `family_slope_inherited_from_link`
+- `family_slope_inheritance_reason`
+
+For downstream use:
+
+- final width should come from:
+  - `link_width_families.csv`
+  - or `links_with_width_families.gpkg`
+- final slope should come from:
+  - `hydraulic_context/link_hydraulic_context.csv`
+- raw sample QC and debugging should use:
+  - `link_width_samples.csv`
 
 ## First-Step Collapse Rule
 

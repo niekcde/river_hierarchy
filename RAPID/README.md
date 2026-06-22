@@ -108,6 +108,17 @@ separate:
 - normalized equivalent-resistance solver heads:
   not written in RAPID prep
 
+Practical data-source rule:
+
+- final per-link width for routing/K calculations should come from
+  `variant/widths/link_width_families.csv` or the equivalent
+  `links_with_width_families.gpkg`
+- final per-link slope should come from
+  `hydraulic_context/link_hydraulic_context.csv`
+- `variant/widths/link_width_samples.csv` remains the raw sample/QC record and
+  should only be used for debugging or for workflows that intentionally
+  summarize raw samples, such as subreach-varying width
+
 ### Forcing Normalization In Prep
 
 The forcing normalization step belongs to `run_prepare_experiment.py`, not to
@@ -220,6 +231,15 @@ Current behavior:
 
 This is mainly intended to preserve along-link width variation when a long
 collapsed link is segmented for RAPID routing.
+
+Important distinction:
+
+- final parent-link width inheritance in `network_variants` affects
+  `link_width_families.csv` / `links_with_width_families.gpkg`
+- subreach-varying width still summarizes raw
+  `variant/widths/link_width_samples.csv` values intentionally, because that
+  workflow is preserving along-link sample variation rather than only consuming
+  the final parent-link family summary
 
 ### Example-Level Reference `kb`
 

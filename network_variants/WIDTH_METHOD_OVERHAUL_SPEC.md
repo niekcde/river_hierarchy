@@ -7,6 +7,27 @@ It supersedes the current transect + `width_scope_mask` concept as the target
 methodology, but it is still a design/specification document rather than an
 implemented code path.
 
+Implementation status note:
+
+- the repository now uses the `two_bank_dt` method in production
+- the implemented method follows the same core design described here:
+  - example-level boundary-component preprocessing
+  - state `origin_mask` construction
+  - per-state `bank_labels.tif`
+  - sample-level left/right bank selection
+  - total/wet/dry decomposition
+  - RivGraph-style trimming to final link summaries
+- the current production implementation also includes several additional
+  safeguards:
+  - adaptive candidate-neighbor expansion
+  - smoothed local tangent estimation for side classification
+  - rejection of candidate bank points whose center-to-bank segment
+    re-intersects the centerline
+  - a hard distinct-component rule for the final accepted left/right pair
+  - anchored segmented-stub inheritance for final width-family summaries when
+    sample-level opposition QC indicates that the stub is not a suitable width
+    object
+
 Related discussion note:
 
 - [WIDTH_METHOD_IMPLEMENTATION_PLAN.md](/Users/6256481/Code/river-hierarchy/network_variants/WIDTH_METHOD_IMPLEMENTATION_PLAN.md)

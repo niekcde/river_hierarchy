@@ -10,6 +10,24 @@ distance-transform-based method described in:
 This checklist is intentionally **not** tied to one example. It is the migration
 plan for the full `river-hierarchy` codebase.
 
+Current implementation snapshot:
+
+- the project now uses the `two_bank_dt` width workflow in production
+- example-level boundary-component labels are built once and reused across
+  states
+- each state writes `origin_mask.tif` and `bank_labels.tif`
+- sample-level outputs now include selected bank IDs, bank coordinates, QC
+  diagnostics, and invalid-sample flags
+- final link-family outputs now support anchored segmented-stub inheritance
+  when sample-level opposition QC shows that a stub is a poor width object
+- hydraulic context now mirrors that decision by inheriting `slope_used` from
+  the same family representative
+
+This checklist should now be read as:
+
+- completed core migration work, plus
+- remaining documentation / cleanup / future refinement items
+
 ## 1. Project Rules
 
 These rules should hold throughout the migration.
@@ -42,6 +60,18 @@ The migration is complete only when:
 - RAPID prep continues to consume the same width-family fields without needing
   method-specific branching
 - legacy `width_scope_mask` logic is removed or clearly deprecated
+
+Current status:
+
+- completed:
+  - new production width method in `run_collapse_experiment.py`
+  - new production width method in `generate_network_variant(...)`
+  - new production width method in anchored-derivation / width-refresh paths
+  - equivalent resistance continues to consume width-family outputs without
+    method branching
+- partially complete:
+  - `width_scope_mask` remains as a compatibility alias to `origin_mask` in
+    some manifests and helper paths and should be treated as deprecated
 
 ## 3. Workstream A: Core Data Model
 
@@ -244,6 +274,9 @@ Add:
 - `rivgraph_distance`
 - `width_method_version`
 - `width_method_cache_dir`
+- `bank_labels`
+- `bank_candidate_neighbors_max`
+- `segmented_stub_inheritance`
 
 Remove/de-emphasize:
 

@@ -5,7 +5,14 @@ calculation in `network_variants`, especially the question of whether the
 collapse-aware `width_wet` / `width_total` workflow should stay with the
 current domain-mask logic or move to a simpler "filled-islands only" rule.
 
-It is intentionally separate from [README.md](/Users/6256481/Code/river-hierarchy/network_variants/README.md) because this is still an implementation decision, not settled user-facing behavior.
+Status note:
+
+- this document is now mainly historical context
+- the repository has since migrated to the implemented `two_bank_dt` workflow
+- current user-facing behavior is described in
+  [README.md](/Users/6256481/Code/river-hierarchy/network_variants/README.md)
+- where this note conflicts with the code or README, the code and README should
+  be treated as authoritative
 
 ## 1. Current State
 

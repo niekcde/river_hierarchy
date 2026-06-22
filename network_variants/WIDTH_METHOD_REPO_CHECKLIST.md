@@ -11,6 +11,16 @@ The goal is not to prescribe exact code, but to specify:
 - which current artifacts become obsolete
 - which tests need replacement
 
+Status note:
+
+- most of the core items in this checklist are now implemented
+- the codebase now has the dedicated `network_variants/width_two_bank.py`
+  module, state `origin_mask.tif`, per-state `bank_labels.tif`, adaptive
+  candidate search, smoothed tangent estimation, crossing-aware bank-point
+  rejection, and final distinct-component bank-pair enforcement
+- this file should now be read mainly as a repository mapping/reference and a
+  place to track remaining cleanup work rather than as a greenfield build plan
+
 ## 1. Recommended Implementation Shape
 
 Do **not** try to implement the full overhaul directly inside the existing
