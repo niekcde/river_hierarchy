@@ -289,6 +289,66 @@ def _preferred_profile_coordinate_column(frame: pd.DataFrame) -> str | None:
     return None
 
 
+def _apply_family_representative_slope_inheritance(
+    link_context: pd.DataFrame,
+    links: gpd.GeoDataFrame,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    result = link_context.copy()
+    result["family_slope_inheritance_applied"] = False
+    result["family_slope_inherited_from_link"] = pd.Series(pd.NA, index=result.index, dtype="Int64")
+    result["family_slope_inheritance_reason"] = ""
+
+    required_columns = {"id_link", "family_width_inheritance_applied", "family_width_inherited_from_link"}
+    if result.empty or links.empty or not required_columns.issubset(links.columns):
+        return result, {"applied_count": 0, "applied_link_ids": []}
+
+    inheritance = links.loc[
+        links["family_width_inheritance_applied"].fillna(False).astype(bool),
+        ["id_link", "family_width_inherited_from_link"],
+    ].copy()
+    if inheritance.empty:
+        return result, {"applied_count": 0, "applied_link_ids": []}
+
+    inheritance["id_link"] = pd.to_numeric(inheritance["id_link"], errors="coerce").astype("Int64")
+    inheritance["family_width_inherited_from_link"] = pd.to_numeric(
+        inheritance["family_width_inherited_from_link"],
+        errors="coerce",
+    ).astype("Int64")
+    inheritance = inheritance.dropna(subset=["id_link", "family_width_inherited_from_link"]).copy()
+    if inheritance.empty:
+        return result, {"applied_count": 0, "applied_link_ids": []}
+
+    link_index_by_id = {
+        int(link_id): int(index)
+        for index, link_id in result["id_link"].items()
+        if pd.notna(link_id)
+    }
+    applied_link_ids: list[int] = []
+    for row in inheritance.itertuples(index=False):
+        stub_link_id = int(row.id_link)
+        representative_link_id = int(row.family_width_inherited_from_link)
+        stub_index = link_index_by_id.get(stub_link_id)
+        representative_index = link_index_by_id.get(representative_link_id)
+        if stub_index is None or representative_index is None:
+            continue
+
+        result.at[stub_index, "slope_used"] = float(result.at[representative_index, "slope_used"])
+        result.at[stub_index, "slope_source_method"] = "family_representative_link"
+        result.at[stub_index, "slope_adjusted"] = True
+        result.at[stub_index, "slope_reason"] = "inherited_from_segmented_family_representative"
+        if "slope_minimum_applied" in result.columns:
+            result.at[stub_index, "slope_minimum_applied"] = bool(result.at[representative_index, "slope_minimum_applied"])
+        result.at[stub_index, "family_slope_inheritance_applied"] = True
+        result.at[stub_index, "family_slope_inherited_from_link"] = representative_link_id
+        result.at[stub_index, "family_slope_inheritance_reason"] = "inherited_from_segmented_family_representative"
+        applied_link_ids.append(stub_link_id)
+
+    return result, {
+        "applied_count": int(len(applied_link_ids)),
+        "applied_link_ids": [int(link_id) for link_id in applied_link_ids],
+    }
+
+
 def _normalize_slope_profile_mode(mode: str | None) -> str:
     normalized = str(mode or "network_dist").strip().lower()
     if normalized not in {"network_dist", "reference_section"}:
@@ -1927,12 +1987,16 @@ def generate_state_hydraulic_context(
         unit_summary=unit_summary,
         config=resolved_config,
     )
+    link_context, family_slope_inheritance_summary = _apply_family_representative_slope_inheritance(
+        result.link_context,
+        links,
+    )
 
     link_context_path = output_path / "link_hydraulic_context.csv"
     node_context_path = output_path / "node_hydraulic_context.csv"
     manifest_path = output_path / HYDRAULIC_CONTEXT_MANIFEST
 
-    result.link_context.to_csv(link_context_path, index=False)
+    link_context.to_csv(link_context_path, index=False)
     result.node_context.to_csv(node_context_path, index=False)
 
     manifest: dict[str, object] = {
@@ -1955,6 +2019,7 @@ def generate_state_hydraulic_context(
             "derived_profile_wse_for_slope": "rapid_wse_for_slope",
             "normalized_solver_heads": "not written here",
         },
+        "family_slope_inheritance": family_slope_inheritance_summary,
         "slope_config": {
             "slope_profile_mode": _normalize_slope_profile_mode(resolved_config.slope_profile_mode),
             "reference_section_summary_path": str(resolved_config.reference_section_summary_path or ""),
@@ -1966,7 +2031,7 @@ def generate_state_hydraulic_context(
         link_context_path=link_context_path,
         node_context_path=node_context_path,
         manifest_path=manifest_path,
-        link_context=result.link_context,
+        link_context=link_context,
         node_context=result.node_context,
         manifest=manifest,
     )

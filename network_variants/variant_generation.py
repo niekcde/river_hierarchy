@@ -61,6 +61,33 @@ DEFAULT_WIDTH_QUANTILES = (0.05, 0.5, 0.95)
 RIVGRAPH_WIDTH_TRIM_MULTIPLIER = 1.1
 DEFAULT_CORE_OVERLAP_FRACTION_THRESHOLD = 0.05
 DEFAULT_UNCHANGED_CORE_OVERLAP_FRACTION = 0.8
+SEGMENTED_STUB_BAD_OPPOSITION_COS_THRESHOLD = -0.5
+SEGMENTED_STUB_BAD_OPPOSITION_FRACTION_THRESHOLD = 0.5
+SEGMENTED_STUB_BAD_OPPOSITION_MARGIN_THRESHOLD = 0.25
+SEGMENTED_STUB_WIDTH_RATIO_THRESHOLD = 1.25
+SEGMENTED_STUB_WIDTH_INHERITANCE_FIELDS = (
+    "wid_adj_total",
+    "wid_med_total",
+    "wid_p05_total",
+    "wid_p50_total",
+    "wid_p95_total",
+    "wid_adj_wet",
+    "wid_med_wet",
+    "wid_p05_wet",
+    "wid_p50_wet",
+    "wid_p95_wet",
+    "wid_adj_dry",
+    "wid_med_dry",
+    "wid_p05_dry",
+    "wid_p50_dry",
+    "wid_p95_dry",
+    "wet_fraction_adj",
+    "dry_fraction_adj",
+    "n_wet_threads_mean",
+    "n_wet_threads_max",
+    "n_channels_mean",
+    "n_channels_max",
+)
 WIDTH_SCOPE_BASE_LABEL = 1
 WIDTH_SCOPE_COMPONENT_LABEL_START = 101
 MAX_LOCAL_DIRECTION_REPAIR_LINKS = 10
@@ -1117,6 +1144,241 @@ def _merge_width_families_onto_links(
             if column in enriched_links.columns:
                 merged[column] = enriched_links[column].values
     return merged
+
+
+def _text_has_value(value: Any) -> bool:
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except TypeError:
+        pass
+    return bool(str(value).strip())
+
+
+def _fraction_bad_opposition_by_link(
+    link_width_samples: pd.DataFrame,
+    *,
+    threshold: float = SEGMENTED_STUB_BAD_OPPOSITION_COS_THRESHOLD,
+) -> dict[int, float]:
+    if link_width_samples.empty or "id_link" not in link_width_samples.columns or "qc_opposition_cos" not in link_width_samples.columns:
+        return {}
+
+    qc = pd.to_numeric(link_width_samples["qc_opposition_cos"], errors="coerce")
+    valid = qc.notna()
+    if "width_invalid" in link_width_samples.columns:
+        valid &= ~link_width_samples["width_invalid"].fillna(False).astype(bool)
+
+    frame = pd.DataFrame(
+        {
+            "id_link": pd.to_numeric(link_width_samples["id_link"], errors="coerce"),
+            "qc_opposition_cos": qc,
+        }
+    ).loc[valid]
+    frame = frame.dropna(subset=["id_link", "qc_opposition_cos"]).copy()
+    if frame.empty:
+        return {}
+
+    fractions = (
+        frame.groupby(frame["id_link"].astype(int), sort=False)["qc_opposition_cos"]
+        .apply(lambda values: float(np.mean(values.to_numpy(dtype=float) > float(threshold))))
+        .to_dict()
+    )
+    return {int(link_id): float(value) for link_id, value in fractions.items()}
+
+
+def _is_touch_fallback_lineage(lineage_type: Any) -> bool:
+    return str(lineage_type or "").startswith("touch_fallback")
+
+
+def _is_segmented_stub_candidate(row: pd.Series) -> bool:
+    if not _is_touch_fallback_lineage(row.get("lineage_type")):
+        return False
+    if _text_has_value(row.get("matched_parent_node_path")):
+        return False
+    core_overlap = pd.to_numeric(pd.Series([row.get("dominant_parent_core_overlap_fraction")]), errors="coerce").iloc[0]
+    return not np.isfinite(core_overlap) or float(core_overlap) < float(DEFAULT_CORE_OVERLAP_FRACTION_THRESHOLD)
+
+
+def _is_stable_family_representative(row: pd.Series) -> bool:
+    if _is_touch_fallback_lineage(row.get("lineage_type")):
+        return False
+    if _text_has_value(row.get("matched_parent_node_path")):
+        return True
+    core_overlap = pd.to_numeric(pd.Series([row.get("dominant_parent_core_overlap_fraction")]), errors="coerce").iloc[0]
+    return bool(np.isfinite(core_overlap) and float(core_overlap) >= float(DEFAULT_CORE_OVERLAP_FRACTION_THRESHOLD))
+
+
+def _select_segmented_stub_family_representative(
+    *,
+    stub_row: pd.Series,
+    adjacency_by_node: Mapping[int, list[int]],
+    stable_link_ids: set[int],
+) -> int | None:
+    endpoint_candidates: list[list[int]] = []
+    for node_column in ("id_us_node", "id_ds_node"):
+        node_id = pd.to_numeric(pd.Series([stub_row.get(node_column)]), errors="coerce").iloc[0]
+        if not np.isfinite(node_id):
+            continue
+        adjacent = [
+            int(link_id)
+            for link_id in adjacency_by_node.get(int(node_id), [])
+            if int(link_id) != int(stub_row["id_link"]) and int(link_id) in stable_link_ids
+        ]
+        adjacent = list(dict.fromkeys(adjacent))
+        if adjacent:
+            endpoint_candidates.append(adjacent)
+
+    if len(endpoint_candidates) != 1:
+        return None
+    if len(endpoint_candidates[0]) != 1:
+        return None
+    return int(endpoint_candidates[0][0])
+
+
+def _apply_segmented_stub_width_inheritance(
+    *,
+    directed_links: gpd.GeoDataFrame,
+    enriched_links: gpd.GeoDataFrame,
+    link_width_samples: pd.DataFrame,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, dict[str, Any]]:
+    adjusted_links = directed_links.copy()
+    adjusted_enriched = enriched_links.copy()
+
+    metadata_defaults: dict[str, Any] = {
+        "family_width_inheritance_candidate": False,
+        "family_width_inheritance_applied": False,
+        "family_representative_link_id": pd.Series(pd.NA, index=adjusted_links.index, dtype="Int64"),
+        "family_width_inherited_from_link": pd.Series(pd.NA, index=adjusted_links.index, dtype="Int64"),
+        "family_width_inheritance_reason": "",
+        "family_stub_bad_opposition_fraction": np.nan,
+        "family_representative_bad_opposition_fraction": np.nan,
+        "family_stub_to_representative_wet_ratio": np.nan,
+        "family_stub_to_representative_total_ratio": np.nan,
+    }
+    for column, default in metadata_defaults.items():
+        if isinstance(default, pd.Series):
+            adjusted_links[column] = default
+        else:
+            adjusted_links[column] = default
+
+    if adjusted_links.empty or adjusted_enriched.empty or link_width_samples.empty:
+        return adjusted_links, adjusted_enriched, {"applied_count": 0, "applied_link_ids": []}
+
+    if "id_link" not in adjusted_links.columns or "id_link" not in adjusted_enriched.columns:
+        return adjusted_links, adjusted_enriched, {"applied_count": 0, "applied_link_ids": []}
+
+    lineage_required = {"lineage_type", "dominant_parent_core_overlap_fraction", "matched_parent_node_path", "id_us_node", "id_ds_node"}
+    if not lineage_required.issubset(adjusted_links.columns):
+        return adjusted_links, adjusted_enriched, {"applied_count": 0, "applied_link_ids": []}
+
+    bad_fraction_by_link = _fraction_bad_opposition_by_link(link_width_samples)
+    if not bad_fraction_by_link:
+        return adjusted_links, adjusted_enriched, {"applied_count": 0, "applied_link_ids": []}
+
+    links_by_id = adjusted_links.set_index(pd.to_numeric(adjusted_links["id_link"], errors="coerce").astype(int), drop=False)
+    enriched_by_id = adjusted_enriched.set_index(pd.to_numeric(adjusted_enriched["id_link"], errors="coerce").astype(int), drop=False)
+    stable_link_ids = {
+        int(link_id)
+        for link_id, row in links_by_id.iterrows()
+        if _is_stable_family_representative(row)
+    }
+    adjacency_by_node: dict[int, list[int]] = {}
+    for row in adjusted_links[["id_link", "id_us_node", "id_ds_node"]].itertuples(index=False):
+        link_id = int(row.id_link)
+        for node_id in (row.id_us_node, row.id_ds_node):
+            numeric_node = pd.to_numeric(pd.Series([node_id]), errors="coerce").iloc[0]
+            if not np.isfinite(numeric_node):
+                continue
+            adjacency_by_node.setdefault(int(numeric_node), []).append(link_id)
+
+    applied_records: list[dict[str, Any]] = []
+    for link_id, stub_row in links_by_id.iterrows():
+        if not _is_segmented_stub_candidate(stub_row):
+            continue
+        adjusted_links.loc[adjusted_links["id_link"].astype(int) == int(link_id), "family_width_inheritance_candidate"] = True
+
+        representative_link_id = _select_segmented_stub_family_representative(
+            stub_row=stub_row,
+            adjacency_by_node=adjacency_by_node,
+            stable_link_ids=stable_link_ids,
+        )
+        if representative_link_id is None or representative_link_id not in enriched_by_id.index:
+            adjusted_links.loc[adjusted_links["id_link"].astype(int) == int(link_id), "family_width_inheritance_reason"] = "no_unique_stable_representative"
+            continue
+
+        stub_mask = adjusted_links["id_link"].astype(int) == int(link_id)
+        adjusted_links.loc[stub_mask, "family_representative_link_id"] = int(representative_link_id)
+
+        stub_bad_fraction = float(bad_fraction_by_link.get(int(link_id), float("nan")))
+        representative_bad_fraction = float(bad_fraction_by_link.get(int(representative_link_id), float("nan")))
+        adjusted_links.loc[stub_mask, "family_stub_bad_opposition_fraction"] = stub_bad_fraction
+        adjusted_links.loc[stub_mask, "family_representative_bad_opposition_fraction"] = representative_bad_fraction
+
+        if not np.isfinite(stub_bad_fraction) or not np.isfinite(representative_bad_fraction):
+            adjusted_links.loc[stub_mask, "family_width_inheritance_reason"] = "missing_opposition_qc"
+            continue
+
+        stub_enriched = enriched_by_id.loc[int(link_id)]
+        representative_enriched = enriched_by_id.loc[int(representative_link_id)]
+        stub_wet = pd.to_numeric(pd.Series([stub_enriched.get("wid_adj_wet")]), errors="coerce").iloc[0]
+        rep_wet = pd.to_numeric(pd.Series([representative_enriched.get("wid_adj_wet")]), errors="coerce").iloc[0]
+        stub_total = pd.to_numeric(pd.Series([stub_enriched.get("wid_adj_total")]), errors="coerce").iloc[0]
+        rep_total = pd.to_numeric(pd.Series([representative_enriched.get("wid_adj_total")]), errors="coerce").iloc[0]
+        wet_ratio = float(stub_wet / rep_wet) if np.isfinite(stub_wet) and np.isfinite(rep_wet) and rep_wet > 0 else float("nan")
+        total_ratio = float(stub_total / rep_total) if np.isfinite(stub_total) and np.isfinite(rep_total) and rep_total > 0 else float("nan")
+        adjusted_links.loc[stub_mask, "family_stub_to_representative_wet_ratio"] = wet_ratio
+        adjusted_links.loc[stub_mask, "family_stub_to_representative_total_ratio"] = total_ratio
+
+        stub_channels = pd.to_numeric(pd.Series([stub_enriched.get("n_channels_max")]), errors="coerce").iloc[0]
+        rep_channels = pd.to_numeric(pd.Series([representative_enriched.get("n_channels_max")]), errors="coerce").iloc[0]
+        width_inflated = bool(
+            (np.isfinite(wet_ratio) and wet_ratio > float(SEGMENTED_STUB_WIDTH_RATIO_THRESHOLD))
+            or (np.isfinite(total_ratio) and total_ratio > float(SEGMENTED_STUB_WIDTH_RATIO_THRESHOLD))
+            or (np.isfinite(stub_channels) and np.isfinite(rep_channels) and float(stub_channels) > float(rep_channels))
+        )
+        bad_enough = bool(
+            stub_bad_fraction >= float(SEGMENTED_STUB_BAD_OPPOSITION_FRACTION_THRESHOLD)
+            and (stub_bad_fraction - representative_bad_fraction) >= float(SEGMENTED_STUB_BAD_OPPOSITION_MARGIN_THRESHOLD)
+        )
+        if not bad_enough:
+            adjusted_links.loc[stub_mask, "family_width_inheritance_reason"] = "stub_opposition_qc_not_bad_enough"
+            continue
+        if not width_inflated:
+            adjusted_links.loc[stub_mask, "family_width_inheritance_reason"] = "stub_not_inflated_vs_representative"
+            continue
+
+        for column in SEGMENTED_STUB_WIDTH_INHERITANCE_FIELDS:
+            if column in adjusted_enriched.columns and column in representative_enriched.index:
+                adjusted_enriched.loc[adjusted_enriched["id_link"].astype(int) == int(link_id), column] = representative_enriched[column]
+
+        adjusted_links.loc[stub_mask, "family_width_inheritance_applied"] = True
+        adjusted_links.loc[stub_mask, "family_width_inherited_from_link"] = int(representative_link_id)
+        adjusted_links.loc[stub_mask, "family_width_inheritance_reason"] = "inherited_from_segmented_family_representative"
+        applied_records.append(
+            {
+                "id_link": int(link_id),
+                "representative_link_id": int(representative_link_id),
+                "stub_bad_opposition_fraction": stub_bad_fraction,
+                "representative_bad_opposition_fraction": representative_bad_fraction,
+                "wet_ratio": wet_ratio,
+                "total_ratio": total_ratio,
+            }
+        )
+
+    summary = {
+        "applied_count": int(len(applied_records)),
+        "applied_link_ids": [int(record["id_link"]) for record in applied_records],
+        "records": applied_records,
+        "criteria": {
+            "bad_opposition_cos_threshold": float(SEGMENTED_STUB_BAD_OPPOSITION_COS_THRESHOLD),
+            "bad_opposition_fraction_threshold": float(SEGMENTED_STUB_BAD_OPPOSITION_FRACTION_THRESHOLD),
+            "bad_opposition_fraction_margin": float(SEGMENTED_STUB_BAD_OPPOSITION_MARGIN_THRESHOLD),
+            "width_ratio_threshold": float(SEGMENTED_STUB_WIDTH_RATIO_THRESHOLD),
+        },
+    }
+    return adjusted_links, adjusted_enriched, summary
 
 
 def _write_width_family_outputs(
@@ -3669,6 +3931,13 @@ def generate_network_variant(
             unit_ids=resolved_unit_ids,
             group_label=group_label,
         )
+        directed_links, enriched_links, segmented_stub_inheritance_summary = _apply_segmented_stub_width_inheritance(
+            directed_links=directed_links,
+            enriched_links=enriched_links,
+            link_width_samples=link_width_samples,
+        )
+    else:
+        segmented_stub_inheritance_summary = {"applied_count": 0, "applied_link_ids": [], "records": []}
 
     directed_enriched_links = _merge_width_families_onto_links(directed_links, enriched_links)
     directed_enriched_links = _apply_width_sample_flow_alignment(
@@ -3748,6 +4017,7 @@ def generate_network_variant(
             "removed_land_labels": removed_bank_labels,
             "n_removed_land_labels": int(len(removed_bank_labels)),
         },
+        "segmented_stub_inheritance": segmented_stub_inheritance_summary,
         "anchor_segmentation": anchor_segmentation_summary,
         "sword_matching": {
             "wse_field": sword_wse_field,
@@ -4085,6 +4355,11 @@ def derive_anchored_variant_from_realized(
         unit_ids=selected_unit_ids,
         group_label=group_label,
     )
+    directed_links, enriched_links, segmented_stub_inheritance_summary = _apply_segmented_stub_width_inheritance(
+        directed_links=directed_links,
+        enriched_links=enriched_links,
+        link_width_samples=link_width_samples,
+    )
 
     directed_enriched_links = _merge_width_families_onto_links(directed_links, enriched_links)
     link_width_families = _write_width_family_outputs(
@@ -4112,6 +4387,7 @@ def derive_anchored_variant_from_realized(
         "total/wet/dry width-family recomputation",
         "SWORD node matching/propagation",
     ]
+    manifest["segmented_stub_inheritance"] = segmented_stub_inheritance_summary
     manifest["ready_for_rapid"] = bool(direction_summary.get("is_valid", False))
     manifest["bank_candidate_neighbors_max"] = int(bank_candidate_neighbors_max)
     manifest["source_paths"] = dict(manifest.get("source_paths", {}))

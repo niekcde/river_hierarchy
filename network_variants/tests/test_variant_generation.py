@@ -14,6 +14,7 @@ from hierarchy_level_definition.unit_detection.bifurcation_confluence_units impo
 from network_variants.variant_generation import (
     _apply_collapsed_selection_metadata,
     _apply_collapse_components_to_mask,
+    _apply_segmented_stub_width_inheritance,
     _assign_variant_directions,
     _build_oriented_child_graph,
     _componentize_units,
@@ -30,7 +31,13 @@ from network_variants.variant_generation import (
     _trim_slice,
     compute_width_families,
 )
-from network_variants.width_two_bank import BoundaryComponentIndex, _find_local_controlling_pair, build_state_bank_labels
+from network_variants.width_two_bank import (
+    BoundaryComponentIndex,
+    _find_local_controlling_pair,
+    _local_tangent_normal,
+    _select_local_controlling_pair,
+    build_state_bank_labels,
+)
 from hierarchy_level_definition.graph_building.directed_network_checks import (
     validate_single_inlet_single_outlet,
 )
@@ -238,6 +245,153 @@ def test_find_local_controlling_pair_expands_candidate_neighbors() -> None:
     assert pair is not None
     assert int(pair["left_component_id"]) == 3
     assert int(pair["right_component_id"]) == 2
+
+
+def test_local_tangent_normal_uses_window_to_reduce_single_pixel_kink() -> None:
+    xs = np.asarray([0.0, 1.0, 2.0, 2.0, 4.0, 5.0, 6.0], dtype=float)
+    ys = np.asarray([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=float)
+
+    tangent, normal = _local_tangent_normal(xs, ys, 3)
+
+    assert tangent[0] > 0.9
+    assert abs(tangent[1]) < 0.2
+    assert abs(float(np.dot(tangent, normal))) < 1e-9
+
+
+def test_select_local_controlling_pair_skips_crossing_bank_ray() -> None:
+    center_xy = np.asarray([0.0, 0.0], dtype=float)
+    normal = np.asarray([0.0, 1.0], dtype=float)
+    centerline = LineString([(-2.0, 0.0), (-1.0, 1.0), (0.0, 0.0), (1.0, 1.0), (2.0, 0.0)])
+    centerline_without_center = centerline.difference(Point(0.0, 0.0).buffer(0.51))
+    candidates = [
+        (9, float(np.linalg.norm(np.asarray([-1.2, 1.2]))), np.asarray([-1.2, 1.2], dtype=float)),
+        (9, float(np.linalg.norm(np.asarray([0.2, 1.8]))), np.asarray([0.2, 1.8], dtype=float)),
+        (3, float(np.linalg.norm(np.asarray([0.0, -2.0]))), np.asarray([0.0, -2.0], dtype=float)),
+    ]
+
+    pair = _select_local_controlling_pair(
+        center_xy,
+        normal,
+        candidates,
+        centerline_without_center=centerline_without_center,
+    )
+
+    assert pair is not None
+    assert int(pair["left_component_id"]) == 3
+    assert int(pair["right_component_id"]) == 9
+    assert np.allclose(pair["right_point"], np.asarray([0.2, 1.8], dtype=float))
+
+
+def test_select_local_controlling_pair_requires_distinct_components() -> None:
+    center_xy = np.asarray([0.0, 0.0], dtype=float)
+    normal = np.asarray([0.0, 1.0], dtype=float)
+    candidates = [
+        (3, 5.0, np.asarray([-1.0, -5.0], dtype=float)),
+        (3, 5.5, np.asarray([1.0, 5.4], dtype=float)),
+        (9, 6.0, np.asarray([0.5, 6.0], dtype=float)),
+    ]
+
+    pair = _select_local_controlling_pair(center_xy, normal, candidates)
+
+    assert pair is not None
+    assert int(pair["left_component_id"]) == 3
+    assert int(pair["right_component_id"]) == 9
+
+
+def test_apply_segmented_stub_width_inheritance_uses_clean_family_representative() -> None:
+    directed_links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": 19,
+                "id_us_node": 14,
+                "id_ds_node": 31,
+                "lineage_type": "touch_fallback_1to1",
+                "dominant_parent_core_overlap_fraction": 0.009,
+                "matched_parent_node_path": "",
+                "geometry": LineString([(0.0, 0.0), (1.0, 0.0)]),
+            },
+            {
+                "id_link": 44,
+                "id_us_node": 31,
+                "id_ds_node": 13,
+                "lineage_type": "unchanged_1to1",
+                "dominant_parent_core_overlap_fraction": 1.0,
+                "matched_parent_node_path": "15,13",
+                "geometry": LineString([(1.0, 0.0), (2.0, 0.0)]),
+            },
+            {
+                "id_link": 21,
+                "id_us_node": 32,
+                "id_ds_node": 14,
+                "lineage_type": "touch_fallback_1to1",
+                "dominant_parent_core_overlap_fraction": 0.006,
+                "matched_parent_node_path": "",
+                "geometry": LineString([(0.0, 1.0), (1.0, 1.0)]),
+            },
+            {
+                "id_link": 45,
+                "id_us_node": 32,
+                "id_ds_node": 16,
+                "lineage_type": "unchanged_1to1",
+                "dominant_parent_core_overlap_fraction": 1.0,
+                "matched_parent_node_path": "17,16",
+                "geometry": LineString([(0.0, 2.0), (1.0, 2.0)]),
+            },
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    enriched_links = directed_links.copy()
+    enriched_links["wid_adj_wet"] = [635.8, 44.8, 782.5, 966.1]
+    enriched_links["wid_adj_total"] = [671.1, 51.8, 1035.1, 973.3]
+    enriched_links["wid_adj_dry"] = [28.1, 0.0, 245.3, 0.0]
+    for prefix in ("wid_med", "wid_p05", "wid_p50", "wid_p95"):
+        enriched_links[f"{prefix}_wet"] = enriched_links["wid_adj_wet"]
+        enriched_links[f"{prefix}_total"] = enriched_links["wid_adj_total"]
+        enriched_links[f"{prefix}_dry"] = enriched_links["wid_adj_dry"]
+    enriched_links["wet_fraction_adj"] = [0.95, 0.86, 0.76, 0.99]
+    enriched_links["dry_fraction_adj"] = [0.04, 0.0, 0.24, 0.0]
+    enriched_links["n_wet_threads_mean"] = [5.0, 1.0, 2.0, 1.0]
+    enriched_links["n_wet_threads_max"] = [5, 1, 2, 1]
+    enriched_links["n_channels_mean"] = [5.0, 1.0, 2.0, 1.0]
+    enriched_links["n_channels_max"] = [5, 1, 2, 1]
+
+    samples = pd.DataFrame(
+        [
+            *[
+                {"id_link": 19, "qc_opposition_cos": value, "width_invalid": False}
+                for value in (-0.2, -0.1, 0.0, 0.1, 0.2, -0.3)
+            ],
+            *[
+                {"id_link": 44, "qc_opposition_cos": value, "width_invalid": False}
+                for value in (-1.0, -0.9, -0.8, -0.7, -0.6, -0.4)
+            ],
+            *[
+                {"id_link": 21, "qc_opposition_cos": value, "width_invalid": False}
+                for value in (-1.0, -0.9, -0.8, -0.7)
+            ],
+            *[
+                {"id_link": 45, "qc_opposition_cos": value, "width_invalid": False}
+                for value in (-0.9, -0.8, -0.7, -0.6)
+            ],
+        ]
+    )
+
+    adjusted_links, adjusted_enriched, summary = _apply_segmented_stub_width_inheritance(
+        directed_links=directed_links,
+        enriched_links=enriched_links,
+        link_width_samples=samples,
+    )
+
+    widths_by_link = adjusted_enriched.set_index("id_link")
+    metadata_by_link = adjusted_links.set_index("id_link")
+
+    assert np.isclose(float(widths_by_link.loc[19, "wid_adj_wet"]), float(widths_by_link.loc[44, "wid_adj_wet"]))
+    assert np.isclose(float(widths_by_link.loc[19, "wid_adj_total"]), float(widths_by_link.loc[44, "wid_adj_total"]))
+    assert bool(metadata_by_link.loc[19, "family_width_inheritance_applied"]) is True
+    assert int(metadata_by_link.loc[19, "family_width_inherited_from_link"]) == 44
+    assert bool(metadata_by_link.loc[21, "family_width_inheritance_applied"]) is False
+    assert summary["applied_link_ids"] == [19]
 
 
 def test_apply_collapsed_selection_metadata_adds_collapsed_unit_columns() -> None:

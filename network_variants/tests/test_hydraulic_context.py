@@ -180,6 +180,87 @@ def test_generate_state_hydraulic_context_writes_artifacts(tmp_path: Path) -> No
     assert "rapid_wse_for_slope" in written_nodes.columns
 
 
+def test_generate_state_hydraulic_context_inherits_family_representative_slope(tmp_path: Path) -> None:
+    links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": 1,
+                "id_us_node": 1,
+                "id_ds_node": 2,
+                "len": 10.0,
+                "family_width_inheritance_applied": True,
+                "family_width_inherited_from_link": 2,
+                "geometry": LineString([(0.0, 0.0), (10.0, 0.0)]),
+            },
+            {
+                "id_link": 2,
+                "id_us_node": 2,
+                "id_ds_node": 3,
+                "len": 100.0,
+                "family_width_inheritance_applied": False,
+                "family_width_inherited_from_link": pd.NA,
+                "geometry": LineString([(10.0, 0.0), (110.0, 0.0)]),
+            },
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    nodes = gpd.GeoDataFrame(
+        [
+            {
+                "id_node": 1,
+                "is_inlet": True,
+                "is_outlet": False,
+                "sword_wse": 10.0,
+                "sword_wse_field": "wse",
+                "sword_wse_fill_method": "requested_field",
+                "geometry": Point(0.0, 0.0),
+            },
+            {
+                "id_node": 2,
+                "is_inlet": False,
+                "is_outlet": False,
+                "sword_wse": 9.5,
+                "sword_wse_field": "wse",
+                "sword_wse_fill_method": "requested_field",
+                "geometry": Point(10.0, 0.0),
+            },
+            {
+                "id_node": 3,
+                "is_inlet": False,
+                "is_outlet": True,
+                "sword_wse": 9.0,
+                "sword_wse_field": "wse",
+                "sword_wse_fill_method": "requested_field",
+                "geometry": Point(110.0, 0.0),
+            },
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+
+    links_path = tmp_path / "links.gpkg"
+    nodes_path = tmp_path / "nodes.gpkg"
+    links.to_file(links_path, driver="GPKG")
+    nodes.to_file(nodes_path, driver="GPKG")
+
+    outputs = generate_state_hydraulic_context(
+        directed_links_path=links_path,
+        directed_nodes_path=nodes_path,
+        hierarchy_output_dir=None,
+        output_dir=tmp_path / "hydraulic_context",
+        state_id="S010_unit_8",
+    )
+
+    by_link = outputs.link_context.set_index("id_link")
+    assert float(by_link.loc[2, "slope_used"]) == pytest.approx(0.005)
+    assert float(by_link.loc[1, "slope_used"]) == pytest.approx(0.005)
+    assert str(by_link.loc[1, "slope_source_method"]) == "family_representative_link"
+    assert bool(by_link.loc[1, "family_slope_inheritance_applied"]) is True
+    assert int(by_link.loc[1, "family_slope_inherited_from_link"]) == 2
+    assert outputs.manifest["family_slope_inheritance"]["applied_link_ids"] == [1]
+
+
 def test_compute_hydraulic_context_can_use_reference_section_profile(tmp_path: Path) -> None:
     summary_path = _write_reference_section_summary(tmp_path)
     nodes = _simple_nodes().copy()

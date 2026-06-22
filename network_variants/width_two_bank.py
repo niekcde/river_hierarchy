@@ -13,6 +13,7 @@ from rasterio.transform import rowcol
 from rasterio.transform import xy as raster_xy
 from scipy.ndimage import binary_dilation, binary_erosion, distance_transform_edt, label
 from scipy.spatial import cKDTree
+from shapely.geometry import LineString, Point
 
 from hierarchy_level_definition.metrics.unit_metrics import edge_width_samples_from_attrs
 
@@ -23,6 +24,7 @@ DEFAULT_MIN_SEARCH_PIXELS = 6.0
 DEFAULT_MAX_SEARCH_MULTIPLIER = 16.0
 DEFAULT_CANDIDATE_NEIGHBORS = 96
 DEFAULT_CANDIDATE_NEIGHBORS_MAX = 2048
+DEFAULT_TANGENT_WINDOW_RADIUS = 15
 DEFAULT_LINE_SAMPLE_SPACING_FACTOR = 0.5
 ORIGIN_WET_LABEL = 1
 ORIGIN_FILL_LABEL_START = 101
@@ -254,15 +256,26 @@ def _local_tangent_normal(xs: np.ndarray, ys: np.ndarray, index: int) -> tuple[n
     if len(xs) == 1:
         tangent = np.asarray([1.0, 0.0], dtype=float)
     else:
-        prev_index = max(index - 1, 0)
-        next_index = min(index + 1, len(xs) - 1)
-        dx = float(xs[next_index] - xs[prev_index])
-        dy = float(ys[next_index] - ys[prev_index])
-        if dx == 0.0 and dy == 0.0:
-            tangent = np.asarray([1.0, 0.0], dtype=float)
-        else:
+        tangent = np.asarray([1.0, 0.0], dtype=float)
+        max_radius = min(int(DEFAULT_TANGENT_WINDOW_RADIUS), len(xs) - 1)
+        for radius in range(max_radius, 0, -1):
+            left_start = max(index - radius, 0)
+            left_stop = index + 1
+            right_start = index
+            right_stop = min(index + radius + 1, len(xs))
+            if left_start >= left_stop or right_start >= right_stop:
+                continue
+            left_x = float(np.mean(xs[left_start:left_stop]))
+            left_y = float(np.mean(ys[left_start:left_stop]))
+            right_x = float(np.mean(xs[right_start:right_stop]))
+            right_y = float(np.mean(ys[right_start:right_stop]))
+            dx = right_x - left_x
+            dy = right_y - left_y
+            if dx == 0.0 and dy == 0.0:
+                continue
             norm = math.hypot(dx, dy)
             tangent = np.asarray([dx / norm, dy / norm], dtype=float)
+            break
     normal = np.asarray([-tangent[1], tangent[0]], dtype=float)
     return tangent, normal
 
@@ -273,9 +286,9 @@ def _query_candidate_components(
     boundary_index: BoundaryComponentIndex,
     radius: float,
     max_neighbors: int,
-) -> dict[int, tuple[float, np.ndarray]]:
+) -> list[tuple[int, float, np.ndarray]]:
     if max_neighbors <= 0:
-        return {}
+        return []
     distances, indices = boundary_index.tree.query(
         center_xy,
         k=max_neighbors,
@@ -283,7 +296,7 @@ def _query_candidate_components(
     )
     distances = np.atleast_1d(distances)
     indices = np.atleast_1d(indices)
-    candidates: dict[int, tuple[float, np.ndarray]] = {}
+    candidates: list[tuple[int, float, np.ndarray]] = []
     for distance, raw_index in zip(distances, indices):
         if not np.isfinite(distance):
             continue
@@ -292,32 +305,75 @@ def _query_candidate_components(
             continue
         component_id = int(boundary_index.component_ids[point_index])
         point = np.asarray([boundary_index.xs[point_index], boundary_index.ys[point_index]], dtype=float)
-        current = candidates.get(component_id)
-        if current is None or float(distance) < current[0]:
-            candidates[component_id] = (float(distance), point)
+        candidates.append((component_id, float(distance), point))
     return candidates
+
+
+def _segment_reintersects_centerline(
+    center_xy: np.ndarray,
+    bank_point: np.ndarray,
+    *,
+    centerline_without_center: Any | None,
+) -> bool:
+    if centerline_without_center is None:
+        return False
+    if getattr(centerline_without_center, "is_empty", False):
+        return False
+    segment = LineString([tuple(center_xy), tuple(np.asarray(bank_point, dtype=float))])
+    return bool(segment.intersects(centerline_without_center))
 
 
 def _select_local_controlling_pair(
     center_xy: np.ndarray,
     normal: np.ndarray,
-    candidates: Mapping[int, tuple[float, np.ndarray]],
+    candidates: Sequence[tuple[int, float, np.ndarray]],
+    *,
+    centerline_without_center: Any | None = None,
 ) -> dict[str, Any] | None:
-    left_best: tuple[int, float, np.ndarray] | None = None
-    right_best: tuple[int, float, np.ndarray] | None = None
-    for component_id, (distance, point) in candidates.items():
+    left_candidates: list[tuple[int, float, np.ndarray]] = []
+    right_candidates: list[tuple[int, float, np.ndarray]] = []
+    seen_left: set[int] = set()
+    seen_right: set[int] = set()
+
+    for component_id, distance, point in sorted(candidates, key=lambda item: item[1]):
         vector = point - center_xy
         signed = float(np.dot(vector, normal))
         if signed == 0.0:
             continue
+        if _segment_reintersects_centerline(
+            center_xy,
+            point,
+            centerline_without_center=centerline_without_center,
+        ):
+            continue
         if signed < 0.0:
-            if left_best is None or distance < left_best[1]:
-                left_best = (int(component_id), float(distance), point)
+            if int(component_id) in seen_left:
+                continue
+            seen_left.add(int(component_id))
+            left_candidates.append((int(component_id), float(distance), point))
         else:
-            if right_best is None or distance < right_best[1]:
-                right_best = (int(component_id), float(distance), point)
-    if left_best is None or right_best is None:
+            if int(component_id) in seen_right:
+                continue
+            seen_right.add(int(component_id))
+            right_candidates.append((int(component_id), float(distance), point))
+
+    if not left_candidates or not right_candidates:
         return None
+
+    best_pair: tuple[tuple[int, float, np.ndarray], tuple[int, float, np.ndarray]] | None = None
+    best_distance = float("inf")
+    for left_candidate in left_candidates:
+        for right_candidate in right_candidates:
+            if int(left_candidate[0]) == int(right_candidate[0]):
+                continue
+            pair_distance = float(left_candidate[1] + right_candidate[1])
+            if pair_distance < best_distance:
+                best_distance = pair_distance
+                best_pair = (left_candidate, right_candidate)
+
+    if best_pair is None:
+        return None
+    left_best, right_best = best_pair
     return {
         "left_component_id": int(left_best[0]),
         "left_distance": float(left_best[1]),
@@ -335,6 +391,7 @@ def _find_local_controlling_pair(
     boundary_index: BoundaryComponentIndex | None,
     search_radius: float,
     candidate_neighbors_max: int,
+    centerline_without_center: Any | None = None,
 ) -> dict[str, Any] | None:
     if boundary_index is None:
         return None
@@ -348,7 +405,12 @@ def _find_local_controlling_pair(
                 radius=search_radius * float(factor),
                 max_neighbors=neighbor_count,
             )
-            pair = _select_local_controlling_pair(center_xy, normal, candidates)
+            pair = _select_local_controlling_pair(
+                center_xy,
+                normal,
+                candidates,
+                centerline_without_center=centerline_without_center,
+            )
             if pair is not None:
                 return pair
             if neighbor_count >= max_neighbors:
@@ -503,6 +565,7 @@ def compute_two_bank_width_families(
 
         total_widths_seed = edge_width_samples_from_attrs({"wid_pix": attrs.get("wid_pix")}, pixel_width_fields=["wid_pix"])
         rows, cols, xs, ys = _unravel_link_pixels(flat_indices, collapsed_shape, collapsed_transform)
+        link_centerline = LineString(np.column_stack([xs, ys])) if len(xs) >= 2 else None
         distances = _distances_along_link(xs, ys)
         if total_widths_seed.size == 0:
             total_widths_seed = 2.0 * dt_map[rows, cols]
@@ -520,6 +583,11 @@ def compute_two_bank_width_families(
             center_xy = np.asarray([float(xs[index]), float(ys[index])], dtype=float)
             _, normal = _local_tangent_normal(xs, ys, index)
             dt_width = max(float(2.0 * dt_map[rows[index], cols[index]]), float(pixel_length))
+            centerline_without_center = None
+            if link_centerline is not None:
+                centerline_without_center = link_centerline.difference(
+                    Point(float(center_xy[0]), float(center_xy[1])).buffer(pixel_length * 0.51)
+                )
 
             search_radius = max(dt_width * DEFAULT_SEARCH_RADIUS_MULTIPLIER, pixel_length * DEFAULT_MIN_SEARCH_PIXELS)
             pair = _find_local_controlling_pair(
@@ -528,6 +596,7 @@ def compute_two_bank_width_families(
                 boundary_index=boundary_index,
                 search_radius=search_radius,
                 candidate_neighbors_max=bank_candidate_neighbors_max,
+                centerline_without_center=centerline_without_center,
             )
 
             if pair is None:
