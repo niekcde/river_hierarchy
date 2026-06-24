@@ -2141,7 +2141,7 @@ def _boundary_overlap_cut_targets(
     selection_edge_pairs: Collection[tuple[int, int]],
     nominal_upstream_node: int,
     nominal_downstream_node: int,
-    parent_overlap_threshold: float = 0.999999,
+    parent_overlap_threshold: float = 0.95,
 ) -> dict[int, list[dict[str, Any]]]:
     if link_match.empty or not selection_edge_pairs:
         return {}

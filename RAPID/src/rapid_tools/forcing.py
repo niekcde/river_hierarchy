@@ -21,6 +21,10 @@ class ForcingConfig:
     resample_minutes: int | None = None
     interpolation_method: str = "time"
     output_cache_dir: str | None = None
+    spinup_hours: float | None = None
+    auto_spinup_from_k: bool = False
+    spinup_k_multiplier: float = 1.1
+    pad_end_with_spinup: bool = True
 
 
 def _read_raw_forcing_frame(path: Path) -> pd.DataFrame:
@@ -85,8 +89,14 @@ def build_forcing_cache_path(
         if config.resample_minutes is not None
         else "native_dt"
     )
+    spinup_token = (
+        f"spinup_{int(round(float(config.spinup_hours) * 3600.0))}s"
+        if config.spinup_hours is not None
+        else "spinup_off"
+    )
+    tail_token = "tail_same_as_spinup" if config.pad_end_with_spinup else "tail_off"
     source_token = _sanitize_cache_token(source_path.stem, fallback="forcing")
-    stem = "__".join((source_token, station_token, start_token, end_token, resample_token))
+    stem = "__".join((source_token, station_token, start_token, end_token, resample_token, spinup_token, tail_token))
     return cache_dir / f"{stem}.csv", cache_dir / f"{stem}.json"
 
 
@@ -129,6 +139,7 @@ def _normalize_raw_forcing_frame(
         "forcing_end_time": config.end_time,
         "forcing_resample_minutes": int(config.resample_minutes) if config.resample_minutes is not None else None,
         "forcing_interpolation_method": config.interpolation_method,
+        "forcing_spinup_hours": float(config.spinup_hours) if config.spinup_hours is not None else None,
         "raw_row_count": int(len(raw_frame)),
     }
 
@@ -220,6 +231,82 @@ def _normalize_raw_forcing_frame(
     return forcing, metadata
 
 
+def _apply_constant_spinup(
+    forcing: pd.DataFrame,
+    *,
+    spinup_hours: float | None,
+    pad_end_with_spinup: bool = True,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    if spinup_hours is None:
+        return forcing, {
+            "spinup_enabled": False,
+            "spinup_hours": None,
+            "spinup_duration_seconds": 0,
+            "spinup_row_count": 0,
+            "spinup_discharge_cms": None,
+            "end_padding_enabled": False,
+            "end_padding_row_count": 0,
+            "end_padding_discharge_cms": None,
+        }
+
+    spinup_hours_float = float(spinup_hours)
+    if spinup_hours_float <= 0:
+        raise ValueError("spinup_hours must be positive when provided.")
+
+    dt_seconds = infer_forcing_dt_seconds(forcing)
+    spinup_duration_seconds = int(np.ceil(spinup_hours_float * 3600.0))
+    spinup_row_count = int(np.ceil(spinup_duration_seconds / dt_seconds))
+    if spinup_row_count <= 0:
+        return forcing, {
+            "spinup_enabled": False,
+            "spinup_hours": spinup_hours_float,
+            "spinup_duration_seconds": 0,
+            "spinup_row_count": 0,
+            "spinup_discharge_cms": None,
+            "end_padding_enabled": False,
+            "end_padding_row_count": 0,
+            "end_padding_discharge_cms": None,
+        }
+
+    first_time = forcing["time"].iloc[0]
+    first_discharge = float(forcing["discharge_cms"].iloc[0])
+    spinup_offsets = np.arange(spinup_row_count, 0, -1, dtype=int)
+    spinup_times = first_time - pd.to_timedelta(spinup_offsets * dt_seconds, unit="s")
+    spinup = pd.DataFrame(
+        {
+            "time": spinup_times,
+            "discharge_cms": np.full(spinup_row_count, first_discharge, dtype=float),
+        }
+    )
+    expanded = pd.concat([spinup, forcing], ignore_index=True)
+    end_padding_row_count = 0
+    end_padding_discharge_cms: float | None = None
+    if pad_end_with_spinup:
+        last_time = forcing["time"].iloc[-1]
+        last_discharge = float(forcing["discharge_cms"].iloc[-1])
+        end_padding_offsets = np.arange(1, spinup_row_count + 1, dtype=int)
+        end_padding_times = last_time + pd.to_timedelta(end_padding_offsets * dt_seconds, unit="s")
+        end_padding = pd.DataFrame(
+            {
+                "time": end_padding_times,
+                "discharge_cms": np.full(spinup_row_count, last_discharge, dtype=float),
+            }
+        )
+        expanded = pd.concat([expanded, end_padding], ignore_index=True)
+        end_padding_row_count = spinup_row_count
+        end_padding_discharge_cms = last_discharge
+    return expanded, {
+        "spinup_enabled": True,
+        "spinup_hours": spinup_hours_float,
+        "spinup_duration_seconds": int(spinup_row_count * dt_seconds),
+        "spinup_row_count": spinup_row_count,
+        "spinup_discharge_cms": first_discharge,
+        "end_padding_enabled": bool(pad_end_with_spinup),
+        "end_padding_row_count": int(end_padding_row_count),
+        "end_padding_discharge_cms": end_padding_discharge_cms,
+    }
+
+
 def prepare_forcing_table(
     forcing_path: str | Path,
     *,
@@ -241,6 +328,8 @@ def prepare_forcing_table(
                     "forcing_cache_csv": str(cache_csv_path),
                     "forcing_cache_metadata_json": str(cache_metadata_path),
                     "forcing_loaded_from_cache": True,
+                    "forcing_spinup_hours": float(config.spinup_hours) if config.spinup_hours is not None else None,
+                    "forcing_pad_end_with_spinup": bool(config.pad_end_with_spinup),
                     "normalized_row_count": int(len(forcing)),
                     "normalized_dt_seconds": infer_forcing_dt_seconds(forcing),
                 }
@@ -253,7 +342,15 @@ def prepare_forcing_table(
         forcing_path=source_path,
         config=config,
     )
+    forcing, spinup_metadata = _apply_constant_spinup(
+        forcing,
+        spinup_hours=config.spinup_hours,
+        pad_end_with_spinup=bool(config.pad_end_with_spinup),
+    )
+    metadata.update(spinup_metadata)
     metadata["forcing_loaded_from_cache"] = False
+    metadata["normalized_row_count"] = int(len(forcing))
+    metadata["normalized_dt_seconds"] = infer_forcing_dt_seconds(forcing)
     if cache_paths is not None:
         cache_csv_path, cache_metadata_path = cache_paths
         forcing.to_csv(cache_csv_path, index=False)

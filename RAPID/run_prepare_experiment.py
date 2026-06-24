@@ -27,6 +27,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--forcing-start-time", help="Optional inclusive UTC truncation start for forcing normalization.")
     parser.add_argument("--forcing-end-time", help="Optional inclusive UTC truncation end for forcing normalization.")
     parser.add_argument("--forcing-resample-minutes", type=int, help="Optional normalized forcing interval in minutes, e.g. 15.")
+    parser.add_argument("--spinup-hours", type=float, help="Optional constant-flow spin-up duration in hours using the first normalized gauge discharge value.")
+    parser.add_argument("--auto-spinup-from-k", action="store_true", help="Compute spin-up automatically from the longest downstream summed-K path in the prepared RAPID network.")
+    parser.add_argument("--spinup-k-multiplier", type=float, default=1.1, help="Multiplier applied to the longest downstream summed-K path when auto-spinup-from-k is enabled.")
+    parser.add_argument("--disable-end-padding-with-spinup", action="store_true", help="Do not append a constant tail equal to the spin-up duration using the final normalized gauge discharge value.")
     parser.add_argument(
         "--forcing-output-cache-dir",
         help="Optional shared cache directory for normalized forcing tables keyed by source, station, time window, and timestep.",
@@ -50,8 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kb-value", type=float, default=20.0, help="K-value helper parameter kb.")
     parser.add_argument("--kb-mode", choices=["fixed", "based_reference_section"], default="fixed", help="How to select kb for RAPID K preparation.")
     parser.add_argument("--kb-model-path", help="Optional local path to the BASED model .ubj file when kb-mode=based_reference_section.")
-    parser.add_argument("--kb-width-sample-field", default="width_wet", help="Reference-section width sample field used when kb-mode=based_reference_section.")
-    parser.add_argument("--kb-width-percentile", type=float, default=90.0, help="Reference-section width percentile used when kb-mode=based_reference_section.")
+    parser.add_argument("--kb-width-sample-field", default="wid_adj_wet", help="Reference-section width field used when kb-mode=based_reference_section. Summary width fields on the reference link are preferred over raw sample percentiles when available.")
+    parser.add_argument("--kb-width-percentile", type=float, default=90.0, help="Reference-section width percentile used only when the selected kb width field is read from raw sample widths.")
     parser.add_argument("--n-manning", type=float, default=0.35, help="Manning roughness used in K preparation.")
     parser.add_argument("--min-width", type=float, default=1.0, help="Minimum positive width used when width is missing or invalid.")
     parser.add_argument("--min-effective-length-for-k-m", type=float, help="Optional K-only lower bound for effective reach length in meters. Geometry and exported link lengths are unchanged.")
@@ -85,6 +89,10 @@ def main(argv: list[str] | None = None) -> int:
             start_time=args.forcing_start_time,
             end_time=args.forcing_end_time,
             resample_minutes=args.forcing_resample_minutes,
+            spinup_hours=args.spinup_hours,
+            auto_spinup_from_k=args.auto_spinup_from_k,
+            spinup_k_multiplier=args.spinup_k_multiplier,
+            pad_end_with_spinup=not args.disable_end_padding_with_spinup,
             output_cache_dir=args.forcing_output_cache_dir,
         ),
         prep_config=RapidPrepConfig(

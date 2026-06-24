@@ -37,6 +37,13 @@ SECOND_COLUMNS_TO_HOURS = {
 }
 
 
+def _compute_relative_change(values: pd.Series, baseline: float) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce")
+    if pd.isna(baseline) or not np.isfinite(float(baseline)) or np.isclose(float(baseline), 0.0):
+        return pd.Series(np.nan, index=numeric.index, dtype=float)
+    return (numeric / float(baseline)) - 1.0
+
+
 @dataclass(frozen=True, slots=True)
 class ReachWaveStack:
     reaches: Any
@@ -378,6 +385,17 @@ def build_experiment_analysis_frame(
             delta = delta / SECONDS_PER_HOUR
         run_registry[delta_column] = delta
 
+    if "lag_to_inflow_peak_seconds" in run_registry.columns:
+        base_lag_seconds = pd.to_numeric(base_row.get("lag_to_inflow_peak_seconds"), errors="coerce")
+        baseline = float(base_lag_seconds) if pd.notna(base_lag_seconds) else float("nan")
+        run_registry["lag_to_inflow_peak_relative_to_base"] = _compute_relative_change(
+            run_registry["lag_to_inflow_peak_seconds"],
+            baseline,
+        )
+        run_registry["lag_to_inflow_peak_pct_shift_vs_base"] = (
+            run_registry["lag_to_inflow_peak_relative_to_base"] * 100.0
+        )
+
     computed_rows = run_registry.loc[run_registry["hydrograph_status"].eq("computed")].copy()
     if not computed_rows.empty:
         base_hydro = load_state_hydrograph(run_registry, base_state_id)
@@ -471,6 +489,32 @@ def build_combined_analysis_frame(
             denom = pd.to_numeric(combined[denominator], errors="coerce")
             num = pd.to_numeric(combined[numerator], errors="coerce")
             combined[output] = np.where(denom.abs() > 1e-12, num / denom, np.nan)
+
+        if "lag_to_inflow_peak_seconds" in combined.columns:
+            lag_reference = combined.loc[
+                combined["scenario_family"].eq("compound_bubble"),
+                ["example_id", "compound_bubble_id", "state_id", "lag_to_inflow_peak_seconds"],
+            ].rename(
+                columns={
+                    "state_id": "matching_compound_state_id",
+                    "lag_to_inflow_peak_seconds": "matching_compound_lag_to_inflow_peak_seconds",
+                }
+            )
+            lag_reference = lag_reference.drop_duplicates(subset=["example_id", "compound_bubble_id"])
+            combined = combined.merge(
+                lag_reference[["example_id", "compound_bubble_id", "matching_compound_lag_to_inflow_peak_seconds"]],
+                on=["example_id", "compound_bubble_id"],
+                how="left",
+            )
+            denom = pd.to_numeric(combined["matching_compound_lag_to_inflow_peak_seconds"], errors="coerce")
+            num = pd.to_numeric(combined["lag_to_inflow_peak_seconds"], errors="coerce")
+            combined["unit_to_bubble_lag_to_inflow_peak_ratio"] = np.where(denom.abs() > 1e-12, num / denom, np.nan)
+            combined["unit_to_bubble_lag_to_inflow_peak_relative"] = (
+                combined["unit_to_bubble_lag_to_inflow_peak_ratio"] - 1.0
+            )
+            combined["unit_to_bubble_lag_to_inflow_peak_pct_shift"] = (
+                combined["unit_to_bubble_lag_to_inflow_peak_relative"] * 100.0
+            )
 
     return combined
 

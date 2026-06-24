@@ -22,10 +22,12 @@ from shapely.ops import substring
 
 from network_variants.reference_context import resolve_kb_context
 
-from .forcing import ForcingConfig, infer_forcing_dt_seconds, prepare_forcing_table, write_inflow_netcdf
+from .forcing import ForcingConfig, _apply_constant_spinup, infer_forcing_dt_seconds, prepare_forcing_table, write_inflow_netcdf
 from .k_values import KValueConfig, compute_k_values, compute_routing_dt_seconds, resolve_width_field
 from .reference_section import compute_reference_section_kb
 from .registry import RapidStateContext, iter_preparable_states, load_state_registry
+
+SECONDS_PER_HOUR = 3600.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +41,7 @@ class RapidPrepConfig:
     kb_value: float = 20.0
     kb_mode: str = "fixed"
     kb_model_path: str | None = None
-    kb_width_sample_field: str = "width_wet"
+    kb_width_sample_field: str = "wid_adj_wet"
     kb_width_percentile: float = 90.0
     n_manning: float = 0.35
     min_width: float = 1.0
@@ -831,6 +833,7 @@ def build_rapid_graph(
             ds,
             key=str(int(row.reach_id)),
             reach_id=int(row.reach_id),
+            rapid_k=float(row.rapid_k) if hasattr(row, "rapid_k") else float("nan"),
             width=float(getattr(row, "rapid_branch_width_m", row.rapid_width_m)),
             width_branch=float(getattr(row, "rapid_branch_width_m", row.rapid_width_m)),
             width_k=float(row.rapid_width_m),
@@ -839,6 +842,25 @@ def build_rapid_graph(
             slope_local=float(row.slope_used),
         )
     return graph
+
+
+def _compute_longest_downstream_k_seconds(graph: nx.MultiDiGraph) -> float:
+    if not nx.is_directed_acyclic_graph(graph):
+        raise ValueError("Automatic spinup from K requires an acyclic RAPID graph.")
+
+    longest_to_node: dict[int, float] = {}
+    for node in nx.topological_sort(graph):
+        best = 0.0
+        for pred, _, key, data in graph.in_edges(node, keys=True, data=True):
+            weight = float(data.get("rapid_k", float("nan")))
+            if not np.isfinite(weight):
+                continue
+            candidate = float(longest_to_node.get(int(pred), 0.0)) + weight
+            if candidate > best:
+                best = candidate
+        longest_to_node[int(node)] = best
+
+    return float(max(longest_to_node.values(), default=0.0))
 
 
 def prepare_state(
@@ -952,13 +974,34 @@ def prepare_state(
     forcing_dt_seconds = None
     routing_dt_seconds = None
     resolved_forcing_metadata = dict(forcing_metadata) if forcing_metadata is not None else None
+    resolved_forcing_config = replace(forcing_config)
     if forcing_table is not None:
         forcing = forcing_table.copy()
     elif forcing_path is not None:
-        forcing, resolved_forcing_metadata = prepare_forcing_table(forcing_path, config=forcing_config)
+        forcing, resolved_forcing_metadata = prepare_forcing_table(forcing_path, config=resolved_forcing_config)
     else:
         forcing = None
     if forcing is not None:
+        if resolved_forcing_config.auto_spinup_from_k and resolved_forcing_config.spinup_hours is None:
+            longest_k_seconds = _compute_longest_downstream_k_seconds(graph)
+            auto_spinup_hours = (longest_k_seconds * float(resolved_forcing_config.spinup_k_multiplier)) / SECONDS_PER_HOUR
+            resolved_forcing_config = replace(
+                resolved_forcing_config,
+                spinup_hours=float(auto_spinup_hours),
+            )
+            forcing, spinup_metadata = _apply_constant_spinup(
+                forcing,
+                spinup_hours=resolved_forcing_config.spinup_hours,
+                pad_end_with_spinup=bool(resolved_forcing_config.pad_end_with_spinup),
+            )
+            if resolved_forcing_metadata is None:
+                resolved_forcing_metadata = {}
+            resolved_forcing_metadata.update(spinup_metadata)
+            resolved_forcing_metadata["forcing_spinup_hours"] = float(resolved_forcing_config.spinup_hours)
+            resolved_forcing_metadata["spinup_source"] = "longest_downstream_k_path"
+            resolved_forcing_metadata["spinup_k_multiplier"] = float(resolved_forcing_config.spinup_k_multiplier)
+            resolved_forcing_metadata["longest_downstream_k_seconds"] = float(longest_k_seconds)
+
         forcing_dt_seconds = infer_forcing_dt_seconds(forcing)
         routing_dt_seconds = compute_routing_dt_seconds(
             rapid_links["rapid_k"],
@@ -973,7 +1016,7 @@ def prepare_state(
         "state_id": context.state_id,
         "state_role": context.state_role,
         "prep_config": asdict(prep_config),
-        "forcing_config": asdict(forcing_config) if forcing_path is not None else None,
+        "forcing_config": asdict(resolved_forcing_config) if forcing_path is not None else None,
         "forcing_metadata": resolved_forcing_metadata,
         "hydraulic_context": {
             "source": hydraulic_context_source,
@@ -1126,7 +1169,14 @@ def prepare_experiment(
 
     try:
         if forcing_path is not None:
-            forcing_table, forcing_metadata = prepare_forcing_table(forcing_path, config=forcing_config)
+            prepass_forcing_config = forcing_config
+            if forcing_config.auto_spinup_from_k:
+                prepass_forcing_config = replace(
+                    forcing_config,
+                    auto_spinup_from_k=False,
+                    spinup_hours=None,
+                )
+            forcing_table, forcing_metadata = prepare_forcing_table(forcing_path, config=prepass_forcing_config)
         if str(resolved_prep_config.kb_mode or "fixed") == "based_reference_section":
             if forcing_table is None:
                 raise ValueError("based_reference_section kb mode requires forcing_path to be provided.")

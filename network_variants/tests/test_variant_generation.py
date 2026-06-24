@@ -16,6 +16,7 @@ from network_variants.variant_generation import (
     _apply_collapse_components_to_mask,
     _apply_segmented_stub_width_inheritance,
     _assign_variant_directions,
+    _boundary_overlap_cut_targets,
     _build_oriented_child_graph,
     _componentize_units,
     _compute_family_stats,
@@ -1284,7 +1285,7 @@ def test_segment_collapsed_links_to_anchor_nodes_projects_parent_nodes_instead_o
         assert updated_nodes.loc[child_id].geometry.distance(parent_nodes.set_index("id_node").loc[parent_id].geometry) == 0.0
 
 
-def test_segment_collapsed_links_to_anchor_nodes_uses_100pct_parent_overlap_for_compound_boundaries() -> None:
+def test_segment_collapsed_links_to_anchor_nodes_uses_high_parent_overlap_for_compound_boundaries() -> None:
     parent_nodes = gpd.GeoDataFrame(
         [
             {"id_node": 12, "is_inlet": False, "is_outlet": True, "geometry": Point(0, 0)},
@@ -1498,6 +1499,81 @@ def test_segment_collapsed_links_to_anchor_nodes_uses_100pct_parent_overlap_for_
             ].iloc[0]
         )
         assert updated_nodes.loc[child_id].geometry.distance(parent_nodes.set_index("id_node").loc[parent_id].geometry) == 0.0
+
+
+def test_boundary_overlap_cut_targets_accepts_parent_overlap_above_95pct_only() -> None:
+    parent_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 12, "is_inlet": False, "is_outlet": True, "geometry": Point(0, 0)},
+            {"id_node": 13, "is_inlet": False, "is_outlet": False, "geometry": Point(10, 0)},
+            {"id_node": 14, "is_inlet": False, "is_outlet": False, "geometry": Point(20, 0)},
+            {"id_node": 15, "is_inlet": False, "is_outlet": False, "geometry": Point(30, 0)},
+            {"id_node": 16, "is_inlet": True, "is_outlet": False, "geometry": Point(40, 0)},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    parent_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 18, "id_nodes": "13, 12", "id_us_node": 13, "id_ds_node": 12, "geometry": LineString([(10, 0), (0, 0)])},
+            {"id_link": 19, "id_nodes": "15, 13", "id_us_node": 15, "id_ds_node": 13, "geometry": LineString([(30, 0), (10, 0)])},
+            {"id_link": 20, "id_nodes": "14, 13", "id_us_node": 14, "id_ds_node": 13, "geometry": LineString([(20, 0), (10, 0)])},
+            {"id_link": 21, "id_nodes": "15, 14", "id_us_node": 15, "id_ds_node": 14, "geometry": LineString([(30, 0), (20, 0)])},
+            {"id_link": 22, "id_nodes": "16, 14", "id_us_node": 16, "id_ds_node": 14, "geometry": LineString([(40, 0), (20, 0)])},
+            {"id_link": 23, "id_nodes": "16, 15", "id_us_node": 16, "id_ds_node": 15, "geometry": LineString([(40, 0), (30, 0)])},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    child_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 30, "id_us_node": 100, "id_ds_node": 101, "geometry": LineString([(40, 0), (20, 0)])},
+            {"id_link": 31, "id_us_node": 101, "id_ds_node": 102, "geometry": LineString([(20, 0), (0, 0)])},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    node_match = pd.DataFrame(
+        [
+            {"child_id_node": 100, "matched_parent_node_id": 16},
+            {"child_id_node": 101, "matched_parent_node_id": 14},
+            {"child_id_node": 102, "matched_parent_node_id": 12},
+        ]
+    )
+    link_match = pd.DataFrame(
+        [
+            {
+                "child_id_link": 30,
+                "parent_id_link": 23,
+                "parent_overlap_fraction": 0.96,
+                "child_overlap_fraction": 0.80,
+                "candidate_rank": 1,
+            },
+            {
+                "child_id_link": 31,
+                "parent_id_link": 18,
+                "parent_overlap_fraction": 0.94,
+                "child_overlap_fraction": 0.75,
+                "candidate_rank": 1,
+            },
+        ]
+    )
+
+    parent_order, parent_graph, _ = _infer_parent_node_order(parent_links, parent_nodes)
+    targets = _boundary_overlap_cut_targets(
+        parent_graph=parent_graph,
+        parent_node_geometries=parent_nodes.set_index("id_node")["geometry"].to_dict(),
+        directed_links=child_links,
+        node_match=node_match,
+        link_match=link_match,
+        selection_edge_pairs={(15, 13), (15, 14), (14, 13)},
+        nominal_upstream_node=15,
+        nominal_downstream_node=13,
+    )
+
+    assert 30 in targets
+    assert [spec["parent_node_id"] for spec in targets[30]] == [15]
+    assert 31 not in targets
 
 
 def test_segment_collapsed_links_to_anchor_nodes_cuts_internal_compound_entry_at_selected_node() -> None:

@@ -1882,7 +1882,7 @@ def run_collapse_experiment(
     equivalent_forcing_path: str | Path | None = None,
     equivalent_forcing_config: ForcingConfig | None = None,
     equivalent_kb_model_path: str | Path | None = None,
-    equivalent_kb_width_sample_field: str = "width_wet",
+    equivalent_kb_width_sample_field: str = "wid_adj_wet",
     equivalent_kb_width_percentile: float = 90.0,
     equivalent_forcing_table_runner: Callable[..., tuple[pd.DataFrame, dict[str, object]]] = prepare_forcing_table,
     equivalent_reference_kb_summary_runner: Callable[..., dict[str, Any]] = compute_reference_section_kb,
@@ -2495,14 +2495,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--equivalent-kb-width-sample-field",
-        default="width_wet",
-        help="Reference-section width sample field used when equivalent-kb-mode=based_reference_section.",
+        default="wid_adj_wet",
+        help="Reference-section width field used when equivalent-kb-mode=based_reference_section. Summary width fields on the reference link are preferred over raw sample percentiles when available.",
     )
     parser.add_argument(
         "--equivalent-kb-width-percentile",
         type=float,
         default=90.0,
-        help="Reference-section width percentile used when equivalent-kb-mode=based_reference_section.",
+        help="Reference-section width percentile used only when the selected equivalent kb width field is read from raw sample widths.",
     )
     parser.add_argument(
         "--equivalent-length-field",

@@ -1377,7 +1377,7 @@ def run_equivalent_resistance_experiment(
     forcing_path: str | Path | None = None,
     forcing_config: ForcingConfig | None = None,
     kb_model_path: str | Path | None = None,
-    kb_width_sample_field: str = "width_wet",
+    kb_width_sample_field: str = "wid_adj_wet",
     kb_width_percentile: float = 90.0,
     forcing_table_runner: Callable[..., tuple[pd.DataFrame, dict[str, object]]] = prepare_forcing_table,
     reference_kb_summary_runner: Callable[..., dict[str, Any]] = compute_reference_section_kb,
@@ -1512,14 +1512,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--equivalent-kb-width-sample-field",
-        default="width_wet",
-        help="Reference-section width sample field used for based_reference_section kb.",
+        default="wid_adj_wet",
+        help="Reference-section width field used for based_reference_section kb. Summary width fields on the reference link are preferred over raw sample percentiles when available.",
     )
     parser.add_argument(
         "--equivalent-kb-width-percentile",
         type=float,
         default=90.0,
-        help="Reference-section width percentile used for based_reference_section kb.",
+        help="Reference-section width percentile used only when the selected equivalent kb width field is read from raw sample widths.",
     )
     parser.add_argument("--equivalent-manning-n", type=float, default=0.035, help="Default Manning n used when links do not provide one.")
     parser.add_argument("--equivalent-chezy-cz", type=float, default=22.0, help="Default Chezy Cz used when links do not provide one.")

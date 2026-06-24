@@ -465,6 +465,9 @@ def test_build_combined_analysis_frame_merges_unit_and_bubble(tmp_path: Path) ->
     assert float(unit_row["delta_peak_time_hours"]) == -1.0
     assert float(bubble_row["delta_peak_time_hours"]) == -2.0
     assert float(unit_row["hydrograph_lag_vs_base_hours"]) == -1.0
+    assert float(unit_row["lag_to_inflow_peak_relative_to_base"]) == -0.5
+    assert float(unit_row["lag_to_inflow_peak_pct_shift_vs_base"]) == -50.0
+    assert pd.isna(unit_row["unit_to_bubble_lag_to_inflow_peak_ratio"])
 
 
 def test_write_wave_mp4_requires_ffmpeg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

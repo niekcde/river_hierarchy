@@ -105,17 +105,37 @@ def _reference_section_paths(experiment_dir: Path) -> dict[str, Path]:
 
 def _load_width_summary(
     link_width_samples_path: Path,
+    link_width_families_path: Path,
     *,
     width_sample_field: str,
     width_percentile: float,
 ) -> dict[str, object]:
+    if link_width_families_path.exists():
+        families = pd.read_csv(link_width_families_path)
+        if width_sample_field in families.columns:
+            widths = pd.to_numeric(families[width_sample_field], errors="coerce")
+            widths = widths[np.isfinite(widths) & widths.gt(0)]
+            if not widths.empty:
+                width_reference = float(widths.iloc[0]) if len(widths) == 1 else float(widths.median())
+                return {
+                    "sample_field": width_sample_field,
+                    "percentile": None,
+                    "sample_count": int(len(widths)),
+                    "positive_sample_count": int(len(widths)),
+                    "width_reference_m": width_reference,
+                    "width_min_m": float(widths.min()),
+                    "width_max_m": float(widths.max()),
+                    "source": "link_width_families",
+                    "statistic": "direct_single_link" if len(widths) == 1 else "median_multi_link",
+                }
+
     if not link_width_samples_path.exists():
         raise FileNotFoundError(f"Reference-section width samples were not found: {link_width_samples_path}")
     samples = pd.read_csv(link_width_samples_path)
     if width_sample_field not in samples.columns:
         raise ValueError(
-            f"Reference-section width samples do not contain '{width_sample_field}'. "
-            f"Available columns: {samples.columns.tolist()}"
+            f"Reference-section width inputs do not contain '{width_sample_field}'. "
+            f"Available sample columns: {samples.columns.tolist()}"
         )
     widths = pd.to_numeric(samples[width_sample_field], errors="coerce")
     widths = widths[np.isfinite(widths) & widths.gt(0)]
@@ -131,6 +151,8 @@ def _load_width_summary(
         "width_reference_m": float(np.nanpercentile(widths.to_numpy(dtype=float), float(width_percentile))),
         "width_min_m": float(widths.min()),
         "width_max_m": float(widths.max()),
+        "source": "link_width_samples",
+        "statistic": "percentile",
     }
 
 
@@ -230,8 +252,10 @@ def ensure_reference_section_geometry(
         reference_paths=reference_paths,
     )
     nodes = gpd.read_file(variant_summary["directed_nodes_path"])
+    variant_output_dir = Path(variant_summary["variant_output_dir"])
     width_summary = _load_width_summary(
         Path(variant_summary["link_width_samples_path"]),
+        variant_output_dir / "widths" / "link_width_families.csv",
         width_sample_field=width_sample_field,
         width_percentile=width_percentile,
     )

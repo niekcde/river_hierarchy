@@ -153,6 +153,13 @@ and inflated width relative to a clean family representative, the final width
 summary can inherit from that representative. This inheritance is applied only
 to the final link-family outputs, not to the raw sample table.
 
+These final family-summary width fields now also matter downstream in RAPID
+prep and equivalent-resistance workflows. The current default reference-width
+choice for derived `kb` calculations is `wid_adj_wet`, and the reference-
+section helper prefers the summary width already written to
+`link_width_families.csv` over recomputing a percentile from raw sample widths
+when that field is available.
+
 Audit columns for this logic include:
 
 - `family_width_inheritance_candidate`

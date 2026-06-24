@@ -21,6 +21,7 @@ from rapid_tools.forcing import ForcingConfig
 from rapid_tools.hydrograph import HydrographMetricConfig, _integrate_trapezoid, summarize_outlet_hydrograph
 from rapid_tools.k_values import KValueConfig, compute_k_values
 from rapid_tools.prep import RapidPrepConfig, build_rapid_graph, compute_reach_ratios, create_conn_file, prepare_experiment
+from rapid_tools.reference_section import _load_width_summary
 from rapid_tools.slope import SlopeConfig, compute_link_slopes
 
 
@@ -230,6 +231,25 @@ def _write_multistation_forcing_csv(experiment_dir: Path) -> Path:
     return path
 
 
+def test_reference_section_width_summary_prefers_link_family_field(tmp_path: Path) -> None:
+    samples_path = tmp_path / "link_width_samples.csv"
+    pd.DataFrame({"width_wet": [100.0, 200.0, 400.0]}).to_csv(samples_path, index=False)
+
+    families_path = tmp_path / "link_width_families.csv"
+    pd.DataFrame({"wid_adj_wet": [275.0]}).to_csv(families_path, index=False)
+
+    summary = _load_width_summary(
+        samples_path,
+        families_path,
+        width_sample_field="wid_adj_wet",
+        width_percentile=90.0,
+    )
+
+    assert summary["width_reference_m"] == 275.0
+    assert summary["source"] == "link_width_families"
+    assert summary["statistic"] == "direct_single_link"
+
+
 def test_prepare_experiment_writes_state_outputs(tmp_path: Path) -> None:
     experiment_dir = _write_state(tmp_path)
     registry = prepare_experiment(
@@ -370,6 +390,69 @@ def test_prepare_experiment_normalizes_station_key_forcing(tmp_path: Path) -> No
     assert forcing_metadata["normalized_dt_seconds"] == 900
     assert forcing_metadata["forcing_loaded_from_cache"] is False
     assert Path(forcing_metadata["forcing_cache_csv"]).exists()
+
+
+def test_prepare_experiment_prepends_constant_spinup(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path)
+
+    registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=experiment_dir / "forcing.csv",
+        forcing_config=ForcingConfig(spinup_hours=2.0),
+        prep_config=RapidPrepConfig(),
+    )
+
+    assert registry.loc[0, "status"] == "prepared"
+
+    prep_dir = experiment_dir / "states" / "S001_unit_1" / "rapid" / "prep"
+    forcing_normalized = pd.read_csv(prep_dir / "forcing_normalized.csv")
+    forcing_times = pd.to_datetime(forcing_normalized["time"], utc=True)
+    assert len(forcing_normalized) == 7
+    assert forcing_normalized["discharge_cms"].round(6).tolist() == [100.0, 100.0, 100.0, 110.0, 120.0, 120.0, 120.0]
+    assert forcing_times.iloc[0].isoformat() == "2019-12-31T22:00:00+00:00"
+    assert forcing_times.iloc[2].isoformat() == "2020-01-01T00:00:00+00:00"
+    assert forcing_times.iloc[-1].isoformat() == "2020-01-01T04:00:00+00:00"
+
+    manifest = json.loads((prep_dir / "rapid_prep_manifest.json").read_text())
+    forcing_metadata = manifest["forcing_metadata"]
+    assert forcing_metadata["spinup_enabled"] is True
+    assert forcing_metadata["spinup_hours"] == 2.0
+    assert forcing_metadata["spinup_duration_seconds"] == 7200
+    assert forcing_metadata["spinup_row_count"] == 2
+    assert forcing_metadata["spinup_discharge_cms"] == 100.0
+    assert forcing_metadata["end_padding_enabled"] is True
+    assert forcing_metadata["end_padding_row_count"] == 2
+    assert forcing_metadata["end_padding_discharge_cms"] == 120.0
+    assert manifest["forcing_config"]["spinup_hours"] == 2.0
+
+
+def test_prepare_experiment_computes_auto_spinup_from_longest_k_path(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path)
+
+    registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=experiment_dir / "forcing.csv",
+        forcing_config=ForcingConfig(auto_spinup_from_k=True, spinup_k_multiplier=1.1),
+        prep_config=RapidPrepConfig(),
+    )
+
+    assert registry.loc[0, "status"] == "prepared"
+
+    prep_dir = experiment_dir / "states" / "S001_unit_1" / "rapid" / "prep"
+    rapid_links = pd.read_csv(prep_dir / "rapid_link_attributes.csv")
+    rapid_k = float(rapid_links.loc[0, "rapid_k"])
+
+    manifest = json.loads((prep_dir / "rapid_prep_manifest.json").read_text())
+    forcing_metadata = manifest["forcing_metadata"]
+    expected_spinup_hours = rapid_k * 1.1 / 3600.0
+
+    assert forcing_metadata["spinup_source"] == "longest_downstream_k_path"
+    assert forcing_metadata["longest_downstream_k_seconds"] == pytest.approx(rapid_k)
+    assert forcing_metadata["spinup_k_multiplier"] == pytest.approx(1.1)
+    assert forcing_metadata["spinup_hours"] == pytest.approx(expected_spinup_hours)
+    assert forcing_metadata["end_padding_enabled"] is True
+    assert manifest["forcing_config"]["spinup_hours"] == pytest.approx(expected_spinup_hours)
+    assert manifest["forcing_config"]["auto_spinup_from_k"] is True
 
 
 def test_prepare_experiment_requires_station_key_for_multistation_forcing(tmp_path: Path) -> None:
