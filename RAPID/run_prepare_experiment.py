@@ -26,7 +26,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--station-key-column", default="station_key", help="Station-key column in the forcing file.")
     parser.add_argument("--forcing-start-time", help="Optional inclusive UTC truncation start for forcing normalization.")
     parser.add_argument("--forcing-end-time", help="Optional inclusive UTC truncation end for forcing normalization.")
-    parser.add_argument("--forcing-resample-minutes", type=int, help="Optional normalized forcing interval in minutes, e.g. 15.")
+    parser.add_argument("--forcing-resample-minutes", type=float, help="Optional normalized forcing interval in minutes. Fractional values are allowed if they resolve to whole seconds.")
+    parser.add_argument("--forcing-resample-seconds", type=int, help="Optional normalized forcing interval in seconds. Prefer this when the admissible RAPID timestep is not a whole number of minutes.")
     parser.add_argument("--spinup-hours", type=float, help="Optional constant-flow spin-up duration in hours using the first normalized gauge discharge value.")
     parser.add_argument("--auto-spinup-from-k", action="store_true", help="Compute spin-up automatically from the longest downstream summed-K path in the prepared RAPID network.")
     parser.add_argument("--spinup-k-multiplier", type=float, default=1.1, help="Multiplier applied to the longest downstream summed-K path when auto-spinup-from-k is enabled.")
@@ -89,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
             start_time=args.forcing_start_time,
             end_time=args.forcing_end_time,
             resample_minutes=args.forcing_resample_minutes,
+            resample_seconds=args.forcing_resample_seconds,
             spinup_hours=args.spinup_hours,
             auto_spinup_from_k=args.auto_spinup_from_k,
             spinup_k_multiplier=args.spinup_k_multiplier,

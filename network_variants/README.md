@@ -593,6 +593,11 @@ Two related workflows now exist:
    Run separately with:
    - `network_variants/run_equivalent_resistance_experiment.py`
 
+   The forcing normalization options used by this runner mirror RAPID prep and
+   now accept either second-based resampling
+   (`--equivalent-forcing-resample-seconds`) or minute-based values that
+   resolve to whole seconds.
+
    This is currently intended for:
    - `independent-units`
    - `compound-bubbles`

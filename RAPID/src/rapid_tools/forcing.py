@@ -18,7 +18,8 @@ class ForcingConfig:
     station_key: str | None = None
     start_time: str | None = None
     end_time: str | None = None
-    resample_minutes: int | None = None
+    resample_minutes: float | None = None
+    resample_seconds: int | None = None
     interpolation_method: str = "time"
     output_cache_dir: str | None = None
     spinup_hours: float | None = None
@@ -69,6 +70,29 @@ def _maybe_infer_dt_seconds(forcing: pd.DataFrame) -> int | None:
     return int(unique[0])
 
 
+def _resolve_resample_seconds(config: ForcingConfig) -> int | None:
+    seconds = config.resample_seconds
+    minutes = config.resample_minutes
+    if seconds is not None and minutes is not None:
+        raise ValueError("Provide only one of resample_seconds or resample_minutes.")
+    if seconds is not None:
+        resolved = int(seconds)
+        if resolved <= 0:
+            raise ValueError("resample_seconds must be a positive integer when provided.")
+        return resolved
+    if minutes is None:
+        return None
+    minutes_float = float(minutes)
+    if minutes_float <= 0:
+        raise ValueError("resample_minutes must be positive when provided.")
+    resolved = int(round(minutes_float * 60.0))
+    if resolved <= 0:
+        raise ValueError("resample_minutes resolved to a non-positive timestep in seconds.")
+    if not np.isclose(minutes_float * 60.0, resolved, atol=1e-9):
+        raise ValueError("resample_minutes must resolve to a whole number of seconds.")
+    return resolved
+
+
 def build_forcing_cache_path(
     forcing_path: str | Path,
     *,
@@ -84,9 +108,10 @@ def build_forcing_cache_path(
     station_token = _sanitize_cache_token(config.station_key, fallback="single_series")
     start_token = _format_timestamp_token(config.start_time, fallback="start_open")
     end_token = _format_timestamp_token(config.end_time, fallback="end_open")
+    resample_seconds = _resolve_resample_seconds(config)
     resample_token = (
-        f"{int(config.resample_minutes)}min"
-        if config.resample_minutes is not None
+        f"{int(resample_seconds)}s"
+        if resample_seconds is not None
         else "native_dt"
     )
     spinup_token = (
@@ -137,7 +162,8 @@ def _normalize_raw_forcing_frame(
         "station_key_requested": config.station_key,
         "forcing_start_time": config.start_time,
         "forcing_end_time": config.end_time,
-        "forcing_resample_minutes": int(config.resample_minutes) if config.resample_minutes is not None else None,
+        "forcing_resample_minutes": float(config.resample_minutes) if config.resample_minutes is not None else None,
+        "forcing_resample_seconds": _resolve_resample_seconds(config),
         "forcing_interpolation_method": config.interpolation_method,
         "forcing_spinup_hours": float(config.spinup_hours) if config.spinup_hours is not None else None,
         "raw_row_count": int(len(raw_frame)),
@@ -208,14 +234,13 @@ def _normalize_raw_forcing_frame(
     if len(forcing) < 2:
         raise ValueError("Forcing normalization requires at least two timesteps after truncation.")
 
-    if config.resample_minutes is not None:
-        if int(config.resample_minutes) <= 0:
-            raise ValueError("resample_minutes must be a positive integer when provided.")
+    resample_seconds = _resolve_resample_seconds(config)
+    if resample_seconds is not None:
         if not str(config.interpolation_method).strip():
             raise ValueError("interpolation_method must be a non-empty string.")
         forcing = (
             forcing.set_index("time")["discharge_cms"]
-            .resample(f"{int(config.resample_minutes)}min")
+            .resample(f"{int(resample_seconds)}s")
             .mean()
             .interpolate(method=config.interpolation_method)
             .reset_index()

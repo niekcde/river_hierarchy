@@ -1528,7 +1528,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--equivalent-station-key-column", default="station_key", help="Station-key column in the forcing file.")
     parser.add_argument("--equivalent-forcing-start-time", default=None, help="Optional forcing truncation start time.")
     parser.add_argument("--equivalent-forcing-end-time", default=None, help="Optional forcing truncation end time.")
-    parser.add_argument("--equivalent-forcing-resample-minutes", type=int, default=None, help="Optional forcing resample interval in minutes.")
+    parser.add_argument(
+        "--equivalent-forcing-resample-minutes",
+        type=float,
+        default=None,
+        help="Optional forcing resample interval in minutes. Fractional values are allowed if they resolve to whole seconds.",
+    )
+    parser.add_argument(
+        "--equivalent-forcing-resample-seconds",
+        type=int,
+        default=None,
+        help="Optional forcing resample interval in seconds. Prefer this when the admissible RAPID timestep is not a whole number of minutes.",
+    )
     parser.add_argument("--equivalent-forcing-output-cache-dir", default=None, help="Optional forcing cache directory.")
     parser.add_argument("--equivalent-time-column", default="time", help="Timestamp column in the forcing file.")
     parser.add_argument("--equivalent-discharge-column", default="discharge", help="Discharge column in the forcing file.")
@@ -1554,6 +1565,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             start_time=args.equivalent_forcing_start_time,
             end_time=args.equivalent_forcing_end_time,
             resample_minutes=args.equivalent_forcing_resample_minutes,
+            resample_seconds=args.equivalent_forcing_resample_seconds,
             output_cache_dir=args.equivalent_forcing_output_cache_dir,
         )
     results = run_equivalent_resistance_experiment(

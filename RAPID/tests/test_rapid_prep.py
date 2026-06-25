@@ -392,6 +392,57 @@ def test_prepare_experiment_normalizes_station_key_forcing(tmp_path: Path) -> No
     assert Path(forcing_metadata["forcing_cache_csv"]).exists()
 
 
+def test_prepare_experiment_normalizes_station_key_forcing_with_second_resolution(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path)
+    forcing_path = _write_multistation_forcing_csv(experiment_dir)
+
+    registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=forcing_path,
+        forcing_config=ForcingConfig(
+            station_key="BR:EXAMPLE_A",
+            start_time="2020-01-01T00:00:00Z",
+            end_time="2020-01-01T01:00:00Z",
+            resample_seconds=990,
+        ),
+        prep_config=RapidPrepConfig(),
+    )
+
+    assert registry.loc[0, "status"] == "prepared"
+
+    prep_dir = experiment_dir / "states" / "S001_unit_1" / "rapid" / "prep"
+    manifest = json.loads((prep_dir / "rapid_prep_manifest.json").read_text())
+    forcing_metadata = manifest["forcing_metadata"]
+    assert forcing_metadata["forcing_resample_seconds"] == 990
+    assert forcing_metadata["normalized_dt_seconds"] == 990
+
+
+def test_prepare_experiment_accepts_fractional_resample_minutes(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path)
+    forcing_path = _write_multistation_forcing_csv(experiment_dir)
+
+    registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=forcing_path,
+        forcing_config=ForcingConfig(
+            station_key="BR:EXAMPLE_A",
+            start_time="2020-01-01T00:00:00Z",
+            end_time="2020-01-01T01:00:00Z",
+            resample_minutes=16.5,
+        ),
+        prep_config=RapidPrepConfig(),
+    )
+
+    assert registry.loc[0, "status"] == "prepared"
+
+    prep_dir = experiment_dir / "states" / "S001_unit_1" / "rapid" / "prep"
+    manifest = json.loads((prep_dir / "rapid_prep_manifest.json").read_text())
+    forcing_metadata = manifest["forcing_metadata"]
+    assert forcing_metadata["forcing_resample_minutes"] == pytest.approx(16.5)
+    assert forcing_metadata["forcing_resample_seconds"] == 990
+    assert forcing_metadata["normalized_dt_seconds"] == 990
+
+
 def test_prepare_experiment_prepends_constant_spinup(tmp_path: Path) -> None:
     experiment_dir = _write_state(tmp_path)
 

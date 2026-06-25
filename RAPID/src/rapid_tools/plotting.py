@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import json
 import warnings
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import geopandas as gpd
+import networkx as nx
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -46,8 +48,10 @@ GEOMETRY_X_METRIC_LABELS = {
     "length_fraction": "Matched parent length fraction of network",
     "child_parent_len_frac": "Child length / matched parent length",
     "child_length_fraction": "Child length / matched parent length",
-    "width_fraction_of_total": "Split width / upstream width",
-    "width_fraction": "Split width / upstream width",
+    "width_fraction_of_total": "Upstream width-share routed into target object",
+    "width_fraction": "Upstream width-share routed into target object",
+    "Lambda_matched": "Lambda_matched",
+    "lambda_matched": "Lambda_matched",
     "neg_log10_lambda": "-log10(Lambda_matched)",
     "log_lambda": "-log10(Lambda_matched)",
     "length_weighted_log_lambda": "matched_len_frac * (-log10(Lambda_matched))",
@@ -92,6 +96,107 @@ def _parse_int_list(value: object) -> list[int]:
     if not text:
         return []
     return [int(float(part.strip())) for part in text.split(",") if part.strip()]
+
+
+def _parse_optional_int_list(value: object) -> list[int]:
+    if value is None or pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text or text.lower() == "none":
+        return []
+    return [int(float(part.strip())) for part in text.split(",") if part.strip()]
+
+
+def mandatory_edges(
+    G: nx.DiGraph,
+    source: object | None = None,
+    sink: object | None = None,
+) -> list[tuple[object, object]]:
+    """
+    Return all directed edges that lie on every source-to-sink path.
+
+    This avoids enumerating all simple paths. Each original edge is converted
+    into an intermediate edge-node, then NetworkX immediate dominators are
+    computed on the transformed graph. Any edge-node on the sink dominator
+    chain corresponds to an original edge that every source-to-sink path must
+    traverse.
+
+    Parameters
+    ----------
+    G
+        Input directed acyclic graph as a standard ``networkx.DiGraph``.
+    source
+        Optional source node. When omitted, the unique node with in-degree 0 is
+        inferred.
+    sink
+        Optional sink node. When omitted, the unique node with out-degree 0 is
+        inferred.
+
+    Returns
+    -------
+    list[tuple]
+        Original directed edges ordered from source to sink.
+
+    Examples
+    --------
+    >>> G = nx.DiGraph()
+    >>> G.add_edges_from([
+    ...     ("A", "B"),
+    ...     ("B", "C"),
+    ...     ("B", "D"),
+    ...     ("C", "E"),
+    ...     ("D", "E"),
+    ...     ("E", "F"),
+    ... ])
+    >>> mandatory_edges(G)
+    [('A', 'B'), ('E', 'F')]
+    """
+    if not isinstance(G, nx.DiGraph):
+        raise TypeError("G must be a networkx.DiGraph")
+
+    if source is None:
+        sources = [node for node in G.nodes if G.in_degree(node) == 0]
+        if len(sources) != 1:
+            raise ValueError(f"Expected exactly one source, found {len(sources)}: {sources}")
+        source = sources[0]
+
+    if sink is None:
+        sinks = [node for node in G.nodes if G.out_degree(node) == 0]
+        if len(sinks) != 1:
+            raise ValueError(f"Expected exactly one sink, found {len(sinks)}: {sinks}")
+        sink = sinks[0]
+
+    if source not in G:
+        raise ValueError(f"source {source!r} is not in G")
+    if sink not in G:
+        raise ValueError(f"sink {sink!r} is not in G")
+    if not nx.has_path(G, source, sink):
+        raise ValueError(f"No directed path from source {source!r} to sink {sink!r}")
+
+    H = nx.DiGraph()
+
+    def original_node(node: object) -> tuple[str, object]:
+        return ("node", node)
+
+    def edge_node(u: object, v: object) -> tuple[str, object, object]:
+        return ("edge", u, v)
+
+    for u, v in G.edges:
+        H.add_edge(original_node(u), edge_node(u, v))
+        H.add_edge(edge_node(u, v), original_node(v))
+
+    h_source = original_node(source)
+    h_sink = original_node(sink)
+    idom = nx.immediate_dominators(H, h_source)
+
+    result: list[tuple[object, object]] = []
+    cur = h_sink
+    while cur != h_source:
+        cur = idom[cur]
+        if cur[0] == "edge":
+            _, u, v = cur
+            result.append((u, v))
+    return result[::-1]
 
 
 def _interp_first_crossing_time(t: np.ndarray, q: np.ndarray, level: float) -> float:
@@ -322,6 +427,8 @@ def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.Dat
                     "child_object_id",
                     "child_link_ids",
                     "child_object_type",
+                    "child_upstream_node",
+                    "child_downstream_node",
                     "Q_unit_variant",
                 ]
             ],
@@ -479,6 +586,37 @@ def _build_base_context(exp_dir: Path) -> dict[str, Any]:
     us_lookup = base_variant.set_index("id_link")["id_us_node"]
     ds_lookup = base_variant.set_index("id_link")["id_ds_node"]
 
+    base_directed_dir = exp_dir / "states" / "S000_base" / "variant" / "directed"
+    directed_paths = sorted(base_directed_dir.glob("*_directed_links.gpkg"))
+    if not directed_paths:
+        raise FileNotFoundError(f"Could not resolve base directed links for {exp_dir}.")
+    base_directed = gpd.read_file(directed_paths[0])
+    base_directed = base_directed.copy()
+    base_directed["id_link"] = pd.to_numeric(base_directed["id_link"], errors="coerce").astype("Int64")
+    base_directed["id_us_node"] = pd.to_numeric(base_directed["id_us_node"], errors="coerce").astype("Int64")
+    base_directed["id_ds_node"] = pd.to_numeric(base_directed["id_ds_node"], errors="coerce").astype("Int64")
+    base_directed = base_directed.dropna(subset=["id_link", "id_us_node", "id_ds_node"]).drop_duplicates(subset=["id_link"])
+    if "unit_ids" not in base_directed.columns:
+        base_directed["unit_ids"] = None
+    base_directed["width_value"] = base_directed["id_link"].map(width_lookup)
+    base_graph = nx.DiGraph()
+    for row in base_directed.itertuples(index=False):
+        base_graph.add_edge(int(row.id_us_node), int(row.id_ds_node))
+    mandatory_edge_pairs = set(mandatory_edges(base_graph))
+    base_in_edges: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    base_out_edges: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in base_directed.itertuples(index=False):
+        edge_record = {
+            "id_link": int(row.id_link),
+            "id_us_node": int(row.id_us_node),
+            "id_ds_node": int(row.id_ds_node),
+            "unit_ids": row.unit_ids,
+            "width_value": float(row.width_value) if pd.notna(row.width_value) else float("nan"),
+            "is_mandatory": (int(row.id_us_node), int(row.id_ds_node)) in mandatory_edge_pairs,
+        }
+        base_in_edges[int(row.id_ds_node)].append(edge_record)
+        base_out_edges[int(row.id_us_node)].append(edge_record)
+
     base_rapid = pd.read_csv(exp_dir / "states" / "S000_base" / "rapid" / "prep" / "rapid_link_attributes.csv")
     dist_cols = [column for column in ["parent_link_id", "network_us_dist_out_m", "network_ds_dist_out_m"] if column in base_rapid.columns]
     dist_df = base_rapid[dist_cols].copy()
@@ -500,6 +638,9 @@ def _build_base_context(exp_dir: Path) -> dict[str, Any]:
         "us_lookup": us_lookup,
         "ds_lookup": ds_lookup,
         "dist_lookup": dist_lookup,
+        "base_in_edges": base_in_edges,
+        "base_out_edges": base_out_edges,
+        "mandatory_edge_pairs": mandatory_edge_pairs,
     }
 
 
@@ -516,47 +657,99 @@ def _child_length(exp_dir: Path, state_id: str, child_link_ids_text: object) -> 
     return float(values.sum())
 
 
+def _is_unit_owned_link(unit_ids_value: object) -> bool:
+    return len(_parse_optional_int_list(unit_ids_value)) > 0
+
+
+def _first_non_unit_upstream_edge(row: pd.Series, ctx: dict[str, Any]) -> dict[str, Any] | None:
+    start_node = pd.to_numeric(row.get("matched_base_upstream_node"), errors="coerce")
+    if pd.isna(start_node):
+        return None
+
+    base_in_edges: dict[int, list[dict[str, Any]]] = ctx["base_in_edges"]
+    queue: list[tuple[int, int]] = [(int(start_node), 0)]
+    visited_nodes: set[int] = set()
+    discovered_by_depth: dict[int, dict[int, dict[str, Any]]] = defaultdict(dict)
+
+    while queue:
+        node, depth = queue.pop(0)
+        if node in visited_nodes:
+            continue
+        visited_nodes.add(node)
+        for edge in base_in_edges.get(node, []):
+            if _is_unit_owned_link(edge.get("unit_ids")):
+                queue.append((int(edge["id_us_node"]), depth + 1))
+            elif bool(edge.get("is_mandatory", False)):
+                discovered_by_depth[depth][int(edge["id_link"])] = edge
+
+    if not discovered_by_depth:
+        return None
+
+    first_depth = min(discovered_by_depth)
+    candidates = discovered_by_depth[first_depth]
+    if len(candidates) == 1:
+        return next(iter(candidates.values()))
+    return None
+
+
+def _compute_target_base_share(row: pd.Series, ctx: dict[str, Any]) -> tuple[float, int | None]:
+    upstream_edge = _first_non_unit_upstream_edge(row, ctx)
+    if upstream_edge is None:
+        return float("nan"), None
+
+    target_links = set(_parse_int_list(row.get("matched_base_link_ids")))
+    if not target_links:
+        return float("nan"), int(upstream_edge["id_link"])
+
+    base_graph = nx.DiGraph()
+    base_out_edges: dict[int, list[dict[str, Any]]] = ctx["base_out_edges"]
+    for us_node, edges in base_out_edges.items():
+        for edge in edges:
+            base_graph.add_edge(int(edge["id_us_node"]), int(edge["id_ds_node"]))
+    if not nx.is_directed_acyclic_graph(base_graph):
+        return float("nan"), int(upstream_edge["id_link"])
+
+    start_node = int(upstream_edge["id_ds_node"])
+    share_by_node: dict[int, float] = defaultdict(float)
+    share_by_node[start_node] = 1.0
+    entry_share = 0.0
+
+    topo = list(nx.topological_sort(base_graph))
+    try:
+        start_index = topo.index(start_node)
+    except ValueError:
+        return float("nan"), int(upstream_edge["id_link"])
+
+    for node in topo[start_index:]:
+        incoming_share = float(share_by_node.get(int(node), 0.0))
+        if incoming_share <= 0:
+            continue
+        outgoing = base_out_edges.get(int(node), [])
+        if not outgoing:
+            continue
+        widths = np.asarray([edge["width_value"] for edge in outgoing], dtype=float)
+        valid = np.isfinite(widths) & (widths > 0)
+        if not np.any(valid):
+            continue
+        width_sum = float(widths[valid].sum())
+        if width_sum <= 0:
+            continue
+        for edge, edge_width, is_valid in zip(outgoing, widths, valid, strict=False):
+            if not is_valid:
+                continue
+            branch_share = incoming_share * (float(edge_width) / width_sum)
+            edge_id = int(edge["id_link"])
+            if edge_id in target_links:
+                entry_share += branch_share
+            else:
+                share_by_node[int(edge["id_ds_node"])] += branch_share
+
+    return float(entry_share), int(upstream_edge["id_link"])
+
+
 def _width_fraction_of_total(row: pd.Series, ctx: dict[str, Any]) -> float:
-    parent_ids = _parse_int_list(row.matched_base_link_ids)
-    if not parent_ids:
-        return float("nan")
-
-    parent_us = pd.to_numeric(getattr(row, "matched_base_upstream_node", np.nan), errors="coerce")
-    if pd.isna(parent_us):
-        return float("nan")
-    parent_us = int(parent_us)
-
-    us_lookup = ctx["us_lookup"]
-    ds_lookup = ctx["ds_lookup"]
-    width_lookup = ctx["width_lookup"]
-    dist_lookup = ctx["dist_lookup"]
-
-    split_ids = [pid for pid in parent_ids if pid in us_lookup.index and int(us_lookup.loc[pid]) == parent_us]
-    if not split_ids:
-        split_ids = parent_ids
-
-    split_width_sum = float(width_lookup.reindex(split_ids).dropna().sum())
-    if not np.isfinite(split_width_sum) or split_width_sum <= 0:
-        return float("nan")
-
-    upstream_candidates = [
-        pid for pid in width_lookup.index
-        if pid not in parent_ids and pid in ds_lookup.index and pd.notna(ds_lookup.loc[pid]) and int(ds_lookup.loc[pid]) == parent_us
-    ]
-    if not upstream_candidates:
-        return float("nan")
-
-    ranked: list[tuple[float, int]] = []
-    for pid in upstream_candidates:
-        if pid in dist_lookup.index and pd.notna(dist_lookup.loc[pid, "parent_mid_dist_out_m"]):
-            ranked.append((float(dist_lookup.loc[pid, "parent_mid_dist_out_m"]), int(pid)))
-        else:
-            ranked.append((float("-inf"), int(pid)))
-    upstream_pid = max(ranked)[1]
-    upstream_width = float(width_lookup.get(upstream_pid, np.nan))
-    if not np.isfinite(upstream_width) or upstream_width <= 0:
-        return float("nan")
-    return float(min(split_width_sum / upstream_width, 1.0))
+    share, _ = _compute_target_base_share(row, ctx)
+    return float(share) if np.isfinite(share) else float("nan")
 
 
 def build_geometry_context_frame(plot_df: pd.DataFrame) -> pd.DataFrame:
@@ -570,6 +763,7 @@ def build_geometry_context_frame(plot_df: pd.DataFrame) -> pd.DataFrame:
     matched_dist_frac: list[float] = []
     child_lens: list[float] = []
     width_fracs: list[float] = []
+    upstream_reference_link_ids: list[float] = []
 
     for row in geom_df.itertuples(index=False):
         exp_dir = Path(row.experiment_dir)
@@ -598,20 +792,25 @@ def build_geometry_context_frame(plot_df: pd.DataFrame) -> pd.DataFrame:
 
         row_series = pd.Series(row._asdict())
         child_lens.append(_child_length(exp_dir, row.state_id, row.child_link_ids))
-        width_fracs.append(_width_fraction_of_total(row_series, ctx))
+        share, upstream_link_id = _compute_target_base_share(row_series, ctx)
+        width_fracs.append(share)
+        upstream_reference_link_ids.append(float(upstream_link_id) if upstream_link_id is not None else float("nan"))
 
     geom_df["matched_base_len"] = matched_lens
     geom_df["along_network_mid_dist_out_m"] = matched_dist_mid
     geom_df["along_network_frac"] = matched_dist_frac
     geom_df["child_len"] = child_lens
     geom_df["child_parent_len_frac"] = geom_df["child_len"] / geom_df["matched_base_len"]
-    geom_df["width_fraction_of_total"] = width_fracs
+    geom_df["upstream_reference_link_id"] = upstream_reference_link_ids
+    geom_df["width_fraction_of_total_raw"] = width_fracs
+    geom_df["width_fraction_of_total"] = pd.to_numeric(geom_df["width_fraction_of_total_raw"], errors="coerce").clip(upper=1.0)
     geom_df["child_parent_weighted_log_lambda"] = geom_df["child_parent_len_frac"] * geom_df["neg_log10_lambda"]
     geom_df["child_parent_width_weighted_log_lambda"] = (
         geom_df["child_parent_len_frac"]
         * geom_df["neg_log10_lambda"]
         * geom_df["width_fraction_of_total"]
     )
+    geom_df["lambda_matched"] = geom_df["Lambda_matched"]
     geom_df["length_fraction"] = geom_df["matched_len_frac"]
     geom_df["child_length_fraction"] = geom_df["child_parent_len_frac"]
     geom_df["width_fraction"] = geom_df["width_fraction_of_total"]

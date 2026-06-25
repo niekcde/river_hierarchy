@@ -128,7 +128,8 @@ Prep can now:
 
 - select one explicit `station_key` from a multi-station forcing source
 - truncate the record to an inclusive UTC start/end window
-- resample the selected hydrograph to a fixed interval in minutes
+- resample the selected hydrograph to a fixed interval in seconds, or by a
+  fractional-minute value that resolves to whole seconds
 - interpolate missing interior bins using time interpolation
 - optionally prepend a constant spin-up at the first normalized discharge value
 - optionally derive that spin-up automatically from the longest downstream
@@ -160,7 +161,7 @@ python RAPID/run_prepare_experiment.py /path/to/experiment \
   --discharge-column discharge \
   --forcing-start-time 2023-02-12T00:00:00Z \
   --forcing-end-time 2023-02-23T00:00:00Z \
-  --forcing-resample-minutes 15 \
+  --forcing-resample-seconds 900 \
   --auto-spinup-from-k \
   --spinup-k-multiplier 1.1 \
   --forcing-output-cache-dir SWORD_gauge_match/outputs/rapid_forcing_cache \
@@ -181,6 +182,9 @@ Important behavior:
   is required
 - if the source contains exactly one station key, prep can infer it
 - forcing truncation uses inclusive bounds
+- prefer `--forcing-resample-seconds` when the stable RAPID routing timestep is
+  not a whole number of minutes; `--forcing-resample-minutes` still works for
+  integer or fractional minute values that resolve to whole seconds
 - resampling changes the forcing timestep seen by RAPID, so prep will still
   validate that a stable routing timestep exists for the chosen normalized dt
 - resampling densifies the series; it does not create new hydrologic
@@ -308,7 +312,7 @@ python RAPID/run_prepare_experiment.py /path/to/experiment \
   --forcing-station-key BR:3652880 \
   --forcing-start-time 2023-02-13T00:00:00Z \
   --forcing-end-time 2023-02-22T00:00:00Z \
-  --forcing-resample-minutes 18 \
+  --forcing-resample-seconds 1080 \
   --auto-spinup-from-k \
   --spinup-k-multiplier 1.1 \
   --kb-mode based_reference_section \
@@ -440,7 +444,25 @@ The geometry context helper also exposes cleaner x-axis aliases:
 - `child_length_fraction`
 - `width_fraction`
 - `log_lambda`
+- `Lambda_matched`
+- `lambda_matched`
 - `k_ratio_to_matched_base`
+
+The width-fraction metric is now a bounded upstream-share metric on the base
+directed graph rather than a direct width ratio. Plotting code:
+
+- finds the first clean upstream mandatory edge using a dominator-based helper
+- propagates width-based split shares downstream through the base DAG
+- sums the shares that first enter the matched target corridor
+
+For debugging and notebook diagnostics the geometry frame keeps:
+
+- `width_fraction_of_total_raw`
+- `width_fraction_of_total`
+- `upstream_reference_link_id`
+
+`width_fraction_of_total` is the capped plotting value. The raw share should
+already be bounded in `[0, 1]` apart from floating-point noise.
 
 Notebook code can discover the currently supported plotting metric names
 through:
