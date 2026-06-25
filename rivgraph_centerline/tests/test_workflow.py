@@ -4,13 +4,69 @@ import sys
 import types
 from pathlib import Path
 
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = PROJECT_ROOT / "rivgraph_centerline" / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from rivgraph_centerline.workflow import WorkflowPaths, _clear_rivgraph_outputs, run_rivgraph_for_run
+from rivgraph_centerline.raster_mask import crop_binary_mask
+from rivgraph_centerline.workflow import (
+    WorkflowPaths,
+    _clear_rivgraph_outputs,
+    prepare_binary_projected_mask,
+    run_rivgraph_for_run,
+)
+
+
+def test_crop_binary_mask_reduces_empty_margins_and_updates_transform() -> None:
+    mask = np.zeros((8, 10), dtype="uint8")
+    mask[3:5, 4:7] = 1
+    transform = from_origin(100, 200, 5, 5)
+
+    cropped, cropped_transform, crop_window = crop_binary_mask(mask, transform, padding=1)
+
+    assert cropped.shape == (4, 5)
+    assert int(cropped.sum()) == 6
+    assert crop_window == {"row_min": 2, "row_max": 6, "col_min": 3, "col_max": 8}
+    assert cropped_transform.c == 115
+    assert cropped_transform.f == 190
+
+
+def test_prepare_binary_projected_mask_trims_projected_output(tmp_path) -> None:
+    src_path = tmp_path / "source.tif"
+    dst_path = tmp_path / "prepared.tif"
+    transform = from_origin(0, 10, 1, 1)
+    data = np.zeros((10, 12), dtype="uint8")
+    data[4:6, 5:7] = 1
+
+    profile = {
+        "driver": "GTiff",
+        "height": data.shape[0],
+        "width": data.shape[1],
+        "count": 1,
+        "dtype": "uint8",
+        "crs": "EPSG:32631",
+        "transform": transform,
+        "nodata": 0,
+    }
+    with rasterio.open(src_path, "w", **profile) as dst:
+        dst.write(data, 1)
+
+    summary = prepare_binary_projected_mask(src_path=src_path, dst_path=dst_path, threshold=0.5, dst_crs="EPSG:32631")
+
+    with rasterio.open(dst_path) as prepared:
+        prepared_data = prepared.read(1)
+        assert prepared_data.shape == (4, 4)
+        assert int(prepared_data.sum()) == 4
+        assert prepared.transform.c == 4
+        assert prepared.transform.f == 7
+
+    assert summary["source_shape"] == [10, 12]
+    assert summary["prepared_shape"] == [4, 4]
 
 
 def test_clear_rivgraph_outputs_removes_only_run_prefixed_files(tmp_path) -> None:

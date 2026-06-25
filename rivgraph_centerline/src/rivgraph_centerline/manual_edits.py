@@ -20,6 +20,8 @@ import numpy as np
 import rasterio
 from rasterio.features import rasterize
 
+from rivgraph_centerline.raster_mask import crop_binary_mask
+
 
 ACTION_ALIASES = {
     "add": "add",
@@ -126,10 +128,20 @@ def apply_manual_edits(
                 raise ValueError(f"Unsupported normalized action at row {idx}: {action}")
             action_counts[action] = action_counts.get(action, 0) + 1
 
-    profile.update(driver="GTiff", dtype="uint8", count=1, nodata=0, compress="lzw")
+    cleaned_cropped, cleaned_transform, crop_window = crop_binary_mask(cleaned, transform)
+    profile.update(
+        driver="GTiff",
+        dtype="uint8",
+        count=1,
+        nodata=0,
+        compress="lzw",
+        transform=cleaned_transform,
+        width=int(cleaned_cropped.shape[1]),
+        height=int(cleaned_cropped.shape[0]),
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(output, "w", **profile) as dst:
-        dst.write(cleaned.astype("uint8"), 1)
+        dst.write(cleaned_cropped.astype("uint8"), 1)
 
     summary = {
         "base_mask": str(base_mask),
@@ -143,6 +155,8 @@ def apply_manual_edits(
         "pixels_added": int(((cleaned == 1) & (base == 0)).sum()),
         "pixels_removed": int(((cleaned == 0) & (base == 1)).sum()),
         "changed_pixels": int((cleaned != base).sum()),
+        "output_shape": [int(cleaned_cropped.shape[0]), int(cleaned_cropped.shape[1])],
+        "crop_window": crop_window,
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")

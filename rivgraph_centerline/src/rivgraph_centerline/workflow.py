@@ -17,6 +17,7 @@ from rasterio.warp import calculate_default_transform, reproject
 from shapely.geometry import Polygon
 
 from rivgraph_centerline.manual_edits import apply_manual_edits
+from rivgraph_centerline.raster_mask import crop_binary_mask
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -452,6 +453,8 @@ def prepare_binary_projected_mask(
         binary = (src_array.filled(0) >= threshold).astype("uint8")
         source_water_pixels = int(binary.sum())
         source_total_pixels = int(binary.size)
+        original_height = int(src.height)
+        original_width = int(src.width)
 
         target_crs = dst_crs
         if target_crs is None:
@@ -459,12 +462,22 @@ def prepare_binary_projected_mask(
 
         if target_crs == src.crs:
             profile = src.profile.copy()
-            profile.update(driver="GTiff", dtype="uint8", count=1, nodata=0, compress="lzw")
+            output_array, output_transform, crop_window = crop_binary_mask(binary, src.transform)
+            profile.update(
+                driver="GTiff",
+                dtype="uint8",
+                count=1,
+                nodata=0,
+                compress="lzw",
+                transform=output_transform,
+                width=int(output_array.shape[1]),
+                height=int(output_array.shape[0]),
+            )
             dst_path.parent.mkdir(parents=True, exist_ok=True)
             with rasterio.open(dst_path, "w", **profile) as dst:
-                dst.write(binary, 1)
+                dst.write(output_array, 1)
             dst_water_pixels = source_water_pixels
-            dst_total_pixels = source_total_pixels
+            dst_total_pixels = int(output_array.size)
         else:
             transform, width, height = calculate_default_transform(
                 src.crs,
@@ -485,21 +498,27 @@ def prepare_binary_projected_mask(
                 nodata=0,
                 compress="lzw",
             )
-            dst_array = np.zeros((height, width), dtype="uint8")
+            projected_array = np.zeros((height, width), dtype="uint8")
             reproject(
                 source=binary,
-                destination=dst_array,
+                destination=projected_array,
                 src_transform=src.transform,
                 src_crs=src.crs,
                 dst_transform=transform,
                 dst_crs=target_crs,
                 resampling=Resampling.nearest,
             )
+            output_array, output_transform, crop_window = crop_binary_mask(projected_array, transform)
+            profile.update(
+                transform=output_transform,
+                width=int(output_array.shape[1]),
+                height=int(output_array.shape[0]),
+            )
             dst_path.parent.mkdir(parents=True, exist_ok=True)
             with rasterio.open(dst_path, "w", **profile) as dst:
-                dst.write(dst_array, 1)
-            dst_water_pixels = int(dst_array.sum())
-            dst_total_pixels = int(dst_array.size)
+                dst.write(output_array, 1)
+            dst_water_pixels = int(output_array.sum())
+            dst_total_pixels = int(output_array.size)
 
         return {
             "source_mask": str(src_path),
@@ -509,6 +528,9 @@ def prepare_binary_projected_mask(
             "target_crs": str(target_crs),
             "source_water_fraction": source_water_pixels / source_total_pixels,
             "prepared_water_fraction": dst_water_pixels / dst_total_pixels,
+            "source_shape": [original_height, original_width],
+            "prepared_shape": [int(profile["height"]), int(profile["width"])],
+            "crop_window": crop_window,
         }
 
 
