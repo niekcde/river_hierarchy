@@ -1,0 +1,56 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{setspace}
+\usepackage{hyperref}
+\setstretch{1.1}
+
+\title{Methods Draft}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Study design}
+We evaluated how hierarchical simplification of multichannel river networks alters both network structure and event-scale routing response. The workflow combined real-case selection, synthetic support experiments, mask-based network extraction, hierarchical unit detection, mask-based collapse and regeneration, hydraulic attribute reconstruction, geometry-informed equivalent-resistance analysis, and comparative routing simulations. The objective was not only to identify simplifiable multichannel structures, but also to assess how their simplification affects both static geometric proxies and dynamic hydrograph response.
+
+\section{Case selection}
+Study cases were defined as multichannel river sections bounded by upstream and downstream gauging stations. Candidate reaches were identified by matching gauging stations to local SWORD river geometry and then screening for cases with suitable hydrologic coverage for event-scale analysis. Retained examples were required to combine clear multichannel planform structure with sufficiently resolved discharge observations to support comparative event routing. The final case set therefore represents river sections for which both geomorphic structure and hydrologic forcing could be evaluated consistently. A map of the retained examples should be included to document the spatial distribution of the study set.
+
+\section{Synthetic support experiments}
+Synthetic networks were used as a methodological support component to isolate the effects of branching configuration, width partitioning, local slope contrasts, sinuosity contrasts, and forcing characteristics under controlled conditions. These experiments were not intended to replace the real-network analysis, but rather to provide interpretable reference behavior against which the real-case results could be understood. The synthetic setup consisted of a canonical corridor with alternative branch configurations, including looped and cross-linked structures, with width-conserving partitioning across branches. A schematic of this synthetic setup would be useful for the Methods.
+
+\section{Mask preparation and network extraction}
+Source water masks were converted to strict binary rasters and manually cleaned where necessary prior to network extraction. These prepared masks were then processed with RivGraph to generate centerlines, nodes, and links for each case. This stage translated planform channel masks into graph-like network representations suitable for hierarchical analysis. Manual cleaning was applied at the mask level rather than by directly editing graph topology, so that extracted networks remained consistent with the interpreted planform geometry.
+
+\section{Directed graph preparation}
+Flow direction was assigned primarily from RivGraph outputs. For the most recent examples, RivGraph-derived direction assignment was used directly. Where automated direction assignment was uncertain, manual review of link direction and inlet--outlet roles could be used as an additional quality-control step, but this was treated as optional rather than mandatory. Regardless of whether manual review was applied, all downstream analyses required a valid directed network containing one connected component, a single source node, and a single sink node. This validation step was necessary because hierarchical unit detection and routing preparation both depend on a coherent directed topology.
+
+\section{Hierarchical unit detection}
+The directed network was decomposed into bifurcation--confluence units. Each unit was defined as one or more directed paths connecting an upstream bifurcation node to a downstream confluence node. This representation captures the local multichannel structure of a river section as a path-based object rather than as an isolated set of links. Units could be simple, multi-thread, or compound and nested, depending on the number of paths and the presence of internal branching structure. In addition to locally defined units, broader multichannel contexts were tracked as compound bubbles, allowing multiple locally simple units to be recognized as part of a larger multichannel zone.
+
+\section{Geometric and topologic metrics for collapse ranking}
+Each detected unit was characterized using a set of geometric and topologic metrics designed to quantify how persistent, imbalanced, and structurally complex the multichannel configuration was. The main metrics used for collapse ranking were path-width disparity, equivalent length, elongation, and topologic complexity. Path-width disparity quantified how unevenly effective pathway importance was distributed among parallel paths. Equivalent length described the characteristic downstream persistence of the split, while elongation normalized this persistence relative to effective width. Topologic complexity summarized the number of valid paths and the amount of internal branching and rejoining structure. These metrics were converted into a reproducible collapse-ranking framework, and grouped candidates were derived from contiguous partitions in ranked feature space using a diminishing-returns rule to select the current optimal number of groups.
+
+\section{Collapse and variant regeneration}
+Simplification was implemented in mask space rather than by directly deleting graph elements. For a selected unit or group of units, local collapse footprints were constructed from the reviewed parent network geometry. Enclosed dry holes within those local collapse domains were then filled on the parent mask, producing a modified binary mask that represented the simplified planform. RivGraph was rerun on this modified mask to generate a regenerated child network. This step is important because each simplified state was therefore treated as a newly generated geometry, rather than as a purely abstract graph reduction. Collapse experiments included both independent and sequential designs, allowing simplification either from the same base network or through iterative regeneration and re-analysis. Where relevant, collapse corridors could be interpreted in realized or anchored form, depending on whether the full regenerated corridor or only the nominal selected interval was retained.
+
+\section{Width reconstruction for regenerated variants}
+Widths were recomputed on regenerated variants using a two-bank, distance-transform-based method. For each regenerated link, width was measured from centerline samples by identifying left and right controlling banks. Three width families were then derived. Total width was measured on the collapsed mask, wet width was measured against the original wet-reference mask, and dry width was computed as the difference between total and wet width. This distinction was necessary because collapse can create traversable corridor area that is not equivalent to pre-existing wetted conveyance. Link-scale width summaries were then derived from the sample-level measurements. A figure combining the original and collapsed geometry with a schematic of total, wet, and dry width measurement would be especially effective here.
+
+\section{Hydraulic context reconstruction}
+To prepare regenerated states for hydraulic comparison, node water-surface-elevation context from matched external reference nodes was used to construct a monotone or interpolated longitudinal profile. This derived profile was used for slope estimation along regenerated networks. Observed or matched node elevation context and derived routing-profile elevation were treated as distinct quantities, so that slope estimation reflected a consistent longitudinal hydraulic context rather than raw local point values alone. This separation helped maintain comparability across regenerated states.
+
+\section{Geometry-informed equivalent resistance}
+Equivalent resistance was used as a geometry-informed predictor of the hydraulic effect of multichannel structures and their simplified replacements. At the state level, edge-level resistances were assigned from link length and width-derived hydraulic geometry, and reduced to equivalent corridor resistance under normalized head boundary conditions. This yielded an equivalent resistance and conductance for each bubble-scale multichannel structure. At the experiment level, realized child corridors were compared against matched base-state corridors to ensure that comparisons remained physically consistent even when the regenerated collapsed corridor extended beyond the nominal selection boundaries. The principal comparison metric was therefore the ratio between realized child-corridor resistance and matched base-corridor resistance, rather than only the ratio against the nominal base object. Equivalent resistance was treated here as a complementary diagnostic of hydraulic effect derived from geometry, rather than as a substitute for event-scale routing simulation.
+
+\section{Event forcing, routing, and comparative response metrics}
+All states derived from the same example were forced with the same observed event hydrograph and routed using the same model parameterization. Parameter settings were held consistent across states to preserve comparability, rather than being retuned independently for each regenerated network. Under this framework, routed outputs were interpreted primarily as relative comparisons among variants. The main response measures were changes in peak timing, peak attenuation, rise time, fall time, and overall hydrograph shape. This comparative design allowed the hydraulic consequences of multichannel simplification to be assessed consistently across both base and regenerated states.
+
+\section{Figure suggestions}
+A compact main-text figure set could include: a map of selected cases; a synthetic-network schematic; an annotated example showing hierarchical unit definition; an original-versus-collapsed regeneration example; a width-methodology figure showing total, wet, and dry width; and a schematic of the equivalent-resistance concept and matched corridor comparison.
+
+\end{document}

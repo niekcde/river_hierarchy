@@ -1,0 +1,243 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\setlist[itemize]{leftmargin=1.5em}
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection.}{0.5em}{}
+
+\title{Methods Outline and Writing Brief}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{Study Design}
+\textbf{Purpose:} State the paper's objective and the full analytical workflow.
+
+\textbf{Key sentences:}
+\begin{itemize}
+\item We evaluated how hierarchical simplification of multichannel river networks alters network geometry and event-scale routing response.
+\item The workflow combined real-case selection, mask-based network extraction, hierarchy detection, mask-based collapse and regeneration, hydraulic attribute reconstruction, equivalent-resistance analysis, and comparative routing simulations.
+\end{itemize}
+
+\textbf{Include:}
+\begin{itemize}
+\item real cases and synthetic support experiments
+\item geometry and topology metrics
+\item equivalent resistance
+\item event-scale routing comparison
+\end{itemize}
+
+\section{Case Selection}
+\textbf{Purpose:} Explain why the examples were chosen and how they were constrained.
+
+\textbf{Key sentences:}
+\begin{itemize}
+\item Study cases were defined as multichannel river sections bounded by upstream and downstream gauging stations.
+\item Cases were retained only where geomorphic complexity and hydrologic data availability supported event-scale comparative analysis.
+\end{itemize}
+
+\textbf{Include:}
+\begin{itemize}
+\item gauge-pair logic
+\item SWORD matching
+\item subdaily discharge availability
+\item event suitability and quality screening
+\item final retained study set
+\end{itemize}
+
+\textbf{Figure suggestion:} map of selected cases.
+
+\section{Synthetic Support Experiments}
+\textbf{Purpose:} Present synthetic networks as a methodological support component.
+
+\textbf{Key sentences:}
+\begin{itemize}
+\item Synthetic networks were used as controlled methodological support to isolate the effects of topology, width partitioning, slope contrasts, sinuosity contrasts, and forcing characteristics.
+\item These experiments supported interpretation of the real-network simplification results rather than replacing them.
+\end{itemize}
+
+\textbf{Include:}
+\begin{itemize}
+\item base corridor setup
+\item looped and cross-linked perturbations
+\item width-conserving branch partitioning
+\item sensitivity dimensions
+\end{itemize}
+
+\textbf{Figure suggestion:} schematic of the synthetic setup.
+
+\section{Mask Preparation and RivGraph Extraction}
+\textbf{Purpose:} Describe the image-to-network conversion.
+
+\textbf{Key sentences:}
+\begin{itemize}
+\item Source water masks were converted to binary rasters and manually cleaned where necessary before centerline and network extraction with RivGraph.
+\item This produced centerline, node, and link geometries for each case.
+\end{itemize}
+
+\textbf{Include:}
+\begin{itemize}
+\item binary raster preparation
+\item manual mask cleaning
+\item RivGraph extraction
+\end{itemize}
+
+\section{Directed Graph Preparation}
+\textbf{Purpose:} Explain how direction assignment was handled and frame manual review as optional.
+
+\textbf{Key sentences:}
+\begin{itemize}
+\item Flow direction was assigned primarily from RivGraph outputs.
+\item Where automated direction assignment was uncertain, manual review of link direction and inlet--outlet roles could be used as an additional quality-control step.
+\item All downstream analyses required a valid directed network with one source and one sink.
+\end{itemize}
+
+\textbf{Include:}
+\begin{itemize}
+\item RivGraph flow assignment
+\item optional manual review and correction
+\item graph validation criteria
+\end{itemize}
+
+\section{Hierarchical Unit Detection}
+\textbf{Purpose:} Define the core analysis object.
+
+\textbf{Key sentences:}
+\begin{itemize}
+\item The network was decomposed into bifurcation--confluence units, each defined by one or more directed paths between an upstream bifurcation and a downstream confluence.
+\item Units could be simple, multi-thread, or compound and nested.
+\end{itemize}
+
+\textbf{Include:}
+\begin{itemize}
+\item path-based unit definition
+\item nested units
+\item compound bubbles as broader multichannel zones
+\end{itemize}
+
+\textbf{Figure suggestion:} annotated unit example on a real network.
+
+\section{Metrics and Collapse Ranking}
+\textbf{Purpose:} Justify how candidate collapses were prioritized.
+
+\textbf{Key sentences:}
+\begin{itemize}
+\item Candidate units were characterized using geometric persistence, path-width disparity, and internal topologic complexity.
+\item Collapse ranking was based on path disparity, elongation, equivalent length, and topologic complexity.
+\end{itemize}
+
+\textbf{Include:}
+\begin{itemize}
+\item \texttt{path\_disparity\_width}
+\item \texttt{equivalent\_length}
+\item \texttt{elongation}
+\item \texttt{topologic\_complexity\_score}
+\item grouped candidates selected from ranked contiguous partitions
+\end{itemize}
+
+\section{Collapse and Variant Regeneration}
+\textbf{Purpose:} Explain that simplification was implemented in mask space and regenerated with RivGraph.
+
+\textbf{Key sentences:}
+\begin{itemize}
+\item Simplification was implemented by modifying the parent mask within selected collapse domains and rerunning RivGraph, rather than deleting graph elements directly.
+\item This ensured that each simplified state was a regenerated network geometry.
+\end{itemize}
+
+\textbf{Include:}
+\begin{itemize}
+\item footprint construction
+\item filling enclosed dry holes
+\item independent and sequential experiments
+\item realized versus anchored interpretations if used in the paper
+\end{itemize}
+
+\textbf{Figure suggestion:} original versus collapsed example.
+
+\section{Width Reconstruction}
+\textbf{Purpose:} Describe the width methodology clearly and concisely.
+
+\textbf{Key sentences:}
+\begin{itemize}
+\item Widths were recomputed on regenerated variants using a two-bank distance-transform-based method.
+\item For each regenerated link, total width was measured on the collapsed mask, wet width on the original wet mask, and dry width as the difference between the two.
+\end{itemize}
+
+\textbf{Include:}
+\begin{itemize}
+\item sample-based bank search
+\item total, wet, and dry width families
+\item why wet versus dry width matters after collapse
+\end{itemize}
+
+\textbf{Figure suggestion:} width-method figure, ideally combined with original and collapsed geometry.
+
+\section{Hydraulic Context Reconstruction}
+\textbf{Purpose:} Explain how slope and profile context were reconstructed.
+
+\textbf{Key sentences:}
+\begin{itemize}
+\item Node water-surface-elevation context from matched external reference nodes was converted to a monotone or interpolated longitudinal profile for slope estimation.
+\item Observed node elevation context and derived routing profile were treated as distinct quantities.
+\end{itemize}
+
+\textbf{Include:}
+\begin{itemize}
+\item SWORD node matching
+\item profile-based slope derivation
+\end{itemize}
+
+\section{Geometry-Informed Equivalent Resistance}
+\textbf{Purpose:} Position equivalent resistance as a core analytical layer.
+
+\textbf{Key sentences:}
+\begin{itemize}
+\item Equivalent resistance was used as a geometry-informed predictor of the hydraulic effect of multichannel structures and their simplified replacements.
+\item Edge-level resistances were computed from link geometry and reduced to equivalent corridor resistance under normalized head boundary conditions.
+\item The principal experiment-level comparison metric was the ratio between realized child-corridor resistance and matched base-corridor resistance.
+\end{itemize}
+
+\textbf{Include:}
+\begin{itemize}
+\item state-level bubble resistance
+\item experiment-level matched comparison
+\item interpretation of \texttt{Lambda\_matched}
+\end{itemize}
+
+\textbf{Figure suggestion:} schematic of bubble reduction and matched corridor comparison.
+
+\section{Event Forcing and Routing Comparison}
+\textbf{Purpose:} Explain the comparative hydrodynamic experiment.
+
+\textbf{Key sentences:}
+\begin{itemize}
+\item All states from a given example were forced with the same observed event hydrograph and routed with the same parameterization.
+\item Results were interpreted as relative differences in timing, attenuation, and hydrograph shape across variants.
+\end{itemize}
+
+\textbf{Include:}
+\begin{itemize}
+\item shared forcing per example
+\item shared routing parameterization
+\item comparative rather than state-specific calibration framing
+\item peak timing, attenuation, rise time, fall time, and hydrograph shape
+\end{itemize}
+
+\section{Suggested Figure Set}
+\begin{itemize}
+\item Figure 1: map of selected real cases
+\item Figure 2: synthetic network setup and sensitivity dimensions
+\item Figure 3: hierarchy definition on a real reviewed network
+\item Figure 4: collapse and regeneration workflow on one example
+\item Figure 5: width methodology on original versus collapsed geometry
+\item Figure 6: equivalent-resistance schematic and matched comparison concept
+\end{itemize}
+
+\end{document}

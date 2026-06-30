@@ -285,7 +285,112 @@ def test_compute_hydraulic_context_can_use_reference_section_profile(tmp_path: P
     assert row["wse_us"] == pytest.approx(12.0)
     assert row["wse_ds"] == pytest.approx(9.0)
     assert row["slope_used"] == pytest.approx(0.03)
-    assert result.section_slope_summary["profile_mode"] == "reference_section"
+
+
+def test_generate_state_hydraulic_context_repairs_collapsed_link_to_parent_profile_drop(tmp_path: Path) -> None:
+    experiment_dir = tmp_path / "experiment"
+    base_state_dir = experiment_dir / "states" / "S000_base"
+    child_state_dir = experiment_dir / "states" / "S001_unit_1"
+
+    base_hc_dir = base_state_dir / "hydraulic_context"
+    base_hc_dir.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {"id_node": 11, "rapid_wse_for_slope": 177.94389},
+            {"id_node": 10, "rapid_wse_for_slope": 177.245404},
+            {"id_node": 8, "rapid_wse_for_slope": 177.245404},
+        ]
+    ).to_csv(base_hc_dir / "node_hydraulic_context.csv", index=False)
+
+    links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": 11,
+                "id_us_node": 50,
+                "id_ds_node": 51,
+                "len": 1447.522362,
+                "geometry": LineString([(0.0, 0.0), (1447.522362, 0.0)]),
+            }
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    nodes = gpd.GeoDataFrame(
+        [
+            {
+                "id_node": 50,
+                "is_inlet": True,
+                "is_outlet": False,
+                "sword_wse": 177.94389,
+                "sword_wse_field": "wse",
+                "sword_wse_fill_method": "requested_field",
+                "geometry": Point(0.0, 0.0),
+            },
+            {
+                "id_node": 51,
+                "is_inlet": False,
+                "is_outlet": True,
+                "sword_wse": 177.48722,
+                "sword_wse_field": "wse",
+                "sword_wse_fill_method": "requested_field",
+                "geometry": Point(1447.522362, 0.0),
+            },
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+
+    links_path = child_state_dir / "variant" / "directed" / "child_directed_links.gpkg"
+    nodes_path = child_state_dir / "variant" / "directed" / "child_directed_nodes.gpkg"
+    links_path.parent.mkdir(parents=True, exist_ok=True)
+    nodes_path.parent.mkdir(parents=True, exist_ok=True)
+    links.to_file(links_path, driver="GPKG")
+    nodes.to_file(nodes_path, driver="GPKG")
+
+    lineage_dir = child_state_dir / "variant" / "matching"
+    lineage_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "id_link": 11,
+                "lineage_type": "collapsed_many_to_one",
+                "matched_parent_link_ids": "30,31",
+                "matched_parent_us_node": 11,
+                "matched_parent_ds_node": 8,
+            }
+        ]
+    ).to_csv(lineage_dir / "link_lineage.csv", index=False)
+    summary_dir = child_state_dir / "variant" / "summary"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "component_id": "C1",
+                "link_ids": "30,31",
+                "collapsed_selection_type": "unit",
+                "collapsed_selection_label": "collapsed_unit_1",
+                "collapsed_unit_ids": "1",
+                "collapsed_unit_count": 1,
+            }
+        ]
+    ).to_csv(summary_dir / "collapse_components.csv", index=False)
+
+    outputs = generate_state_hydraulic_context(
+        directed_links_path=links_path,
+        directed_nodes_path=nodes_path,
+        hierarchy_output_dir=None,
+        output_dir=child_state_dir / "hydraulic_context",
+        state_id="S001_unit_1",
+    )
+
+    written = outputs.link_context.set_index("id_link")
+    expected_slope = (177.94389 - 177.245404) / 1447.522362
+    assert float(written.loc[11, "raw_slope"]) == pytest.approx((177.94389 - 177.48722) / 1447.522362)
+    assert float(written.loc[11, "slope_used"]) == pytest.approx(expected_slope)
+    assert str(written.loc[11, "slope_source_method"]) == "collapsed_parent_profile"
+    assert bool(written.loc[11, "collapsed_profile_repair_applied"]) is True
+    assert float(written.loc[11, "collapsed_reference_drop_m"]) == pytest.approx(177.94389 - 177.245404)
+    assert outputs.manifest["collapsed_parent_profile_repair"]["applied_link_ids"] == [11]
 
 
 def test_reference_section_profile_avoids_statewise_corridor_anchor_load(

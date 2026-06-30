@@ -38,14 +38,18 @@ TIMING_Y_METRIC_LABELS = {
     "hydrograph_lag_vs_base_hours": "Hydrograph lag vs base [hours]",
     "lag_to_inflow_peak_relative_to_base": "Lag-to-inflow-peak relative change vs base",
     "lag_to_inflow_peak_pct_shift_vs_base": "Lag-to-inflow-peak percent shift vs base [%]",
+    "lag_to_inflow_peak_hour_shift_vs_base": "Lag-to-inflow-peak hour shift vs base [hours]",
+    "lag_to_inflow_peak_hour_shift_vs_observed_peak": "Lag-to-inflow-peak hour shift vs observed gauge peak lag [hours]",
     "unit_to_bubble_lag_to_inflow_peak_relative": "Lag-to-inflow-peak relative change vs matching compound",
     "unit_to_bubble_lag_to_inflow_peak_pct_shift": "Lag-to-inflow-peak percent shift vs matching compound [%]",
 }
 
 GEOMETRY_X_METRIC_LABELS = {
     "along_network_frac": "Along-network fractional distance",
+    "downstream_network_distance_m": "Downstream network distance to outlet [m]",
     "matched_len_frac": "Matched parent length fraction of network",
-    "length_fraction": "Matched parent length fraction of network",
+    "length_fraction": "Selected length fraction",
+    "len_fraction": "Selected length fraction",
     "child_parent_len_frac": "Child length / matched parent length",
     "child_length_fraction": "Child length / matched parent length",
     "width_fraction_of_total": "Upstream width-share routed into target object",
@@ -54,7 +58,10 @@ GEOMETRY_X_METRIC_LABELS = {
     "lambda_matched": "Lambda_matched",
     "neg_log10_lambda": "-log10(Lambda_matched)",
     "log_lambda": "-log10(Lambda_matched)",
-    "length_weighted_log_lambda": "matched_len_frac * (-log10(Lambda_matched))",
+    "length_weighted_log_lambda": "Selected length fraction * (-log10(Lambda_matched))",
+    "len_fraction_weighted_log_lambda": "Selected length fraction * (-log10(Lambda_matched))",
+    "width_weighted_log_lambda": "Selected length fraction * (-log10(Lambda_matched)) * width_fraction",
+    "len_fraction_width_weighted_log_lambda": "Selected length fraction * (-log10(Lambda_matched)) * width_fraction",
     "child_parent_weighted_log_lambda": "(child_len / matched_parent_len) * (-log10(Lambda_matched))",
     "child_parent_width_weighted_log_lambda": "(child_len / matched_parent_len) * (-log10(Lambda_matched)) * width_fraction",
     "k_ratio_to_matched_base": "K_variant_realized / K_eq_matched_base",
@@ -266,6 +273,7 @@ def _load_outlet(states_dir: Path, state_id: str) -> pd.DataFrame:
     df = pd.read_csv(states_dir / state_id / "rapid" / "run" / "outlet_hydrograph.csv")
     df = df[["time_seconds", "time_utc", "q_outlet_cms"]].copy()
     df["time_utc"] = pd.to_datetime(df["time_utc"], utc=True)
+    df["time_utc_seconds"] = df["time_utc"].astype("int64") / 1_000_000_000.0
     return df
 
 
@@ -348,11 +356,17 @@ def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.Dat
     unit_summary = _load_unit_summary(exp_dir)
 
     state_ids = run.loc[run["state_id"].ne("S000_base"), "state_id"].tolist()
+    if not state_ids:
+        warnings.warn(
+            f"Skipping {exp_dir.name}: no derived RAPID run rows are available.",
+            stacklevel=2,
+        )
+        return pd.DataFrame()
 
     base = _load_outlet(states_dir, "S000_base")
-    t_base = base["time_seconds"].to_numpy()
+    t_base = base["time_utc_seconds"].to_numpy(dtype=float)
     q_base = base["q_outlet_cms"].to_numpy()
-    dt_seconds = float(np.median(np.diff(t_base)))
+    dt_seconds = float(np.median(np.diff(base["time_seconds"].to_numpy(dtype=float))))
 
     base_metrics = {
         "peak_time_seconds": float(t_base[np.argmax(q_base)]),
@@ -367,7 +381,7 @@ def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.Dat
     rows: list[dict[str, Any]] = []
     for state_id in state_ids:
         df = _load_outlet(states_dir, state_id)
-        t = df["time_seconds"].to_numpy()
+        t = df["time_utc_seconds"].to_numpy(dtype=float)
         q = df["q_outlet_cms"].to_numpy()
         metrics = {
             "state_id": state_id,
@@ -383,6 +397,13 @@ def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.Dat
         for key, base_value in base_metrics.items():
             metrics[key.replace("_seconds", "_shift_hours")] = (metrics[key] - base_value) / SECONDS_PER_HOUR
         rows.append(metrics)
+
+    if not rows:
+        warnings.warn(
+            f"Skipping {exp_dir.name}: no derived outlet hydrographs could be loaded.",
+            stacklevel=2,
+        )
+        return pd.DataFrame()
 
     summary = pd.DataFrame(rows).merge(
         comp[
@@ -494,6 +515,9 @@ def _build_analysis_metric_frame(
         "hydrograph_lag_vs_base_hours",
         "lag_to_inflow_peak_relative_to_base",
         "lag_to_inflow_peak_pct_shift_vs_base",
+        "lag_to_inflow_peak_hour_shift_vs_base",
+        "observed_gauge_peak_shift_hours",
+        "lag_to_inflow_peak_hour_shift_vs_observed_peak",
         "unit_to_bubble_lag_to_inflow_peak_relative",
         "unit_to_bubble_lag_to_inflow_peak_pct_shift",
     ]
@@ -752,7 +776,17 @@ def _width_fraction_of_total(row: pd.Series, ctx: dict[str, Any]) -> float:
     return float(share) if np.isfinite(share) else float("nan")
 
 
-def build_geometry_context_frame(plot_df: pd.DataFrame) -> pd.DataFrame:
+def build_geometry_context_frame(
+    plot_df: pd.DataFrame,
+    *,
+    length_mode: str = "matched_parent_vs_network",
+) -> pd.DataFrame:
+    valid_length_modes = {"matched_parent_vs_network", "child_vs_matched_parent"}
+    if length_mode not in valid_length_modes:
+        raise ValueError(
+            f"length_mode must be one of {sorted(valid_length_modes)}, got {length_mode!r}."
+        )
+
     geom_df = plot_df.copy()
     contexts: dict[str, dict[str, Any]] = {}
     for exp_dir_str in geom_df["experiment_dir"].dropna().unique():
@@ -798,6 +832,7 @@ def build_geometry_context_frame(plot_df: pd.DataFrame) -> pd.DataFrame:
 
     geom_df["matched_base_len"] = matched_lens
     geom_df["along_network_mid_dist_out_m"] = matched_dist_mid
+    geom_df["downstream_network_distance_m"] = matched_dist_mid
     geom_df["along_network_frac"] = matched_dist_frac
     geom_df["child_len"] = child_lens
     geom_df["child_parent_len_frac"] = geom_df["child_len"] / geom_df["matched_base_len"]
@@ -811,14 +846,91 @@ def build_geometry_context_frame(plot_df: pd.DataFrame) -> pd.DataFrame:
         * geom_df["width_fraction_of_total"]
     )
     geom_df["lambda_matched"] = geom_df["Lambda_matched"]
-    geom_df["length_fraction"] = geom_df["matched_len_frac"]
+    geom_df["length_mode"] = length_mode
+    if length_mode == "matched_parent_vs_network":
+        geom_df["length_fraction"] = geom_df["matched_len_frac"]
+    else:
+        geom_df["length_fraction"] = geom_df["child_parent_len_frac"]
+    geom_df["len_fraction"] = geom_df["length_fraction"]
     geom_df["child_length_fraction"] = geom_df["child_parent_len_frac"]
+    geom_df["length_weighted_log_lambda"] = geom_df["length_fraction"] * geom_df["neg_log10_lambda"]
+    geom_df["len_fraction_weighted_log_lambda"] = geom_df["length_weighted_log_lambda"]
+    geom_df["width_weighted_log_lambda"] = (
+        geom_df["length_fraction"]
+        * geom_df["neg_log10_lambda"]
+        * geom_df["width_fraction_of_total"]
+    )
+    geom_df["len_fraction_width_weighted_log_lambda"] = geom_df["width_weighted_log_lambda"]
     geom_df["width_fraction"] = geom_df["width_fraction_of_total"]
     geom_df["log_lambda"] = geom_df["neg_log10_lambda"]
     if {"K_variant_realized", "K_eq_matched_base"}.issubset(geom_df.columns):
         denom = pd.to_numeric(geom_df["K_eq_matched_base"], errors="coerce")
         num = pd.to_numeric(geom_df["K_variant_realized"], errors="coerce")
         geom_df["k_ratio_to_matched_base"] = np.where(denom.abs() > 1e-12, num / denom, np.nan)
+
+    geom_df["unit_downstream_order"] = pd.Series(np.nan, index=geom_df.index, dtype=float)
+    geom_df["compound_downstream_order"] = pd.Series(np.nan, index=geom_df.index, dtype=float)
+
+    if {"example_id", "unit_id", "downstream_network_distance_m"}.issubset(geom_df.columns):
+        unit_order_frame = (
+            geom_df.loc[geom_df["unit_id"].notna(), ["example_id", "unit_id", "downstream_network_distance_m"]]
+            .copy()
+        )
+        if not unit_order_frame.empty:
+            unit_order_frame["unit_id"] = pd.to_numeric(unit_order_frame["unit_id"], errors="coerce").astype("Int64")
+            unit_order_frame["downstream_network_distance_m"] = pd.to_numeric(
+                unit_order_frame["downstream_network_distance_m"], errors="coerce"
+            )
+            unit_order_frame = (
+                unit_order_frame.groupby(["example_id", "unit_id"], as_index=False)["downstream_network_distance_m"]
+                .mean()
+                .sort_values(["example_id", "downstream_network_distance_m", "unit_id"], ascending=[True, True, True])
+            )
+            unit_order_frame["unit_downstream_order"] = (
+                unit_order_frame.groupby("example_id").cumcount() + 1
+            ).astype(float)
+            geom_df = geom_df.merge(
+                unit_order_frame[["example_id", "unit_id", "unit_downstream_order"]],
+                on=["example_id", "unit_id"],
+                how="left",
+                suffixes=("", "_derived"),
+            )
+            if "unit_downstream_order_derived" in geom_df.columns:
+                geom_df["unit_downstream_order"] = geom_df["unit_downstream_order_derived"]
+                geom_df = geom_df.drop(columns=["unit_downstream_order_derived"])
+
+    if {"example_id", "compound_bubble_id", "downstream_network_distance_m"}.issubset(geom_df.columns):
+        compound_order_frame = (
+            geom_df.loc[geom_df["compound_bubble_id"].notna(), ["example_id", "compound_bubble_id", "downstream_network_distance_m"]]
+            .copy()
+        )
+        if not compound_order_frame.empty:
+            compound_order_frame["compound_bubble_id"] = pd.to_numeric(
+                compound_order_frame["compound_bubble_id"], errors="coerce"
+            ).astype("Int64")
+            compound_order_frame["downstream_network_distance_m"] = pd.to_numeric(
+                compound_order_frame["downstream_network_distance_m"], errors="coerce"
+            )
+            compound_order_frame = (
+                compound_order_frame.groupby(["example_id", "compound_bubble_id"], as_index=False)["downstream_network_distance_m"]
+                .mean()
+                .sort_values(
+                    ["example_id", "downstream_network_distance_m", "compound_bubble_id"],
+                    ascending=[True, True, True],
+                )
+            )
+            compound_order_frame["compound_downstream_order"] = (
+                compound_order_frame.groupby("example_id").cumcount() + 1
+            ).astype(float)
+            geom_df = geom_df.merge(
+                compound_order_frame[["example_id", "compound_bubble_id", "compound_downstream_order"]],
+                on=["example_id", "compound_bubble_id"],
+                how="left",
+                suffixes=("", "_derived"),
+            )
+            if "compound_downstream_order_derived" in geom_df.columns:
+                geom_df["compound_downstream_order"] = geom_df["compound_downstream_order_derived"]
+                geom_df = geom_df.drop(columns=["compound_downstream_order_derived"])
     return geom_df
 
 

@@ -1,0 +1,301 @@
+Study Design
+
+Purpose: State the paper’s objective and the full analytical workflow.
+
+Key sentences:
+
+- We evaluated how hierarchical simplification of multichannel river
+  networks alters network geometry and event-scale routing response.
+
+- The workflow combined real-case selection, mask-based network
+  extraction, hierarchy detection, mask-based collapse and regeneration,
+  hydraulic attribute reconstruction, equivalent-resistance analysis,
+  and comparative routing simulations.
+
+Include:
+
+- real cases and synthetic support experiments
+
+- geometry and topology metrics
+
+- equivalent resistance
+
+- event-scale routing comparison
+
+Case Selection
+
+Purpose: Explain why the examples were chosen and how they were
+constrained.
+
+Key sentences:
+
+- Study cases were defined as multichannel river sections bounded by
+  upstream and downstream gauging stations.
+
+- Cases were retained only where geomorphic complexity and hydrologic
+  data availability supported event-scale comparative analysis.
+
+Include:
+
+- gauge-pair logic
+
+- SWORD matching
+
+- subdaily discharge availability
+
+- event suitability and quality screening
+
+- final retained study set
+
+Figure suggestion: map of selected cases.
+
+Synthetic Support Experiments
+
+Purpose: Present synthetic networks as a methodological support
+component.
+
+Key sentences:
+
+- Synthetic networks were used as controlled methodological support to
+  isolate the effects of topology, width partitioning, slope contrasts,
+  sinuosity contrasts, and forcing characteristics.
+
+- These experiments supported interpretation of the real-network
+  simplification results rather than replacing them.
+
+Include:
+
+- base corridor setup
+
+- looped and cross-linked perturbations
+
+- width-conserving branch partitioning
+
+- sensitivity dimensions
+
+Figure suggestion: schematic of the synthetic setup.
+
+Mask Preparation and RivGraph Extraction
+
+Purpose: Describe the image-to-network conversion.
+
+Key sentences:
+
+- Source water masks were converted to binary rasters and manually
+  cleaned where necessary before centerline and network extraction with
+  RivGraph.
+
+- This produced centerline, node, and link geometries for each case.
+
+Include:
+
+- binary raster preparation
+
+- manual mask cleaning
+
+- RivGraph extraction
+
+Directed Graph Preparation
+
+Purpose: Explain how direction assignment was handled and frame manual
+review as optional.
+
+Key sentences:
+
+- Flow direction was assigned primarily from RivGraph outputs.
+
+- Where automated direction assignment was uncertain, manual review of
+  link direction and inlet–outlet roles could be used as an additional
+  quality-control step.
+
+- All downstream analyses required a valid directed network with one
+  source and one sink.
+
+Include:
+
+- RivGraph flow assignment
+
+- optional manual review and correction
+
+- graph validation criteria
+
+Hierarchical Unit Detection
+
+Purpose: Define the core analysis object.
+
+Key sentences:
+
+- The network was decomposed into bifurcation–confluence units, each
+  defined by one or more directed paths between an upstream bifurcation
+  and a downstream confluence.
+
+- Units could be simple, multi-thread, or compound and nested.
+
+Include:
+
+- path-based unit definition
+
+- nested units
+
+- compound bubbles as broader multichannel zones
+
+Figure suggestion: annotated unit example on a real network.
+
+Metrics and Collapse Ranking
+
+Purpose: Justify how candidate collapses were prioritized.
+
+Key sentences:
+
+- Candidate units were characterized using geometric persistence,
+  path-width disparity, and internal topologic complexity.
+
+- Collapse ranking was based on path disparity, elongation, equivalent
+  length, and topologic complexity.
+
+Include:
+
+- path_disparity_width
+
+- equivalent_length
+
+- elongation
+
+- topologic_complexity_score
+
+- grouped candidates selected from ranked contiguous partitions
+
+Collapse and Variant Regeneration
+
+Purpose: Explain that simplification was implemented in mask space and
+regenerated with RivGraph.
+
+Key sentences:
+
+- Simplification was implemented by modifying the parent mask within
+  selected collapse domains and rerunning RivGraph, rather than deleting
+  graph elements directly.
+
+- This ensured that each simplified state was a regenerated network
+  geometry.
+
+Include:
+
+- footprint construction
+
+- filling enclosed dry holes
+
+- independent and sequential experiments
+
+- realized versus anchored interpretations if used in the paper
+
+Figure suggestion: original versus collapsed example.
+
+Width Reconstruction
+
+Purpose: Describe the width methodology clearly and concisely.
+
+Key sentences:
+
+- Widths were recomputed on regenerated variants using a two-bank
+  distance-transform-based method.
+
+- For each regenerated link, total width was measured on the collapsed
+  mask, wet width on the original wet mask, and dry width as the
+  difference between the two.
+
+Include:
+
+- sample-based bank search
+
+- total, wet, and dry width families
+
+- why wet versus dry width matters after collapse
+
+Figure suggestion: width-method figure, ideally combined with original
+and collapsed geometry.
+
+Hydraulic Context Reconstruction
+
+Purpose: Explain how slope and profile context were reconstructed.
+
+Key sentences:
+
+- Node water-surface-elevation context from matched external reference
+  nodes was converted to a monotone or interpolated longitudinal profile
+  for slope estimation.
+
+- Observed node elevation context and derived routing profile were
+  treated as distinct quantities.
+
+Include:
+
+- SWORD node matching
+
+- profile-based slope derivation
+
+Geometry-Informed Equivalent Resistance
+
+Purpose: Position equivalent resistance as a core analytical layer.
+
+Key sentences:
+
+- Equivalent resistance was used as a geometry-informed predictor of the
+  hydraulic effect of multichannel structures and their simplified
+  replacements.
+
+- Edge-level resistances were computed from link geometry and reduced to
+  equivalent corridor resistance under normalized head boundary
+  conditions.
+
+- The principal experiment-level comparison metric was the ratio between
+  realized child-corridor resistance and matched base-corridor
+  resistance.
+
+Include:
+
+- state-level bubble resistance
+
+- experiment-level matched comparison
+
+- interpretation of Lambda_matched
+
+Figure suggestion: schematic of bubble reduction and matched corridor
+comparison.
+
+Event Forcing and Routing Comparison
+
+Purpose: Explain the comparative hydrodynamic experiment.
+
+Key sentences:
+
+- All states from a given example were forced with the same observed
+  event hydrograph and routed with the same parameterization.
+
+- Results were interpreted as relative differences in timing,
+  attenuation, and hydrograph shape across variants.
+
+Include:
+
+- shared forcing per example
+
+- shared routing parameterization
+
+- comparative rather than state-specific calibration framing
+
+- peak timing, attenuation, rise time, fall time, and hydrograph shape
+
+Suggested Figure Set
+
+- Figure 1: map of selected real cases
+
+- Figure 2: synthetic network setup and sensitivity dimensions
+
+- Figure 3: hierarchy definition on a real reviewed network
+
+- Figure 4: collapse and regeneration workflow on one example
+
+- Figure 5: width methodology on original versus collapsed geometry
+
+- Figure 6: equivalent-resistance schematic and matched comparison
+  concept

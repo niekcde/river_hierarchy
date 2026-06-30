@@ -94,6 +94,17 @@ COMPOUND_BUBBLE_QC_COLUMNS: dict[str, object] = {
     "bubble_path_drop_qc_failed": False,
 }
 
+COLLAPSED_PARENT_PROFILE_COLUMNS: dict[str, object] = {
+    "collapsed_profile_repair_candidate": False,
+    "collapsed_profile_repair_applied": False,
+    "collapsed_profile_repair_reason": "",
+    "collapsed_parent_us_node": pd.Series(dtype="Int64"),
+    "collapsed_parent_ds_node": pd.Series(dtype="Int64"),
+    "collapsed_reference_drop_m": np.nan,
+    "collapsed_reference_slope": np.nan,
+    "collapsed_profile_change_factor": np.nan,
+}
+
 
 def _load_unit_summary_if_exists(hierarchy_output_dir: str | Path | None) -> pd.DataFrame | None:
     if hierarchy_output_dir is None:
@@ -103,6 +114,176 @@ def _load_unit_summary_if_exists(hierarchy_output_dir: str | Path | None) -> pd.
     if not unit_summary_path.exists():
         return None
     return pd.read_csv(unit_summary_path)
+
+
+def _infer_state_dir_from_links_path(links_path: Path) -> Path | None:
+    resolved = Path(links_path).expanduser().resolve()
+    for parent in resolved.parents:
+        if parent.parent.name == "states":
+            return parent
+    return None
+
+
+def _parse_int_list(value: object) -> list[int]:
+    if value is None or pd.isna(value):
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    return [int(float(part.strip())) for part in text.split(",") if part.strip()]
+
+
+def _compute_base_node_profile_lookup(
+    *,
+    state_dir: Path,
+    config: SlopeConfig,
+) -> pd.DataFrame | None:
+    experiment_dir = state_dir.parent.parent
+    base_state_dir = experiment_dir / "states" / "S000_base"
+    base_node_context_path = base_state_dir / "hydraulic_context" / "node_hydraulic_context.csv"
+    if base_node_context_path.exists():
+        base_node_context = pd.read_csv(base_node_context_path)
+        if {"id_node", "rapid_wse_for_slope"}.issubset(base_node_context.columns):
+            base_node_context["id_node"] = pd.to_numeric(base_node_context["id_node"], errors="coerce").astype("Int64")
+            base_node_context["rapid_wse_for_slope"] = pd.to_numeric(
+                base_node_context["rapid_wse_for_slope"], errors="coerce"
+            )
+            return base_node_context[["id_node", "rapid_wse_for_slope"]].dropna(subset=["id_node"])
+
+    directed_dir = base_state_dir / "variant" / "directed"
+    base_links_candidates = sorted(directed_dir.glob("*_directed_links.gpkg"))
+    base_nodes_candidates = sorted(directed_dir.glob("*_directed_nodes.gpkg"))
+    if not base_links_candidates or not base_nodes_candidates:
+        return None
+
+    base_links = gpd.read_file(base_links_candidates[0])
+    base_nodes = gpd.read_file(base_nodes_candidates[0])
+    base_unit_summary = _load_unit_summary_if_exists(base_state_dir / "hierarchy")
+    base_result = compute_hydraulic_context(
+        base_links,
+        base_nodes,
+        unit_summary=base_unit_summary,
+        config=config,
+    )
+    lookup = base_result.node_context[["id_node", "rapid_wse_for_slope"]].copy()
+    lookup["id_node"] = pd.to_numeric(lookup["id_node"], errors="coerce").astype("Int64")
+    lookup["rapid_wse_for_slope"] = pd.to_numeric(lookup["rapid_wse_for_slope"], errors="coerce")
+    return lookup.dropna(subset=["id_node"])
+
+
+def _apply_collapsed_parent_profile_slope_repair(
+    link_context: pd.DataFrame,
+    *,
+    links_path: Path,
+    config: SlopeConfig,
+) -> pd.DataFrame:
+    result = link_context.copy()
+    for column, default in COLLAPSED_PARENT_PROFILE_COLUMNS.items():
+        if column not in result.columns:
+            result[column] = default
+
+    state_dir = _infer_state_dir_from_links_path(links_path)
+    if state_dir is None or state_dir.name == "S000_base":
+        result["collapsed_profile_repair_reason"] = np.where(
+            result["collapsed_profile_repair_reason"].eq(""),
+            "base_or_unknown_state",
+            result["collapsed_profile_repair_reason"],
+        )
+        return result
+
+    lineage_path = state_dir / "variant" / "matching" / "link_lineage.csv"
+    if not lineage_path.exists():
+        result["collapsed_profile_repair_reason"] = np.where(
+            result["collapsed_profile_repair_reason"].eq(""),
+            "missing_lineage",
+            result["collapsed_profile_repair_reason"],
+        )
+        return result
+
+    lineage = pd.read_csv(lineage_path)
+    required = {"id_link", "lineage_type", "matched_parent_us_node", "matched_parent_ds_node", "matched_parent_link_ids"}
+    if not required.issubset(lineage.columns):
+        result["collapsed_profile_repair_reason"] = np.where(
+            result["collapsed_profile_repair_reason"].eq(""),
+            "missing_lineage_columns",
+            result["collapsed_profile_repair_reason"],
+        )
+        return result
+
+    lineage = lineage[list(required)].copy()
+    lineage["id_link"] = pd.to_numeric(lineage["id_link"], errors="coerce").astype("Int64")
+    for column in ("matched_parent_us_node", "matched_parent_ds_node"):
+        lineage[column] = pd.to_numeric(lineage[column], errors="coerce").astype("Int64")
+    lineage["_matched_parent_link_ids"] = lineage["matched_parent_link_ids"].map(_parse_int_list)
+
+    collapsed_component_links: set[int] = set()
+    collapse_components_path = state_dir / "variant" / "summary" / "collapse_components.csv"
+    if collapse_components_path.exists():
+        collapse_components = pd.read_csv(collapse_components_path)
+        if "link_ids" in collapse_components.columns:
+            for value in collapse_components["link_ids"].tolist():
+                collapsed_component_links.update(_parse_int_list(value))
+
+    result = result.merge(lineage, on="id_link", how="left", suffixes=("", "_lineage"))
+    result["_collapsed_parent_link_overlap"] = result["_matched_parent_link_ids"].map(
+        lambda ids: bool(set(ids).intersection(collapsed_component_links))
+    )
+    collapsed_mask = (
+        result["lineage_type"].astype(str).eq("collapsed_many_to_one")
+        & result["_collapsed_parent_link_overlap"]
+        & result["matched_parent_us_node"].notna()
+        & result["matched_parent_ds_node"].notna()
+        & pd.to_numeric(result["link_length_m"], errors="coerce").gt(0)
+    )
+    result.loc[collapsed_mask, "collapsed_profile_repair_candidate"] = True
+    if not collapsed_mask.any():
+        result.loc[result["collapsed_profile_repair_reason"].eq(""), "collapsed_profile_repair_reason"] = "no_collapsed_candidates"
+        return result
+
+    base_lookup = _compute_base_node_profile_lookup(state_dir=state_dir, config=config)
+    if base_lookup is None or base_lookup.empty:
+        result.loc[collapsed_mask, "collapsed_profile_repair_reason"] = "missing_base_profile"
+        return result
+
+    base_lookup = base_lookup.drop_duplicates(subset=["id_node"]).set_index("id_node")
+    for row_index, row in result.loc[collapsed_mask].iterrows():
+        us_node = int(row["matched_parent_us_node"])
+        ds_node = int(row["matched_parent_ds_node"])
+        result.at[row_index, "collapsed_parent_us_node"] = us_node
+        result.at[row_index, "collapsed_parent_ds_node"] = ds_node
+        if us_node not in base_lookup.index or ds_node not in base_lookup.index:
+            result.at[row_index, "collapsed_profile_repair_reason"] = "missing_base_parent_nodes"
+            continue
+
+        us_wse = float(base_lookup.loc[us_node, "rapid_wse_for_slope"])
+        ds_wse = float(base_lookup.loc[ds_node, "rapid_wse_for_slope"])
+        link_length = float(row["link_length_m"])
+        reference_drop = float(us_wse - ds_wse)
+        if not np.isfinite(reference_drop):
+            result.at[row_index, "collapsed_profile_repair_reason"] = "nonfinite_reference_drop"
+            continue
+        if reference_drop <= 0:
+            result.at[row_index, "collapsed_profile_repair_reason"] = "nonpositive_reference_drop"
+            continue
+        if not np.isfinite(link_length) or link_length <= 0:
+            result.at[row_index, "collapsed_profile_repair_reason"] = "invalid_link_length"
+            continue
+
+        repaired_slope = max(reference_drop / link_length, float(config.min_slope))
+        prior_slope = float(row["slope_used"]) if pd.notna(row["slope_used"]) else float("nan")
+        result.at[row_index, "collapsed_reference_drop_m"] = reference_drop
+        result.at[row_index, "collapsed_reference_slope"] = repaired_slope
+        result.at[row_index, "slope_used"] = repaired_slope
+        result.at[row_index, "slope_source_method"] = "collapsed_parent_profile"
+        result.at[row_index, "slope_adjusted"] = True
+        result.at[row_index, "slope_reason"] = "filled_from_collapsed_parent_profile"
+        result.at[row_index, "slope_minimum_applied"] = bool(repaired_slope == float(config.min_slope))
+        result.at[row_index, "collapsed_profile_repair_applied"] = True
+        result.at[row_index, "collapsed_profile_repair_reason"] = "ok"
+        if np.isfinite(prior_slope) and prior_slope > 0:
+            result.at[row_index, "collapsed_profile_change_factor"] = float(repaired_slope / prior_slope)
+
+    return result
 
 
 def _infer_reference_section_summary_path(*paths: Path) -> Path | None:
@@ -1991,6 +2172,11 @@ def generate_state_hydraulic_context(
         result.link_context,
         links,
     )
+    link_context = _apply_collapsed_parent_profile_slope_repair(
+        link_context,
+        links_path=links_path,
+        config=resolved_config,
+    )
 
     link_context_path = output_path / "link_hydraulic_context.csv"
     node_context_path = output_path / "node_hydraulic_context.csv"
@@ -2020,6 +2206,32 @@ def generate_state_hydraulic_context(
             "normalized_solver_heads": "not written here",
         },
         "family_slope_inheritance": family_slope_inheritance_summary,
+        "collapsed_parent_profile_repair": {
+            "candidate_link_ids": sorted(
+                pd.to_numeric(
+                    link_context.loc[
+                        link_context.get("collapsed_profile_repair_candidate", False).fillna(False),
+                        "id_link",
+                    ],
+                    errors="coerce",
+                )
+                .dropna()
+                .astype(int)
+                .tolist()
+            ),
+            "applied_link_ids": sorted(
+                pd.to_numeric(
+                    link_context.loc[
+                        link_context.get("collapsed_profile_repair_applied", False).fillna(False),
+                        "id_link",
+                    ],
+                    errors="coerce",
+                )
+                .dropna()
+                .astype(int)
+                .tolist()
+            ),
+        },
         "slope_config": {
             "slope_profile_mode": _normalize_slope_profile_mode(resolved_config.slope_profile_mode),
             "reference_section_summary_path": str(resolved_config.reference_section_summary_path or ""),

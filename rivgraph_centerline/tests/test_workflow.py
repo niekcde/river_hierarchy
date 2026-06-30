@@ -286,4 +286,112 @@ def test_run_rivgraph_for_run_falls_back_to_centerline_mesh_for_flow_assignment(
     assert summary["flow_mesh_mode_used"] == "centerline"
     assert summary["flow_mesh_fallback_applied"] is True
     assert "IndexError: list index out of range" == summary["flow_mesh_primary_error"]
+    assert summary["flow_mesh_secondary_error"] is None
+    assert summary["flow_directions_requested"] is True
+    assert summary["flow_directions_assigned"] is True
     assert summary["outputs"]["manual_fixlinks_csv"] == str(paths.rivgraph_dir / "02_fixlinks.csv")
+
+
+def test_run_rivgraph_for_run_records_double_mesh_failure_without_crashing(tmp_path, monkeypatch) -> None:
+    paths = WorkflowPaths.from_name("02", tmp_path / "run")
+    paths.ensure_dirs()
+
+    mask_path = tmp_path / "mask.tif"
+    mask_path.write_text("mask", encoding="utf-8")
+
+    class DummyRiver:
+        def __init__(self, *, name: str, path_to_mask: str, results_folder: str, exit_sides: str, verbose: bool) -> None:
+            self.name = name
+            self.path_to_mask = path_to_mask
+            self.results_folder = Path(results_folder)
+            self.exit_sides = exit_sides
+            self.verbose = verbose
+            self.single_thread = False
+            self.Iskel = "iskel"
+            self.links = {"id": [0, 1]}
+            self.nodes = {"id": [0, 1], "inlets": [1], "outlets": [0]}
+            self.paths = {
+                "Iskel": str(self.results_folder / f"{self.name}_skel.tif"),
+                "links": str(self.results_folder / f"{self.name}_links.gpkg"),
+                "nodes": str(self.results_folder / f"{self.name}_nodes.gpkg"),
+                "centerline": str(self.results_folder / f"{self.name}_centerline.gpkg"),
+                "linkdirs": str(self.results_folder / f"{self.name}_link_directions.tif"),
+                "fixlinks_csv": str(self.results_folder / f"{self.name}_fixlinks.csv"),
+                "log": str(self.results_folder / f"{self.name}_log.log"),
+            }
+
+        def skeletonize(self) -> None:
+            return None
+
+        def to_geotiff(self, kind: str) -> None:
+            if kind == "skeleton":
+                Path(self.paths["Iskel"]).write_text(kind, encoding="utf-8")
+            else:
+                Path(self.paths["linkdirs"]).write_text(kind, encoding="utf-8")
+
+        def compute_network(self) -> None:
+            return None
+
+        def finalize_ids(self) -> None:
+            return None
+
+        def compute_link_width_and_length(self) -> None:
+            return None
+
+        def compute_centerline(self) -> None:
+            return None
+
+        def compute_mesh(self, single_thread: bool = False) -> None:
+            self.single_thread = single_thread
+            if single_thread:
+                raise IndexError("index 2 is out of bounds for axis 0 with size 1")
+
+        def assign_flow_directions(self) -> None:
+            if getattr(self, "single_thread", False) is False:
+                raise IndexError("list index out of range")
+            raise AssertionError("centerline fallback should fail during compute_mesh first")
+
+        def to_geovectors(self, kind: str, ftype: str = "gpkg") -> None:
+            if kind == "network":
+                Path(self.paths["links"]).write_text("links", encoding="utf-8")
+                Path(self.paths["nodes"]).write_text("nodes", encoding="utf-8")
+            else:
+                Path(self.paths["centerline"]).write_text(ftype, encoding="utf-8")
+
+    rivgraph_module = types.ModuleType("rivgraph")
+    classes_module = types.ModuleType("rivgraph.classes")
+    rivers_module = types.ModuleType("rivgraph.rivers")
+    river_utils_module = types.ModuleType("rivgraph.rivers.river_utils")
+
+    classes_module.river = DummyRiver
+    river_utils_module.prune_river = lambda links, nodes, exit_sides, iskel: (links, nodes)
+    rivgraph_module.classes = classes_module
+    rivgraph_module.rivers = rivers_module
+    rivers_module.river_utils = river_utils_module
+
+    monkeypatch.setitem(sys.modules, "rivgraph", rivgraph_module)
+    monkeypatch.setitem(sys.modules, "rivgraph.classes", classes_module)
+    monkeypatch.setitem(sys.modules, "rivgraph.rivers", rivers_module)
+    monkeypatch.setitem(sys.modules, "rivgraph.rivers.river_utils", river_utils_module)
+
+    _, summary = run_rivgraph_for_run(
+        name="02",
+        run_dir=paths.run_dir,
+        mask=mask_path,
+        exit_sides="SN",
+        assign_flow=True,
+        verbose=False,
+        flow_mesh_mode="auto",
+    )
+
+    assert summary["flow_directions_requested"] is True
+    assert summary["flow_directions_assigned"] is False
+    assert summary["flow_mesh_mode_requested"] == "auto"
+    assert summary["flow_mesh_mode_used"] is None
+    assert summary["flow_mesh_fallback_applied"] is True
+    assert summary["flow_mesh_primary_error"] == "IndexError: list index out of range"
+    assert summary["flow_mesh_secondary_error"] == "IndexError: index 2 is out of bounds for axis 0 with size 1"
+    assert summary["outputs"]["direction_raster"] is None
+    assert summary["outputs"]["links"] == str(paths.rivgraph_dir / "02_links.gpkg")
+    assert Path(summary["outputs"]["links"]).exists()
+    assert Path(summary["outputs"]["centerline"]).exists()

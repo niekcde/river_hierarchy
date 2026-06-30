@@ -5,6 +5,7 @@ import math
 import shutil
 import subprocess
 from collections import deque
+from functools import lru_cache
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -36,12 +37,120 @@ SECOND_COLUMNS_TO_HOURS = {
     "hydrograph_duration_seconds": "hydrograph_duration_hours",
 }
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+GAUGE_QUALITY_XLSX = REPO_ROOT / "SWORD_gauge_match" / "outputs" / "mask_hydro_quality.xlsx"
+GAUGE_SUBDAILY_CSV = REPO_ROOT / "SWORD_gauge_match" / "outputs" / "subdaily_timeseries.csv"
+GAUGE_SUBDAILY_PARQUET = REPO_ROOT / "SWORD_gauge_match" / "outputs" / "subdaily_timeseries.parquet"
+GAUGE_SUBDAILY_VALUES_DIR = REPO_ROOT / "SWORD_gauge_match" / "outputs" / "subdaily_values"
+
 
 def _compute_relative_change(values: pd.Series, baseline: float) -> pd.Series:
     numeric = pd.to_numeric(values, errors="coerce")
     if pd.isna(baseline) or not np.isfinite(float(baseline)) or np.isclose(float(baseline), 0.0):
         return pd.Series(np.nan, index=numeric.index, dtype=float)
     return (numeric / float(baseline)) - 1.0
+
+
+@lru_cache(maxsize=1)
+def _load_gauge_quality_sheet() -> pd.DataFrame | None:
+    if not GAUGE_QUALITY_XLSX.exists():
+        return None
+    try:
+        quality = pd.read_excel(GAUGE_QUALITY_XLSX, sheet_name="Hydrograph_quality")
+    except Exception:
+        return None
+    if "Example" not in quality.columns:
+        return None
+    return quality
+
+
+def _load_station_timeseries_for_observed_lag(station_key: str) -> pd.DataFrame:
+    station_key = str(station_key).strip()
+    if not station_key:
+        return pd.DataFrame(columns=["time", "discharge_cms"])
+
+    prefix = station_key.split(":", 1)[0]
+    candidate_paths = [
+        GAUGE_SUBDAILY_VALUES_DIR / prefix / "subdaily_timeseries.parquet",
+        GAUGE_SUBDAILY_PARQUET,
+        GAUGE_SUBDAILY_CSV,
+    ]
+
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        try:
+            if path.suffix == ".parquet":
+                try:
+                    frame = pd.read_parquet(path, filters=[("station_key", "==", station_key)])
+                except Exception:
+                    frame = pd.read_parquet(path)
+            else:
+                frame = pd.read_csv(path)
+        except Exception:
+            continue
+
+        if "station_key" not in frame.columns:
+            continue
+        frame = frame.loc[frame["station_key"].astype(str).str.strip().eq(station_key)].copy()
+        if frame.empty:
+            continue
+        if "discharge" in frame.columns and "discharge_cms" not in frame.columns:
+            frame = frame.rename(columns={"discharge": "discharge_cms"})
+        if "time" not in frame.columns or "discharge_cms" not in frame.columns:
+            continue
+        frame["time"] = pd.to_datetime(frame["time"], utc=True, errors="coerce")
+        frame["discharge_cms"] = pd.to_numeric(frame["discharge_cms"], errors="coerce")
+        frame = frame.dropna(subset=["time", "discharge_cms"]).sort_values("time")
+        if not frame.empty:
+            return frame[["time", "discharge_cms"]].reset_index(drop=True)
+
+    return pd.DataFrame(columns=["time", "discharge_cms"])
+
+
+@lru_cache(maxsize=256)
+def _observed_gauge_peak_shift_hours(example_id: str) -> float:
+    quality = _load_gauge_quality_sheet()
+    if quality is None or quality.empty:
+        return float("nan")
+
+    numeric_example_id = pd.to_numeric(pd.Series([example_id]), errors="coerce").iloc[0]
+    if pd.isna(numeric_example_id):
+        return float("nan")
+
+    row = quality.loc[pd.to_numeric(quality["Example"], errors="coerce").eq(float(numeric_example_id))]
+    if row.empty:
+        return float("nan")
+    row = row.iloc[0]
+
+    up_station = str(row.get("Up", "")).strip()
+    down_station = str(row.get("Down", "")).strip()
+    if not up_station or not down_station:
+        return float("nan")
+
+    period_start = pd.to_datetime(row.get("Period_start"), utc=True, errors="coerce")
+    period_end = pd.to_datetime(row.get("Period_end"), utc=True, errors="coerce")
+    if pd.isna(period_start) or pd.isna(period_end):
+        return float("nan")
+
+    up_ts = _load_station_timeseries_for_observed_lag(up_station)
+    down_ts = _load_station_timeseries_for_observed_lag(down_station)
+    if up_ts.empty or down_ts.empty:
+        return float("nan")
+
+    up_ts = up_ts.loc[up_ts["time"].between(period_start, period_end)].copy()
+    down_ts = down_ts.loc[down_ts["time"].between(period_start, period_end)].copy()
+    if up_ts.empty or down_ts.empty:
+        return float("nan")
+
+    up_peak_idx = up_ts["discharge_cms"].idxmax()
+    down_peak_idx = down_ts["discharge_cms"].idxmax()
+    up_peak_time = up_ts.loc[up_peak_idx, "time"]
+    down_peak_time = down_ts.loc[down_peak_idx, "time"]
+    if pd.isna(up_peak_time) or pd.isna(down_peak_time):
+        return float("nan")
+
+    return float((down_peak_time - up_peak_time).total_seconds() / SECONDS_PER_HOUR)
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,6 +503,14 @@ def build_experiment_analysis_frame(
         )
         run_registry["lag_to_inflow_peak_pct_shift_vs_base"] = (
             run_registry["lag_to_inflow_peak_relative_to_base"] * 100.0
+        )
+        run_registry["lag_to_inflow_peak_hour_shift_vs_base"] = (
+            run_registry["lag_to_inflow_peak_relative_to_base"] * (baseline / SECONDS_PER_HOUR)
+        )
+        observed_peak_shift_hours = _observed_gauge_peak_shift_hours(str(tables["example_id"]))
+        run_registry["observed_gauge_peak_shift_hours"] = observed_peak_shift_hours
+        run_registry["lag_to_inflow_peak_hour_shift_vs_observed_peak"] = (
+            run_registry["lag_to_inflow_peak_relative_to_base"] * observed_peak_shift_hours
         )
 
     computed_rows = run_registry.loc[run_registry["hydrograph_status"].eq("computed")].copy()

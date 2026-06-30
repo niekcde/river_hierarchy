@@ -259,15 +259,27 @@ def _assign_flow_directions_with_mesh_mode(
         raise ValueError("flow_mesh_mode must be one of: auto, valley, centerline")
 
     if flow_mesh_mode == "centerline":
-        network.single_thread = True
-        network.compute_mesh(single_thread=True)
-        network.assign_flow_directions()
-        return {
-            "requested": flow_mesh_mode,
-            "used": "centerline",
-            "fallback_applied": False,
-            "primary_error": None,
-        }
+        try:
+            network.single_thread = True
+            network.compute_mesh(single_thread=True)
+            network.assign_flow_directions()
+            return {
+                "requested": flow_mesh_mode,
+                "used": "centerline",
+                "fallback_applied": False,
+                "primary_error": None,
+                "secondary_error": None,
+                "succeeded": True,
+            }
+        except Exception as exc:
+            return {
+                "requested": flow_mesh_mode,
+                "used": None,
+                "fallback_applied": False,
+                "primary_error": f"{type(exc).__name__}: {exc}",
+                "secondary_error": None,
+                "succeeded": False,
+            }
 
     try:
         network.single_thread = False
@@ -277,21 +289,35 @@ def _assign_flow_directions_with_mesh_mode(
             "used": "valley",
             "fallback_applied": False,
             "primary_error": None,
+            "secondary_error": None,
+            "succeeded": True,
         }
-    except Exception as exc:
+    except Exception as primary_exc:
         if flow_mesh_mode != "auto":
             raise
 
-        _clear_partial_mesh(network)
-        network.single_thread = True
-        network.compute_mesh(single_thread=True)
-        network.assign_flow_directions()
-        return {
-            "requested": flow_mesh_mode,
-            "used": "centerline",
-            "fallback_applied": True,
-            "primary_error": f"{type(exc).__name__}: {exc}",
-        }
+        try:
+            _clear_partial_mesh(network)
+            network.single_thread = True
+            network.compute_mesh(single_thread=True)
+            network.assign_flow_directions()
+            return {
+                "requested": flow_mesh_mode,
+                "used": "centerline",
+                "fallback_applied": True,
+                "primary_error": f"{type(primary_exc).__name__}: {primary_exc}",
+                "secondary_error": None,
+                "succeeded": True,
+            }
+        except Exception as secondary_exc:
+            return {
+                "requested": flow_mesh_mode,
+                "used": None,
+                "fallback_applied": True,
+                "primary_error": f"{type(primary_exc).__name__}: {primary_exc}",
+                "secondary_error": f"{type(secondary_exc).__name__}: {secondary_exc}",
+                "succeeded": False,
+            }
 
 
 def run_rivgraph_for_run(
@@ -332,17 +358,20 @@ def run_rivgraph_for_run(
     network.compute_link_width_and_length()
     network.compute_centerline()
     flow_mesh_summary: dict[str, object] | None = None
+    flow_directions_assigned = False
     if assign_flow:
         flow_mesh_summary = _assign_flow_directions_with_mesh_mode(
             network,
             flow_mesh_mode=flow_mesh_mode,
         )
-        network.to_geotiff("directions")
+        flow_directions_assigned = bool(flow_mesh_summary.get("succeeded"))
+        if flow_directions_assigned:
+            network.to_geotiff("directions")
     network.to_geovectors("network", ftype=vector_format)
     network.to_geovectors("centerline", ftype=vector_format)
 
     n_directional_links_certain: int | None = None
-    if assign_flow and "certain" in network.links:
+    if flow_directions_assigned and "certain" in network.links:
         n_directional_links_certain = int(np.count_nonzero(np.asarray(network.links["certain"])))
 
     prepare_summary = load_json(paths.prepare_summary) if paths.prepare_summary.exists() else {}
@@ -354,12 +383,14 @@ def run_rivgraph_for_run(
         "input_mask_stage": input_stage,
         "exit_sides": exit_sides,
         "vector_format": vector_format,
-        "flow_directions_assigned": assign_flow,
-        "flow_direction_backend": "rivgraph" if assign_flow else None,
+        "flow_directions_requested": assign_flow,
+        "flow_directions_assigned": flow_directions_assigned,
+        "flow_direction_backend": "rivgraph" if flow_directions_assigned else None,
         "flow_mesh_mode_requested": flow_mesh_mode if assign_flow else None,
         "flow_mesh_mode_used": None if flow_mesh_summary is None else flow_mesh_summary["used"],
         "flow_mesh_fallback_applied": False if flow_mesh_summary is None else flow_mesh_summary["fallback_applied"],
         "flow_mesh_primary_error": None if flow_mesh_summary is None else flow_mesh_summary["primary_error"],
+        "flow_mesh_secondary_error": None if flow_mesh_summary is None else flow_mesh_summary["secondary_error"],
         "rivgraph_results_dir": str(paths.rivgraph_dir),
         "cleaned_rivgraph_target": clean_target,
         "deleted_rivgraph_outputs": deleted_rivgraph_outputs,
@@ -375,7 +406,7 @@ def run_rivgraph_for_run(
             "links": network.paths.get("links"),
             "nodes": network.paths.get("nodes"),
             "centerline": network.paths.get("centerline"),
-            "direction_raster": existing_path(network.paths.get("linkdirs")) if assign_flow else None,
+            "direction_raster": existing_path(network.paths.get("linkdirs")) if flow_directions_assigned else None,
             "manual_fixlinks_csv": existing_path(network.paths.get("fixlinks_csv")) if assign_flow else None,
             "log": network.paths.get("log"),
         },

@@ -1213,8 +1213,15 @@ def test_independent_units_rerun_cleans_existing_state_directories(tmp_path: Pat
 
     base_stale = output_dir / "states" / "S000_base" / "stale.txt"
     child_stale = output_dir / "states" / "S001_unit_5" / "stale.txt"
+    stale_state_dir = output_dir / "states" / "S999_stale"
+    stale_registry = output_dir / "rapid_run_registry.csv"
+    stale_transition = output_dir / "equivalent_transition_registry.csv"
     base_stale.write_text("old")
     child_stale.write_text("old")
+    stale_state_dir.mkdir(parents=True)
+    (stale_state_dir / "stale.txt").write_text("old")
+    stale_registry.write_text("old")
+    stale_transition.write_text("old")
 
     second = run_collapse_experiment(
         "independent-units",
@@ -1234,6 +1241,10 @@ def test_independent_units_rerun_cleans_existing_state_directories(tmp_path: Pat
     assert second.manifest["n_complete_states"] == 2
     assert not base_stale.exists()
     assert not child_stale.exists()
+    assert not stale_state_dir.exists()
+    assert not stale_registry.exists()
+    assert stale_transition.exists()
+    assert stale_transition.read_text() != "old"
 
 
 def test_independent_units_records_exception_type_for_child_build_failures(tmp_path: Path) -> None:

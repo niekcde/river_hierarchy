@@ -995,6 +995,12 @@ def _reset_state_dir(state_dir: Path) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
 
 
+def _reset_experiment_output_dir(output_dir: Path) -> None:
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
 def _format_exception(exc: BaseException) -> str:
     message = str(exc).strip()
     if message:
@@ -1898,6 +1904,7 @@ def run_collapse_experiment(
     root_example_id = _infer_example_id(cleaned_mask_path)
     experiment_id = experiment_id or _default_experiment_id(cleaned_mask_path, mode)
     output_path = Path(output_dir) if output_dir is not None else _default_output_dir(cleaned_mask_path, experiment_id)
+    _reset_experiment_output_dir(output_path)
     states_dir = output_path / "states"
     states_dir.mkdir(parents=True, exist_ok=True)
     boundary_component_output_dir = output_path / "boundary_components"
