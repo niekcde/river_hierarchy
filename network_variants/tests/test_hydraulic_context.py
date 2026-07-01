@@ -287,7 +287,7 @@ def test_compute_hydraulic_context_can_use_reference_section_profile(tmp_path: P
     assert row["slope_used"] == pytest.approx(0.03)
 
 
-def test_generate_state_hydraulic_context_repairs_collapsed_link_to_parent_profile_drop(tmp_path: Path) -> None:
+def test_generate_state_hydraulic_context_applies_collapsed_unit_head_solver(tmp_path: Path) -> None:
     experiment_dir = tmp_path / "experiment"
     base_state_dir = experiment_dir / "states" / "S000_base"
     child_state_dir = experiment_dir / "states" / "S001_unit_1"
@@ -297,10 +297,20 @@ def test_generate_state_hydraulic_context_repairs_collapsed_link_to_parent_profi
     pd.DataFrame(
         [
             {"id_node": 11, "rapid_wse_for_slope": 177.94389},
-            {"id_node": 10, "rapid_wse_for_slope": 177.245404},
             {"id_node": 8, "rapid_wse_for_slope": 177.245404},
         ]
     ).to_csv(base_hc_dir / "node_hydraulic_context.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "id_link": 30,
+                "id_us_node": 11,
+                "id_ds_node": 8,
+                "link_length_m": 1447.522362,
+                "slope_used": (177.94389 - 177.245404) / 1447.522362,
+            }
+        ]
+    ).to_csv(base_hc_dir / "link_hydraulic_context.csv", index=False)
 
     links = gpd.GeoDataFrame(
         [
@@ -347,26 +357,22 @@ def test_generate_state_hydraulic_context_repairs_collapsed_link_to_parent_profi
     links.to_file(links_path, driver="GPKG")
     nodes.to_file(nodes_path, driver="GPKG")
 
-    lineage_dir = child_state_dir / "variant" / "matching"
-    lineage_dir.mkdir(parents=True, exist_ok=True)
+    matching_dir = child_state_dir / "variant" / "matching"
+    matching_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
         [
-            {
-                "id_link": 11,
-                "lineage_type": "collapsed_many_to_one",
-                "matched_parent_link_ids": "30,31",
-                "matched_parent_us_node": 11,
-                "matched_parent_ds_node": 8,
-            }
+            {"child_id_node": 50, "matched_parent_node_id": 11, "match_within_tolerance": True},
+            {"child_id_node": 51, "matched_parent_node_id": 8, "match_within_tolerance": True},
         ]
-    ).to_csv(lineage_dir / "link_lineage.csv", index=False)
+    ).to_csv(matching_dir / "node_match.csv", index=False)
     summary_dir = child_state_dir / "variant" / "summary"
     summary_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
         [
             {
                 "component_id": "C1",
-                "link_ids": "30,31",
+                "link_ids": "30",
+                "node_ids": "8,11",
                 "collapsed_selection_type": "unit",
                 "collapsed_selection_label": "collapsed_unit_1",
                 "collapsed_unit_ids": "1",
@@ -387,10 +393,176 @@ def test_generate_state_hydraulic_context_repairs_collapsed_link_to_parent_profi
     expected_slope = (177.94389 - 177.245404) / 1447.522362
     assert float(written.loc[11, "raw_slope"]) == pytest.approx((177.94389 - 177.48722) / 1447.522362)
     assert float(written.loc[11, "slope_used"]) == pytest.approx(expected_slope)
-    assert str(written.loc[11, "slope_source_method"]) == "collapsed_parent_profile"
+    assert str(written.loc[11, "slope_source_method"]) == "collapsed_unit_head_solver"
     assert bool(written.loc[11, "collapsed_profile_repair_applied"]) is True
     assert float(written.loc[11, "collapsed_reference_drop_m"]) == pytest.approx(177.94389 - 177.245404)
-    assert outputs.manifest["collapsed_parent_profile_repair"]["applied_link_ids"] == [11]
+    assert outputs.manifest["collapsed_unit_head_solver"]["applied_link_ids"] == [11]
+
+
+def test_generate_state_hydraulic_context_reports_collapsed_unit_boundary_analysis_from_slope_used(
+    tmp_path: Path,
+) -> None:
+    experiment_dir = tmp_path / "experiment"
+    base_state_dir = experiment_dir / "states" / "S000_base"
+    child_state_dir = experiment_dir / "states" / "S001_unit_1"
+
+    base_hc_dir = base_state_dir / "hydraulic_context"
+    base_hc_dir.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {"id_node": 1, "rapid_wse_for_slope": 9.0},
+            {"id_node": 2, "rapid_wse_for_slope": 9.5},
+            {"id_node": 3, "rapid_wse_for_slope": 10.0},
+        ]
+    ).to_csv(base_hc_dir / "node_hydraulic_context.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "id_link": 10,
+                "id_us_node": 3,
+                "id_ds_node": 2,
+                "link_length_m": 100.0,
+                "slope_used": 0.01,
+            },
+            {
+                "id_link": 11,
+                "id_us_node": 2,
+                "id_ds_node": 1,
+                "link_length_m": 100.0,
+                "slope_used": 0.02,
+            },
+        ]
+    ).to_csv(base_hc_dir / "link_hydraulic_context.csv", index=False)
+
+    links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": 1,
+                "id_us_node": 30,
+                "id_ds_node": 40,
+                "len": 50.0,
+                "geometry": LineString([(0.0, 0.0), (50.0, 0.0)]),
+            },
+            {
+                "id_link": 2,
+                "id_us_node": 40,
+                "id_ds_node": 31,
+                "len": 50.0,
+                "geometry": LineString([(50.0, 0.0), (100.0, 0.0)]),
+            },
+            {
+                "id_link": 3,
+                "id_us_node": 31,
+                "id_ds_node": 32,
+                "len": 100.0,
+                "geometry": LineString([(100.0, 0.0), (200.0, 0.0)]),
+            },
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    nodes = gpd.GeoDataFrame(
+        [
+            {
+                "id_node": 30,
+                "is_inlet": True,
+                "is_outlet": False,
+                "sword_wse": 8.0,
+                "sword_wse_field": "wse",
+                "sword_wse_fill_method": "requested_field",
+                "geometry": Point(0.0, 0.0),
+            },
+            {
+                "id_node": 40,
+                "is_inlet": False,
+                "is_outlet": False,
+                "sword_wse": 7.5,
+                "sword_wse_field": "wse",
+                "sword_wse_fill_method": "requested_field",
+                "geometry": Point(50.0, 0.0),
+            },
+            {
+                "id_node": 31,
+                "is_inlet": False,
+                "is_outlet": False,
+                "sword_wse": 7.0,
+                "sword_wse_field": "wse",
+                "sword_wse_fill_method": "requested_field",
+                "geometry": Point(100.0, 0.0),
+            },
+            {
+                "id_node": 32,
+                "is_inlet": False,
+                "is_outlet": True,
+                "sword_wse": 6.5,
+                "sword_wse_field": "wse",
+                "sword_wse_fill_method": "requested_field",
+                "geometry": Point(200.0, 0.0),
+            },
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+
+    links_path = child_state_dir / "variant" / "directed" / "child_directed_links.gpkg"
+    nodes_path = child_state_dir / "variant" / "directed" / "child_directed_nodes.gpkg"
+    links_path.parent.mkdir(parents=True, exist_ok=True)
+    links.to_file(links_path, driver="GPKG")
+    nodes.to_file(nodes_path, driver="GPKG")
+
+    matching_dir = child_state_dir / "variant" / "matching"
+    matching_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {"child_id_node": 30, "matched_parent_node_id": 3, "match_within_tolerance": True},
+            {"child_id_node": 31, "matched_parent_node_id": 2, "match_within_tolerance": True},
+            {"child_id_node": 32, "matched_parent_node_id": 1, "match_within_tolerance": True},
+        ]
+    ).to_csv(matching_dir / "node_match.csv", index=False)
+
+    summary_dir = child_state_dir / "variant" / "summary"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "component_id": "C1",
+                "link_ids": "10,11",
+                "node_ids": "1,2,3",
+                "collapsed_selection_type": "unit",
+                "collapsed_selection_label": "collapsed_unit_1",
+                "collapsed_unit_ids": "1",
+                "collapsed_unit_count": 1,
+            }
+        ]
+    ).to_csv(summary_dir / "collapse_components.csv", index=False)
+
+    outputs = generate_state_hydraulic_context(
+        directed_links_path=links_path,
+        directed_nodes_path=nodes_path,
+        hierarchy_output_dir=None,
+        output_dir=child_state_dir / "hydraulic_context",
+        state_id="S001_unit_1",
+    )
+
+    analysis = outputs.manifest["collapsed_unit_boundary_analysis"]
+    assert len(analysis) == 1
+    component = analysis[0]
+    assert component["variant_boundary_nodes"] == [30, 31, 32]
+    assert component["variant_entry_nodes"] == [30]
+    assert component["variant_exit_nodes"] == [32]
+
+    boundary_heads = {
+        item["variant_node"]: item["head_m"]
+        for item in component["variant_boundary_heads"]
+    }
+    assert boundary_heads[32] == pytest.approx(9.0)
+    assert boundary_heads[31] == pytest.approx(11.0)
+    assert boundary_heads[30] == pytest.approx(12.0)
+
+    base_consistency = component["base_path_drop_consistency"]
+    assert base_consistency["3->1"]["drop_mean_m"] == pytest.approx(3.0)
+    assert base_consistency["3->2"]["drop_mean_m"] == pytest.approx(1.0)
+    assert base_consistency["2->1"]["drop_mean_m"] == pytest.approx(2.0)
 
 
 def test_reference_section_profile_avoids_statewise_corridor_anchor_load(

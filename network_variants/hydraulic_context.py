@@ -11,6 +11,7 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 from shapely.geometry import LineString, Point
 from shapely.ops import linemerge, unary_union
 
@@ -106,6 +107,13 @@ COLLAPSED_PARENT_PROFILE_COLUMNS: dict[str, object] = {
 }
 
 
+def _safe_float(value: object) -> float | None:
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return None
+    return float(numeric)
+
+
 def _load_unit_summary_if_exists(hierarchy_output_dir: str | Path | None) -> pd.DataFrame | None:
     if hierarchy_output_dir is None:
         return None
@@ -169,6 +177,282 @@ def _compute_base_node_profile_lookup(
     lookup["id_node"] = pd.to_numeric(lookup["id_node"], errors="coerce").astype("Int64")
     lookup["rapid_wse_for_slope"] = pd.to_numeric(lookup["rapid_wse_for_slope"], errors="coerce")
     return lookup.dropna(subset=["id_node"])
+
+
+def _solve_base_component_heads(
+    base_component_links: pd.DataFrame,
+    *,
+    base_node_context: pd.DataFrame,
+) -> tuple[dict[int, float], int | None]:
+    if base_component_links.empty:
+        return {}, None
+
+    node_ids = sorted(
+        set(pd.to_numeric(base_component_links["id_us_node"], errors="coerce").dropna().astype(int))
+        | set(pd.to_numeric(base_component_links["id_ds_node"], errors="coerce").dropna().astype(int))
+    )
+    if not node_ids:
+        return {}, None
+
+    base_node_lookup = base_node_context.copy()
+    base_node_lookup["id_node"] = pd.to_numeric(base_node_lookup["id_node"], errors="coerce").astype("Int64")
+    base_node_lookup["rapid_wse_for_slope"] = pd.to_numeric(
+        base_node_lookup["rapid_wse_for_slope"], errors="coerce"
+    )
+    base_node_lookup = base_node_lookup.dropna(subset=["id_node"]).drop_duplicates(subset=["id_node"]).set_index("id_node")
+
+    anchor_candidates = [
+        (int(node_id), float(base_node_lookup.loc[int(node_id), "rapid_wse_for_slope"]))
+        for node_id in node_ids
+        if int(node_id) in base_node_lookup.index
+    ]
+    if not anchor_candidates:
+        return {}, None
+
+    anchor_node, anchor_head = min(anchor_candidates, key=lambda item: item[1])
+    node_index = {node_id: index for index, node_id in enumerate(node_ids)}
+    equations: list[np.ndarray] = []
+    rhs: list[float] = []
+    for row in base_component_links.itertuples(index=False):
+        us_node = int(row.id_us_node)
+        ds_node = int(row.id_ds_node)
+        drop = float(row.link_length_m) * float(row.slope_used)
+        coeff = np.zeros(len(node_ids), dtype=float)
+        coeff[node_index[us_node]] = 1.0
+        coeff[node_index[ds_node]] = -1.0
+        equations.append(coeff)
+        rhs.append(drop)
+
+    anchor_coeff = np.zeros(len(node_ids), dtype=float)
+    anchor_coeff[node_index[anchor_node]] = 1.0
+    equations.append(anchor_coeff)
+    rhs.append(anchor_head)
+
+    matrix = np.vstack(equations)
+    target = np.asarray(rhs, dtype=float)
+    solution, *_ = np.linalg.lstsq(matrix, target, rcond=None)
+    return {node_id: float(solution[node_index[node_id]]) for node_id in node_ids}, anchor_node
+
+
+def _build_collapsed_unit_boundary_analysis(
+    link_context: pd.DataFrame,
+    *,
+    links_path: Path,
+) -> list[dict[str, object]]:
+    state_dir = _infer_state_dir_from_links_path(links_path)
+    if state_dir is None or state_dir.name == "S000_base":
+        return []
+
+    collapse_components_path = state_dir / "variant" / "summary" / "collapse_components.csv"
+    node_match_path = state_dir / "variant" / "matching" / "node_match.csv"
+    experiment_dir = state_dir.parent.parent
+    base_state_dir = experiment_dir / "states" / "S000_base"
+    base_link_context_path = base_state_dir / "hydraulic_context" / "link_hydraulic_context.csv"
+    base_node_context_path = base_state_dir / "hydraulic_context" / "node_hydraulic_context.csv"
+    if not (
+        collapse_components_path.exists()
+        and node_match_path.exists()
+        and base_link_context_path.exists()
+        and base_node_context_path.exists()
+    ):
+        return []
+
+    collapse_components = pd.read_csv(collapse_components_path)
+    node_match = pd.read_csv(node_match_path)
+    base_link_context = pd.read_csv(base_link_context_path)
+    base_node_context = pd.read_csv(base_node_context_path)
+
+    if not {"child_id_node", "matched_parent_node_id"}.issubset(node_match.columns):
+        return []
+
+    node_match["child_id_node"] = pd.to_numeric(node_match["child_id_node"], errors="coerce").astype("Int64")
+    node_match["matched_parent_node_id"] = pd.to_numeric(node_match["matched_parent_node_id"], errors="coerce").astype("Int64")
+    if "match_within_tolerance" in node_match.columns:
+        node_match = node_match.loc[node_match["match_within_tolerance"].fillna(False).astype(bool)].copy()
+
+    variant_graph = nx.DiGraph()
+    for row in link_context.itertuples(index=False):
+        if pd.isna(getattr(row, "id_us_node", np.nan)) or pd.isna(getattr(row, "id_ds_node", np.nan)):
+            continue
+        variant_graph.add_edge(
+            int(row.id_us_node),
+            int(row.id_ds_node),
+            id_link=int(row.id_link),
+            link_length_m=float(row.link_length_m),
+            slope_used=float(row.slope_used),
+        )
+
+    analyses: list[dict[str, object]] = []
+    for row in collapse_components.itertuples(index=False):
+        base_unit_nodes = sorted(set(_parse_int_list(getattr(row, "node_ids", ""))))
+        base_unit_links = sorted(set(_parse_int_list(getattr(row, "link_ids", ""))))
+        if not base_unit_nodes or not base_unit_links:
+            continue
+
+        matched_rows = node_match.loc[node_match["matched_parent_node_id"].isin(base_unit_nodes)].copy()
+        if matched_rows.empty:
+            continue
+
+        variant_boundary_pairs = sorted(
+            {
+                (int(child_id), int(parent_id))
+                for child_id, parent_id in zip(
+                    matched_rows["child_id_node"].tolist(),
+                    matched_rows["matched_parent_node_id"].tolist(),
+                    strict=False,
+                )
+                if pd.notna(child_id) and pd.notna(parent_id)
+            }
+        )
+        if len(variant_boundary_pairs) < 2:
+            continue
+
+        variant_boundary_nodes = sorted({child_id for child_id, _ in variant_boundary_pairs})
+        variant_path_records: list[dict[str, object]] = []
+        variant_local_link_ids: set[int] = set()
+        boundary_predecessors = {node_id: set() for node_id in variant_boundary_nodes}
+        boundary_successors = {node_id: set() for node_id in variant_boundary_nodes}
+        cutoff = max(2, min(len(variant_graph.nodes), 40))
+        for source in variant_boundary_nodes:
+            for target in variant_boundary_nodes:
+                if source == target or source not in variant_graph or target not in variant_graph:
+                    continue
+                if not nx.has_path(variant_graph, source, target):
+                    continue
+                for node_path in nx.all_simple_paths(variant_graph, source, target, cutoff=cutoff):
+                    link_ids = [
+                        int(variant_graph[us_node][ds_node]["id_link"])
+                        for us_node, ds_node in zip(node_path[:-1], node_path[1:], strict=False)
+                    ]
+                    variant_local_link_ids.update(link_ids)
+                    boundary_predecessors[target].add(source)
+                    boundary_successors[source].add(target)
+                    variant_path_records.append(
+                        {
+                            "source_boundary_node": int(source),
+                            "target_boundary_node": int(target),
+                            "node_path": [int(node_id) for node_id in node_path],
+                            "link_path": link_ids,
+                        }
+                    )
+
+        if not variant_path_records:
+            continue
+
+        variant_entry_nodes = sorted(
+            node_id for node_id in variant_boundary_nodes if not boundary_predecessors[node_id]
+        )
+        variant_exit_nodes = sorted(
+            node_id for node_id in variant_boundary_nodes if not boundary_successors[node_id]
+        )
+
+        base_component_links = base_link_context.loc[
+            pd.to_numeric(base_link_context["id_link"], errors="coerce").isin(base_unit_links)
+        ].copy()
+        if base_component_links.empty:
+            continue
+        for column in ("id_link", "id_us_node", "id_ds_node"):
+            base_component_links[column] = pd.to_numeric(base_component_links[column], errors="coerce").astype("Int64")
+        for column in ("link_length_m", "slope_used"):
+            base_component_links[column] = pd.to_numeric(base_component_links[column], errors="coerce")
+        base_component_links = base_component_links.dropna(
+            subset=["id_link", "id_us_node", "id_ds_node", "link_length_m", "slope_used"]
+        ).copy()
+        if base_component_links.empty:
+            continue
+
+        base_graph = nx.DiGraph()
+        for base_link in base_component_links.itertuples(index=False):
+            drop = float(base_link.link_length_m) * float(base_link.slope_used)
+            base_graph.add_edge(
+                int(base_link.id_us_node),
+                int(base_link.id_ds_node),
+                id_link=int(base_link.id_link),
+                link_length_m=float(base_link.link_length_m),
+                slope_used=float(base_link.slope_used),
+                drop_m=drop,
+            )
+
+        base_path_drop_records: list[dict[str, object]] = []
+        base_drop_consistency: dict[str, dict[str, float | int | bool | None]] = {}
+        for source in base_unit_nodes:
+            for target in base_unit_nodes:
+                if source == target or source not in base_graph or target not in base_graph:
+                    continue
+                if not nx.has_path(base_graph, source, target):
+                    continue
+                pair_key = f"{source}->{target}"
+                pair_drops: list[float] = []
+                for node_path in nx.all_simple_paths(base_graph, source, target, cutoff=max(2, len(base_unit_nodes))):
+                    link_ids = [
+                        int(base_graph[us_node][ds_node]["id_link"])
+                        for us_node, ds_node in zip(node_path[:-1], node_path[1:], strict=False)
+                    ]
+                    drop_m = float(
+                        sum(base_graph[us_node][ds_node]["drop_m"] for us_node, ds_node in zip(node_path[:-1], node_path[1:], strict=False))
+                    )
+                    pair_drops.append(drop_m)
+                    base_path_drop_records.append(
+                        {
+                            "source_base_node": int(source),
+                            "target_base_node": int(target),
+                            "node_path": [int(node_id) for node_id in node_path],
+                            "link_path": link_ids,
+                            "drop_m": drop_m,
+                        }
+                    )
+                if pair_drops:
+                    drop_min = float(min(pair_drops))
+                    drop_max = float(max(pair_drops))
+                    base_drop_consistency[pair_key] = {
+                        "n_paths": int(len(pair_drops)),
+                        "drop_min_m": drop_min,
+                        "drop_max_m": drop_max,
+                        "drop_mean_m": float(np.mean(pair_drops)),
+                        "drop_spread_m": float(drop_max - drop_min),
+                        "is_consistent": bool(np.isclose(drop_min, drop_max, rtol=1e-6, atol=1e-9)),
+                    }
+
+        solved_base_heads, anchor_node = _solve_base_component_heads(
+            base_component_links,
+            base_node_context=base_node_context,
+        )
+        variant_boundary_heads = [
+            {
+                "variant_node": int(child_id),
+                "base_node": int(parent_id),
+                "head_m": solved_base_heads.get(int(parent_id)),
+            }
+            for child_id, parent_id in variant_boundary_pairs
+        ]
+
+        analyses.append(
+            {
+                "component_id": str(getattr(row, "component_id", "")),
+                "collapsed_selection_label": str(getattr(row, "collapsed_selection_label", "")),
+                "base_unit_nodes": [int(node_id) for node_id in base_unit_nodes],
+                "base_unit_links": [int(link_id) for link_id in base_unit_links],
+                "variant_boundary_node_matches": [
+                    {"variant_node": int(child_id), "base_node": int(parent_id)}
+                    for child_id, parent_id in variant_boundary_pairs
+                ],
+                "variant_boundary_nodes": [int(node_id) for node_id in variant_boundary_nodes],
+                "variant_entry_nodes": [int(node_id) for node_id in variant_entry_nodes],
+                "variant_exit_nodes": [int(node_id) for node_id in variant_exit_nodes],
+                "variant_local_link_ids": sorted(int(link_id) for link_id in variant_local_link_ids),
+                "variant_paths": variant_path_records,
+                "base_path_drop_consistency": base_drop_consistency,
+                "base_head_anchor_node": int(anchor_node) if anchor_node is not None else None,
+                "base_boundary_heads": [
+                    {"base_node": int(node_id), "head_m": float(head_value)}
+                    for node_id, head_value in sorted(solved_base_heads.items())
+                    if node_id in base_unit_nodes
+                ],
+                "variant_boundary_heads": variant_boundary_heads,
+            }
+        )
+
+    return analyses
 
 
 def _apply_collapsed_parent_profile_slope_repair(
@@ -284,6 +568,175 @@ def _apply_collapsed_parent_profile_slope_repair(
             result.at[row_index, "collapsed_profile_change_factor"] = float(repaired_slope / prior_slope)
 
     return result
+
+
+def _apply_collapsed_unit_head_solver(
+    link_context: pd.DataFrame,
+    *,
+    collapsed_unit_boundary_analysis: list[dict[str, object]],
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    result = link_context.copy()
+    for column, default in COLLAPSED_PARENT_PROFILE_COLUMNS.items():
+        if column not in result.columns:
+            result[column] = default
+
+    if not collapsed_unit_boundary_analysis:
+        result.loc[result["collapsed_profile_repair_reason"].eq(""), "collapsed_profile_repair_reason"] = "no_unit_boundary_analysis"
+        return result, {"candidate_link_ids": [], "applied_link_ids": [], "solved_component_ids": []}
+
+    index_by_link_id = {
+        int(link_id): int(row_index)
+        for row_index, link_id in result["id_link"].items()
+        if pd.notna(link_id)
+    }
+    candidate_link_ids: set[int] = set()
+    applied_link_ids: set[int] = set()
+    solved_component_ids: list[str] = []
+
+    for component in collapsed_unit_boundary_analysis:
+        component_id = str(component.get("component_id", "") or "")
+        variant_local_link_ids = [
+            int(link_id)
+            for link_id in component.get("variant_local_link_ids", []) or []
+            if int(link_id) in index_by_link_id
+        ]
+        if not variant_local_link_ids:
+            continue
+        candidate_link_ids.update(variant_local_link_ids)
+
+        boundary_heads = {
+            int(item["variant_node"]): float(item["head_m"])
+            for item in component.get("variant_boundary_heads", []) or []
+            if item.get("head_m") is not None
+        }
+        if len(boundary_heads) < 2:
+            for link_id in variant_local_link_ids:
+                result.at[index_by_link_id[link_id], "collapsed_profile_repair_reason"] = "insufficient_boundary_heads"
+            continue
+
+        local_links = result.loc[
+            pd.to_numeric(result["id_link"], errors="coerce").isin(variant_local_link_ids)
+        ].copy()
+        if local_links.empty:
+            continue
+        local_links["id_link"] = pd.to_numeric(local_links["id_link"], errors="coerce").astype("Int64")
+        local_links["id_us_node"] = pd.to_numeric(local_links["id_us_node"], errors="coerce").astype("Int64")
+        local_links["id_ds_node"] = pd.to_numeric(local_links["id_ds_node"], errors="coerce").astype("Int64")
+        local_links["link_length_m"] = pd.to_numeric(local_links["link_length_m"], errors="coerce")
+        local_links = local_links.dropna(subset=["id_link", "id_us_node", "id_ds_node", "link_length_m"]).copy()
+        if local_links.empty:
+            continue
+
+        local_node_ids = sorted(
+            set(local_links["id_us_node"].astype(int).tolist())
+            | set(local_links["id_ds_node"].astype(int).tolist())
+        )
+        internal_nodes = [node_id for node_id in local_node_ids if node_id not in boundary_heads]
+        internal_index = {node_id: index for index, node_id in enumerate(internal_nodes)}
+
+        edges: list[tuple[int, int, int, float]] = [
+            (
+                int(row.id_link),
+                int(row.id_us_node),
+                int(row.id_ds_node),
+                float(row.link_length_m),
+            )
+            for row in local_links.itertuples(index=False)
+        ]
+
+        if not edges:
+            continue
+
+        initial_alpha = float(
+            np.nanmean(pd.to_numeric(local_links.get("slope_used", np.nan), errors="coerce"))
+        )
+        if not np.isfinite(initial_alpha):
+            initial_alpha = 0.0
+        initial_heads = np.array(
+            [
+                float(boundary_heads.get(node_id, np.mean(list(boundary_heads.values()))))
+                for node_id in internal_nodes
+            ],
+            dtype=float,
+        )
+        x0 = np.concatenate([initial_heads, np.asarray([initial_alpha], dtype=float)])
+
+        def head(node_id: int, x: np.ndarray) -> float:
+            if node_id in boundary_heads:
+                return float(boundary_heads[node_id])
+            return float(x[internal_index[node_id]])
+
+        def objective(x: np.ndarray) -> float:
+            alpha = float(x[-1])
+            return float(
+                sum(
+                    ((((head(us_node, x) - head(ds_node, x)) / link_length) - alpha) ** 2)
+                    for _, us_node, ds_node, link_length in edges
+                    if link_length > 0
+                )
+            )
+
+        constraints = [
+            {
+                "type": "ineq",
+                "fun": lambda x, us_node=us_node, ds_node=ds_node: float(head(us_node, x) - head(ds_node, x)),
+            }
+            for _, us_node, ds_node, _ in edges
+        ]
+
+        try:
+            solution = minimize(
+                objective,
+                x0,
+                method="SLSQP",
+                constraints=constraints,
+                options={"ftol": 1e-12, "maxiter": 5000},
+            )
+        except Exception:
+            solution = None
+
+        if solution is None or not solution.success:
+            reason = "solver_failed"
+            if solution is not None and solution.message:
+                reason = f"solver_failed:{solution.message}"
+            for link_id in variant_local_link_ids:
+                result.at[index_by_link_id[link_id], "collapsed_profile_repair_reason"] = reason
+            continue
+
+        solved_component_ids.append(component_id)
+        x = np.asarray(solution.x, dtype=float)
+        for link_id, us_node, ds_node, link_length in edges:
+            row_index = index_by_link_id.get(int(link_id))
+            if row_index is None:
+                continue
+            candidate_link_ids.add(int(link_id))
+            reference_drop = float(head(us_node, x) - head(ds_node, x))
+            repaired_slope = float(reference_drop / link_length) if link_length > 0 else float("nan")
+            prior_slope = _safe_float(result.at[row_index, "slope_used"])
+            result.at[row_index, "collapsed_profile_repair_candidate"] = True
+            result.at[row_index, "collapsed_profile_repair_applied"] = True
+            result.at[row_index, "collapsed_profile_repair_reason"] = "ok"
+            result.at[row_index, "collapsed_reference_drop_m"] = reference_drop
+            result.at[row_index, "collapsed_reference_slope"] = repaired_slope
+            result.at[row_index, "slope_used"] = repaired_slope
+            result.at[row_index, "slope_source_method"] = "collapsed_unit_head_solver"
+            result.at[row_index, "slope_adjusted"] = True
+            result.at[row_index, "slope_reason"] = "filled_from_collapsed_unit_head_solver"
+            result.at[row_index, "slope_minimum_applied"] = False
+            if np.isfinite(prior_slope) and prior_slope > 0:
+                result.at[row_index, "collapsed_profile_change_factor"] = float(repaired_slope / prior_slope)
+            applied_link_ids.add(int(link_id))
+
+    untouched_mask = (
+        result["collapsed_profile_repair_candidate"].fillna(False).astype(bool)
+        & result["collapsed_profile_repair_reason"].eq("")
+    )
+    result.loc[untouched_mask, "collapsed_profile_repair_reason"] = "not_applied"
+    return result, {
+        "candidate_link_ids": sorted(int(link_id) for link_id in candidate_link_ids),
+        "applied_link_ids": sorted(int(link_id) for link_id in applied_link_ids),
+        "solved_component_ids": sorted(component_id for component_id in solved_component_ids if component_id),
+    }
 
 
 def _infer_reference_section_summary_path(*paths: Path) -> Path | None:
@@ -2172,10 +2625,13 @@ def generate_state_hydraulic_context(
         result.link_context,
         links,
     )
-    link_context = _apply_collapsed_parent_profile_slope_repair(
+    collapsed_unit_boundary_analysis = _build_collapsed_unit_boundary_analysis(
         link_context,
         links_path=links_path,
-        config=resolved_config,
+    )
+    link_context, collapsed_unit_head_solver_summary = _apply_collapsed_unit_head_solver(
+        link_context,
+        collapsed_unit_boundary_analysis=collapsed_unit_boundary_analysis,
     )
 
     link_context_path = output_path / "link_hydraulic_context.csv"
@@ -2206,32 +2662,8 @@ def generate_state_hydraulic_context(
             "normalized_solver_heads": "not written here",
         },
         "family_slope_inheritance": family_slope_inheritance_summary,
-        "collapsed_parent_profile_repair": {
-            "candidate_link_ids": sorted(
-                pd.to_numeric(
-                    link_context.loc[
-                        link_context.get("collapsed_profile_repair_candidate", False).fillna(False),
-                        "id_link",
-                    ],
-                    errors="coerce",
-                )
-                .dropna()
-                .astype(int)
-                .tolist()
-            ),
-            "applied_link_ids": sorted(
-                pd.to_numeric(
-                    link_context.loc[
-                        link_context.get("collapsed_profile_repair_applied", False).fillna(False),
-                        "id_link",
-                    ],
-                    errors="coerce",
-                )
-                .dropna()
-                .astype(int)
-                .tolist()
-            ),
-        },
+        "collapsed_unit_head_solver": collapsed_unit_head_solver_summary,
+        "collapsed_unit_boundary_analysis": collapsed_unit_boundary_analysis,
         "slope_config": {
             "slope_profile_mode": _normalize_slope_profile_mode(resolved_config.slope_profile_mode),
             "reference_section_summary_path": str(resolved_config.reference_section_summary_path or ""),

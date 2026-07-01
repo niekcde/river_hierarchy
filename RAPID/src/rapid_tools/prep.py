@@ -23,7 +23,13 @@ from shapely.ops import substring
 from network_variants.reference_context import resolve_kb_context
 
 from .forcing import ForcingConfig, _apply_constant_spinup, infer_forcing_dt_seconds, prepare_forcing_table, write_inflow_netcdf
-from .k_values import KValueConfig, compute_k_values, compute_routing_dt_seconds, resolve_width_field
+from .k_values import (
+    KValueConfig,
+    apply_stability_effective_length_cap,
+    compute_k_values,
+    compute_routing_dt_seconds,
+    resolve_width_field,
+)
 from .reference_section import compute_reference_section_kb
 from .registry import RapidStateContext, iter_preparable_states, load_state_registry
 
@@ -49,6 +55,8 @@ class RapidPrepConfig:
     use_celerity_capping: bool = False
     min_celerity_mps: float = 0.28
     max_celerity_mps: float = 1.524
+    use_stability_effective_length_cap: bool = False
+    stability_effective_length_cap_margin_seconds: float = 10.0
     target_subreach_length_m: float | None = None
     min_slope: float = 1e-6
     max_slope_for_k: float | None = None
@@ -952,6 +960,13 @@ def prepare_state(
             max_celerity_mps=prep_config.max_celerity_mps,
         ),
     )
+    if prep_config.use_stability_effective_length_cap:
+        rapid_links = apply_stability_effective_length_cap(
+            rapid_links,
+            x_value=prep_config.x_value,
+            min_celerity_mps=prep_config.min_celerity_mps,
+            safety_margin_seconds=prep_config.stability_effective_length_cap_margin_seconds,
+        )
 
     graph = build_rapid_graph(rapid_links, rapid_nodes)
     conn_path, total_reach_order = create_conn_file(graph, context.rapid_prep_dir)
@@ -1060,6 +1075,7 @@ def prepare_state(
             "n_width_adjusted": int(rapid_links["rapid_width_adjusted"].fillna(False).sum()),
             "n_subreach_width_fallback_used": int(rapid_links["rapid_subreach_width_fallback_used"].fillna(False).sum()) if "rapid_subreach_width_fallback_used" in rapid_links.columns else 0,
             "n_length_floor_applied": int(rapid_links["rapid_length_floor_applied"].fillna(False).sum()) if "rapid_length_floor_applied" in rapid_links.columns else 0,
+            "n_stability_length_cap_applied": int(rapid_links["rapid_stability_length_cap_applied"].fillna(False).sum()) if "rapid_stability_length_cap_applied" in rapid_links.columns else 0,
         },
         "routing": {
             "reach_order": reach_order,
@@ -1075,6 +1091,12 @@ def prepare_state(
             "min_effective_length_m": float(rapid_links["rapid_effective_length_m"].min()) if "rapid_effective_length_m" in rapid_links.columns and len(rapid_links) else float("nan"),
             "max_effective_length_m": float(rapid_links["rapid_effective_length_m"].max()) if "rapid_effective_length_m" in rapid_links.columns and len(rapid_links) else float("nan"),
             "pct_length_floor_applied": float(rapid_links["rapid_length_floor_applied"].fillna(False).astype(bool).mean()) if "rapid_length_floor_applied" in rapid_links.columns and len(rapid_links) else float("nan"),
+            "pct_stability_length_cap_applied": float(rapid_links["rapid_stability_length_cap_applied"].fillna(False).astype(bool).mean()) if "rapid_stability_length_cap_applied" in rapid_links.columns and len(rapid_links) else float("nan"),
+            "stability_length_cap_triggered": bool(rapid_links["rapid_stability_length_cap_triggered"].fillna(False).any()) if "rapid_stability_length_cap_triggered" in rapid_links.columns and len(rapid_links) else False,
+            "stability_length_cap_dt_min_before_seconds": float(rapid_links["rapid_stability_length_cap_dt_min_before_seconds"].iloc[0]) if "rapid_stability_length_cap_dt_min_before_seconds" in rapid_links.columns and len(rapid_links) else float("nan"),
+            "stability_length_cap_dt_max_before_seconds": float(rapid_links["rapid_stability_length_cap_dt_max_before_seconds"].iloc[0]) if "rapid_stability_length_cap_dt_max_before_seconds" in rapid_links.columns and len(rapid_links) else float("nan"),
+            "stability_length_cap_dt_min_after_seconds": float(rapid_links["rapid_stability_length_cap_dt_min_after_seconds"].iloc[0]) if "rapid_stability_length_cap_dt_min_after_seconds" in rapid_links.columns and len(rapid_links) else float("nan"),
+            "stability_length_cap_dt_max_after_seconds": float(rapid_links["rapid_stability_length_cap_dt_max_after_seconds"].iloc[0]) if "rapid_stability_length_cap_dt_max_after_seconds" in rapid_links.columns and len(rapid_links) else float("nan"),
             "pct_slope_outlier_flagged": float(rapid_links["slope_outlier_flag"].fillna(False).astype(bool).mean()) if "slope_outlier_flag" in rapid_links.columns and len(rapid_links) else float("nan"),
             "n_compound_bubbles_qc": int(rapid_links.loc[rapid_links["compound_bubble_id_link"].notna(), "compound_bubble_id_link"].nunique()) if "compound_bubble_id_link" in rapid_links.columns else 0,
             "n_valid_compound_bubbles_qc": int(rapid_links.loc[rapid_links["bubble_slope_qc_valid"].fillna(False), "compound_bubble_id_link"].nunique()) if "bubble_slope_qc_valid" in rapid_links.columns and "compound_bubble_id_link" in rapid_links.columns else 0,
@@ -1131,6 +1153,8 @@ def prepare_state(
         "max_link_length_m": float(rapid_links["link_length_m"].max()) if len(rapid_links) else float("nan"),
         "n_length_floor_applied": int(rapid_links["rapid_length_floor_applied"].fillna(False).sum()) if "rapid_length_floor_applied" in rapid_links.columns else 0,
         "pct_length_floor_applied": float(rapid_links["rapid_length_floor_applied"].fillna(False).astype(bool).mean()) if "rapid_length_floor_applied" in rapid_links.columns and len(rapid_links) else float("nan"),
+        "n_stability_length_cap_applied": int(rapid_links["rapid_stability_length_cap_applied"].fillna(False).sum()) if "rapid_stability_length_cap_applied" in rapid_links.columns else 0,
+        "pct_stability_length_cap_applied": float(rapid_links["rapid_stability_length_cap_applied"].fillna(False).astype(bool).mean()) if "rapid_stability_length_cap_applied" in rapid_links.columns and len(rapid_links) else float("nan"),
         "n_slope_outlier_flagged": int(rapid_links["slope_outlier_flag"].fillna(False).sum()) if "slope_outlier_flag" in rapid_links.columns else 0,
         "pct_slope_outlier_flagged": float(rapid_links["slope_outlier_flag"].fillna(False).astype(bool).mean()) if "slope_outlier_flag" in rapid_links.columns and len(rapid_links) else float("nan"),
         "n_compound_bubbles_qc": int(rapid_links.loc[rapid_links["compound_bubble_id_link"].notna(), "compound_bubble_id_link"].nunique()) if "compound_bubble_id_link" in rapid_links.columns else 0,

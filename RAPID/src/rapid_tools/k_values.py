@@ -145,19 +145,102 @@ def compute_k_values(
     return frame
 
 
+def compute_dt_bounds(
+    k_values: pd.Series,
+    *,
+    x_value: float,
+) -> tuple[float, float]:
+    finite = pd.to_numeric(k_values, errors="coerce")
+    finite = finite[np.isfinite(finite)]
+    if finite.empty:
+        raise ValueError("No finite RAPID K values were available for routing dt selection.")
+    dt_min = float(np.max(2.0 * finite * x_value))
+    dt_max = float(np.min(2.0 * finite * (1.0 - x_value)))
+    return dt_min, dt_max
+
+
+def apply_stability_effective_length_cap(
+    link_frame: pd.DataFrame,
+    *,
+    x_value: float,
+    min_celerity_mps: float,
+    safety_margin_seconds: float,
+) -> pd.DataFrame:
+    if x_value <= 0:
+        raise ValueError("Muskingum X must be positive when applying the stability length cap.")
+    if min_celerity_mps <= 0:
+        raise ValueError("Minimum celerity must be positive when applying the stability length cap.")
+    if safety_margin_seconds < 0:
+        raise ValueError("Stability length-cap safety margin must be nonnegative.")
+
+    frame = link_frame.copy()
+    current_effective_length = pd.to_numeric(frame["rapid_effective_length_m"], errors="coerce").astype(float)
+    floor_length = pd.to_numeric(frame.get("rapid_effective_length_floor_m"), errors="coerce")
+    floor_length = floor_length.fillna(-np.inf).astype(float)
+
+    frame["rapid_stability_length_cap_enabled"] = True
+    frame["rapid_stability_length_cap_margin_seconds"] = float(safety_margin_seconds)
+    frame["rapid_effective_length_m_pre_stability_cap"] = current_effective_length
+    frame["rapid_stability_length_cap_candidate"] = False
+    frame["rapid_stability_length_cap_applied"] = False
+    frame["rapid_stability_length_cap_triggered"] = False
+    frame["rapid_stability_length_cap_target_m"] = np.nan
+    frame["rapid_stability_length_cap_active_m"] = np.nan
+
+    dt_min_before, dt_max_before = compute_dt_bounds(frame["rapid_k"], x_value=x_value)
+    frame["rapid_stability_length_cap_dt_min_before_seconds"] = float(dt_min_before)
+    frame["rapid_stability_length_cap_dt_max_before_seconds"] = float(dt_max_before)
+
+    target_upper_dt = dt_max_before - float(safety_margin_seconds)
+    if dt_min_before <= target_upper_dt + 1e-9 or target_upper_dt <= 0:
+        frame["rapid_stability_length_cap_dt_min_after_seconds"] = float(dt_min_before)
+        frame["rapid_stability_length_cap_dt_max_after_seconds"] = float(dt_max_before)
+        return frame
+
+    target_cap = float(target_upper_dt * min_celerity_mps / (2.0 * x_value))
+    if not np.isfinite(target_cap) or target_cap <= 0:
+        frame["rapid_stability_length_cap_dt_min_after_seconds"] = float(dt_min_before)
+        frame["rapid_stability_length_cap_dt_max_after_seconds"] = float(dt_max_before)
+        return frame
+
+    active_cap = np.maximum(target_cap, floor_length)
+    candidate_mask = (
+        pd.to_numeric(frame["rapid_celerity_mps"], errors="coerce")
+        .astype(float)
+        .pipe(lambda s: np.isclose(s, float(min_celerity_mps), rtol=1e-12, atol=1e-12))
+        & pd.to_numeric(frame.get("rapid_celerity_capped"), errors="coerce").fillna(False).astype(bool)
+        & current_effective_length.gt(active_cap)
+    )
+
+    frame["rapid_stability_length_cap_triggered"] = True
+    frame["rapid_stability_length_cap_target_m"] = float(target_cap)
+    frame["rapid_stability_length_cap_active_m"] = active_cap.astype(float)
+    frame["rapid_stability_length_cap_candidate"] = candidate_mask
+
+    if candidate_mask.any():
+        updated_effective_length = current_effective_length.where(~candidate_mask, active_cap)
+        frame["rapid_effective_length_m"] = updated_effective_length.astype(float)
+        frame["rapid_stability_length_cap_applied"] = candidate_mask
+        frame["rapid_k"] = (frame["rapid_effective_length_m"].astype(float) / frame["rapid_celerity_mps"]).astype(float)
+        frame["rapid_k_source_method"] = np.where(
+            frame["rapid_stability_length_cap_applied"],
+            frame["rapid_k_source_method"].astype(str) + "+stability_length_cap",
+            frame["rapid_k_source_method"],
+        )
+
+    dt_min_after, dt_max_after = compute_dt_bounds(frame["rapid_k"], x_value=x_value)
+    frame["rapid_stability_length_cap_dt_min_after_seconds"] = float(dt_min_after)
+    frame["rapid_stability_length_cap_dt_max_after_seconds"] = float(dt_max_after)
+    return frame
+
+
 def compute_routing_dt_seconds(
     k_values: pd.Series,
     *,
     x_value: float,
     forcing_dt_seconds: int,
 ) -> int:
-    finite = pd.to_numeric(k_values, errors="coerce")
-    finite = finite[np.isfinite(finite)]
-    if finite.empty:
-        raise ValueError("No finite RAPID K values were available for routing dt selection.")
-
-    dt_min = float(np.max(2.0 * finite * x_value))
-    dt_max = float(np.min(2.0 * finite * (1.0 - x_value)))
+    dt_min, dt_max = compute_dt_bounds(k_values, x_value=x_value)
     if dt_min > dt_max:
         raise ValueError(
             f"No stable RAPID routing timestep exists for x={x_value}. "

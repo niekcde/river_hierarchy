@@ -8,6 +8,7 @@ import geopandas as gpd
 import networkx as nx
 import numpy as np
 import pandas as pd
+import pytest
 from scipy.io import netcdf_file
 from shapely.geometry import LineString, Point
 
@@ -19,7 +20,11 @@ if str(SRC) not in sys.path:
 from rapid_tools.engine import run_prepared_experiment, write_qout_netcdf
 from rapid_tools.forcing import ForcingConfig
 from rapid_tools.hydrograph import HydrographMetricConfig, _integrate_trapezoid, summarize_outlet_hydrograph
-from rapid_tools.k_values import KValueConfig, compute_k_values
+from rapid_tools.k_values import (
+    KValueConfig,
+    apply_stability_effective_length_cap,
+    compute_k_values,
+)
 from rapid_tools.prep import RapidPrepConfig, build_rapid_graph, compute_reach_ratios, create_conn_file, prepare_experiment
 from rapid_tools.reference_section import _load_width_summary
 from rapid_tools.slope import SlopeConfig, compute_link_slopes
@@ -883,6 +888,59 @@ def test_compute_k_values_applies_effective_length_floor() -> None:
     assert abs(float(floored.loc[1, "rapid_k"]) - (130.0 / celerity)) < 1e-9
 
 
+def test_apply_stability_effective_length_cap_targets_min_celerity_reaches() -> None:
+    frame = pd.DataFrame(
+        {
+            "rapid_effective_length_m": [200.0, 219.4320578362918],
+            "rapid_effective_length_floor_m": [np.nan, np.nan],
+            "rapid_celerity_mps": [0.5747646461475523, 0.07],
+            "rapid_celerity_capped": [False, True],
+            "rapid_k_source_method": ["hydraulic_celerity_uncapped", "hydraulic_celerity_capped"],
+            "rapid_k": [347.96833928973554, 3134.743683375597],
+        }
+    )
+
+    adjusted = apply_stability_effective_length_cap(
+        frame,
+        x_value=0.1,
+        min_celerity_mps=0.07,
+        safety_margin_seconds=10.0,
+    )
+
+    expected_cap = (626.3430107215239 - 10.0) * 0.07 / 0.2
+    assert bool(adjusted.loc[0, "rapid_stability_length_cap_applied"]) is False
+    assert bool(adjusted.loc[1, "rapid_stability_length_cap_applied"]) is True
+    assert abs(float(adjusted.loc[1, "rapid_effective_length_m"]) - expected_cap) < 1e-9
+    assert adjusted.loc[1, "rapid_k_source_method"] == "hydraulic_celerity_capped+stability_length_cap"
+    assert float(adjusted.loc[0, "rapid_stability_length_cap_dt_min_after_seconds"]) < float(
+        adjusted.loc[0, "rapid_stability_length_cap_dt_max_after_seconds"]
+    )
+
+
+def test_apply_stability_effective_length_cap_respects_effective_length_floor() -> None:
+    frame = pd.DataFrame(
+        {
+            "rapid_effective_length_m": [200.0, 240.0],
+            "rapid_effective_length_floor_m": [np.nan, 218.0],
+            "rapid_celerity_mps": [0.5747646461475523, 0.07],
+            "rapid_celerity_capped": [False, True],
+            "rapid_k_source_method": ["hydraulic_celerity_uncapped", "hydraulic_celerity_capped"],
+            "rapid_k": [347.96833928973554, 240.0 / 0.07],
+        }
+    )
+
+    adjusted = apply_stability_effective_length_cap(
+        frame,
+        x_value=0.1,
+        min_celerity_mps=0.07,
+        safety_margin_seconds=10.0,
+    )
+
+    assert bool(adjusted.loc[0, "rapid_stability_length_cap_applied"]) is False
+    assert bool(adjusted.loc[1, "rapid_stability_length_cap_applied"]) is True
+    assert abs(float(adjusted.loc[1, "rapid_effective_length_m"]) - 218.0) < 1e-12
+
+
 def test_integrate_trapezoid_falls_back_to_trapz(monkeypatch) -> None:
     monkeypatch.delattr(np, "trapezoid", raising=False)
     area = _integrate_trapezoid(
@@ -1288,6 +1346,8 @@ def test_prepare_experiment_exports_celerity_columns(tmp_path: Path) -> None:
             use_celerity_capping=True,
             min_celerity_mps=0.28,
             max_celerity_mps=1.524,
+            use_stability_effective_length_cap=True,
+            stability_effective_length_cap_margin_seconds=10.0,
         ),
     )
 
@@ -1304,6 +1364,17 @@ def test_prepare_experiment_exports_celerity_columns(tmp_path: Path) -> None:
         "rapid_celerity_cap_max_mps",
         "rapid_effective_length_m",
         "rapid_length_floor_applied",
+        "rapid_stability_length_cap_enabled",
+        "rapid_effective_length_m_pre_stability_cap",
+        "rapid_stability_length_cap_candidate",
+        "rapid_stability_length_cap_applied",
+        "rapid_stability_length_cap_triggered",
+        "rapid_stability_length_cap_target_m",
+        "rapid_stability_length_cap_active_m",
+        "rapid_stability_length_cap_dt_min_before_seconds",
+        "rapid_stability_length_cap_dt_max_before_seconds",
+        "rapid_stability_length_cap_dt_min_after_seconds",
+        "rapid_stability_length_cap_dt_max_after_seconds",
         "slope_outlier_flag",
         "bubble_slope_qc_candidate",
         "bubble_slope_qc_valid",

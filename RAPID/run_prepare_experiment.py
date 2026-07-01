@@ -63,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-celerity-capping", action="store_true", help="Cap the implied hydraulic celerity before converting it to RAPID K.")
     parser.add_argument("--min-celerity-mps", type=float, default=0.28, help="Minimum celerity bound in m/s when celerity capping is enabled.")
     parser.add_argument("--max-celerity-mps", type=float, default=1.524, help="Maximum celerity bound in m/s when celerity capping is enabled.")
+    parser.add_argument("--use-stability-effective-length-cap", action="store_true", help="In unstable or near-unstable states, shorten K-only effective lengths on minimum-celerity reaches to the maximum value allowed by the current dt_max and the requested safety margin.")
+    parser.add_argument("--stability-effective-length-cap-margin-seconds", type=float, default=10.0, help="Requested safety margin below dt_max when deriving the statewise K-only effective-length cap.")
     parser.add_argument("--target-subreach-length-m", type=float, help="Target RAPID-only subreach length in meters. Long links are split using max(1, round(L / target)).")
     parser.add_argument("--min-slope", type=float, default=1e-6, help="Legacy metadata only. Effective slope limits should be applied during variant hydraulic-context generation, not RAPID prep.")
     parser.add_argument("--max-slope-for-k", type=float, help="Legacy metadata only. Effective slope limits should be applied during variant hydraulic-context generation, not RAPID prep.")
@@ -115,6 +117,8 @@ def main(argv: list[str] | None = None) -> int:
             use_celerity_capping=args.use_celerity_capping,
             min_celerity_mps=args.min_celerity_mps,
             max_celerity_mps=args.max_celerity_mps,
+            use_stability_effective_length_cap=args.use_stability_effective_length_cap,
+            stability_effective_length_cap_margin_seconds=args.stability_effective_length_cap_margin_seconds,
             target_subreach_length_m=args.target_subreach_length_m,
             min_slope=args.min_slope,
             max_slope_for_k=args.max_slope_for_k,
