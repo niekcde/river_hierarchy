@@ -165,6 +165,7 @@ def apply_stability_effective_length_cap(
     x_value: float,
     min_celerity_mps: float,
     safety_margin_seconds: float,
+    celerity_rel_buffer: float = 0.03,
 ) -> pd.DataFrame:
     if x_value <= 0:
         raise ValueError("Muskingum X must be positive when applying the stability length cap.")
@@ -172,6 +173,8 @@ def apply_stability_effective_length_cap(
         raise ValueError("Minimum celerity must be positive when applying the stability length cap.")
     if safety_margin_seconds < 0:
         raise ValueError("Stability length-cap safety margin must be nonnegative.")
+    if celerity_rel_buffer < 0:
+        raise ValueError("Celerity relative buffer must be nonnegative.")
 
     frame = link_frame.copy()
     current_effective_length = pd.to_numeric(frame["rapid_effective_length_m"], errors="coerce").astype(float)
@@ -197,23 +200,23 @@ def apply_stability_effective_length_cap(
         frame["rapid_stability_length_cap_dt_max_after_seconds"] = float(dt_max_before)
         return frame
 
-    target_cap = float(target_upper_dt * min_celerity_mps / (2.0 * x_value))
-    if not np.isfinite(target_cap) or target_cap <= 0:
+    celerity = pd.to_numeric(frame["rapid_celerity_mps"], errors="coerce").astype(float)
+    near_floor_threshold = float(min_celerity_mps) * (1.0 + float(celerity_rel_buffer))
+    target_cap = (target_upper_dt * celerity / (2.0 * x_value)).astype(float)
+    if not np.isfinite(target_cap).any():
         frame["rapid_stability_length_cap_dt_min_after_seconds"] = float(dt_min_before)
         frame["rapid_stability_length_cap_dt_max_after_seconds"] = float(dt_max_before)
         return frame
 
     active_cap = np.maximum(target_cap, floor_length)
     candidate_mask = (
-        pd.to_numeric(frame["rapid_celerity_mps"], errors="coerce")
-        .astype(float)
-        .pipe(lambda s: np.isclose(s, float(min_celerity_mps), rtol=1e-12, atol=1e-12))
-        & pd.to_numeric(frame.get("rapid_celerity_capped"), errors="coerce").fillna(False).astype(bool)
+        celerity.le(near_floor_threshold)
         & current_effective_length.gt(active_cap)
+        & np.isfinite(active_cap)
     )
 
     frame["rapid_stability_length_cap_triggered"] = True
-    frame["rapid_stability_length_cap_target_m"] = float(target_cap)
+    frame["rapid_stability_length_cap_target_m"] = target_cap.astype(float)
     frame["rapid_stability_length_cap_active_m"] = active_cap.astype(float)
     frame["rapid_stability_length_cap_candidate"] = candidate_mask
 
@@ -239,11 +242,30 @@ def compute_routing_dt_seconds(
     *,
     x_value: float,
     forcing_dt_seconds: int,
+    preferred_routing_dt_seconds: int | None = None,
 ) -> int:
     dt_min, dt_max = compute_dt_bounds(k_values, x_value=x_value)
+    return compute_routing_dt_seconds_from_bounds(
+        dt_min=dt_min,
+        dt_max=dt_max,
+        forcing_dt_seconds=forcing_dt_seconds,
+        preferred_routing_dt_seconds=preferred_routing_dt_seconds,
+        x_value=x_value,
+    )
+
+
+def compute_routing_dt_seconds_from_bounds(
+    *,
+    dt_min: float,
+    dt_max: float,
+    forcing_dt_seconds: int,
+    preferred_routing_dt_seconds: int | None = None,
+    x_value: float | None = None,
+) -> int:
     if dt_min > dt_max:
+        x_text = f"{x_value}" if x_value is not None else "unknown"
         raise ValueError(
-            f"No stable RAPID routing timestep exists for x={x_value}. "
+            f"No stable RAPID routing timestep exists for x={x_text}. "
             f"Computed dt_min={dt_min:.3f} > dt_max={dt_max:.3f}."
         )
 
@@ -262,6 +284,60 @@ def compute_routing_dt_seconds(
             f"the forcing timestep {forcing_dt_seconds}."
         )
 
-    midpoint = 0.5 * (dt_min + dt_max)
-    best = min(candidates, key=lambda value: (abs(value - midpoint), -value))
+    target = float(preferred_routing_dt_seconds) if preferred_routing_dt_seconds is not None else 0.5 * (dt_min + dt_max)
+    best = min(candidates, key=lambda value: (abs(value - target), -value))
     return int(best)
+
+
+def find_nearby_compatible_forcing_and_routing_dt(
+    k_values: pd.Series,
+    *,
+    x_value: float,
+    forcing_dt_seconds: int,
+    preferred_routing_dt_seconds: int | None = None,
+    search_max_offset_seconds: int = 120,
+) -> tuple[int, int]:
+    dt_min, dt_max = compute_dt_bounds(k_values, x_value=x_value)
+    if dt_min > dt_max:
+        raise ValueError(
+            f"No stable RAPID routing timestep exists for x={x_value}. "
+            f"Computed dt_min={dt_min:.3f} > dt_max={dt_max:.3f}."
+        )
+
+    preferred = int(preferred_routing_dt_seconds) if preferred_routing_dt_seconds is not None else int(round(0.5 * (dt_min + dt_max)))
+    multiples_of_five: list[tuple[int, int]] = []
+    integer_candidates: list[tuple[int, int]] = []
+    for offset in range(0, int(search_max_offset_seconds) + 1):
+        forcing_candidates = [forcing_dt_seconds] if offset == 0 else [forcing_dt_seconds - offset, forcing_dt_seconds + offset]
+        for candidate_forcing_dt in forcing_candidates:
+            if candidate_forcing_dt <= 0:
+                continue
+            try:
+                candidate_routing_dt = compute_routing_dt_seconds_from_bounds(
+                    dt_min=dt_min,
+                    dt_max=dt_max,
+                    forcing_dt_seconds=int(candidate_forcing_dt),
+                    preferred_routing_dt_seconds=preferred,
+                    x_value=x_value,
+                )
+            except ValueError:
+                continue
+            record = (int(candidate_forcing_dt), int(candidate_routing_dt))
+            if int(candidate_forcing_dt) % 5 == 0 and int(candidate_routing_dt) % 5 == 0:
+                multiples_of_five.append(record)
+            integer_candidates.append(record)
+
+    if multiples_of_five:
+        return min(
+            multiples_of_five,
+            key=lambda pair: (abs(pair[1] - preferred), abs(pair[0] - forcing_dt_seconds), pair[0], -pair[1]),
+        )
+    if integer_candidates:
+        return min(
+            integer_candidates,
+            key=lambda pair: (abs(pair[1] - preferred), abs(pair[0] - forcing_dt_seconds), pair[0], -pair[1]),
+        )
+    raise ValueError(
+        "Could not find a nearby forcing timestep with any routing timestep that satisfies the Muskingum "
+        f"stability bounds [{dt_min:.3f}, {dt_max:.3f}] and evenly divides the forcing timestep."
+    )

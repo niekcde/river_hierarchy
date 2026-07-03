@@ -27,6 +27,7 @@ from .k_values import (
     KValueConfig,
     apply_stability_effective_length_cap,
     compute_k_values,
+    find_nearby_compatible_forcing_and_routing_dt,
     compute_routing_dt_seconds,
     resolve_width_field,
 )
@@ -57,6 +58,9 @@ class RapidPrepConfig:
     max_celerity_mps: float = 1.524
     use_stability_effective_length_cap: bool = False
     stability_effective_length_cap_margin_seconds: float = 10.0
+    stability_effective_length_cap_celerity_rel_buffer: float = 0.03
+    preferred_routing_dt_seconds: int | None = None
+    forcing_dt_search_max_offset_seconds: int = 120
     target_subreach_length_m: float | None = None
     min_slope: float = 1e-6
     max_slope_for_k: float | None = None
@@ -966,6 +970,7 @@ def prepare_state(
             x_value=prep_config.x_value,
             min_celerity_mps=prep_config.min_celerity_mps,
             safety_margin_seconds=prep_config.stability_effective_length_cap_margin_seconds,
+            celerity_rel_buffer=prep_config.stability_effective_length_cap_celerity_rel_buffer,
         )
 
     graph = build_rapid_graph(rapid_links, rapid_nodes)
@@ -988,6 +993,7 @@ def prepare_state(
     inflow_path = None
     forcing_dt_seconds = None
     routing_dt_seconds = None
+    routing_dt_source = "forcing_dt_exact_divisor"
     resolved_forcing_metadata = dict(forcing_metadata) if forcing_metadata is not None else None
     resolved_forcing_config = replace(forcing_config)
     if forcing_table is not None:
@@ -1018,11 +1024,78 @@ def prepare_state(
             resolved_forcing_metadata["longest_downstream_k_seconds"] = float(longest_k_seconds)
 
         forcing_dt_seconds = infer_forcing_dt_seconds(forcing)
-        routing_dt_seconds = compute_routing_dt_seconds(
-            rapid_links["rapid_k"],
-            x_value=prep_config.x_value,
-            forcing_dt_seconds=forcing_dt_seconds,
-        )
+        original_forcing_dt_seconds = int(forcing_dt_seconds)
+        try:
+            routing_dt_seconds = compute_routing_dt_seconds(
+                rapid_links["rapid_k"],
+                x_value=prep_config.x_value,
+                forcing_dt_seconds=forcing_dt_seconds,
+                preferred_routing_dt_seconds=prep_config.preferred_routing_dt_seconds,
+            )
+        except ValueError as exc:
+            can_search_nearby_forcing_dt = (
+                forcing_path is not None
+                and (
+                    resolved_forcing_config.resample_seconds is not None
+                    or resolved_forcing_config.resample_minutes is not None
+                )
+                and prep_config.forcing_dt_search_max_offset_seconds > 0
+                and "evenly divides the forcing timestep" in str(exc)
+            )
+            if not can_search_nearby_forcing_dt:
+                raise
+
+            fallback_forcing_dt_seconds, fallback_routing_dt_seconds = find_nearby_compatible_forcing_and_routing_dt(
+                rapid_links["rapid_k"],
+                x_value=prep_config.x_value,
+                forcing_dt_seconds=forcing_dt_seconds,
+                preferred_routing_dt_seconds=prep_config.preferred_routing_dt_seconds,
+                search_max_offset_seconds=prep_config.forcing_dt_search_max_offset_seconds,
+            )
+            fallback_forcing_config = replace(
+                forcing_config,
+                resample_seconds=int(fallback_forcing_dt_seconds),
+                resample_minutes=None,
+            )
+            if forcing_config.auto_spinup_from_k:
+                fallback_forcing_config = replace(
+                    fallback_forcing_config,
+                    auto_spinup_from_k=False,
+                    spinup_hours=None,
+                )
+            forcing, resolved_forcing_metadata = prepare_forcing_table(forcing_path, config=fallback_forcing_config)
+            resolved_forcing_config = replace(fallback_forcing_config)
+            if resolved_forcing_config.auto_spinup_from_k and resolved_forcing_config.spinup_hours is None:
+                raise AssertionError("fallback forcing config should disable auto_spinup_from_k before reload")
+            if forcing_config.auto_spinup_from_k:
+                longest_k_seconds = _compute_longest_downstream_k_seconds(graph)
+                auto_spinup_hours = (longest_k_seconds * float(forcing_config.spinup_k_multiplier)) / SECONDS_PER_HOUR
+                resolved_forcing_config = replace(
+                    fallback_forcing_config,
+                    auto_spinup_from_k=True,
+                    spinup_hours=float(auto_spinup_hours),
+                )
+                forcing, spinup_metadata = _apply_constant_spinup(
+                    forcing,
+                    spinup_hours=resolved_forcing_config.spinup_hours,
+                    pad_end_with_spinup=bool(resolved_forcing_config.pad_end_with_spinup),
+                )
+                resolved_forcing_metadata.update(spinup_metadata)
+                resolved_forcing_metadata["forcing_spinup_hours"] = float(resolved_forcing_config.spinup_hours)
+                resolved_forcing_metadata["spinup_source"] = "longest_downstream_k_path"
+                resolved_forcing_metadata["spinup_k_multiplier"] = float(forcing_config.spinup_k_multiplier)
+                resolved_forcing_metadata["longest_downstream_k_seconds"] = float(longest_k_seconds)
+
+            forcing_dt_seconds = infer_forcing_dt_seconds(forcing)
+            routing_dt_seconds = int(fallback_routing_dt_seconds)
+            routing_dt_source = "nearby_forcing_dt_fallback"
+            if resolved_forcing_metadata is None:
+                resolved_forcing_metadata = {}
+            resolved_forcing_metadata["forcing_dt_fallback_applied"] = True
+            resolved_forcing_metadata["forcing_dt_fallback_original_seconds"] = int(original_forcing_dt_seconds)
+            resolved_forcing_metadata["forcing_dt_fallback_selected_seconds"] = int(forcing_dt_seconds)
+            resolved_forcing_metadata["routing_dt_fallback_selected_seconds"] = int(routing_dt_seconds)
+
         forcing_table_path = context.rapid_prep_dir / "forcing_normalized.csv"
         forcing.to_csv(forcing_table_path, index=False)
         inflow_path = write_inflow_netcdf(rapid_links_total_order, forcing, context.rapid_prep_dir / "inflow.nc")
@@ -1081,6 +1154,7 @@ def prepare_state(
             "reach_order": reach_order,
             "forcing_dt_seconds": forcing_dt_seconds,
             "routing_dt_seconds": routing_dt_seconds,
+            "routing_dt_source": routing_dt_source,
         },
         "diagnostics": {
             "link_multiplier": float(len(rapid_links) / len(prepared_links)) if len(prepared_links) else float("nan"),
@@ -1132,6 +1206,7 @@ def prepare_state(
         "forcing_loaded_from_cache": bool(resolved_forcing_metadata.get("forcing_loaded_from_cache", False)) if resolved_forcing_metadata is not None else False,
         "forcing_dt_seconds": forcing_dt_seconds if forcing_dt_seconds is not None else "",
         "routing_dt_seconds": routing_dt_seconds if routing_dt_seconds is not None else "",
+        "routing_dt_source": routing_dt_source if routing_dt_seconds is not None else "",
         "hydraulic_context_source": hydraulic_context_source,
         "hydraulic_context_output_dir": str(context.hydraulic_context_output_dir) if context.hydraulic_context_output_dir is not None else "",
         "hydraulic_context_link_csv": str(hydraulic_context_link_path) if hydraulic_context_link_path is not None else "",

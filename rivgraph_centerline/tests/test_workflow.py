@@ -17,6 +17,7 @@ from rivgraph_centerline.raster_mask import crop_binary_mask
 from rivgraph_centerline.workflow import (
     WorkflowPaths,
     _clear_rivgraph_outputs,
+    _sanitize_rivgraph_centerline_link_fields,
     prepare_binary_projected_mask,
     run_rivgraph_for_run,
 )
@@ -94,6 +95,25 @@ def test_clear_rivgraph_outputs_removes_only_run_prefixed_files(tmp_path) -> Non
     assert not stale_links.exists()
     assert not nested.exists()
     assert unrelated.exists()
+
+
+def test_sanitize_rivgraph_centerline_link_fields_drops_scalar_metadata() -> None:
+    links = {
+        "id": [0, 1, 2],
+        "idx": [[1], [2], [3]],
+        "conn": [[0, 1], [1, 2], [2, 3]],
+        "len": [1.0, 2.0, 3.0],
+        "n_networks": 1,
+        "_ids_finalized": False,
+        "_ids_finalization_method": "topology not finalized",
+        "bad_scalar": 7,
+        "bad_text": "abc",
+        "bad_short": [1, 2],
+    }
+
+    _sanitize_rivgraph_centerline_link_fields(links)
+
+    assert set(links) == {"id", "idx", "conn", "len", "n_networks"}
 
 
 def test_run_rivgraph_for_run_cleans_stale_outputs_before_rerun(tmp_path, monkeypatch) -> None:

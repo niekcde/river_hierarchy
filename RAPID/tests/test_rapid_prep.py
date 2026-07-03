@@ -24,6 +24,8 @@ from rapid_tools.k_values import (
     KValueConfig,
     apply_stability_effective_length_cap,
     compute_k_values,
+    compute_routing_dt_seconds,
+    find_nearby_compatible_forcing_and_routing_dt,
 )
 from rapid_tools.prep import RapidPrepConfig, build_rapid_graph, compute_reach_ratios, create_conn_file, prepare_experiment
 from rapid_tools.reference_section import _load_width_summary
@@ -939,6 +941,55 @@ def test_apply_stability_effective_length_cap_respects_effective_length_floor() 
     assert bool(adjusted.loc[0, "rapid_stability_length_cap_applied"]) is False
     assert bool(adjusted.loc[1, "rapid_stability_length_cap_applied"]) is True
     assert abs(float(adjusted.loc[1, "rapid_effective_length_m"]) - 218.0) < 1e-12
+
+
+def test_apply_stability_effective_length_cap_targets_near_floor_reaches() -> None:
+    frame = pd.DataFrame(
+        {
+            "rapid_effective_length_m": [200.0, 239.610667],
+            "rapid_effective_length_floor_m": [np.nan, np.nan],
+            "rapid_celerity_mps": [0.5747646461475523, 0.071441],
+            "rapid_celerity_capped": [False, False],
+            "rapid_k_source_method": ["hydraulic_celerity_uncapped", "hydraulic_celerity_uncapped"],
+            "rapid_k": [347.96833928973554, 239.610667 / 0.071441],
+        }
+    )
+
+    adjusted = apply_stability_effective_length_cap(
+        frame,
+        x_value=0.1,
+        min_celerity_mps=0.07,
+        safety_margin_seconds=10.0,
+        celerity_rel_buffer=0.03,
+    )
+
+    expected_cap = (626.3430107215239 - 10.0) * 0.071441 / 0.2
+    assert bool(adjusted.loc[1, "rapid_stability_length_cap_applied"]) is True
+    assert abs(float(adjusted.loc[1, "rapid_effective_length_m"]) - expected_cap) < 1e-9
+
+
+def test_compute_routing_dt_seconds_prefers_requested_timestep() -> None:
+    k_values = pd.Series([1000.0, 277.77777777777777], dtype=float)
+    selected = compute_routing_dt_seconds(
+        k_values,
+        x_value=0.1,
+        forcing_dt_seconds=960,
+        preferred_routing_dt_seconds=480,
+    )
+    assert selected == 480
+
+
+def test_find_nearby_compatible_forcing_and_routing_dt_prefers_multiple_of_five() -> None:
+    k_values = pd.Series([3134.745], dtype=float)
+    forcing_dt_seconds, routing_dt_seconds = find_nearby_compatible_forcing_and_routing_dt(
+        k_values,
+        x_value=0.1,
+        forcing_dt_seconds=620,
+        preferred_routing_dt_seconds=620,
+        search_max_offset_seconds=20,
+    )
+    assert forcing_dt_seconds == 630
+    assert routing_dt_seconds == 630
 
 
 def test_integrate_trapezoid_falls_back_to_trapz(monkeypatch) -> None:

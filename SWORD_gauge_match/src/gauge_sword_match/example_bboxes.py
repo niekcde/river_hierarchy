@@ -217,7 +217,7 @@ def _load_example_reaches(
     sword_parquet_dir: str | Path,
     width_field: str,
     crs,
-    ) -> gpd.GeoDataFrame:
+        ) -> gpd.GeoDataFrame:
     if route_table.empty:
         return gpd.GeoDataFrame({"example_id": []}, geometry=gpd.GeoSeries([], crs=crs), crs=crs)
 

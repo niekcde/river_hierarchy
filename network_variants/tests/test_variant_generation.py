@@ -785,6 +785,119 @@ def test_resolved_lineage_uses_parent_node_path_and_keeps_parallel_edges() -> No
     assert np.isclose(lineage_row["matched_parent_overlap_fraction"], 1.0)
 
 
+def test_assign_variant_directions_preserves_canonical_parent_outlet() -> None:
+    parent_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 0, "is_inlet": True, "is_outlet": False, "geometry": Point(0, 0)},
+            {"id_node": 1, "is_inlet": False, "is_outlet": False, "geometry": Point(10, 0)},
+            {"id_node": 2, "is_inlet": False, "is_outlet": False, "geometry": Point(20, 0)},
+            {"id_node": 3, "is_inlet": False, "is_outlet": True, "geometry": Point(30, 0)},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    parent_nodes["idx_node"] = np.arange(len(parent_nodes))
+    parent_nodes["id_links"] = ["0", "0,1", "1,2", "2"]
+    parent_nodes["n_links"] = [1, 2, 2, 1]
+    parent_nodes["type_io"] = ["inlet", "neither", "neither", "outlet"]
+    parent_nodes["schema_rg"] = "rg-v1"
+
+    parent_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 0, "id_nodes": "0, 1", "id_us_node": 0, "id_ds_node": 1, "geometry": LineString([(0, 0), (10, 0)])},
+            {"id_link": 1, "id_nodes": "1, 2", "id_us_node": 1, "id_ds_node": 2, "geometry": LineString([(10, 0), (20, 0)])},
+            {"id_link": 2, "id_nodes": "2, 3", "id_us_node": 2, "id_ds_node": 3, "geometry": LineString([(20, 0), (30, 0)])},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    parent_links["idx_link"] = ""
+    parent_links["n_nodes"] = 2
+    parent_links["is_inlet"] = [True, False, False]
+    parent_links["is_outlet"] = [False, False, True]
+    parent_links["type_io"] = ["inlet", "neither", "outlet"]
+    parent_links["schema_rg"] = "rg-v1"
+    parent_links["link_conn"] = ""
+    parent_links["wid_pix"] = ""
+    parent_links["len"] = [10.0, 10.0, 10.0]
+    parent_links["wid"] = [4.0, 4.0, 4.0]
+    parent_links["wid_adj"] = [4.0, 4.0, 4.0]
+    parent_links["wid_med"] = [4.0, 4.0, 4.0]
+    parent_links["len_adj"] = [10.0, 10.0, 10.0]
+    parent_links["sinuosity"] = [1.0, 1.0, 1.0]
+
+    child_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 10, "is_inlet": True, "is_outlet": False, "geometry": Point(0, 0)},
+            {"id_node": 11, "is_inlet": False, "is_outlet": False, "geometry": Point(10, 0)},
+            {"id_node": 12, "is_inlet": False, "is_outlet": True, "geometry": Point(20, 0)},
+            {"id_node": 13, "is_inlet": False, "is_outlet": False, "geometry": Point(20, -10)},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    child_nodes["idx_node"] = np.arange(len(child_nodes))
+    child_nodes["id_links"] = ["20", "20,21,22", "21", "22"]
+    child_nodes["n_links"] = [1, 3, 1, 1]
+    child_nodes["type_io"] = ["inlet", "neither", "outlet", "neither"]
+    child_nodes["schema_rg"] = "rg-v1"
+
+    child_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 20, "id_nodes": "10, 11", "geometry": LineString([(0, 0), (10, 0)])},
+            {"id_link": 21, "id_nodes": "11, 12", "geometry": LineString([(10, 0), (20, 0)])},
+            {"id_link": 22, "id_nodes": "11, 13", "geometry": LineString([(10, 0), (20, -10)])},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    child_links["idx_link"] = ""
+    child_links["n_nodes"] = 2
+    child_links["id_us_node"] = pd.NA
+    child_links["id_ds_node"] = pd.NA
+    child_links["is_inlet"] = [True, False, False]
+    child_links["is_outlet"] = [False, True, False]
+    child_links["type_io"] = ["inlet", "outlet", "neither"]
+    child_links["schema_rg"] = "rg-v1"
+    child_links["link_conn"] = ""
+    child_links["wid_pix"] = ""
+    child_links["len"] = [10.0, 10.0, 14.0]
+    child_links["wid"] = [4.0, 4.0, 4.0]
+    child_links["wid_adj"] = [4.0, 4.0, 4.0]
+    child_links["wid_med"] = [4.0, 4.0, 4.0]
+    child_links["len_adj"] = [10.0, 10.0, 14.0]
+    child_links["sinuosity"] = [1.0, 1.0, 1.0]
+
+    parent_order, _, _ = _infer_parent_node_order(parent_links, parent_nodes)
+    node_match = _match_child_nodes_to_parent_nodes(
+        parent_nodes,
+        child_nodes,
+        match_tolerance=1.0,
+        parent_node_order=parent_order,
+    )
+    link_match = _match_child_links_to_parent_links(
+        parent_links,
+        child_links,
+        match_tolerance=1.0,
+    )
+    directed_links, directed_nodes, summary = _assign_variant_directions(
+        child_links=child_links,
+        child_nodes=child_nodes,
+        parent_links=parent_links,
+        parent_nodes=parent_nodes,
+        node_match=node_match,
+        link_match=link_match,
+    )
+
+    outlet_links = directed_links.loc[directed_links["is_outlet"].fillna(False), "id_link"].astype(int).tolist()
+    outlet_nodes = directed_nodes.loc[directed_nodes["is_outlet"].fillna(False), "id_node"].astype(int).tolist()
+    assert outlet_links == [21]
+    assert outlet_nodes == [12]
+    assert summary["sink_nodes"] == [12]
+    assert summary["canonical_sink_nodes"] == [12]
+    assert sorted(summary["topology_sink_nodes"]) == [12, 13]
+
+
 def test_segment_collapsed_links_to_anchor_nodes_splits_link_at_nominal_parent_nodes() -> None:
     parent_nodes = gpd.GeoDataFrame(
         [
@@ -936,6 +1049,10 @@ def test_segment_collapsed_links_to_anchor_nodes_splits_link_at_nominal_parent_n
     assert kept["wid_pix"] == "20.000000,30.000000"
     assert int(kept["id_us_node"]) in set(updated_nodes["id_node"].astype(int))
     assert int(kept["id_ds_node"]) in set(updated_nodes["id_node"].astype(int))
+    outlet_flags = dict(zip(updated_links["id_link"].astype(int), updated_links["is_outlet"].astype(bool)))
+    inlet_flags = dict(zip(updated_links["id_link"].astype(int), updated_links["is_inlet"].astype(bool)))
+    assert sum(outlet_flags.values()) == 1
+    assert sum(inlet_flags.values()) == 1
 
     matched_pairs = {
         (int(row.child_id_node), int(row.matched_parent_node_id))

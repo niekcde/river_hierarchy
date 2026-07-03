@@ -1433,6 +1433,97 @@ def _type_io_label(*, is_inlet: bool, is_outlet: bool) -> str:
     return "neither"
 
 
+def _resolve_canonical_child_boundary_nodes(
+    *,
+    parent_nodes: gpd.GeoDataFrame,
+    node_match: pd.DataFrame,
+    topology_source_nodes: Collection[int] = (),
+    topology_sink_nodes: Collection[int] = (),
+) -> tuple[set[int], set[int], list[str]]:
+    issues: list[str] = []
+    if node_match.empty or "matched_parent_node_id" not in node_match.columns:
+        return set(), set(), issues
+
+    if parent_nodes.empty or not {"id_node", "is_inlet", "is_outlet"}.issubset(parent_nodes.columns):
+        return set(), set(), issues
+
+    parent_lookup = parent_nodes.set_index("id_node", drop=False)[["is_inlet", "is_outlet"]].to_dict("index")
+    matches = node_match.copy()
+    matches["child_id_node"] = pd.to_numeric(matches["child_id_node"], errors="coerce")
+    matches["matched_parent_node_id"] = pd.to_numeric(matches["matched_parent_node_id"], errors="coerce")
+    matches = matches.dropna(subset=["child_id_node", "matched_parent_node_id"]).copy()
+    if matches.empty:
+        return set(), set(), issues
+
+    matches["child_id_node"] = matches["child_id_node"].astype(int)
+    matches["matched_parent_node_id"] = matches["matched_parent_node_id"].astype(int)
+    if "match_distance" in matches.columns:
+        matches["match_distance"] = pd.to_numeric(matches["match_distance"], errors="coerce")
+    else:
+        matches["match_distance"] = np.nan
+    if "parent_node_order" in matches.columns:
+        matches["parent_node_order"] = pd.to_numeric(matches["parent_node_order"], errors="coerce")
+    else:
+        matches["parent_node_order"] = np.nan
+
+    canonical_inlet_nodes: set[int] = set()
+    canonical_outlet_nodes: set[int] = set()
+    topology_source_node_set = {int(node_id) for node_id in topology_source_nodes}
+    topology_sink_node_set = {int(node_id) for node_id in topology_sink_nodes}
+    for parent_node_id, flags in parent_lookup.items():
+        is_inlet = bool(flags.get("is_inlet", False))
+        is_outlet = bool(flags.get("is_outlet", False))
+        if not is_inlet and not is_outlet:
+            continue
+
+        candidates = matches.loc[matches["matched_parent_node_id"] == int(parent_node_id)].copy()
+        if candidates.empty:
+            fallback_candidates = matches.iloc[0:0].copy()
+            if is_inlet and topology_source_node_set:
+                fallback_candidates = matches.loc[matches["child_id_node"].isin(topology_source_node_set)].copy()
+                if not fallback_candidates.empty:
+                    fallback_candidates = fallback_candidates.sort_values(
+                        ["parent_node_order", "match_distance", "child_id_node"],
+                        kind="mergesort",
+                        na_position="last",
+                    )
+            if is_outlet and topology_sink_node_set:
+                fallback_candidates = matches.loc[matches["child_id_node"].isin(topology_sink_node_set)].copy()
+                if not fallback_candidates.empty:
+                    fallback_candidates = fallback_candidates.sort_values(
+                        ["parent_node_order", "match_distance", "child_id_node"],
+                        ascending=[False, True, True],
+                        kind="mergesort",
+                        na_position="last",
+                    )
+            if fallback_candidates.empty:
+                issues.append(f"No child node match was found for canonical parent boundary node {int(parent_node_id)}.")
+                continue
+            candidates = fallback_candidates
+
+        if is_inlet and "child_is_inlet_raw" in candidates.columns:
+            preferred = candidates.loc[candidates["child_is_inlet_raw"].fillna(False)]
+            if not preferred.empty:
+                candidates = preferred.copy()
+        if is_outlet and "child_is_outlet_raw" in candidates.columns:
+            preferred = candidates.loc[candidates["child_is_outlet_raw"].fillna(False)]
+            if not preferred.empty:
+                candidates = preferred.copy()
+
+        candidates = candidates.sort_values(
+            ["match_distance", "child_id_node"],
+            kind="mergesort",
+            na_position="last",
+        )
+        child_node_id = int(candidates.iloc[0]["child_id_node"])
+        if is_inlet:
+            canonical_inlet_nodes.add(child_node_id)
+        if is_outlet:
+            canonical_outlet_nodes.add(child_node_id)
+
+    return canonical_inlet_nodes, canonical_outlet_nodes, issues
+
+
 def _infer_parent_node_order(
     parent_links: gpd.GeoDataFrame,
     parent_nodes: gpd.GeoDataFrame,
@@ -2602,6 +2693,14 @@ def _segment_collapsed_links_to_anchor_nodes(
             new_row["id_nodes"] = f"{int(segment_node_ids[index])}, {int(segment_node_ids[index + 1])}"
             if "raw_id_nodes" in new_row:
                 new_row["raw_id_nodes"] = new_row["id_nodes"]
+            segment_is_inlet = bool(row_data.get("is_inlet", False)) and index == 0
+            segment_is_outlet = bool(row_data.get("is_outlet", False)) and index == (len(segments) - 1)
+            if "is_inlet" in new_row:
+                new_row["is_inlet"] = segment_is_inlet
+            if "is_outlet" in new_row:
+                new_row["is_outlet"] = segment_is_outlet
+            if "type_io" in new_row:
+                new_row["type_io"] = _type_io_label(is_inlet=segment_is_inlet, is_outlet=segment_is_outlet)
             new_row["id_link"] = int(link_id) if index == keep_index else int(next_link_id)
             if index != keep_index:
                 next_link_id += 1
@@ -3441,8 +3540,24 @@ def _assign_variant_directions(
         )
         report = validate_single_inlet_single_outlet(child_graph, require_flag_match=False)
 
-    source_nodes = sorted(int(node_id) for node_id in report.source_nodes)
-    sink_nodes = sorted(int(node_id) for node_id in report.sink_nodes)
+    topology_source_nodes = sorted(int(node_id) for node_id in report.source_nodes)
+    topology_sink_nodes = sorted(int(node_id) for node_id in report.sink_nodes)
+    canonical_source_nodes, canonical_sink_nodes, canonical_issues = _resolve_canonical_child_boundary_nodes(
+        parent_nodes=parent_nodes,
+        node_match=node_match,
+        topology_source_nodes=topology_source_nodes,
+        topology_sink_nodes=topology_sink_nodes,
+    )
+    source_nodes = (
+        sorted(int(node_id) for node_id in canonical_source_nodes)
+        if canonical_source_nodes
+        else topology_source_nodes
+    )
+    sink_nodes = (
+        sorted(int(node_id) for node_id in canonical_sink_nodes)
+        if canonical_sink_nodes
+        else topology_sink_nodes
+    )
     source_node = source_nodes[0] if len(source_nodes) == 1 else None
     sink_node = sink_nodes[0] if len(sink_nodes) == 1 else None
     source_node_set = set(source_nodes)
@@ -3544,8 +3659,12 @@ def _assign_variant_directions(
         "n_oriented_links": int(len(directed_links)),
         "n_node_matches": int(node_match["match_within_tolerance"].fillna(False).sum()),
         "n_link_matches": int(link_match["child_id_link"].nunique()),
-        "issues": list(report.issues),
+        "issues": list(report.issues) + canonical_issues,
         "validation_report": report.to_dict(),
+        "topology_source_nodes": topology_source_nodes,
+        "topology_sink_nodes": topology_sink_nodes,
+        "canonical_source_nodes": sorted(int(node_id) for node_id in canonical_source_nodes),
+        "canonical_sink_nodes": sorted(int(node_id) for node_id in canonical_sink_nodes),
     }
     return directed_links, directed_nodes, summary
 

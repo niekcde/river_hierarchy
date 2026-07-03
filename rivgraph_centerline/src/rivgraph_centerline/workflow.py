@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import shutil
+import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -356,7 +358,8 @@ def run_rivgraph_for_run(
     _sanitize_rivgraph_topology_metadata(network.links, network.nodes)
     network.finalize_ids()
     network.compute_link_width_and_length()
-    network.compute_centerline()
+    with _rivgraph_centerline_compat():
+        network.compute_centerline()
     flow_mesh_summary: dict[str, object] | None = None
     flow_directions_assigned = False
     if assign_flow:
@@ -661,3 +664,49 @@ def _sanitize_rivgraph_topology_metadata(links: dict[str, object], nodes: dict[s
 
     if "super_apex" in nodes and nodes["super_apex"] not in valid_node_ids:
         del nodes["super_apex"]
+
+
+def _sanitize_rivgraph_centerline_link_fields(links: dict[str, object]) -> None:
+    """Remove scalar/private link metadata that RivGraph centerline code cannot index."""
+
+    n_links = len(links.get("id", []))
+    for key in list(links.keys()):
+        if key in {"id", "n_networks"}:
+            continue
+        value = links[key]
+        if key.startswith("_") or isinstance(value, (str, bytes)):
+            del links[key]
+            continue
+        try:
+            value_len = len(value)
+        except TypeError:
+            del links[key]
+            continue
+        if value_len != n_links:
+            del links[key]
+
+
+@contextmanager
+def _rivgraph_centerline_compat():
+    """Patch RivGraph centerline internals to ignore non-per-link metadata fields."""
+
+    lnu = sys.modules.get("rivgraph.ln_utils")
+    if lnu is None:
+        try:
+            import rivgraph.ln_utils as lnu  # type: ignore[no-redef]
+        except ModuleNotFoundError:
+            yield
+            return
+
+    original = lnu.link_widths_and_lengths
+
+    def patched_link_widths_and_lengths(*args, **kwargs):
+        links = original(*args, **kwargs)
+        _sanitize_rivgraph_centerline_link_fields(links)
+        return links
+
+    lnu.link_widths_and_lengths = patched_link_widths_and_lengths
+    try:
+        yield
+    finally:
+        lnu.link_widths_and_lengths = original

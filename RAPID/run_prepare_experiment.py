@@ -65,6 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-celerity-mps", type=float, default=1.524, help="Maximum celerity bound in m/s when celerity capping is enabled.")
     parser.add_argument("--use-stability-effective-length-cap", action="store_true", help="In unstable or near-unstable states, shorten K-only effective lengths on minimum-celerity reaches to the maximum value allowed by the current dt_max and the requested safety margin.")
     parser.add_argument("--stability-effective-length-cap-margin-seconds", type=float, default=10.0, help="Requested safety margin below dt_max when deriving the statewise K-only effective-length cap.")
+    parser.add_argument("--stability-effective-length-cap-celerity-rel-buffer", type=float, default=0.03, help="Relative buffer above min-celerity that is still treated as near-floor for the stability effective-length cap.")
+    parser.add_argument("--preferred-routing-dt-seconds", type=int, help="Preferred universal routing timestep. When multiple admissible divisors exist, choose the one closest to this value instead of the midpoint of the stability interval.")
+    parser.add_argument("--forcing-dt-search-max-offset-seconds", type=int, default=120, help="If the current forcing timestep has no admissible routing divisor, search nearby forcing timesteps within this offset to find a compatible routing timestep.")
     parser.add_argument("--target-subreach-length-m", type=float, help="Target RAPID-only subreach length in meters. Long links are split using max(1, round(L / target)).")
     parser.add_argument("--min-slope", type=float, default=1e-6, help="Legacy metadata only. Effective slope limits should be applied during variant hydraulic-context generation, not RAPID prep.")
     parser.add_argument("--max-slope-for-k", type=float, help="Legacy metadata only. Effective slope limits should be applied during variant hydraulic-context generation, not RAPID prep.")
@@ -119,6 +122,9 @@ def main(argv: list[str] | None = None) -> int:
             max_celerity_mps=args.max_celerity_mps,
             use_stability_effective_length_cap=args.use_stability_effective_length_cap,
             stability_effective_length_cap_margin_seconds=args.stability_effective_length_cap_margin_seconds,
+            stability_effective_length_cap_celerity_rel_buffer=args.stability_effective_length_cap_celerity_rel_buffer,
+            preferred_routing_dt_seconds=args.preferred_routing_dt_seconds,
+            forcing_dt_search_max_offset_seconds=args.forcing_dt_search_max_offset_seconds,
             target_subreach_length_m=args.target_subreach_length_m,
             min_slope=args.min_slope,
             max_slope_for_k=args.max_slope_for_k,
