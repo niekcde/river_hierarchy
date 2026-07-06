@@ -5,8 +5,10 @@ import types
 from pathlib import Path
 
 import numpy as np
+import geopandas as gpd
 import rasterio
 from rasterio.transform import from_origin
+from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPoint, Point, Polygon
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = PROJECT_ROOT / "rivgraph_centerline" / "src"
@@ -17,6 +19,8 @@ from rivgraph_centerline.raster_mask import crop_binary_mask
 from rivgraph_centerline.workflow import (
     WorkflowPaths,
     _clear_rivgraph_outputs,
+    _patched_rivgraph_dir_centerline,
+    _representative_project_point,
     _sanitize_rivgraph_centerline_link_fields,
     prepare_binary_projected_mask,
     run_rivgraph_for_run,
@@ -114,6 +118,92 @@ def test_sanitize_rivgraph_centerline_link_fields_drops_scalar_metadata() -> Non
     _sanitize_rivgraph_centerline_link_fields(links)
 
     assert set(links) == {"id", "idx", "conn", "len", "n_networks"}
+
+
+def test_representative_project_point_reduces_non_point_geometries() -> None:
+    multipoint = MultiPoint([(0, 0), (1, 1)])
+    multiline = MultiLineString([[(0, 0), (4, 0)], [(0, 0), (1, 0)]])
+    geom_collection = GeometryCollection([LineString([(0, 0), (2, 0)]), Point(3, 3)])
+
+    reduced_multipoint = _representative_project_point(multipoint)
+    reduced_multiline = _representative_project_point(multiline)
+    reduced_collection = _representative_project_point(geom_collection)
+
+    assert isinstance(reduced_multipoint, Point)
+    assert tuple(reduced_multipoint.coords)[0] == (0.0, 0.0)
+    assert isinstance(reduced_multiline, Point)
+    assert reduced_multiline.equals(Point(2, 0))
+    assert isinstance(reduced_collection, Point)
+    assert reduced_collection.equals(Point(3, 3))
+
+
+def test_patched_rivgraph_dir_centerline_averages_ambiguous_mesh_membership() -> None:
+    class DummyDy:
+        @staticmethod
+        def algmap(name: str) -> str:
+            return name
+
+        @staticmethod
+        def get_link_vector(links, nodes, link_id, imshape, pixlen=1.0):
+            return np.array([1.0, 0.0])
+
+    class DummyGu:
+        @staticmethod
+        def xy_to_coords(cols, rows, gt):
+            return np.asarray(cols, dtype=float), np.asarray(rows, dtype=float)
+
+    def original_dir_centerline(*args, **kwargs):
+        raise AssertionError("patched wrapper should be used instead")
+
+    original_dir_centerline.__globals__.update(
+        {
+            "gpd": gpd,
+            "np": np,
+            "Point": Point,
+            "Polygon": Polygon,
+            "gu": DummyGu,
+            "dy": DummyDy,
+            "math": __import__("math"),
+        }
+    )
+
+    links = {
+        "id": [10],
+        "conn": [[1, 2]],
+        "idx": [[0, 1]],
+        "guess": [[]],
+        "guess_alg": [[]],
+    }
+    nodes = {"id": [1, 2], "idx": [0, 1]}
+    meshpolys = [
+        Polygon([(0, -1), (1, -1), (1, 1), (0, 1)]),
+        Polygon([(1, -1), (2, -1), (2, 1), (1, 1)]),
+        Polygon([(2, -1), (3, -1), (3, 1), (2, 1)]),
+    ]
+    meshlines = [
+        LineString([(0, -1), (0, 1)]),
+        LineString([(1, -1), (1, 1)]),
+        LineString([(2, -1), (2, 1)]),
+        LineString([(3, -1), (3, 1)]),
+    ]
+    imask = np.zeros((3, 3), dtype=int)
+    gt = (0.0, 1.0, 0.0, 0.0, 0.0, -1.0)
+
+    result = _patched_rivgraph_dir_centerline(
+        original_dir_centerline,
+        links,
+        nodes,
+        meshpolys,
+        meshlines,
+        imask,
+        gt,
+        1.0,
+    )
+
+    assert np.isclose(result["cldists"][0, 0], 0.5)
+    assert result["guess"][0] == [1, 1]
+    assert result["guess_alg"][0] == ["cl_dist_guess", "cl_ang_guess"]
+    assert np.isfinite(result["clangs"][0, 0])
 
 
 def test_run_rivgraph_for_run_cleans_stale_outputs_before_rerun(tmp_path, monkeypatch) -> None:

@@ -16,7 +16,8 @@ import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import calculate_default_transform, reproject
-from shapely.geometry import Polygon
+from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPoint, Point, Polygon
+from shapely.geometry.base import BaseGeometry
 
 from rivgraph_centerline.manual_edits import apply_manual_edits
 from rivgraph_centerline.raster_mask import crop_binary_mask
@@ -264,7 +265,8 @@ def _assign_flow_directions_with_mesh_mode(
         try:
             network.single_thread = True
             network.compute_mesh(single_thread=True)
-            network.assign_flow_directions()
+            with _rivgraph_flow_direction_compat():
+                network.assign_flow_directions()
             return {
                 "requested": flow_mesh_mode,
                 "used": "centerline",
@@ -285,7 +287,8 @@ def _assign_flow_directions_with_mesh_mode(
 
     try:
         network.single_thread = False
-        network.assign_flow_directions()
+        with _rivgraph_flow_direction_compat():
+            network.assign_flow_directions()
         return {
             "requested": flow_mesh_mode,
             "used": "valley",
@@ -302,7 +305,8 @@ def _assign_flow_directions_with_mesh_mode(
             _clear_partial_mesh(network)
             network.single_thread = True
             network.compute_mesh(single_thread=True)
-            network.assign_flow_directions()
+            with _rivgraph_flow_direction_compat():
+                network.assign_flow_directions()
             return {
                 "requested": flow_mesh_mode,
                 "used": "centerline",
@@ -684,6 +688,163 @@ def _sanitize_rivgraph_centerline_link_fields(links: dict[str, object]) -> None:
             continue
         if value_len != n_links:
             del links[key]
+
+
+def _representative_project_point(geometry: object) -> object:
+    """Reduce non-point Shapely intersections to a single representative point."""
+
+    if geometry is None or not hasattr(geometry, "geom_type") or getattr(geometry, "is_empty", False):
+        return geometry
+    if isinstance(geometry, Point):
+        return geometry
+    if isinstance(geometry, MultiPoint):
+        return list(geometry.geoms)[0] if len(geometry.geoms) else geometry
+    if isinstance(geometry, LineString):
+        return geometry.interpolate(0.5, normalized=True)
+    if isinstance(geometry, MultiLineString):
+        lines = [line for line in geometry.geoms if not line.is_empty]
+        if not lines:
+            return geometry
+        longest = max(lines, key=lambda line: line.length)
+        return longest.interpolate(0.5, normalized=True)
+    if isinstance(geometry, GeometryCollection):
+        points = [geom for geom in geometry.geoms if isinstance(geom, Point) and not geom.is_empty]
+        if points:
+            return points[0]
+        lines = [geom for geom in geometry.geoms if isinstance(geom, (LineString, MultiLineString)) and not geom.is_empty]
+        if lines:
+            return _representative_project_point(max(lines, key=lambda line: line.length))
+    if hasattr(geometry, "representative_point"):
+        return geometry.representative_point()
+    return geometry
+
+
+def _patched_rivgraph_dir_centerline(
+    original: object,
+    links: dict[str, object],
+    nodes: dict[str, object],
+    meshpolys: list[object],
+    meshlines: list[object],
+    Imask: np.ndarray,
+    gt: tuple[float, ...],
+    pixlen: float,
+) -> dict[str, object]:
+    """Compatibility wrapper for RivGraph dir_centerline with ambiguous joins."""
+
+    gpd_module = original.__globals__["gpd"]
+    np_module = original.__globals__["np"]
+    Point_cls = original.__globals__["Point"]
+    Polygon_cls = original.__globals__["Polygon"]
+    gu_module = original.__globals__["gu"]
+    dy_module = original.__globals__["dy"]
+    math_module = original.__globals__["math"]
+
+    alg = dy_module.algmap("cl_dist_guess")
+    mp_gdf = gpd_module.GeoDataFrame(geometry=[Polygon_cls(mp) for mp in meshpolys])
+    rc = np_module.unravel_index(nodes["idx"], Imask.shape)
+    nodecoords = gu_module.xy_to_coords(rc[1], rc[0], gt)
+    node_gdf = gpd_module.GeoDataFrame(
+        geometry=[Point_cls(x, y) for x, y in zip(nodecoords[0], nodecoords[1])],
+        index=nodes["id"],
+    )
+
+    intersect = gpd_module.sjoin(node_gdf, mp_gdf, predicate="intersects", rsuffix="right")
+    node_mesh_index = intersect.groupby(level=0)["index_right"].mean() if not intersect.empty else pd.Series(dtype=float)
+
+    cldists = np_module.zeros((len(links["id"]), 1))
+    for i, lconn in enumerate(links["conn"]):
+        first = node_mesh_index.get(lconn[0])
+        second = node_mesh_index.get(lconn[1])
+        if pd.isna(first) or pd.isna(second):
+            continue
+        cldists[i] = float(second) - float(first)
+
+    for i, c in enumerate(cldists):
+        if c != 0:
+            if c > 0:
+                links["guess"][i].append(links["conn"][i][0])
+                links["guess_alg"][i].append(alg)
+            elif c < 0:
+                links["guess"][i].append(links["conn"][i][-1])
+                links["guess_alg"][i].append(alg)
+
+    links["cldists"] = np_module.abs(cldists)
+
+    alg = dy_module.algmap("cl_ang_guess")
+    clangs = np_module.ones((len(links["id"]), 1)) * np_module.nan
+    for i, (lconn, lidx) in enumerate(zip(links["conn"], links["idx"])):
+        first = node_mesh_index.get(lconn[0])
+        second = node_mesh_index.get(lconn[1])
+        if pd.isna(first) or pd.isna(second):
+            continue
+        first_idx = int(np_module.floor(min(first, second)))
+        second_idx = int(np_module.floor(max(first, second)))
+        if second_idx + 1 >= len(meshlines):
+            continue
+
+        first_coords = np_module.asarray(meshlines[first_idx].coords)
+        second_coords = np_module.asarray(meshlines[second_idx + 1].coords)
+        first_mp = np_module.mean(first_coords, axis=0)
+        second_mp = np_module.mean(second_coords, axis=0)
+
+        cl_vec = second_mp - first_mp
+        norm = np_module.sqrt(np_module.sum(cl_vec**2))
+        if not np_module.isfinite(norm) or norm == 0:
+            continue
+        cl_vec = cl_vec / norm
+
+        link_vec = dy_module.get_link_vector(links, nodes, links["id"][i], Imask.shape, pixlen=pixlen)
+        link_vec_rev = -link_vec
+        lva = math_module.atan2(np_module.linalg.det([cl_vec, link_vec]), np_module.dot(cl_vec, link_vec))
+        lvar = math_module.atan2(np_module.linalg.det([cl_vec, link_vec_rev]), np_module.dot(cl_vec, link_vec_rev))
+
+        clangs[i] = np_module.min(np_module.abs([lva, lvar]))
+        if np_module.abs(lvar) < np_module.abs(lva):
+            links["guess"][i].append(links["conn"][i][1])
+            links["guess_alg"][i].append(alg)
+        else:
+            links["guess"][i].append(links["conn"][i][0])
+            links["guess_alg"][i].append(alg)
+    links["clangs"] = clangs
+
+    return links
+
+
+@contextmanager
+def _rivgraph_flow_direction_compat():
+    """Patch RivGraph direction internals for modern Shapely/GeoPandas behavior."""
+
+    try:
+        import rivgraph.rivers.river_directionality as rd
+    except ModuleNotFoundError:
+        yield
+        return
+
+    original_project = BaseGeometry.project
+    original_dir_centerline = rd.dir_centerline
+
+    def patched_project(self, other, *args, **kwargs):
+        return original_project(self, _representative_project_point(other), *args, **kwargs)
+
+    def patched_dir_centerline(links, nodes, meshpolys, meshlines, Imask, gt, pixlen):
+        return _patched_rivgraph_dir_centerline(
+            original_dir_centerline,
+            links,
+            nodes,
+            meshpolys,
+            meshlines,
+            Imask,
+            gt,
+            pixlen,
+        )
+
+    BaseGeometry.project = patched_project
+    rd.dir_centerline = patched_dir_centerline
+    try:
+        yield
+    finally:
+        BaseGeometry.project = original_project
+        rd.dir_centerline = original_dir_centerline
 
 
 @contextmanager
