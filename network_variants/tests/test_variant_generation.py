@@ -135,6 +135,8 @@ def test_compute_width_families_base_channel_preserves_single_thread_width(tmp_p
     assert float(enriched.loc[0, "wid_adj_dry"]) < 1.0
     assert int(enriched.loc[0, "n_wet_threads_max"]) == 1
     assert int(enriched.loc[0, "n_channels_max"]) == 1
+    assert np.isclose(float(enriched.loc[0, "qc_mean_opposition_cos_trimmed"]), -1.0, atol=1e-6)
+    assert np.isclose(float(enriched.loc[0, "qc_min_opposition_cos"]), -1.0, atol=1e-6)
     assert set(samples["width_method"]) == {"two_bank_dt"}
     assert int(samples["n_channels"].max()) == 1
 

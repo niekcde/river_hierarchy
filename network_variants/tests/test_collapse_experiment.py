@@ -14,6 +14,7 @@ from network_variants.collapse_experiment import (
     BaseStateVariantOutputs,
     ExperimentStateContext,
     _build_unit_link_membership,
+    _ensure_seed_direction_columns,
     _normalize_numeric_id_columns,
     _write_equivalent_transition_outputs,
     main,
@@ -614,6 +615,78 @@ def test_base_state_is_materialized_as_local_variant_outputs(tmp_path: Path) -> 
     assert state_hydraulic_context_runner.calls
 
 
+def test_base_only_stops_after_materializing_base_state(tmp_path: Path) -> None:
+    workflow_runner = _make_workflow_runner([_workflow_outputs([5])])
+    variant_runner = _make_variant_runner()
+    base_state_materializer = _make_base_state_materializer()
+    state_hydraulic_context_runner = _make_state_hydraulic_context_runner()
+
+    results = run_collapse_experiment(
+        "independent-units",
+        cleaned_mask_path=tmp_path / "base_cleaned.tif",
+        reviewed_links_path=tmp_path / "base_links.gpkg",
+        reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=tmp_path / "experiment",
+        unit_workflow_runner=workflow_runner,
+        unit_workflow_writer=write_unit_workflow_outputs,
+        variant_runner=variant_runner,
+        base_state_variant_materializer=base_state_materializer,
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
+        base_only=True,
+    )
+
+    assert list(results.state_registry["state_id"]) == ["S000_base"]
+    assert results.transition_registry.empty
+    assert results.manifest["stop_reason"] == "base_only_requested"
+    assert results.manifest["options"]["variant"]["base_only"] is True
+    assert len(workflow_runner.calls) == 1
+    assert not variant_runner.calls
+    assert base_state_materializer.calls
+    assert state_hydraulic_context_runner.calls
+
+
+def test_seed_direction_columns_uses_raw_id_nodes_when_explicit_direction_missing() -> None:
+    links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": 1,
+                "id_nodes": "10, 11",
+                "id_us_node": pd.NA,
+                "id_ds_node": pd.NA,
+                "geometry": None,
+            },
+            {
+                "id_link": 2,
+                "id_nodes": "11, 12",
+                "id_us_node": pd.NA,
+                "id_ds_node": pd.NA,
+                "geometry": None,
+            },
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 10, "is_inlet": True, "is_outlet": False, "geometry": None},
+            {"id_node": 11, "is_inlet": False, "is_outlet": False, "geometry": None},
+            {"id_node": 12, "is_inlet": False, "is_outlet": True, "geometry": None},
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+
+    seeded = _ensure_seed_direction_columns(links, nodes)
+
+    assert seeded["id_us_node"].astype(int).tolist() == [10, 11]
+    assert seeded["id_ds_node"].astype(int).tolist() == [11, 12]
+    assert seeded["is_inlet"].tolist() == [True, False]
+    assert seeded["is_outlet"].tolist() == [False, True]
+    assert seeded["type_io"].tolist() == ["inlet", "outlet"]
+    assert seeded["direction_assignment_method"].tolist() == ["raw_id_nodes_seed", "raw_id_nodes_seed"]
+
+
 def test_anchored_collapse_corridor_mode_is_passed_to_variant_generation(tmp_path: Path) -> None:
     workflow_runner = _make_workflow_runner([_workflow_outputs([5]), _workflow_outputs([])])
     variant_runner = _make_variant_runner()
@@ -782,6 +855,92 @@ def test_main_runs_both_collapse_corridor_modes_with_suffixed_outputs(
     assert [Path(call["output_dir"]).name for call in calls] == ["demo_output__realized", "demo_output__anchored"]
     assert "variant_runner" not in calls[0]
     assert callable(calls[1]["variant_runner"])
+
+
+def test_main_passes_base_only_into_run_collapse_experiment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_collapse_experiment(mode: str, **kwargs: Any) -> SimpleNamespace:
+        calls.append({"mode": mode, **dict(kwargs)})
+        output_dir = Path(kwargs["output_dir"])
+        return SimpleNamespace(
+            output_dir=output_dir,
+            state_registry=pd.DataFrame([{"state_id": "S000_base"}]),
+            transition_registry=pd.DataFrame(),
+            equivalent_transition_registry=pd.DataFrame(),
+            manifest={"mode": mode, "stop_reason": "base_only_requested", "terminal_state_id": "S000_base"},
+        )
+
+    monkeypatch.setattr(collapse_experiment_module, "run_collapse_experiment", fake_run_collapse_experiment)
+
+    exit_code = main(
+        [
+            "independent-units",
+            "--cleaned-mask",
+            str(tmp_path / "base_cleaned.tif"),
+            "--reviewed-links",
+            str(tmp_path / "base_links.gpkg"),
+            "--reviewed-nodes",
+            str(tmp_path / "base_nodes.gpkg"),
+            "--exit-sides",
+            "NS",
+            "--output-dir",
+            str(tmp_path / "demo_output"),
+            "--base-only",
+        ]
+    )
+
+    assert exit_code == 0
+    assert len(calls) == 1
+    assert calls[0]["base_only"] is True
+
+
+def test_main_base_only_anchored_spawns_realized_and_anchored_base_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_collapse_experiment(mode: str, **kwargs: Any) -> SimpleNamespace:
+        calls.append({"mode": mode, **dict(kwargs)})
+        output_dir = Path(kwargs["output_dir"])
+        return SimpleNamespace(
+            output_dir=output_dir,
+            state_registry=pd.DataFrame([{"state_id": "S000_base"}]),
+            transition_registry=pd.DataFrame(),
+            equivalent_transition_registry=pd.DataFrame(),
+            manifest={"mode": mode, "stop_reason": "base_only_requested", "terminal_state_id": "S000_base"},
+        )
+
+    monkeypatch.setattr(collapse_experiment_module, "run_collapse_experiment", fake_run_collapse_experiment)
+
+    exit_code = main(
+        [
+            "independent-units",
+            "--cleaned-mask",
+            str(tmp_path / "base_cleaned.tif"),
+            "--reviewed-links",
+            str(tmp_path / "base_links.gpkg"),
+            "--reviewed-nodes",
+            str(tmp_path / "base_nodes.gpkg"),
+            "--exit-sides",
+            "NS",
+            "--output-dir",
+            str(tmp_path / "demo_output"),
+            "--collapse-corridor-mode",
+            "anchored",
+            "--base-only",
+        ]
+    )
+
+    assert exit_code == 0
+    assert len(calls) == 2
+    assert [call["collapse_corridor_mode"] for call in calls] == ["realized", "anchored"]
+    assert [Path(call["output_dir"]).name for call in calls] == ["demo_output__realized", "demo_output__anchored"]
+    assert all(call["base_only"] is True for call in calls)
 
 
 def test_main_anchored_runs_realized_and_anchored_with_suffixed_outputs(

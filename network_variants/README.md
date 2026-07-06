@@ -448,6 +448,9 @@ Important:
   available
 - collapse experiments can be run in `realized`, `anchored`, or `both`
   corridor modes using `--collapse-corridor-mode`
+- use `--base-only` to materialize just `states/S000_base/` when you want to
+  inspect or manually review the directed base network before paying for the
+  full family of derived states
 
 ### Routing Interpretation
 
@@ -491,6 +494,25 @@ Example: independent base-unit variants
   --experiment-id sarl_03_independent_units \
   --collapse-corridor-mode realized
 ```
+
+Example: materialize only the base directed state for review
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python \
+  network_variants/run_collapse_experiment.py \
+  independent-units \
+  --cleaned-mask rivgraph_centerline/outputs/runs/02/masks_cleaned/02_cleaned.tif \
+  --reviewed-links rivgraph_centerline/outputs/runs/02/rivgraph/02_links.gpkg \
+  --reviewed-nodes rivgraph_centerline/outputs/runs/02/rivgraph/02_nodes.gpkg \
+  --exit-sides SN \
+  --experiment-id 02_indep__anchored \
+  --output-dir network_variants/output/02_indep__anchored \
+  --collapse-corridor-mode anchored \
+  --base-only
+```
+
+This writes `states/S000_base/` including the base directed links/nodes and
+hydraulic context, then stops before generating any unit or group child states.
 
 Example: independent compound-bubble variants
 

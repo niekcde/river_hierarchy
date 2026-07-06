@@ -89,6 +89,15 @@ def _compute_family_stats(values: np.ndarray, trim_slice: slice) -> dict[str, fl
     }
 
 
+def _trim_valid_series(values: np.ndarray, trim_slice: slice) -> np.ndarray:
+    trimmed = np.asarray(values[trim_slice], dtype=float)
+    trimmed = trimmed[np.isfinite(trimmed)]
+    if trimmed.size > 0:
+        return trimmed
+    full = np.asarray(values, dtype=float)
+    return full[np.isfinite(full)]
+
+
 def _trim_slice(total_widths: np.ndarray, distances: np.ndarray) -> slice:
     if total_widths.size == 0 or distances.size == 0:
         return slice(0, 0)
@@ -719,6 +728,7 @@ def compute_two_bank_width_families(
         qc_dt_array = np.asarray(qc_relative_dt_diff, dtype=float)
         qc_opp_array = np.asarray(qc_opposition_cos, dtype=float)
         qc_chord_array = np.asarray(qc_width_chord_diff, dtype=float)
+        qc_opp_trimmed = _trim_valid_series(qc_opp_array, trim_slice)
 
         summary_records.append(
             {
@@ -751,6 +761,7 @@ def compute_two_bank_width_families(
                 "qc_mean_relative_dt_diff": float(np.nanmean(qc_dt_array)) if np.isfinite(qc_dt_array).any() else float("nan"),
                 "qc_max_relative_dt_diff": float(np.nanmax(qc_dt_array)) if np.isfinite(qc_dt_array).any() else float("nan"),
                 "qc_mean_width_chord_diff": float(np.nanmean(qc_chord_array)) if np.isfinite(qc_chord_array).any() else float("nan"),
+                "qc_mean_opposition_cos_trimmed": float(np.mean(qc_opp_trimmed)) if qc_opp_trimmed.size else float("nan"),
                 "qc_min_opposition_cos": float(np.nanmin(qc_opp_array)) if np.isfinite(qc_opp_array).any() else float("nan"),
                 "width_method": "two_bank_dt",
             }

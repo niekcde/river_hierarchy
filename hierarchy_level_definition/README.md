@@ -24,6 +24,78 @@ Recommended order:
 5. Build collapse rankings / ordered group partitions in `collapse_decisions/unit_collapse_decisions.py`.
 6. Inspect the same steps in `notebooks/level_detection_workbench.ipynb`.
 
+## Batch Link Reversals Without The GUI
+
+If you already know which reviewed links need to be reversed, you can skip the
+GUI and apply those edits from a CSV with:
+
+- `manual_review/apply_link_reversals.py`
+
+This script:
+
+- reads a CSV with `example_id` and `link_id`
+- reverses every listed link in `manual_review/outputs/<example_id>/directed_links.gpkg`
+- writes a backup first as `directed_links_old.gpkg`
+- updates `manual_link_directions.csv`
+- immediately runs the same network validation step from `graph_building/directed_network_checks.py`
+- writes validation outputs to `graph_building/outputs/<example_id>/`
+
+Expected CSV format:
+
+```csv
+example_id,link_id,note
+sarl_03,154,wrong direction near outlet
+sarl_03,212,
+sarl_07,88,checked manually
+```
+
+Required columns:
+
+- `example_id`
+- `link_id`
+
+Optional columns:
+
+- `note`
+  This is ignored by the script and is only there for your own tracking.
+
+Default command:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python \
+  hierarchy_level_definition/manual_review/apply_link_reversals.py \
+  --csv path/to/manual_link_reversals.csv
+```
+
+Optional flags:
+
+- `--review-root <dir>`
+  Use a different reviewed-network root instead of `hierarchy_level_definition/manual_review/outputs/`.
+- `--validation-root <dir>`
+  Use a different validation-output root instead of `hierarchy_level_definition/graph_building/outputs/`.
+- `--overwrite-old-backup`
+  Overwrite an existing `*_old` backup file if one is already present.
+- `--summary-json <path>`
+  Write the run summary JSON to a custom location instead of `<csv_stem>_summary.json`.
+
+Example with optional flags:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python \
+  hierarchy_level_definition/manual_review/apply_link_reversals.py \
+  --csv path/to/manual_link_reversals.csv \
+  --review-root hierarchy_level_definition/manual_review/outputs \
+  --validation-root hierarchy_level_definition/graph_building/outputs \
+  --summary-json path/to/manual_link_reversals_summary.json
+```
+
+Behavior notes:
+
+- every listed link is reversed exactly once
+- duplicate `example_id` and `link_id` rows are treated as an error
+- if validation fails after the edits, the edited files and validation outputs are still kept for inspection
+- the command exits with a non-zero status if any network fails validation or if any requested edit errors out
+
 If you want one end-to-end runner instead of separate stages, use:
 
 - `run_unit_workflow.py`

@@ -1283,6 +1283,74 @@ def _normalize_numeric_id_columns(
     return result
 
 
+def _type_io_label(*, is_inlet: bool, is_outlet: bool) -> str:
+    if is_inlet and is_outlet:
+        return "both"
+    if is_inlet:
+        return "inlet"
+    if is_outlet:
+        return "outlet"
+    return "neither"
+
+
+def _ensure_seed_direction_columns(
+    links: gpd.GeoDataFrame,
+    nodes: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    result = links.copy()
+    us_nodes = pd.to_numeric(result.get("id_us_node"), errors="coerce")
+    ds_nodes = pd.to_numeric(result.get("id_ds_node"), errors="coerce")
+    if us_nodes is not None and ds_nodes is not None and us_nodes.notna().all() and ds_nodes.notna().all():
+        return result
+
+    node_frame = nodes.copy()
+    node_frame["id_node"] = pd.to_numeric(node_frame["id_node"], errors="coerce").astype("Int64")
+    inlet_nodes = set(
+        node_frame.loc[node_frame.get("is_inlet", False).fillna(False), "id_node"].dropna().astype(int).tolist()
+    )
+    outlet_nodes = set(
+        node_frame.loc[node_frame.get("is_outlet", False).fillna(False), "id_node"].dropna().astype(int).tolist()
+    )
+
+    seeded_us: list[int] = []
+    seeded_ds: list[int] = []
+    seeded_id_nodes: list[str] = []
+    seeded_is_inlet: list[bool] = []
+    seeded_is_outlet: list[bool] = []
+    seeded_type_io: list[str] = []
+
+    for row in result.itertuples(index=False):
+        pair = _parse_int_list(getattr(row, "id_nodes"))
+        if len(pair) != 2:
+            raise ValueError(f"Expected exactly two node ids in id_nodes, got {getattr(row, 'id_nodes')!r}.")
+        us_node, ds_node = int(pair[0]), int(pair[1])
+        is_inlet = us_node in inlet_nodes
+        is_outlet = ds_node in outlet_nodes
+        seeded_us.append(us_node)
+        seeded_ds.append(ds_node)
+        seeded_id_nodes.append(f"{us_node}, {ds_node}")
+        seeded_is_inlet.append(is_inlet)
+        seeded_is_outlet.append(is_outlet)
+        seeded_type_io.append(_type_io_label(is_inlet=is_inlet, is_outlet=is_outlet))
+
+    result["id_us_node"] = pd.Series(seeded_us, index=result.index, dtype="Int64")
+    result["id_ds_node"] = pd.Series(seeded_ds, index=result.index, dtype="Int64")
+    result["id_nodes"] = seeded_id_nodes
+    result["is_inlet"] = seeded_is_inlet
+    result["is_outlet"] = seeded_is_outlet
+    result["type_io"] = seeded_type_io
+    if "direction_assignment_method" not in result.columns:
+        result["direction_assignment_method"] = "raw_id_nodes_seed"
+    else:
+        result["direction_assignment_method"] = result["direction_assignment_method"].where(
+            pd.notna(result["direction_assignment_method"]) & result["direction_assignment_method"].astype(str).ne(""),
+            "raw_id_nodes_seed",
+        )
+    if "geometry_reversed_to_match_flow" not in result.columns:
+        result["geometry_reversed_to_match_flow"] = False
+    return result
+
+
 def _build_identity_link_match(links: gpd.GeoDataFrame) -> pd.DataFrame:
     base_links = links.copy()
     base_links["id_link"] = base_links["id_link"].astype(int)
@@ -1534,6 +1602,7 @@ def _materialize_base_state_variant(
 
     reviewed_links = gpd.read_file(context.reviewed_links_path)
     reviewed_nodes = gpd.read_file(context.reviewed_nodes_path)
+    reviewed_links = _ensure_seed_direction_columns(reviewed_links, reviewed_nodes)
     directed_links = _apply_collapsed_selection_metadata(reviewed_links, unit_ids=[], group_label=None)
     directed_nodes = _apply_collapsed_selection_metadata(reviewed_nodes, unit_ids=[], group_label=None)
     directed_links = _normalize_numeric_id_columns(directed_links)
@@ -1890,6 +1959,7 @@ def run_collapse_experiment(
     equivalent_kb_model_path: str | Path | None = None,
     equivalent_kb_width_sample_field: str = "wid_adj_wet",
     equivalent_kb_width_percentile: float = 90.0,
+    base_only: bool = False,
     equivalent_forcing_table_runner: Callable[..., tuple[pd.DataFrame, dict[str, object]]] = prepare_forcing_table,
     equivalent_reference_kb_summary_runner: Callable[..., dict[str, Any]] = compute_reference_section_kb,
 ) -> CollapseExperimentOutputs:
@@ -2081,6 +2151,7 @@ def run_collapse_experiment(
                     "debug_hierarchy": bool(debug_hierarchy),
                 },
                 "variant": {
+                    "base_only": bool(base_only),
                     "collapse_corridor_mode": collapse_corridor_mode,
                     "exit_sides": exit_sides,
                     "preferred_width_field": preferred_width_field,
@@ -2153,6 +2224,18 @@ def run_collapse_experiment(
         )
         state_records[0] = _state_record(base_context, mode)
         write_metadata()
+
+    if base_only:
+        stop_reason = "base_only_requested"
+        terminal_state_id = base_context.state_id
+        write_metadata()
+        return CollapseExperimentOutputs(
+            state_registry=pd.DataFrame.from_records(state_records),
+            transition_registry=pd.DataFrame.from_records(transition_records),
+            equivalent_transition_registry=_equivalent_transition_frame(equivalent_transition_records),
+            output_dir=output_path,
+            manifest=json.loads((output_path / "experiment_manifest.json").read_text(encoding="utf-8")),
+        )
 
     if mode in {"independent-units", "compound-bubbles"}:
         if mode == "compound-bubbles":
@@ -2616,6 +2699,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-compound-bubble-slope-qc", action="store_true", help="Disable compound-bubble path-drop QC during state hydraulic-context generation.")
     parser.add_argument("--disable-compound-bubble-slope-repair", action="store_true", help="Disable compound-bubble slope repair during state hydraulic-context generation.")
     parser.add_argument("--verbose-rivgraph", action="store_true", help="Print RivGraph progress to stdout.")
+    parser.add_argument(
+        "--base-only",
+        action="store_true",
+        help=(
+            "Materialize only the S000_base state, including its directed variant and hydraulic context, "
+            "then stop before building derived unit/group states."
+        ),
+    )
     return parser
 
 
@@ -2694,6 +2785,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "equivalent_kb_model_path": args.equivalent_kb_model_path,
         "equivalent_kb_width_sample_field": args.equivalent_kb_width_sample_field,
         "equivalent_kb_width_percentile": args.equivalent_kb_width_percentile,
+        "base_only": args.base_only,
     }
 
     persist_realized_and_anchored = args.collapse_corridor_mode in {"both", "anchored"}
