@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import geopandas as gpd
+import pandas as pd
 import pytest
 from shapely.geometry import LineString, Point
 
@@ -12,7 +13,9 @@ from hierarchy_level_definition.manual_review.apply_link_reversals import (
     DEFAULT_LINK_CSV_NAME,
     DEFAULT_NODES_NAME,
     build_manual_direction_frame,
+    filter_requests_to_example,
     load_requests,
+    normalize_example_id,
     process_example,
 )
 
@@ -117,7 +120,7 @@ def test_process_example_reverses_links_and_runs_validation(tmp_path: Path) -> N
         [12],
         review_root=review_root,
         validation_root=validation_root,
-        overwrite_backup=False,
+        old_backup_mode="error",
     )
 
     assert result["validation_is_valid"] is True
@@ -141,6 +144,50 @@ def test_process_example_reverses_links_and_runs_validation(tmp_path: Path) -> N
     with report_path.open("r", encoding="utf-8") as handle:
         report = json.load(handle)
     assert report["is_valid"] is True
+
+
+def test_process_example_use_mode_rebuilds_from_original_backup(tmp_path: Path) -> None:
+    review_root = tmp_path / "manual_review_outputs"
+    validation_root = tmp_path / "validation_outputs"
+    links_path, _, manual_csv_path = _write_review_network(
+        review_root,
+        example_id="baseline",
+        links_rows=[
+            {
+                "id_link": 1,
+                "id_nodes": "1, 2",
+                "id_us_node": 1,
+                "id_ds_node": 2,
+                "manual_direction_reviewed": True,
+                "manual_us_node": 1,
+                "manual_ds_node": 2,
+                "geometry_reversed_manual": False,
+                "is_inlet": False,
+                "is_outlet": False,
+                "geometry": LineString([(0, 0), (1, 0)]),
+            }
+        ],
+        node_rows=[
+            {"id_node": 1, "is_inlet": True, "is_outlet": False, "geometry": Point(0, 0)},
+            {"id_node": 2, "is_inlet": False, "is_outlet": True, "geometry": Point(1, 0)},
+        ],
+    )
+
+    process_example(
+        "baseline", [1], review_root=review_root, validation_root=validation_root, old_backup_mode="error"
+    )
+    result = process_example(
+        "baseline", [1], review_root=review_root, validation_root=validation_root, old_backup_mode="use"
+    )
+
+    edited = gpd.read_file(links_path).iloc[0]
+    original = gpd.read_file(links_path.with_name("directed_links_old.gpkg")).iloc[0]
+    assert (int(edited["id_us_node"]), int(edited["id_ds_node"])) == (2, 1)
+    assert (int(original["id_us_node"]), int(original["id_ds_node"])) == (1, 2)
+    assert result["old_backup_mode"] == "use"
+    assert result["links_source_path"].endswith("directed_links_old.gpkg")
+    manual = pd.read_csv(manual_csv_path).iloc[0]
+    assert (int(manual["usnode"]), int(manual["dsnode"])) == (2, 1)
 
 
 def test_process_example_writes_invalid_validation_report(tmp_path: Path) -> None:
@@ -192,7 +239,7 @@ def test_process_example_writes_invalid_validation_report(tmp_path: Path) -> Non
         [20],
         review_root=review_root,
         validation_root=validation_root,
-        overwrite_backup=False,
+        old_backup_mode="error",
     )
 
     assert result["validation_is_valid"] is False
@@ -218,7 +265,50 @@ def test_load_requests_autodetects_semicolon_and_normalizes_example_id(tmp_path:
     requests = load_requests(csv_path)
 
     assert requests["example_id"].tolist() == ["02", "10"]
+
+
+def test_load_requests_drops_empty_trailing_rows(tmp_path: Path) -> None:
+    csv_path = tmp_path / "flow_direction_adjustments.csv"
+    csv_path.write_text("example_id;link_id\n2;85\n;\n  ;  \n10;21\n", encoding="utf-8")
+
+    requests = load_requests(csv_path)
+
+    assert requests["example_id"].tolist() == ["02", "10"]
     assert requests["link_id"].tolist() == [85, 21]
+
+
+def test_normalize_example_id_handles_integral_float_strings() -> None:
+    assert normalize_example_id("2.0") == "02"
+    assert normalize_example_id("10.0") == "10"
+
+
+def test_filter_requests_to_example_matches_leading_zero_variants() -> None:
+    requests = pd.DataFrame(
+        {
+            "example_id": ["02", "03", "05"],
+            "link_id": [85, 21, 14],
+        }
+    )
+
+    filtered_int_style = filter_requests_to_example(requests, example_id="2")
+    filtered_zero_style = filter_requests_to_example(requests, example_id="02")
+
+    assert filtered_int_style["example_id"].tolist() == ["02"]
+    assert filtered_int_style["link_id"].tolist() == [85]
+    assert filtered_zero_style["example_id"].tolist() == ["02"]
+    assert filtered_zero_style["link_id"].tolist() == [85]
+
+
+def test_filter_requests_to_example_raises_for_missing_network() -> None:
+    requests = pd.DataFrame(
+        {
+            "example_id": ["02", "03"],
+            "link_id": [85, 21],
+        }
+    )
+
+    with pytest.raises(ValueError, match="No reversal requests found for example_id"):
+        filter_requests_to_example(requests, example_id="5")
 
 
 def test_process_example_supports_rivgraph_run_layout(tmp_path: Path) -> None:
@@ -271,7 +361,7 @@ def test_process_example_supports_rivgraph_run_layout(tmp_path: Path) -> None:
         [85],
         review_root=review_root,
         validation_root=validation_root,
-        overwrite_backup=False,
+        old_backup_mode="error",
     )
 
     assert result["links_path"].endswith("/02/rivgraph/02_links.gpkg")

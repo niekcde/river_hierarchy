@@ -6,7 +6,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Literal
 
 import geopandas as gpd
 import pandas as pd
@@ -161,6 +161,7 @@ def load_requests(csv_path: str | Path) -> pd.DataFrame:
         raise ValueError(f"Missing required column(s) in reversal CSV: {missing}.")
 
     requests = requests.copy()
+    requests = requests.replace(r"^\s*$", pd.NA, regex=True).dropna(how="all")
     requests["example_id"] = requests["example_id"].astype(str).str.strip().map(normalize_example_id)
     requests["link_id"] = requests["link_id"].astype("Int64")
 
@@ -182,10 +183,17 @@ def load_requests(csv_path: str | Path) -> pd.DataFrame:
     return requests
 
 
-def normalize_example_id(value: str) -> str:
-    if value.isdigit():
-        return f"{int(value):02d}"
-    return value
+def normalize_example_id(value: Any) -> str:
+    text = str(value).strip()
+    if text == "":
+        return text
+    try:
+        numeric = float(text)
+    except ValueError:
+        return text
+    if numeric.is_integer():
+        return f"{int(numeric):02d}"
+    return text
 
 
 def ensure_exists(path: Path, *, label: str) -> None:
@@ -341,7 +349,7 @@ def process_example(
     *,
     review_root: str | Path,
     validation_root: str | Path,
-    overwrite_backup: bool,
+    old_backup_mode: Literal["error", "overwrite", "use"] = "error",
 ) -> dict[str, Any]:
     paths = resolve_review_paths(
         example_id,
@@ -351,18 +359,30 @@ def process_example(
     ensure_exists(paths.links_path, label="Reviewed links GeoPackage")
     ensure_exists(paths.nodes_path, label="Reviewed nodes GeoPackage")
 
-    links_backup = copy_backup(paths.links_path, overwrite=overwrite_backup)
-    manual_link_backup = None
-    if paths.manual_link_csv_path.exists():
-        manual_link_backup = copy_backup(paths.manual_link_csv_path, overwrite=overwrite_backup)
+    if old_backup_mode not in {"error", "overwrite", "use"}:
+        raise ValueError(f"Unsupported old backup mode: {old_backup_mode!r}")
 
-    links = gpd.read_file(paths.links_path)
+    if old_backup_mode == "use":
+        links_backup = backup_path(paths.links_path)
+        ensure_exists(links_backup, label="Original links backup")
+        manual_link_backup = backup_path(paths.manual_link_csv_path)
+        links_source_path = links_backup
+        manual_link_source_path = manual_link_backup if manual_link_backup.exists() else None
+    else:
+        links_backup = copy_backup(paths.links_path, overwrite=old_backup_mode == "overwrite")
+        manual_link_backup = None
+        if paths.manual_link_csv_path.exists():
+            manual_link_backup = copy_backup(paths.manual_link_csv_path, overwrite=old_backup_mode == "overwrite")
+        links_source_path = paths.links_path
+        manual_link_source_path = paths.manual_link_csv_path if paths.manual_link_csv_path.exists() else None
+
+    links = gpd.read_file(links_source_path)
     nodes = gpd.read_file(paths.nodes_path)
     reversed_link_ids = {int(link_id) for link_id in requested_links}
     edited_links, reversal_frame = apply_reversals(links, reversed_link_ids)
 
-    if paths.manual_link_csv_path.exists():
-        manual_link_frame = update_manual_direction_frame(pd.read_csv(paths.manual_link_csv_path), reversed_link_ids)
+    if manual_link_source_path is not None:
+        manual_link_frame = update_manual_direction_frame(pd.read_csv(manual_link_source_path), reversed_link_ids)
     else:
         manual_link_frame = build_manual_direction_frame(edited_links, nodes)
 
@@ -374,10 +394,12 @@ def process_example(
         "n_links_reversed": len(reversed_link_ids),
         "reversed_link_ids": sorted(reversed_link_ids),
         "links_path": str(paths.links_path),
+        "links_source_path": str(links_source_path),
+        "old_backup_mode": old_backup_mode,
         "nodes_path": str(paths.nodes_path),
         "links_backup_path": str(links_backup),
         "manual_link_csv_path": str(paths.manual_link_csv_path),
-        "manual_link_csv_backup_path": str(manual_link_backup) if manual_link_backup is not None else None,
+        "manual_link_csv_backup_path": str(manual_link_backup) if manual_link_backup is not None and manual_link_backup.exists() else None,
         "validation_output_dir": str(paths.validation_output_dir),
         "validation_is_valid": bool(validation_report["is_valid"]),
         "validation_issues": validation_report["issues"],
@@ -398,6 +420,25 @@ def default_summary_path(csv_path: str | Path) -> Path:
     return csv_path.with_name(f"{csv_path.stem}_summary.json")
 
 
+def filter_requests_to_example(
+    requests: pd.DataFrame,
+    *,
+    example_id: str | None,
+) -> pd.DataFrame:
+    if example_id is None:
+        return requests
+
+    normalized = normalize_example_id(example_id)
+    filtered = requests.loc[requests["example_id"] == normalized].copy()
+    if filtered.empty:
+        available = sorted(requests["example_id"].astype(str).unique().tolist())
+        raise ValueError(
+            f"No reversal requests found for example_id {example_id!r} "
+            f"(normalized to {normalized!r}). Available example_id values: {available}."
+        )
+    return filtered
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -407,6 +448,11 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--csv", required=True, help="CSV with at least example_id and link_id columns.")
+    parser.add_argument(
+        "--example-id",
+        default=None,
+        help="Optional single example_id filter. Values like 2 and 02 are treated equivalently.",
+    )
     parser.add_argument(
         "--review-root",
         default=str(default_review_root()),
@@ -418,9 +464,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Root directory for graph_building validation outputs, written to <validation-root>/<example_id>/.",
     )
     parser.add_argument(
-        "--overwrite-old-backup",
-        action="store_true",
-        help="Overwrite existing *_old backups if they already exist.",
+        "--old-backup-mode",
+        choices=("error", "overwrite", "use"),
+        default="error",
+        help=(
+            "How to handle *_old files: error (default) refuses an existing backup; "
+            "overwrite replaces it from the current working files; use reads it as the "
+            "immutable baseline and regenerates the current working files."
+        ),
     )
     parser.add_argument(
         "--summary-json",
@@ -433,6 +484,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     requests = load_requests(args.csv)
+    requests = filter_requests_to_example(requests, example_id=args.example_id)
     grouped = requests.groupby("example_id", sort=True)["link_id"].agg(list)
 
     results: list[dict[str, Any]] = []
@@ -444,7 +496,7 @@ def main() -> None:
                 link_ids,
                 review_root=args.review_root,
                 validation_root=args.validation_root,
-                overwrite_backup=args.overwrite_old_backup,
+                old_backup_mode=args.old_backup_mode,
             )
             results.append(result)
             print(

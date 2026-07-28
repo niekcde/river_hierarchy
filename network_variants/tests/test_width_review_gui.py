@@ -8,8 +8,10 @@ import pandas as pd
 from shapely.geometry import LineString
 
 from network_variants.width_review_gui import (
+    QC_MEDIAN_FALLBACK_FIELD,
     QC_TRIMMED_FALLBACK_FIELD,
     apply_width_review_updates,
+    build_parser,
     build_candidate_frame,
     compute_sample_qc_frame,
     solve_continuity_replacement,
@@ -35,7 +37,39 @@ def test_compute_sample_qc_frame_marks_trimmed_rows_and_aggregates() -> None:
     row = qc.iloc[0]
     assert np.isclose(float(row["qc_mean_opposition_cos"]), -0.7)
     assert np.isclose(float(row[QC_TRIMMED_FALLBACK_FIELD]), -0.8)
+    assert np.isclose(float(row[QC_MEDIAN_FALLBACK_FIELD]), -0.8)
     assert int(row["n_trimmed_qc_samples"]) == 1
+
+
+def test_build_candidate_frame_adds_signed_dev_and_split_fields() -> None:
+    families = pd.DataFrame(
+        {
+            "id_link": [1, 2, 3],
+            "id_us_node": [10, 11, 11],
+            "id_ds_node": [11, 12, 13],
+            "n_units": [1, 1, 0],
+            "len": [10.0, 5.0, 7.0],
+            "wid_adj_wet": [2.0, 4.0, 1.0],
+        }
+    )
+    sample_qc = pd.DataFrame(
+        {
+            "id_link": [1, 2, 3],
+            "qc_mean_opposition_cos": [-0.9, -0.5, -0.8],
+            QC_TRIMMED_FALLBACK_FIELD: [-0.9, -0.5, -0.8],
+            QC_MEDIAN_FALLBACK_FIELD: [-0.9, -0.5, -0.8],
+            "n_trimmed_qc_samples": [3, 2, 1],
+        }
+    )
+
+    frame = build_candidate_frame(families, sample_qc, width_field="wid_adj_wet", len_over_width_threshold=10.0)
+    row = frame.loc[frame["id_link"] == 2].iloc[0]
+    assert "us_signed_dev" in frame.columns
+    assert "ds_signed_dev" in frame.columns
+    assert "split_sensitive" in frame.columns
+    assert "n_trimmed_qc_samples" in frame.columns
+    assert np.isfinite(float(row["us_signed_dev"]))
+    assert bool(row["split_sensitive"]) is True
 
 
 def test_solve_continuity_replacement_reduces_node_deviation() -> None:
@@ -55,6 +89,25 @@ def test_solve_continuity_replacement_reduces_node_deviation() -> None:
     assert replacement["proposed_width"] < 8.0
     assert replacement["predicted_node_dev_max_after"] < 3.0
     assert replacement["predicted_improvement"] > 0
+
+
+def test_solve_continuity_replacement_handles_missing_other_link_context() -> None:
+    frame = pd.DataFrame(
+        {
+            "id_link": [31, 32, 33, 34],
+            "id_us_node": [30, 21, 23, 26],
+            "id_ds_node": [21, 20, 21, 21],
+            "wid_adj_wet": [448.9, 512.5, 193.7, 255.2],
+            "node_dev_max": [0.1, 0.15, 0.1, 0.1],
+        }
+    )
+    candidate_row = frame.loc[frame["id_link"] == 32].iloc[0]
+
+    replacement = solve_continuity_replacement(candidate_row, frame, width_field="wid_adj_wet")
+
+    assert np.isfinite(replacement["proposed_width"])
+    assert replacement["proposed_width"] > 0
+    assert np.isfinite(replacement["predicted_node_dev_max_after"])
 
 
 def test_apply_width_review_updates_scales_core_fields_and_preserves_originals(tmp_path: Path) -> None:
@@ -145,3 +198,112 @@ def test_apply_width_review_updates_scales_core_fields_and_preserves_originals(t
     assert bool(row_good["width_reviewed_flag"]) is True
     assert row_good["width_review_decision"] == "good"
     assert bool(row_good["width_update_applied"]) is False
+
+
+def test_apply_width_review_updates_is_idempotent_and_can_revert_to_good(tmp_path: Path) -> None:
+    links_path = tmp_path / "02_links.gpkg"
+    source_links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": 11,
+                "wid": 40.0,
+                "wid_adj": 20.0,
+                "wid_med": 16.0,
+                "id_us_node": 2,
+                "id_ds_node": 3,
+                "geometry": LineString([(1.0, 0.0), (2.0, 0.0)]),
+            },
+            {
+                "id_link": 10,
+                "wid": 60.0,
+                "wid_adj": 30.0,
+                "wid_med": 24.0,
+                "id_us_node": 1,
+                "id_ds_node": 2,
+                "geometry": LineString([(0.0, 0.0), (1.0, 0.0)]),
+            },
+            {
+                "id_link": 12,
+                "wid": 60.0,
+                "wid_adj": 30.0,
+                "wid_med": 24.0,
+                "id_us_node": 3,
+                "id_ds_node": 4,
+                "geometry": LineString([(2.0, 0.0), (3.0, 0.0)]),
+            },
+            {
+                "id_link": 13,
+                "wid": 60.0,
+                "wid_adj": 30.0,
+                "wid_med": 24.0,
+                "id_us_node": 2,
+                "id_ds_node": 5,
+                "geometry": LineString([(1.0, 0.0), (1.0, -1.0)]),
+            },
+        ],
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    source_links.to_file(links_path, driver="GPKG")
+
+    candidate_frame = pd.DataFrame(
+        {
+            "id_link": [10, 11, 12, 13],
+            "id_us_node": [1, 2, 3, 2],
+            "id_ds_node": [2, 3, 4, 5],
+            "wid_adj_wet": [2.0, 8.0, 10.0, 2.0],
+            "node_dev_max": [1.0, 3.0, 1.0, 1.0],
+        }
+    )
+    bad_decisions = pd.DataFrame({"id_link": [11], "review_decision": ["bad"]})
+
+    apply_width_review_updates(
+        review_decisions=bad_decisions,
+        candidate_frame=candidate_frame,
+        width_field="wid_adj_wet",
+        source_links_path=links_path,
+        parent_link_mapping={10: 10, 11: 11, 12: 12, 13: 13},
+        overwrite_backup=True,
+    )
+    updated_once = gpd.read_file(links_path).set_index("id_link", drop=False)
+    first_wid = float(updated_once.loc[11, "wid"])
+    first_wid_adj = float(updated_once.loc[11, "wid_adj"])
+    first_wid_med = float(updated_once.loc[11, "wid_med"])
+
+    apply_width_review_updates(
+        review_decisions=bad_decisions,
+        candidate_frame=candidate_frame,
+        width_field="wid_adj_wet",
+        source_links_path=links_path,
+        parent_link_mapping={10: 10, 11: 11, 12: 12, 13: 13},
+        overwrite_backup=True,
+    )
+    updated_twice = gpd.read_file(links_path).set_index("id_link", drop=False)
+    assert np.isclose(float(updated_twice.loc[11, "wid"]), first_wid)
+    assert np.isclose(float(updated_twice.loc[11, "wid_adj"]), first_wid_adj)
+    assert np.isclose(float(updated_twice.loc[11, "wid_med"]), first_wid_med)
+
+    good_decisions = pd.DataFrame({"id_link": [11], "review_decision": ["good"]})
+    apply_width_review_updates(
+        review_decisions=good_decisions,
+        candidate_frame=candidate_frame,
+        width_field="wid_adj_wet",
+        source_links_path=links_path,
+        parent_link_mapping={10: 10, 11: 11, 12: 12, 13: 13},
+        overwrite_backup=True,
+    )
+    reverted = gpd.read_file(links_path).set_index("id_link", drop=False)
+    row = reverted.loc[11]
+    assert np.isclose(float(row["wid"]), 40.0)
+    assert np.isclose(float(row["wid_adj"]), 20.0)
+    assert np.isclose(float(row["wid_med"]), 16.0)
+    assert bool(row["width_update_applied"]) is False
+    assert pd.isna(row["wid_orig"])
+    assert pd.isna(row["wid_adj_orig"])
+    assert pd.isna(row["wid_med_orig"])
+
+
+def test_build_parser_supports_start_over_flag() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["/tmp/variant", "--start-over"])
+    assert args.start_over is True

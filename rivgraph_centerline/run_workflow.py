@@ -58,6 +58,12 @@ def parse_args() -> argparse.Namespace:
     edits_parser.add_argument("--layer", default=None, help="Vector layer name. Defaults to the first layer.")
     edits_parser.add_argument("--action-field", default="action", help="Field containing add/remove values.")
     edits_parser.add_argument("--center-only", action="store_true", help="Only edit pixels whose centers fall inside polygons.")
+    edits_parser.add_argument("--tiny-land-remove-max-pixels", type=int, default=3, help="Remove main-river land components with this many pixels or fewer after edits. Use a negative value to disable.")
+    edits_parser.add_argument("--tiny-land-export-min-pixels", type=int, default=4, help="Minimum component size, in pixels, for the exported post-cleanup main-river land QA layer.")
+    edits_parser.add_argument("--tiny-land-export-max-pixels", type=int, default=10, help="Maximum component size, in pixels, for the exported post-cleanup main-river land QA layer. Use a negative value to disable export.")
+    edits_parser.add_argument("--tiny-land-export-path", type=Path, default=None, help="Optional GeoPackage path for the post-cleanup main-river small-land export.")
+    edits_parser.add_argument("--diagonal-passage-export-path", type=Path, default=None, help="Optional GeoPackage path for the post-cleanup main-river diagonal-passage diagnostic points.")
+    edits_parser.add_argument("--keep-largest-water-component", action="store_true", help="Discard all 8-connected water components except the largest after manual edits.")
 
     run_parser = subparsers.add_parser("run-rivgraph", help="Run RivGraph on the prepared or cleaned mask.")
     add_run_identity_args(run_parser)
@@ -123,6 +129,12 @@ def parse_args() -> argparse.Namespace:
     )
     all_parser.add_argument("--force-prepare", action="store_true", help="Rebuild the prepared mask even if it exists.")
     all_parser.add_argument("--quiet", action="store_true", help="Disable verbose RivGraph logging.")
+    all_parser.add_argument("--tiny-land-remove-max-pixels", type=int, default=3, help="Remove main-river land components with this many pixels or fewer after edits. Use a negative value to disable.")
+    all_parser.add_argument("--tiny-land-export-min-pixels", type=int, default=4, help="Minimum component size, in pixels, for the exported post-cleanup main-river land QA layer.")
+    all_parser.add_argument("--tiny-land-export-max-pixels", type=int, default=10, help="Maximum component size, in pixels, for the exported post-cleanup main-river land QA layer. Use a negative value to disable export.")
+    all_parser.add_argument("--tiny-land-export-path", type=Path, default=None, help="Optional GeoPackage path for the post-cleanup main-river small-land export.")
+    all_parser.add_argument("--diagonal-passage-export-path", type=Path, default=None, help="Optional GeoPackage path for the post-cleanup main-river diagonal-passage diagnostic points.")
+    all_parser.add_argument("--keep-largest-water-component", action="store_true", help="Discard all 8-connected water components except the largest after manual edits.")
 
     return parser.parse_args()
 
@@ -159,6 +171,12 @@ def dispatch(args: argparse.Namespace) -> dict[str, object]:
             layer=args.layer,
             action_field=args.action_field,
             all_touched=not args.center_only,
+            tiny_land_remove_max_pixels=args.tiny_land_remove_max_pixels,
+            tiny_land_export_min_pixels=args.tiny_land_export_min_pixels,
+            tiny_land_export_max_pixels=args.tiny_land_export_max_pixels,
+            tiny_land_export_path=args.tiny_land_export_path,
+            diagonal_passage_export_path=args.diagonal_passage_export_path,
+            keep_largest_water_component=args.keep_largest_water_component,
         )
         return {"command": args.command, "run_paths": paths_to_dict(paths), "summary": summary}
 
@@ -193,6 +211,12 @@ def dispatch(args: argparse.Namespace) -> dict[str, object]:
             verbose=not args.quiet,
             clean_target=not args.keep_existing_rivgraph_files,
             flow_mesh_mode=args.flow_mesh_mode,
+            tiny_land_remove_max_pixels=args.tiny_land_remove_max_pixels,
+            tiny_land_export_min_pixels=args.tiny_land_export_min_pixels,
+            tiny_land_export_max_pixels=args.tiny_land_export_max_pixels,
+            tiny_land_export_path=args.tiny_land_export_path,
+            diagonal_passage_export_path=args.diagonal_passage_export_path,
+            keep_largest_water_component=args.keep_largest_water_component,
         )
         return {"command": args.command, "run_paths": paths_to_dict(paths), "summary": summary}
 

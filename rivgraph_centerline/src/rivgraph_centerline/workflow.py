@@ -167,12 +167,28 @@ def apply_edits_for_run(
     layer: str | None = None,
     action_field: str = "action",
     all_touched: bool = True,
+    tiny_land_remove_max_pixels: int = 3,
+    tiny_land_export_min_pixels: int = 4,
+    tiny_land_export_max_pixels: int = 10,
+    tiny_land_export_path: Path | None = None,
+    diagonal_passage_export_path: Path | None = None,
+    keep_largest_water_component: bool = False,
 ) -> tuple[WorkflowPaths, dict[str, object]]:
     paths = WorkflowPaths.from_name(name, run_dir, output_root=output_root)
     paths.ensure_dirs()
     edits_path = paths.manual_edits_path if edits is None else Path(edits).expanduser().resolve()
     base_mask_path = paths.prepared_mask if base_mask is None else Path(base_mask).expanduser().resolve()
     output_path = paths.cleaned_mask if output_mask is None else Path(output_mask).expanduser().resolve()
+    export_path = (
+        paths.manual_edits_dir / f"{paths.name}_main_river_small_land_{tiny_land_export_min_pixels}_to_{tiny_land_export_max_pixels}px.gpkg"
+        if tiny_land_export_path is None
+        else Path(tiny_land_export_path).expanduser().resolve()
+    )
+    diagonal_export_path = (
+        paths.manual_edits_dir / f"{paths.name}_main_river_diagonal_passages.gpkg"
+        if diagonal_passage_export_path is None
+        else Path(diagonal_passage_export_path).expanduser().resolve()
+    )
 
     summary = apply_manual_edits(
         base_mask=base_mask_path,
@@ -182,6 +198,12 @@ def apply_edits_for_run(
         action_field=action_field,
         all_touched=all_touched,
         summary_path=paths.manual_edits_summary,
+        tiny_land_remove_max_pixels=tiny_land_remove_max_pixels,
+        tiny_land_export_min_pixels=tiny_land_export_min_pixels,
+        tiny_land_export_max_pixels=tiny_land_export_max_pixels,
+        tiny_land_export_path=export_path,
+        diagonal_passage_export_path=diagonal_export_path,
+        keep_largest_water_component=keep_largest_water_component,
     )
     summary.update(
         {
@@ -439,6 +461,12 @@ def run_all_for_run(
     verbose: bool = True,
     clean_target: bool = True,
     flow_mesh_mode: str = "auto",
+    tiny_land_remove_max_pixels: int = 3,
+    tiny_land_export_min_pixels: int = 4,
+    tiny_land_export_max_pixels: int = 10,
+    tiny_land_export_path: Path | None = None,
+    diagonal_passage_export_path: Path | None = None,
+    keep_largest_water_component: bool = False,
 ) -> dict[str, object]:
     paths, prepare_summary = prepare_mask_for_run(
         name=name,
@@ -458,6 +486,12 @@ def run_all_for_run(
             run_dir=paths.run_dir,
             edits=edits_path,
             output_root=output_root,
+            tiny_land_remove_max_pixels=tiny_land_remove_max_pixels,
+            tiny_land_export_min_pixels=tiny_land_export_min_pixels,
+            tiny_land_export_max_pixels=tiny_land_export_max_pixels,
+            tiny_land_export_path=tiny_land_export_path,
+            diagonal_passage_export_path=diagonal_passage_export_path,
+            keep_largest_water_component=keep_largest_water_component,
         )
 
     _, rivgraph_summary = run_rivgraph_for_run(

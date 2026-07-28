@@ -514,6 +514,78 @@ Example: materialize only the base directed state for review
 This writes `states/S000_base/` including the base directed links/nodes and
 hydraulic context, then stops before generating any unit or group child states.
 
+### Recommended Parent Review Workflow
+
+For the current RivGraph-to-variant workflow, the reviewed parent RivGraph
+network should be treated as the only manual source of truth for directions and
+core widths.
+
+Recommended order:
+
+1. Run `rivgraph_centerline/run_workflow.py apply-edits`.
+2. Run `rivgraph_centerline/run_workflow.py run-rivgraph`.
+3. Inspect parent directions in the RivGraph run outputs.
+4. If needed, apply direction fixes directly to the parent files with
+   `hierarchy_level_definition/manual_review/apply_link_reversals.py`.
+5. Materialize `S000_base` with `--base-only` when you want to inspect the
+   directed base state before running the full variant family.
+6. Run `network_variants/width_review_gui.py` on the base-state variant output
+   to review short suspicious links in directed local context.
+7. The width review GUI writes accepted core-width corrections back to the
+   parent RivGraph links file, not to `S000_base` itself.
+8. Run the full collapse experiment only after the parent directions and parent
+   core widths are in the desired state.
+
+Important interpretation:
+
+- directions are manually corrected only in the parent RivGraph network
+- `S000_base` is used as a review surface, not as a separate manual direction
+  source of truth
+- the width review GUI currently updates parent `wid`, `wid_adj`, and
+  `wid_med` in the RivGraph links GeoPackage
+- later per-state fields such as `wid_adj_wet` are recomputed inside the
+  variant workflow, but they inherit from the corrected parent network and
+  geometry context
+
+This avoids maintaining separate manual edits in both the parent network and a
+derived base-state product.
+
+### Future Width-Review Automation
+
+The current width workflow is intentionally manual:
+
+- build a candidate set from short unit-involved links
+- inspect the local directed context in the GUI
+- label each candidate as `good` or `bad`
+- write accepted parent-width corrections back to the RivGraph source links
+
+If this review is repeated across all example networks, the saved review tables
+can be combined into a labeled training dataset. A simple classifier could then
+be trained to approximate the manual decision boundary.
+
+Reasonable first models:
+
+- logistic regression
+- linear support vector machine
+
+Reasonable first features:
+
+- `qc_mean_opposition_cos_trimmed`
+- `node_dev_max`
+- `len_over_width`
+- `us_dev`
+- `ds_dev`
+- `n_units`
+
+The intended use of such a model would be triage rather than full automation:
+
+- auto-pass obvious good links
+- auto-flag obvious bad links
+- keep borderline cases for manual GUI review
+
+That future classifier is not yet part of the production workflow, but the
+current review CSV outputs are designed to make that next step feasible.
+
 Example: independent compound-bubble variants
 
 ```bash

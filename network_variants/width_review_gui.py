@@ -18,7 +18,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from rasterio.features import shapes
 from rasterio.windows import from_bounds
-from shapely.geometry import box, shape
+from shapely.geometry import Point, box, shape
 
 if __package__ is None or __package__ == "":
     repo_root = Path(__file__).resolve().parents[1]
@@ -34,13 +34,16 @@ DEFAULT_REVIEW_CSV_NAME = "width_review_decisions.csv"
 DEFAULT_REVIEW_SUMMARY_NAME = "width_review_apply_summary.json"
 QC_TRIMMED_FIELD = "qc_mean_opposition_cos_trimmed"
 QC_TRIMMED_FALLBACK_FIELD = "qc_mean_opposition_cos_trimmed_from_samples"
+QC_MEDIAN_FALLBACK_FIELD = "qc_median_opposition_cos_trimmed_from_samples"
 DISPLAY_METRIC_FIELDS = (
     "len_over_width",
-    "us_dev",
-    "ds_dev",
-    "node_dev_max",
+    "us_signed_dev",
+    "ds_signed_dev",
     QC_TRIMMED_FALLBACK_FIELD,
+    QC_MEDIAN_FALLBACK_FIELD,
     "qc_mean_opposition_cos",
+    "n_trimmed_qc_samples",
+    "split_sensitive",
 )
 
 
@@ -124,6 +127,7 @@ def compute_sample_qc_frame(samples: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
                     "id_link",
                     "qc_mean_opposition_cos",
                     QC_TRIMMED_FALLBACK_FIELD,
+                    QC_MEDIAN_FALLBACK_FIELD,
                     "n_trimmed_qc_samples",
                 ]
             ),
@@ -148,6 +152,7 @@ def compute_sample_qc_frame(samples: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         .agg(
             **{
                 QC_TRIMMED_FALLBACK_FIELD: ("qc_opposition_cos", "mean"),
+                QC_MEDIAN_FALLBACK_FIELD: ("qc_opposition_cos", "median"),
                 "n_trimmed_qc_samples": ("qc_opposition_cos", "count"),
             }
         )
@@ -198,11 +203,16 @@ def build_candidate_frame(
 
     frame["us_node_out_over_in"] = frame["us_out_width_sum"] / frame["us_in_width_sum"]
     frame["ds_node_out_over_in"] = frame["ds_out_width_sum"] / frame["ds_in_width_sum"]
+    frame["us_signed_dev"] = frame["us_node_out_over_in"] - 1.0
+    frame["ds_signed_dev"] = frame["ds_node_out_over_in"] - 1.0
     frame["us_dev"] = (frame["us_node_out_over_in"] - 1.0).abs()
     frame["ds_dev"] = (frame["ds_node_out_over_in"] - 1.0).abs()
     frame["node_dev_max"] = frame[["us_dev", "ds_dev"]].max(axis=1)
 
     frame["candidate_flag"] = frame["n_units"].gt(0) & frame["len_over_width"].lt(float(len_over_width_threshold))
+    frame["link_share_of_us_out"] = frame[width_field] / frame["us_out_width_sum"]
+    frame["us_only_outgoing"] = frame["us_out_count"].fillna(0).le(1)
+    frame["split_sensitive"] = frame["us_out_count"].fillna(0).gt(1)
     frame["review_order"] = np.arange(len(frame), dtype=int)
     return frame
 
@@ -263,15 +273,22 @@ def solve_continuity_replacement(
     *,
     width_field: str,
 ) -> dict[str, float | int | str]:
+    def _sum_width(mask: pd.Series, *, empty_as_zero: bool) -> float:
+        values = pd.to_numeric(frame.loc[mask, width_field], errors="coerce")
+        values = values[np.isfinite(values)]
+        if values.empty:
+            return 0.0 if empty_as_zero else float("nan")
+        return float(values.sum())
+
     link_id = int(candidate_row["id_link"])
     us_node = int(candidate_row["id_us_node"])
     ds_node = int(candidate_row["id_ds_node"])
     current_width = float(candidate_row[width_field])
 
-    us_in = float(frame.loc[frame["id_ds_node"] == us_node, width_field].sum(min_count=1))
-    us_out_other = float(frame.loc[(frame["id_us_node"] == us_node) & (frame["id_link"] != link_id), width_field].sum(min_count=1))
-    ds_in_other = float(frame.loc[(frame["id_ds_node"] == ds_node) & (frame["id_link"] != link_id), width_field].sum(min_count=1))
-    ds_out = float(frame.loc[frame["id_us_node"] == ds_node, width_field].sum(min_count=1))
+    us_in = _sum_width(frame["id_ds_node"] == us_node, empty_as_zero=False)
+    us_out_other = _sum_width((frame["id_us_node"] == us_node) & (frame["id_link"] != link_id), empty_as_zero=True)
+    ds_in_other = _sum_width((frame["id_ds_node"] == ds_node) & (frame["id_link"] != link_id), empty_as_zero=True)
+    ds_out = _sum_width(frame["id_us_node"] == ds_node, empty_as_zero=False)
 
     local_mask = (
         (frame["id_us_node"].isin([us_node, ds_node])) |
@@ -504,8 +521,22 @@ def apply_width_review_updates(
         source_links.at[row_index, "width_reviewed_flag"] = True
         source_links.at[row_index, "width_review_decision"] = decision
         source_links.at[row_index, "width_update_source_link_id"] = link_id
+        existing_orig_values: dict[str, float] = {}
+        for field in CORE_WIDTH_FIELDS:
+            orig_field = f"{field}_orig"
+            orig_value = pd.to_numeric(pd.Series([source_links.at[row_index, orig_field]]), errors="coerce").iloc[0]
+            if np.isfinite(orig_value):
+                existing_orig_values[field] = float(orig_value)
 
         if decision != "bad":
+            if existing_orig_values:
+                for field, orig_value in existing_orig_values.items():
+                    source_links.at[row_index, field] = float(orig_value)
+                    source_links.at[row_index, f"{field}_orig"] = np.nan
+            source_links.at[row_index, "width_update_applied"] = False
+            source_links.at[row_index, "width_update_method"] = None
+            source_links.at[row_index, "width_update_scale_factor"] = np.nan
+            source_links.at[row_index, "width_update_target_context_width"] = np.nan
             continue
 
         candidate_row = candidate_lookup.loc[link_id]
@@ -523,11 +554,14 @@ def apply_width_review_updates(
 
         for field in CORE_WIDTH_FIELDS:
             orig_field = f"{field}_orig"
-            current_value = pd.to_numeric(pd.Series([source_links.at[row_index, field]]), errors="coerce").iloc[0]
-            if not np.isfinite(current_value):
-                continue
-            source_links.at[row_index, orig_field] = float(current_value)
-            source_links.at[row_index, field] = float(current_value) * float(scale_factor)
+            base_value = existing_orig_values.get(field)
+            if base_value is None:
+                current_value = pd.to_numeric(pd.Series([source_links.at[row_index, field]]), errors="coerce").iloc[0]
+                if not np.isfinite(current_value):
+                    continue
+                base_value = float(current_value)
+                source_links.at[row_index, orig_field] = base_value
+            source_links.at[row_index, field] = float(base_value) * float(scale_factor)
 
         applied_rows.append(
             {
@@ -561,15 +595,20 @@ class WidthReviewGui:
         candidate_frame: pd.DataFrame,
         metric_frame: pd.DataFrame,
         directed_links: gpd.GeoDataFrame,
+        marked_samples: pd.DataFrame,
         width_field: str,
+        show_dt_points: bool,
+        initial_decisions: pd.DataFrame | None = None,
     ) -> None:
         self.root = root
         self.paths = paths
         self.width_field = width_field
+        self.show_dt_points = bool(show_dt_points)
         self.root.title(f"Width review {paths.example_id} / {paths.variant_id}")
         self.collapsed_mask_path = paths.collapsed_mask_path
 
         self.metric_frame = metric_frame.copy()
+        self.marked_samples = marked_samples.copy()
         self.candidate_frame = candidate_frame.loc[candidate_frame["candidate_flag"]].copy()
         self.candidate_frame = self.candidate_frame.sort_values(
             ["len_over_width", "node_dev_max", QC_TRIMMED_FIELD],
@@ -602,8 +641,28 @@ class WidthReviewGui:
                 "review_decision": pd.Series([pd.NA] * len(self.candidate_frame), dtype="object"),
             }
         )
-        self.current_pos = 0 if not self.candidate_frame.empty else None
+        if initial_decisions is not None and not initial_decisions.empty:
+            initial = initial_decisions.copy()
+            initial["id_link"] = pd.to_numeric(initial["id_link"], errors="coerce").astype("Int64")
+            initial = initial.dropna(subset=["id_link"]).copy()
+            initial["id_link"] = initial["id_link"].astype(int)
+            if "review_decision" in initial.columns:
+                initial["review_decision"] = initial["review_decision"].astype("string")
+                initial = initial.loc[initial["review_decision"].notna(), ["id_link", "review_decision"]]
+                initial = initial.drop_duplicates(subset=["id_link"], keep="last")
+                self.decisions = self.decisions.drop(columns=["review_decision"]).merge(
+                    initial,
+                    on="id_link",
+                    how="left",
+                    validate="1:1",
+                )
+        if self.candidate_frame.empty:
+            self.current_pos = None
+        else:
+            undecided = self.decisions["review_decision"].isna()
+            self.current_pos = int(undecided.idxmax()) if undecided.any() else 0
         self.saved = False
+        self.map_view_mode = "local"
 
         self._build_ui()
         self._bind_shortcuts()
@@ -630,6 +689,8 @@ class WidthReviewGui:
         tk.Button(button_row, text="Skip [S]", command=lambda: self._set_decision("skip")).pack(side=tk.LEFT, padx=2)
         tk.Button(button_row, text="Prev [Left]", command=lambda: self._move_relative(-1)).pack(side=tk.LEFT, padx=2)
         tk.Button(button_row, text="Next [Right]", command=lambda: self._move_relative(1)).pack(side=tk.LEFT, padx=2)
+        tk.Button(button_row, text="Zoom Focal [Z]", command=self._zoom_to_focal).pack(side=tk.LEFT, padx=8)
+        tk.Button(button_row, text="Zoom Reset [X]", command=self._reset_zoom).pack(side=tk.LEFT, padx=2)
         tk.Button(button_row, text="Save and Close [W]", command=self._save_and_close).pack(side=tk.LEFT, padx=8)
 
         self.figure = Figure(figsize=(14, 7), dpi=100)
@@ -655,6 +716,10 @@ class WidthReviewGui:
             self._move_relative(-1)
         elif key == "right":
             self._move_relative(1)
+        elif key == "z":
+            self._zoom_to_focal()
+        elif key == "x":
+            self._reset_zoom()
         elif key == "w":
             self._save_and_close()
 
@@ -686,59 +751,144 @@ class WidthReviewGui:
         if self.current_pos is None:
             return
         self.current_pos = max(0, min(len(self.candidate_frame) - 1, self.current_pos + step))
+        self.map_view_mode = "local"
+        self._draw()
+
+    def _zoom_to_focal(self) -> None:
+        self.map_view_mode = "focal"
+        self._draw()
+
+    def _reset_zoom(self) -> None:
+        self.map_view_mode = "local"
         self._draw()
 
     def _neighbor_table_text(self, local_links: pd.DataFrame, focal_link_id: int) -> str:
         rows = []
-        for row in local_links.sort_values("id_link", kind="mergesort").itertuples(index=False):
+        ordered = local_links.assign(
+            _is_focal=local_links["id_link"].astype(int).eq(int(focal_link_id))
+        ).sort_values(["_is_focal", "id_link"], ascending=[False, True], kind="mergesort")
+        for row in ordered.itertuples(index=False):
             role = "FOCAL" if int(row.id_link) == focal_link_id else "nbr"
             wid = pd.to_numeric(pd.Series([getattr(row, "wid", np.nan)]), errors="coerce").iloc[0]
             wid_adj = pd.to_numeric(pd.Series([getattr(row, "wid_adj", np.nan)]), errors="coerce").iloc[0]
-            wid_med = pd.to_numeric(pd.Series([getattr(row, "wid_med", np.nan)]), errors="coerce").iloc[0]
-            len_over_width = pd.to_numeric(pd.Series([getattr(row, "len_over_width", np.nan)]), errors="coerce").iloc[0]
-            us_dev = pd.to_numeric(pd.Series([getattr(row, "us_dev", np.nan)]), errors="coerce").iloc[0]
-            ds_dev = pd.to_numeric(pd.Series([getattr(row, "ds_dev", np.nan)]), errors="coerce").iloc[0]
-            node_dev_max = pd.to_numeric(pd.Series([getattr(row, "node_dev_max", np.nan)]), errors="coerce").iloc[0]
-            qc_trimmed = pd.to_numeric(
-                pd.Series([getattr(row, QC_TRIMMED_FALLBACK_FIELD, np.nan)]),
-                errors="coerce",
-            ).iloc[0]
-            qc_mean = pd.to_numeric(pd.Series([getattr(row, "qc_mean_opposition_cos", np.nan)]), errors="coerce").iloc[0]
             rows.append(
                 f"{role:5s} "
                 f"{'link=':<7s}{int(row.id_link):<7d}  "
                 f"{'dir=':<9s}{int(row.id_us_node):<3d}->{int(row.id_ds_node):<3d}  "
             )
-            rows.append(
-                "      "
-                f"{'wid=':<7s}{wid:<7.1f}  " 
-                f"{'wid_adj=':<9s}{wid_adj:<7.1f}  " 
-                f"{'wid_med=':<7s}{wid_med:<7.1f}"
-
-            )
-            rows.append(
-                "      "
-                f"{'len/w=':<7s}{len_over_width:<7.3f}  "
-                f"{'us_dev=':<9s}{us_dev:<7.3f}  "
-                f"{'ds_dev=':<7s}{ds_dev:<7.3f}  "
-                f"{'dev_max=':<7s}{node_dev_max:<7.3f}  "
-            )
-            rows.append(
-                "      "
-                f"{'qc_tr=':<7s}{qc_trimmed:<7.3f}  "
-                f"{'qc=':<9s}{qc_mean:<7.3f}"
-            )
+            rows.append("      " f"{'wid=':<7s}{wid:<7.1f}  " f"{'wid_adj=':<9s}{wid_adj:<7.1f}")
+            if role == "FOCAL":
+                len_over_width = pd.to_numeric(pd.Series([getattr(row, "len_over_width", np.nan)]), errors="coerce").iloc[0]
+                us_signed_dev = pd.to_numeric(pd.Series([getattr(row, "us_signed_dev", np.nan)]), errors="coerce").iloc[0]
+                ds_signed_dev = pd.to_numeric(pd.Series([getattr(row, "ds_signed_dev", np.nan)]), errors="coerce").iloc[0]
+                qc_trimmed = pd.to_numeric(
+                    pd.Series([getattr(row, QC_TRIMMED_FALLBACK_FIELD, np.nan)]),
+                    errors="coerce",
+                ).iloc[0]
+                qc_median = pd.to_numeric(
+                    pd.Series([getattr(row, QC_MEDIAN_FALLBACK_FIELD, np.nan)]),
+                    errors="coerce",
+                ).iloc[0]
+                n_trimmed = pd.to_numeric(pd.Series([getattr(row, "n_trimmed_qc_samples", np.nan)]), errors="coerce").iloc[0]
+                split_sensitive = bool(pd.to_numeric(pd.Series([getattr(row, "split_sensitive", np.nan)]), errors="coerce").fillna(0).iloc[0])
+                rows.append(
+                    "      "
+                    f"{'len/w=':<7s}{len_over_width:<7.3f}  "
+                    f"{'us_sd=':<7s}{us_signed_dev:<7.3f}  "
+                    f"{'ds_sd=':<7s}{ds_signed_dev:<7.3f}"
+                )
+                rows.append(
+                    "      "
+                    f"{'qc_tm=':<7s}{qc_trimmed:<7.3f}  "
+                    f"{'qc_md=':<7s}{qc_median:<7.3f}  "
+                    f"{'n_trim=':<8s}{n_trimmed:<6.0f}"
+                )
+                rows.append("      " f"{'split=':<7s}{str(split_sensitive):<7s}")
             rows.append("")
         return "\n".join(rows)
 
-    def _plot_direction_arrow(self, geometry: Any, *, color: str, linewidth: float, zorder: int) -> None:
+    def _routing_impact_text(self, row: pd.Series) -> str:
+        us_out_count = int(pd.to_numeric(pd.Series([row.get("us_out_count")]), errors="coerce").fillna(0).iloc[0])
+        us_only_outgoing = bool(pd.to_numeric(pd.Series([row.get("us_only_outgoing")]), errors="coerce").fillna(0).iloc[0])
+        link_share = pd.to_numeric(pd.Series([row.get("link_share_of_us_out")]), errors="coerce").iloc[0]
+        if us_only_outgoing or us_out_count <= 1:
+            return "routing: local-only | upstream node has no alternative outgoing split"
+        share_text = f"{link_share:.3f}" if np.isfinite(link_share) else "nan"
+        return f"routing: split-sensitive | us_out_count={us_out_count} | share_us_out={share_text}"
+
+    def _current_dt_points(self, link_id: int) -> pd.DataFrame:
+        if self.marked_samples.empty or "id_link" not in self.marked_samples.columns:
+            return self.marked_samples.iloc[0:0].copy()
+        samples = self.marked_samples.loc[self.marked_samples["id_link"] == link_id].copy()
+        if samples.empty:
+            return samples
+        if "used_in_trimmed_width" in samples.columns:
+            samples = samples.loc[samples["used_in_trimmed_width"].fillna(False)].copy()
+        if "width_invalid" in samples.columns:
+            samples = samples.loc[~samples["width_invalid"].fillna(False).astype(bool)].copy()
+        return samples
+
+    def _map_bounds(
+        self,
+        local_links: gpd.GeoDataFrame,
+        dt_points: pd.DataFrame,
+    ) -> tuple[float, float, float, float]:
+        minx, miny, maxx, maxy = local_links.total_bounds
+        bounds = [minx, miny, maxx, maxy]
+        if self.show_dt_points and not dt_points.empty:
+            xs = pd.to_numeric(dt_points["x"], errors="coerce")
+            ys = pd.to_numeric(dt_points["y"], errors="coerce")
+            xs = xs[np.isfinite(xs)]
+            ys = ys[np.isfinite(ys)]
+            if not xs.empty and not ys.empty:
+                bounds[0] = min(bounds[0], float(xs.min()))
+                bounds[1] = min(bounds[1], float(ys.min()))
+                bounds[2] = max(bounds[2], float(xs.max()))
+                bounds[3] = max(bounds[3], float(ys.max()))
+        span = max(bounds[2] - bounds[0], bounds[3] - bounds[1], 1.0)
+        pad = span * 0.15
+        return (bounds[0] - pad, bounds[1] - pad, bounds[2] + pad, bounds[3] + pad)
+
+    def _focal_bounds(
+        self,
+        focal_frame: gpd.GeoDataFrame,
+        dt_points: pd.DataFrame,
+    ) -> tuple[float, float, float, float]:
+        if focal_frame.empty:
+            return self._map_bounds(focal_frame, dt_points)
+        minx, miny, maxx, maxy = focal_frame.total_bounds
+        bounds = [minx, miny, maxx, maxy]
+        if self.show_dt_points and not dt_points.empty:
+            xs = [pd.to_numeric(dt_points.get(col, np.nan), errors="coerce") for col in ("x", "left_bank_x", "right_bank_x")]
+            ys = [pd.to_numeric(dt_points.get(col, np.nan), errors="coerce") for col in ("y", "left_bank_y", "right_bank_y")]
+            xs = pd.concat(xs, ignore_index=True)
+            ys = pd.concat(ys, ignore_index=True)
+            xs = xs[np.isfinite(xs)]
+            ys = ys[np.isfinite(ys)]
+            if not xs.empty and not ys.empty:
+                bounds[0] = min(bounds[0], float(xs.min()))
+                bounds[1] = min(bounds[1], float(ys.min()))
+                bounds[2] = max(bounds[2], float(xs.max()))
+                bounds[3] = max(bounds[3], float(ys.max()))
+        span = max(bounds[2] - bounds[0], bounds[3] - bounds[1], 1.0)
+        pad = span * 0.24
+        return (bounds[0] - pad, bounds[1] - pad, bounds[2] + pad, bounds[3] + pad)
+
+    def _plot_direction_arrow(
+        self,
+        geometry: Any,
+        *,
+        color: str,
+        linewidth: float,
+        zorder: int,
+        position_frac: float = 0.3,
+    ) -> None:
         if geometry is None or geometry.is_empty:
             return
         try:
-            midpoint = geometry.interpolate(0.5, normalized=True)
             half_step = 0.03
-            start = geometry.interpolate(max(0.0, 0.3 - half_step), normalized=True)
-            end = geometry.interpolate(min(1.0, 0.3 + half_step), normalized=True)
+            start = geometry.interpolate(max(0.0, position_frac - half_step), normalized=True)
+            end = geometry.interpolate(min(1.0, position_frac + half_step), normalized=True)
         except Exception:
             print(f"Warning: could not compute arrow for geometry {geometry}")
             return
@@ -763,20 +913,73 @@ class WidthReviewGui:
             zorder=zorder,
         )
 
-    def _local_island_geometries(self, local_links: pd.DataFrame) -> list[Any]:
+    def _label_anchor(
+        self,
+        geometry: Any,
+        *,
+        span: float,
+        position_frac: float,
+        side: float,
+        offset_scale: float = 0.03,
+    ) -> tuple[float, float]:
+        if geometry is None or geometry.is_empty:
+            return (float("nan"), float("nan"))
+        try:
+            point = geometry.interpolate(position_frac, normalized=True)
+            left = geometry.interpolate(max(0.0, position_frac - 0.03), normalized=True)
+            right = geometry.interpolate(min(1.0, position_frac + 0.03), normalized=True)
+        except Exception:
+            point = geometry.representative_point()
+            return float(point.x), float(point.y)
+
+        dx = float(right.x - left.x)
+        dy = float(right.y - left.y)
+        norm = float(np.hypot(dx, dy))
+        if not np.isfinite(norm) or norm == 0:
+            return float(point.x), float(point.y)
+        nx = -dy / norm
+        ny = dx / norm
+        offset = span * offset_scale * side
+        return float(point.x + nx * offset), float(point.y + ny * offset)
+
+    def _annotation_layout(
+        self,
+        *,
+        feature_id: int,
+        focal_link_id: int,
+    ) -> dict[str, float]:
+        is_focal = int(feature_id) == int(focal_link_id)
+        if is_focal:
+            return {
+                "arrow_frac": 0.6 if self.map_view_mode == "focal" else 0.42,
+                "label_frac": 0.78 if self.map_view_mode == "focal" else 0.68,
+                "label_side": -1.0,
+                "label_offset_scale": 0.042 if self.map_view_mode == "focal" else 0.034,
+            }
+        alternating_side = -1.0 if int(feature_id) % 2 == 0 else 1.0
+        return {
+            "arrow_frac": 0.34 if self.map_view_mode == "focal" else 0.27,
+            "label_frac": 0.58 if self.map_view_mode == "focal" else 0.48,
+            "label_side": alternating_side,
+            "label_offset_scale": 0.038 if self.map_view_mode == "focal" else 0.03,
+        }
+
+    def _local_island_geometries(
+        self,
+        local_links: pd.DataFrame,
+        dt_points: pd.DataFrame,
+        ) -> list[Any]:
         if local_links.empty:
             return []
-        minx, miny, maxx, maxy = local_links.total_bounds
-        span = max(maxx - minx, maxy - miny, 1.0)
-        pad = span * 0.1
-        bounds = (minx - pad, miny - pad, maxx + pad, maxy + pad)
+        bounds = self._map_bounds(local_links, dt_points)
+        span = max(bounds[2] - bounds[0], bounds[3] - bounds[1], 1.0)
         bbox = box(*bounds)
 
         with rasterio.open(self.collapsed_mask_path) as ds:
             window = from_bounds(*bounds, transform=ds.transform).round_offsets().round_lengths()
             if window.width <= 0 or window.height <= 0:
                 return []
-            data = ds.read(1, window=window, boundless=True, fill_value=0)
+            data      = ds.read(1, window=window, boundless=True, fill_value=0)
             transform = ds.window_transform(window)
 
         land_mask = (data == 0).astype(np.uint8)
@@ -785,21 +988,20 @@ class WidthReviewGui:
 
         islands: list[Any] = []
         eps = span * 1e-6 + 1e-9
+        corners = [
+            Point(bounds[0], bounds[1]),
+            Point(bounds[0], bounds[3]),
+            Point(bounds[2], bounds[1]),
+            Point(bounds[2], bounds[3]),
+        ]
         for geom_mapping, value in shapes(land_mask, mask=land_mask.astype(bool), transform=transform):
             if int(value) != 1:
                 continue
             geom = shape(geom_mapping).intersection(bbox)
             if geom.is_empty:
                 continue
-            gx0, gy0, gx1, gy1 = geom.bounds
-            touches_edge = (
-                abs(gx0 - bounds[0]) <= eps or
-                abs(gy0 - bounds[1]) <= eps or
-                abs(gx1 - bounds[2]) <= eps or
-                abs(gy1 - bounds[3]) <= eps
-            )
-            if touches_edge:
-                continue
+            # if any(geom.intersects(corner.buffer(eps)) for corner in corners):
+            #     continue
             islands.append(geom)
         return islands
 
@@ -819,7 +1021,12 @@ class WidthReviewGui:
         local_links = self.directed_links.loc[self.directed_links["id_link"].isin(neighbor_ids)].copy()
         focal_frame = local_links.loc[local_links["id_link"] == link_id]
         neighbor_frame = local_links.loc[local_links["id_link"] != link_id]
-        island_geoms = self._local_island_geometries(local_links)
+        dt_points = self._current_dt_points(link_id)
+        local_bounds = self._map_bounds(local_links, dt_points)
+        focal_bounds = self._focal_bounds(focal_frame, dt_points)
+        bounds = focal_bounds if self.map_view_mode == "focal" else local_bounds
+        span = max(bounds[2] - bounds[0], bounds[3] - bounds[1], 1.0)
+        island_geoms = self._local_island_geometries(local_links, dt_points)
 
         if island_geoms:
             island_gdf = gpd.GeoDataFrame(geometry=island_geoms, crs=local_links.crs)
@@ -835,18 +1042,41 @@ class WidthReviewGui:
         if not neighbor_frame.empty:
             neighbor_frame.plot(ax=self.ax_map, color="#9ecae1", linewidth=2, zorder=1)
         if not focal_frame.empty:
-            focal_frame.plot(ax=self.ax_map, color="#d62728", linewidth=4, zorder=3)
+            focal_frame.plot(ax=self.ax_map, color="#001f87", linewidth=4, zorder=3)
         for feature in neighbor_frame.itertuples(index=False):
-            self._plot_direction_arrow(feature.geometry, color="#3182bd", linewidth=1.5, zorder=2)
-        # for feature in focal_frame.itertuples(index=False):
-        #     self._plot_direction_arrow(feature.geometry, color="#7f0000", linewidth=2.2, zorder=4)
+            layout = self._annotation_layout(feature_id=int(feature.id_link), focal_link_id=link_id)
+            self._plot_direction_arrow(
+                feature.geometry,
+                color="#3182bd",
+                linewidth=1.5,
+                zorder=2,
+                position_frac=layout["arrow_frac"],
+            )
+        for feature in focal_frame.itertuples(index=False):
+            layout = self._annotation_layout(feature_id=int(feature.id_link), focal_link_id=link_id)
+            self._plot_direction_arrow(
+                feature.geometry,
+                color="#626262",
+                linewidth=2.1,
+                zorder=4,
+                position_frac=layout["arrow_frac"],
+            )
 
         for feature in local_links.itertuples(index=False):
-            point = feature.geometry.representative_point()
+            layout = self._annotation_layout(feature_id=int(feature.id_link), focal_link_id=link_id)
+            label_x, label_y = self._label_anchor(
+                feature.geometry,
+                span=span,
+                position_frac=layout["label_frac"],
+                side=layout["label_side"],
+                offset_scale=layout["label_offset_scale"],
+            )
+            if not np.isfinite(label_x) or not np.isfinite(label_y):
+                continue
             width_value = pd.to_numeric(pd.Series([getattr(feature, self.width_field, np.nan)]), errors="coerce").iloc[0]
             self.ax_map.text(
-                point.x,
-                point.y,
+                label_x,
+                label_y,
                 f"{int(feature.id_link)}\n{width_value:.1f}",
                 fontsize=8,
                 ha="center",
@@ -855,24 +1085,116 @@ class WidthReviewGui:
                 zorder=4,
             )
 
+        if self.show_dt_points and not dt_points.empty:
+            xvals = pd.to_numeric(dt_points["x"], errors="coerce")
+            yvals = pd.to_numeric(dt_points["y"], errors="coerce")
+            point_values = pd.to_numeric(dt_points.get("qc_opposition_cos", np.nan), errors="coerce")
+            valid = np.isfinite(xvals) & np.isfinite(yvals)
+            xvals = xvals[valid]
+            yvals = yvals[valid]
+            point_values = point_values[valid]
+            # self.ax_map.scatter(
+            #     xvals,
+            #     yvals,
+            #     s=32,
+            #     c=point_values if np.isfinite(point_values).any() else "#222222",
+            #     cmap="coolwarm",
+            #     edgecolors="black",
+            #     linewidths=0.4,
+            #     zorder=5,
+            # )
+            left_x = pd.to_numeric(dt_points.get("left_bank_x", np.nan), errors="coerce")
+            left_y = pd.to_numeric(dt_points.get("left_bank_y", np.nan), errors="coerce")
+            right_x = pd.to_numeric(dt_points.get("right_bank_x", np.nan), errors="coerce")
+            right_y = pd.to_numeric(dt_points.get("right_bank_y", np.nan), errors="coerce")
+            transect_valid = valid & np.isfinite(left_x) & np.isfinite(left_y) & np.isfinite(right_x) & np.isfinite(right_y)
+            if transect_valid.any():
+                for cx, cy, lx, ly, rx, ry in zip(
+                    xvals[transect_valid],
+                    yvals[transect_valid],
+                    left_x[transect_valid],
+                    left_y[transect_valid],
+                    right_x[transect_valid],
+                    right_y[transect_valid],
+                ):
+                    self.ax_map.plot(
+                        [float(cx), float(lx)],
+                        [float(cy), float(ly)],
+                        color="#2ca25f",
+                        linewidth=1.0,
+                        alpha=0.45,
+                        zorder=4,
+                    )
+                    self.ax_map.plot(
+                        [float(cx), float(rx)],
+                        [float(cy), float(ry)],
+                        color="#de2d26",
+                        linewidth=1.0,
+                        alpha=0.45,
+                        zorder=4,
+                    )
+                self.ax_map.scatter(
+                    left_x[transect_valid],
+                    left_y[transect_valid],
+                    s=18,
+                    c="#2ca25f",
+                    edgecolors="black",
+                    linewidths=0.35,
+                    zorder=5,
+                    label="left bank",
+                )
+                self.ax_map.scatter(
+                    right_x[transect_valid],
+                    right_y[transect_valid],
+                    s=18,
+                    c="#de2d26",
+                    edgecolors="black",
+                    linewidths=0.35,
+                    zorder=5,
+                    label="right bank",
+                )
+            # for sample_row in dt_points.loc[valid].itertuples(index=False):
+            #     sx = pd.to_numeric(pd.Series([getattr(sample_row, "x", np.nan)]), errors="coerce").iloc[0]
+            #     sy = pd.to_numeric(pd.Series([getattr(sample_row, "y", np.nan)]), errors="coerce").iloc[0]
+            #     if not np.isfinite(sx) or not np.isfinite(sy):
+            #         continue
+            #     sample_index = getattr(sample_row, "sample_index", None)
+            #     label = f"{int(sample_index)}" if sample_index is not None and not pd.isna(sample_index) else ""
+            #     if label:
+            #         self.ax_map.text(
+            #             float(sx),
+            #             float(sy),
+            #             label,
+            #             fontsize=7,
+            #             ha="left",
+            #             va="bottom",
+            #             color="black",
+            #             bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.6, "pad": 0.1},
+            #             zorder=6,
+            #         )
+
         self.ax_map.set_aspect("equal", adjustable="box")
+        self.ax_map.set_xlim(bounds[0], bounds[2])
+        self.ax_map.set_ylim(bounds[1], bounds[3])
         self.ax_map.set_title("Local link neighborhood")
 
         metrics_lines = [
-            f"link {link_id} | review {self.current_pos + 1}/{len(self.candidate_frame)} | decision={decision}",
-            f"len_over_width={float(row['len_over_width']):.3f} | us_dev={float(row['us_dev']):.3f} | ds_dev={float(row['ds_dev']):.3f}",
-            f"node_dev_max={float(row['node_dev_max']):.3f} | qc_trimmed={float(row[QC_TRIMMED_FIELD]):.3f} | qc_mean={float(row['qc_mean_opposition_cos']):.3f}",
+            f"link {link_id} | review {self.current_pos + 1}/{len(self.candidate_frame)} | decision={decision} | view={self.map_view_mode}",
+            f"len_over_width={float(row['len_over_width']):.3f} | us_signed_dev={float(row['us_signed_dev']):.3f} | ds_signed_dev={float(row['ds_signed_dev']):.3f}",
+            f"qc_trimmed={float(row[QC_TRIMMED_FIELD]):.3f} | qc_median={float(row[QC_MEDIAN_FALLBACK_FIELD]):.3f} | n_trimmed={float(row['n_trimmed_qc_samples']):.0f}",
             f"context width field={self.width_field} value={float(row[self.width_field]):.3f} | n_units={int(row['n_units'])}",
         ]
         self.info_var.set("\n".join(metrics_lines))
 
         self.ax_table.axis("off")
         self.ax_table.set_title("Local widths and metrics")
+        right_panel_text = self._neighbor_table_text(local_links, link_id) + "\n" 
+        # + self._routing_impact_text(row)
         self.ax_table.text(
             0.0,
             1.0,
-            self._neighbor_table_text(local_links, link_id),
-            fontsize=12,
+            right_panel_text,
+            fontsize=14,
             family="monospace",
             va="top",
             linespacing=1.5,
@@ -900,10 +1222,10 @@ def load_review_context(
     *,
     width_field: str,
     len_over_width_threshold: float,
-) -> tuple[pd.DataFrame, pd.DataFrame, gpd.GeoDataFrame, dict[int, int]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, gpd.GeoDataFrame, dict[int, int]]:
     families = pd.read_csv(paths.link_width_families_path)
     samples = pd.read_csv(paths.link_width_samples_path)
-    _, sample_qc = compute_sample_qc_frame(samples)
+    marked_samples, sample_qc = compute_sample_qc_frame(samples)
     resolved_width_field = width_field if width_field in families.columns else "wid_adj"
     candidate_frame = build_candidate_frame(
         families,
@@ -913,7 +1235,7 @@ def load_review_context(
     )
     directed_links = gpd.read_file(paths.directed_links_path)
     parent_link_mapping = build_parent_link_mapping(link_lineage_path=paths.link_lineage_path, families=families)
-    return candidate_frame, sample_qc, directed_links, parent_link_mapping
+    return candidate_frame, marked_samples, sample_qc, directed_links, parent_link_mapping
 
 
 def run_width_review_gui(
@@ -922,13 +1244,18 @@ def run_width_review_gui(
     width_field: str,
     len_over_width_threshold: float,
     overwrite_backup: bool,
+    show_dt_points: bool,
+    start_over: bool,
 ) -> dict[str, Any] | None:
-    candidate_frame, _, directed_links, parent_link_mapping = load_review_context(
+    candidate_frame, marked_samples, _, directed_links, parent_link_mapping = load_review_context(
         paths,
         width_field=width_field,
         len_over_width_threshold=len_over_width_threshold,
     )
     resolved_width_field = width_field if width_field in candidate_frame.columns else "wid_adj"
+    initial_decisions = None
+    if not start_over and paths.review_csv_path.exists():
+        initial_decisions = pd.read_csv(paths.review_csv_path)
 
     root = tk.Tk()
     gui = WidthReviewGui(
@@ -937,7 +1264,10 @@ def run_width_review_gui(
         candidate_frame=candidate_frame,
         metric_frame=candidate_frame,
         directed_links=directed_links,
+        marked_samples=marked_samples,
         width_field=resolved_width_field,
+        show_dt_points=show_dt_points,
+        initial_decisions=initial_decisions,
     )
     root.mainloop()
 
@@ -991,6 +1321,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-csv", default=None, help="Optional explicit review CSV output path.")
     parser.add_argument("--review-summary-json", default=None, help="Optional explicit apply-summary JSON output path.")
     parser.add_argument("--overwrite-backup", action="store_true", help="Overwrite an existing *_width_review_old.gpkg backup.")
+    parser.add_argument(
+        "--start-over",
+        action="store_true",
+        help="Ignore any existing saved review CSV and start the GUI with all links undecided.",
+    )
+    parser.add_argument(
+        "--dt-points",
+        action="store_true",
+        help="Overlay the trimmed distance-transform sample points used for the focal link width/QC computations.",
+    )
     return parser
 
 
@@ -1008,6 +1348,8 @@ def main() -> None:
         width_field=args.width_field,
         len_over_width_threshold=args.len_over_width_threshold,
         overwrite_backup=args.overwrite_backup,
+        show_dt_points=args.dt_points,
+        start_over=args.start_over,
     )
     if summary is None:
         print("Review closed without saving.")
