@@ -169,6 +169,18 @@ products in that single pass.
 `run-all` reuses the existing prepared mask unless you pass `--force-prepare`,
 so you do not need to rebuild the binary mask after making manual edits.
 
+## Panelized fallback for masks that exceed local memory
+
+When whole-mask RivGraph is killed during skeletonization, create and manually
+review V/H panel-break lines, then run `run-panelized-rivgraph`. The command
+creates the panel plan from those reviewed breaks, runs directed RivGraph per
+panel, reconciles the global topology, and writes `merged_links_directed.gpkg`.
+
+Follow-up still required: `network_variants/variant_generation.py` currently
+always reruns RivGraph on a full collapsed mask. Add a panelized backend there
+that reuses the reviewed panel plan and breaks for every collapsed state; until
+then, large-raster collapse variants must not use that full-mask rerun path.
+
 ## Environment notes
 
 Use the separate conda environment defined in `environment.yml`. It targets
