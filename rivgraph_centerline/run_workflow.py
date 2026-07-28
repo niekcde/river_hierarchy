@@ -90,6 +90,13 @@ def parse_args() -> argparse.Namespace:
     panel_masks_parser.add_argument("--panel-id", action="append", default=None, help="Repeat to prepare selected panels only.")
     panel_masks_parser.add_argument("--overwrite", action="store_true")
 
+    panel_run_parser = subparsers.add_parser("run-panel-rivgraph", help="Run RivGraph for one prepared panel mask.")
+    add_run_identity_args(panel_run_parser)
+    panel_run_parser.add_argument("--panel-id", required=True)
+    panel_run_parser.add_argument("--exit-sides", required=True, help="Local panel exit sides, e.g. SN.")
+    panel_run_parser.add_argument("--assign-flow", action="store_true")
+    panel_run_parser.add_argument("--flow-mesh-mode", choices=("auto", "valley", "centerline"), default="auto")
+
     run_parser = subparsers.add_parser("run-rivgraph", help="Run RivGraph on the prepared or cleaned mask.")
     add_run_identity_args(run_parser)
     run_parser.add_argument("--mask", type=Path, default=None, help="Explicit input mask override.")
@@ -175,6 +182,11 @@ def add_run_identity_args(parser: argparse.ArgumentParser) -> None:
 
 
 def dispatch(args: argparse.Namespace) -> dict[str, object]:
+    if args.command == "run-panel-rivgraph":
+        parent = WorkflowPaths.from_name(args.name, args.run_dir)
+        panel_dir = parent.run_dir / "panels" / args.panel_id
+        paths, summary = run_rivgraph_for_run(name=f"{parent.name}_{args.panel_id}", run_dir=panel_dir, mask=panel_dir / "mask.tif", mask_stage="explicit", exit_sides=args.exit_sides, assign_flow=args.assign_flow, flow_mesh_mode=args.flow_mesh_mode)
+        return {"command": args.command, "run_paths": paths_to_dict(paths), "summary": summary}
     if args.command in {"create-panel-breaks", "plan-panels", "prepare-panel-masks"}:
         paths = WorkflowPaths.from_name(args.name, args.run_dir)
         mask = paths.cleaned_mask if args.mask is None else args.mask
