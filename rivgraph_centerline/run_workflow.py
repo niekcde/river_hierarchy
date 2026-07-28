@@ -20,6 +20,7 @@ from rivgraph_centerline.workflow import (  # noqa: E402
     run_rivgraph_for_run,
     prepare_mask_for_run,
 )
+from rivgraph_centerline.panelization import create_panel_breaks, plan_panels  # noqa: E402
 
 
 def main() -> None:
@@ -64,6 +65,23 @@ def parse_args() -> argparse.Namespace:
     edits_parser.add_argument("--tiny-land-export-path", type=Path, default=None, help="Optional GeoPackage path for the post-cleanup main-river small-land export.")
     edits_parser.add_argument("--diagonal-passage-export-path", type=Path, default=None, help="Optional GeoPackage path for the post-cleanup main-river diagonal-passage diagnostic points.")
     edits_parser.add_argument("--keep-largest-water-component", action="store_true", help="Discard all 8-connected water components except the largest after manual edits.")
+
+    breaks_parser = subparsers.add_parser("create-panel-breaks", help="Create an editable provisional panel-break GeoPackage.")
+    add_run_identity_args(breaks_parser)
+    breaks_parser.add_argument("--mask", type=Path, default=None, help="Cleaned mask override.")
+    breaks_parser.add_argument("--output", type=Path, default=None, help="GeoPackage output override.")
+    breaks_parser.add_argument("--rows", type=int, default=4)
+    breaks_parser.add_argument("--columns", type=int, default=4)
+    breaks_parser.add_argument("--overwrite", action="store_true")
+
+    plan_parser = subparsers.add_parser("plan-panels", help="Build irregular panel cores and overlap QA layers from edited breaks.")
+    add_run_identity_args(plan_parser)
+    plan_parser.add_argument("--mask", type=Path, default=None)
+    plan_parser.add_argument("--panel-breaks", type=Path, default=None)
+    plan_parser.add_argument("--output", type=Path, default=None)
+    plan_parser.add_argument("--overlap-m", type=float, default=5000)
+    plan_parser.add_argument("--max-panel-pixels", type=int, default=160_000_000)
+    plan_parser.add_argument("--overwrite", action="store_true")
 
     run_parser = subparsers.add_parser("run-rivgraph", help="Run RivGraph on the prepared or cleaned mask.")
     add_run_identity_args(run_parser)
@@ -150,6 +168,15 @@ def add_run_identity_args(parser: argparse.ArgumentParser) -> None:
 
 
 def dispatch(args: argparse.Namespace) -> dict[str, object]:
+    if args.command in {"create-panel-breaks", "plan-panels"}:
+        paths = WorkflowPaths.from_name(args.name, args.run_dir)
+        mask = paths.cleaned_mask if args.mask is None else args.mask
+        breaks = paths.manual_edits_dir / f"{paths.name}_panel_breaks.gpkg" if getattr(args, "panel_breaks", None) is None else args.panel_breaks
+        if args.command == "create-panel-breaks":
+            summary = create_panel_breaks(mask_path=mask, output_path=(paths.manual_edits_dir / f"{paths.name}_panel_breaks.gpkg") if args.output is None else args.output, rows=args.rows, columns=args.columns, overwrite=args.overwrite)
+        else:
+            summary = plan_panels(mask_path=mask, breaks_path=breaks, output_path=(paths.run_dir / "panels" / "panel_plan.gpkg") if args.output is None else args.output, overlap_m=args.overlap_m, max_panel_pixels=args.max_panel_pixels, overwrite=args.overwrite)
+        return {"command": args.command, "summary": summary}
     if args.command == "prepare-mask":
         paths, summary = prepare_mask_for_run(
             name=args.name,
