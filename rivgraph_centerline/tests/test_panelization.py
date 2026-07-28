@@ -7,14 +7,14 @@ import numpy as np
 import geopandas as gpd
 import rasterio
 from rasterio.transform import from_origin
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Point
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = PROJECT_ROOT / "rivgraph_centerline" / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from rivgraph_centerline.panelization import _provisional_panel_grid, create_panel_breaks, plan_panels, prepare_panel_masks, rebuild_core_network_nodes
+from rivgraph_centerline.panelization import _provisional_panel_grid, assign_core_network_direction, create_panel_breaks, plan_panels, prepare_panel_masks, rebuild_core_network_nodes
 
 
 def test_panel_breaks_and_plan_create_four_irregular_core_outputs(tmp_path: Path) -> None:
@@ -62,3 +62,37 @@ def test_provisional_panel_grid_is_budget_based_and_aspect_aware() -> None:
     rows, columns = _provisional_panel_grid(height=48_000, width=40_500, max_panel_pixels=160_000_000)
     assert (rows, columns) == (4, 4)
     assert np.ceil(48_000 / rows) * np.ceil(40_500 / columns) <= 160_000_000
+
+
+def test_assign_core_network_direction_uses_distinct_downstream_node(tmp_path: Path) -> None:
+    core_dir = tmp_path / "core"
+    panel_rivgraph = tmp_path / "panels" / "P001" / "rivgraph"
+    core_dir.mkdir(parents=True)
+    panel_rivgraph.mkdir(parents=True)
+    crs = "EPSG:32611"
+    gpd.GeoDataFrame(
+        {"global_link_id": [0], "source_segments": ["P001:1:0"], "id_node_a": [10], "id_node_b": [11]},
+        geometry=[LineString([(0, 0), (10, 0)])], crs=crs,
+    ).to_file(core_dir / "merged_links.gpkg", layer="merged_links", driver="GPKG")
+    gpd.GeoDataFrame(
+        {"segment_id": ["P001:1:0"], "panel_id": ["P001"], "source_link_id": [1]},
+        geometry=[LineString([(0, 0), (10, 0)])], crs=crs,
+    ).to_file(core_dir / "core_segments.gpkg", layer="core_segments", driver="GPKG")
+    gpd.GeoDataFrame(
+        {"id_link": [1], "id_us_node": [5], "id_ds_node": [6]},
+        geometry=[LineString([(0, 0), (10, 0)])], crs=crs,
+    ).to_file(panel_rivgraph / "x_P001_links.gpkg", driver="GPKG")
+    gpd.GeoDataFrame({"id_node": [5, 6]}, geometry=[Point(0, 0), Point(10, 0)], crs=crs).to_file(panel_rivgraph / "x_P001_nodes.gpkg", driver="GPKG")
+
+    summary = assign_core_network_direction(
+        merged_links_path=core_dir / "merged_links.gpkg",
+        core_segments_path=core_dir / "core_segments.gpkg",
+        panel_root=tmp_path / "panels",
+        run_name="x",
+        output_dir=core_dir,
+    )
+
+    assert summary["assigned_link_count"] == 1
+    directed = gpd.read_file(core_dir / "merged_links_directed.gpkg", layer="merged_links")
+    assert directed.loc[0, "id_us_node"] == 10
+    assert directed.loc[0, "id_ds_node"] == 11

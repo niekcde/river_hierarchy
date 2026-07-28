@@ -337,7 +337,7 @@ def assign_core_network_direction(
         upstream_endpoint = 0 if votes[0] > votes[1] else 1
         downstream_endpoint = 1 - upstream_endpoint
         upstream_ids.append(int(row.id_node_a) if upstream_endpoint == 0 else int(row.id_node_b))
-        downstream_ids.append(int(row.id_node_b) if downstream_endpoint == 0 else int(row.id_node_a))
+        downstream_ids.append(int(row.id_node_a) if downstream_endpoint == 0 else int(row.id_node_b))
         status.append("assigned")
         coordinates = list(row.geometry.coords)
         geometries.append(row.geometry if upstream_endpoint == 0 else LineString(coordinates[::-1]))
@@ -357,6 +357,104 @@ def assign_core_network_direction(
     }
     summary_output.write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
+
+
+def publish_panelized_rivgraph_handoff(
+    *,
+    directed_links_path: Path,
+    nodes_path: Path,
+    core_segments_path: Path,
+    panel_root: Path,
+    run_name: str,
+    rivgraph_dir: Path,
+    overwrite: bool = False,
+) -> dict[str, object]:
+    """Publish panelized vectors under the normal ``<run>/rivgraph`` contract.
+
+    This deliberately publishes vectors only. A full-mask skeleton, distance
+    transform, and direction raster cannot be reconstructed without attempting
+    the memory-prohibitive whole-mask RivGraph run.
+    """
+    links = gpd.read_file(directed_links_path, layer="merged_links")
+    nodes = gpd.read_file(nodes_path, layer="merged_nodes")
+    segments = gpd.read_file(core_segments_path, layer="core_segments")
+    if links["id_us_node"].isna().any() or links["id_ds_node"].isna().any():
+        raise ValueError("Cannot publish panelized handoff while directed links remain ambiguous.")
+    output_links = rivgraph_dir / f"{run_name}_links.gpkg"
+    output_nodes = rivgraph_dir / f"{run_name}_nodes.gpkg"
+    output_centerline = rivgraph_dir / f"{run_name}_centerline.gpkg"
+    if not overwrite and any(path.exists() for path in (output_links, output_nodes, output_centerline)):
+        raise FileExistsError(f"Panelized RivGraph handoff already exists in {rivgraph_dir}; use --overwrite to replace it.")
+
+    source_rows: dict[tuple[str, int], object] = {}
+    for panel in sorted(segments["panel_id"].unique()):
+        panel_links = gpd.read_file(panel_root / panel / "rivgraph" / f"{run_name}_{panel}_links.gpkg").set_index("id_link")
+        for source_link_id, source in panel_links.iterrows():
+            source_rows[(panel, int(source_link_id))] = source
+    segment_by_id = segments.set_index("segment_id")
+    width_fields = ("wid", "wid_adj", "wid_med", "sinuosity")
+    enriched_records: list[dict[str, object]] = []
+    for row in links.itertuples(index=False):
+        values: dict[str, list[tuple[float, float]]] = {field: [] for field in width_fields}
+        for segment_id in str(row.source_segments).split(";"):
+            segment = segment_by_id.loc[segment_id]
+            source = source_rows[(segment.panel_id, int(segment.source_link_id))]
+            weight = float(segment.geometry.length)
+            for field in width_fields:
+                value = source.get(field)
+                if pd.notna(value):
+                    values[field].append((float(value), weight))
+        record = row._asdict()
+        record["id_link"] = int(row.global_link_id)
+        record["idx_link"] = int(row.global_link_id)
+        record["n_nodes"] = 2
+        record["len"] = float(row.geometry.length)
+        record["schema_rg"] = "panelized-rivgraph-v1"
+        for field, weighted in values.items():
+            record[field] = sum(value * weight for value, weight in weighted) / sum(weight for _, weight in weighted) if weighted else None
+        enriched_records.append(record)
+    published_links = gpd.GeoDataFrame(enriched_records, geometry="geometry", crs=links.crs)
+    incoming = published_links["id_ds_node"].astype(int).value_counts()
+    outgoing = published_links["id_us_node"].astype(int).value_counts()
+    node_ids = nodes["id_node"].astype(int)
+    inlet_ids = set(node_ids.loc[~node_ids.isin(incoming.index) & node_ids.isin(outgoing.index)])
+    outlet_ids = set(node_ids.loc[~node_ids.isin(outgoing.index) & node_ids.isin(incoming.index)])
+    published_links["is_inlet"] = published_links["id_us_node"].astype(int).isin(inlet_ids)
+    published_links["is_outlet"] = published_links["id_ds_node"].astype(int).isin(outlet_ids)
+    published_links["type_io"] = "neither"
+    published_links.loc[published_links.is_inlet, "type_io"] = "inlet"
+    published_links.loc[published_links.is_outlet, "type_io"] = "outlet"
+    node_links: dict[int, list[int]] = {int(node_id): [] for node_id in node_ids}
+    for row in published_links.itertuples(index=False):
+        node_links[int(row.id_us_node)].append(int(row.id_link))
+        node_links[int(row.id_ds_node)].append(int(row.id_link))
+    published_nodes = nodes.copy()
+    published_nodes["idx_node"] = published_nodes["id_node"].astype(int)
+    published_nodes["id_links"] = published_nodes["id_node"].astype(int).map(lambda node_id: ", ".join(map(str, node_links[node_id])))
+    published_nodes["n_links"] = published_nodes["id_node"].astype(int).map(lambda node_id: len(node_links[node_id]))
+    published_nodes["is_inlet"] = published_nodes["id_node"].astype(int).isin(inlet_ids)
+    published_nodes["is_outlet"] = published_nodes["id_node"].astype(int).isin(outlet_ids)
+    published_nodes["type_io"] = "neither"
+    published_nodes.loc[published_nodes.is_inlet, "type_io"] = "inlet"
+    published_nodes.loc[published_nodes.is_outlet, "type_io"] = "outlet"
+    published_nodes["schema_rg"] = "panelized-rivgraph-v1"
+
+    # Preserve the normal file name while honestly representing a branched
+    # network as a MultiLineString rather than pretending it is one main line.
+    centerline = gpd.GeoDataFrame({"schema_rg": ["panelized-rivgraph-v1"]}, geometry=[unary_union(published_links.geometry.tolist())], crs=links.crs)
+    rivgraph_dir.mkdir(parents=True, exist_ok=True)
+    published_links.to_file(output_links, driver="GPKG")
+    published_nodes.to_file(output_nodes, driver="GPKG")
+    centerline.to_file(output_centerline, driver="GPKG")
+    manifest = {
+        "mode": "panelized",
+        "links": str(output_links),
+        "nodes": str(output_nodes),
+        "centerline": str(output_centerline),
+        "unavailable_full_mask_products": ["skeleton", "distance_transform", "link_directions_raster"],
+    }
+    (rivgraph_dir / f"{run_name}_panelized_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
 
 
 def plan_boundary_matches(*, plan_path: Path, breaks_path: Path, mask_path: Path, output_path: Path, global_exit_sides: str = "SE") -> dict[str, object]:

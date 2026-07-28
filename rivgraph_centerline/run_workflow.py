@@ -20,7 +20,7 @@ from rivgraph_centerline.workflow import (  # noqa: E402
     run_rivgraph_for_run,
     prepare_mask_for_run,
 )
-from rivgraph_centerline.panelization import create_panel_breaks, plan_panels, prepare_panel_masks, match_panel_boundary_links, concatenate_matched_panel_links, rebuild_pilot_nodes, validate_pilot_topology, plan_boundary_matches, build_core_boundary_network, rebuild_core_network_nodes, assign_core_network_direction  # noqa: E402
+from rivgraph_centerline.panelization import create_panel_breaks, plan_panels, prepare_panel_masks, match_panel_boundary_links, concatenate_matched_panel_links, rebuild_pilot_nodes, validate_pilot_topology, plan_boundary_matches, build_core_boundary_network, rebuild_core_network_nodes, assign_core_network_direction, publish_panelized_rivgraph_handoff  # noqa: E402
 
 
 def main() -> None:
@@ -143,6 +143,9 @@ def parse_args() -> argparse.Namespace:
     add_run_identity_args(direction_parser)
     direction_parser.add_argument("--endpoint-tolerance-m", type=float, default=0.01)
     direction_parser.add_argument("--overwrite", action="store_true")
+    handoff_parser = subparsers.add_parser("publish-panelized-rivgraph", help="Publish panelized vectors under the standard run/rivgraph file names.")
+    add_run_identity_args(handoff_parser)
+    handoff_parser.add_argument("--overwrite", action="store_true")
     panelized_parser = subparsers.add_parser("run-panelized-rivgraph", help="Create a plan from reviewed breaks, then run the complete panelized RivGraph workflow.")
     add_run_identity_args(panelized_parser)
     panelized_parser.add_argument("--exit-sides", required=True, help="Global river orientation, upstream first (for example SE).")
@@ -269,11 +272,16 @@ def dispatch(args: argparse.Namespace) -> dict[str, object]:
         core = build_core_boundary_network(plan_path=plan, breaks_path=breaks, panel_root=parent.run_dir / "panels", run_name=parent.name, output_dir=core_dir, tolerance_m=args.boundary_tolerance_m, overwrite=args.overwrite, boundary_match_plan_path=match_plan)
         nodes = rebuild_core_network_nodes(merged_links_path=core_dir / "merged_core_links.gpkg", output_dir=core_dir, endpoint_tolerance_m=args.endpoint_tolerance_m, overwrite=args.overwrite)
         direction = assign_core_network_direction(merged_links_path=core_dir / "merged_links.gpkg", core_segments_path=core_dir / "core_segments.gpkg", panel_root=parent.run_dir / "panels", run_name=parent.name, output_dir=core_dir, endpoint_tolerance_m=args.endpoint_tolerance_m, overwrite=args.overwrite)
+        handoff = publish_panelized_rivgraph_handoff(directed_links_path=core_dir / "merged_links_directed.gpkg", nodes_path=core_dir / "merged_nodes.gpkg", core_segments_path=core_dir / "core_segments.gpkg", panel_root=parent.run_dir / "panels", run_name=parent.name, rivgraph_dir=parent.rivgraph_dir, overwrite=args.overwrite)
         summary_path = parent.run_dir / "merged_network" / "panelized_workflow_summary.json"
-        summary = {"mask": str(mask), "plan": planned, "breaks": str(breaks), "global_exit_sides": args.exit_sides.upper(), "prepared": prepared, "boundary_plan": boundary_plan, "panels": panel_results, "core_network": core, "nodes": nodes, "direction": direction}
+        summary = {"mask": str(mask), "plan": planned, "breaks": str(breaks), "global_exit_sides": args.exit_sides.upper(), "prepared": prepared, "boundary_plan": boundary_plan, "panels": panel_results, "core_network": core, "nodes": nodes, "direction": direction, "handoff": handoff}
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         return {"command": args.command, "summary_path": str(summary_path), "panel_count": len(panel_results), "directed_links": direction["output"], "ambiguous_link_count": direction["ambiguous_link_count"]}
+    if args.command == "publish-panelized-rivgraph":
+        parent = WorkflowPaths.from_name(args.name, args.run_dir)
+        core_dir = parent.run_dir / "merged_network" / "core_boundary"
+        return {"command": args.command, "summary": publish_panelized_rivgraph_handoff(directed_links_path=core_dir / "merged_links_directed.gpkg", nodes_path=core_dir / "merged_nodes.gpkg", core_segments_path=core_dir / "core_segments.gpkg", panel_root=parent.run_dir / "panels", run_name=parent.name, rivgraph_dir=parent.rivgraph_dir, overwrite=args.overwrite)}
     if args.command == "assign-core-network-direction":
         parent = WorkflowPaths.from_name(args.name, args.run_dir)
         output_dir = parent.run_dir / "merged_network" / "core_boundary"
