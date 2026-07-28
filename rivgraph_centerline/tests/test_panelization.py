@@ -12,7 +12,7 @@ SRC_ROOT = PROJECT_ROOT / "rivgraph_centerline" / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from rivgraph_centerline.panelization import create_panel_breaks, plan_panels
+from rivgraph_centerline.panelization import create_panel_breaks, plan_panels, prepare_panel_masks
 
 
 def test_panel_breaks_and_plan_create_four_irregular_core_outputs(tmp_path: Path) -> None:
@@ -27,3 +27,6 @@ def test_panel_breaks_and_plan_create_four_irregular_core_outputs(tmp_path: Path
     assert summary["over_budget_panel_ids"] == []
     assert plan.exists()
     assert plan.with_suffix(".json").exists()
+    prepared = prepare_panel_masks(mask_path=mask, plan_path=plan, output_dir=tmp_path / "panels", panel_ids={"P001"})
+    assert prepared["prepared_panel_ids"] == ["P001"]
+    assert (tmp_path / "panels" / "P001" / "mask.tif").exists()

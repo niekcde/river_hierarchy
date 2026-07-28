@@ -7,8 +7,12 @@ from pathlib import Path
 
 import geopandas as gpd
 import rasterio
+from rasterio.features import rasterize
+from rasterio.windows import from_bounds
 from shapely.geometry import LineString, box
 from shapely.ops import polygonize, unary_union
+
+from rivgraph_centerline.raster_mask import crop_binary_mask
 
 
 PANEL_BREAK_LAYER = "panel_breaks"
@@ -75,3 +79,43 @@ def plan_panels(
                "max_panel_pixels": max_panel_pixels, "over_budget_panel_ids": cores.loc[~cores["within_pixel_budget"], "panel_id"].tolist()}
     output_path.with_suffix(".json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
+
+
+def prepare_panel_masks(*, mask_path: Path, plan_path: Path, output_dir: Path, panel_ids: set[str] | None = None, overwrite: bool = False) -> dict[str, object]:
+    """Clip buffered processing areas to independently runnable binary masks."""
+    cores = gpd.read_file(plan_path, layer="panel_cores")
+    processing = gpd.read_file(plan_path, layer="processing_areas")
+    selected = processing if panel_ids is None else processing.loc[processing["panel_id"].isin(panel_ids)]
+    missing = set() if panel_ids is None else panel_ids.difference(set(processing["panel_id"]))
+    if missing:
+        raise ValueError(f"Unknown panel_id(s): {sorted(missing)}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest: list[dict[str, object]] = []
+    with rasterio.open(mask_path) as src:
+        for record in selected.itertuples(index=False):
+            panel_dir = output_dir / record.panel_id
+            panel_mask = panel_dir / "mask.tif"
+            if panel_mask.exists() and not overwrite:
+                raise FileExistsError(f"Panel mask already exists: {panel_mask}")
+            geometry = record.geometry
+            window = from_bounds(*geometry.bounds, transform=src.transform).round_offsets().round_lengths()
+            window = window.intersection(rasterio.windows.Window(0, 0, src.width, src.height))
+            data = src.read(1, window=window)
+            local_transform = src.window_transform(window)
+            keep = rasterize([(geometry, 1)], out_shape=data.shape, transform=local_transform, fill=0, dtype="uint8").astype(bool)
+            clipped = ((data > 0) & keep).astype("uint8")
+            cropped, cropped_transform, crop_window = crop_binary_mask(clipped, local_transform)
+            profile = src.profile.copy()
+            profile.update(driver="GTiff", dtype="uint8", count=1, nodata=0, compress="lzw", height=cropped.shape[0], width=cropped.shape[1], transform=cropped_transform)
+            panel_dir.mkdir(parents=True, exist_ok=True)
+            with rasterio.open(panel_mask, "w", **profile) as dst:
+                dst.write(cropped, 1)
+            core = cores.loc[cores["panel_id"] == record.panel_id].geometry.iloc[0]
+            summary = {"panel_id": record.panel_id, "mask": str(panel_mask), "source_mask": str(mask_path), "water_pixels": int(cropped.sum()),
+                       "shape": [int(cropped.shape[0]), int(cropped.shape[1])], "crop_window": crop_window,
+                       "core_bounds": list(core.bounds), "processing_bounds": list(geometry.bounds)}
+            (panel_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            manifest.append(summary)
+    manifest_path = output_dir / "panel_mask_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return {"output_dir": str(output_dir), "manifest": str(manifest_path), "prepared_panel_ids": [item["panel_id"] for item in manifest]}
