@@ -18,6 +18,17 @@ from rivgraph_centerline.raster_mask import crop_binary_mask
 
 
 PANEL_BREAK_LAYER = "panel_breaks"
+STANDARD_LINK_COLUMNS = [
+    "id_link", "idx_link", "id_nodes", "n_nodes", "id_us_node", "id_ds_node",
+    "is_inlet", "is_outlet", "type_io", "schema_rg", "link_conn", "wid_pix",
+    "len", "wid", "wid_adj", "wid_med", "len_adj", "sinuosity", "certain",
+    "certain_order", "certain_alg", "guess", "guess_alg", "maxang", "cldists",
+    "clangs", "wid_pctdiff", "geometry",
+]
+STANDARD_NODE_COLUMNS = [
+    "id_node", "idx_node", "id_links", "n_links", "is_inlet", "is_outlet",
+    "type_io", "schema_rg", "geometry",
+]
 
 
 def _line_parts(geometry: object) -> list[LineString]:
@@ -404,12 +415,44 @@ def publish_panelized_rivgraph_handoff(
                 value = source.get(field)
                 if pd.notna(value):
                     values[field].append((float(value), weight))
-        record = row._asdict()
-        record["id_link"] = int(row.global_link_id)
-        record["idx_link"] = int(row.global_link_id)
-        record["n_nodes"] = 2
-        record["len"] = float(row.geometry.length)
-        record["schema_rg"] = "panelized-rivgraph-v1"
+        source_segments = [segment_by_id.loc[segment_id] for segment_id in str(row.source_segments).split(";")]
+        adjusted_length = 0.0
+        width_pixels: list[str] = []
+        for segment in source_segments:
+            source = source_rows[(segment.panel_id, int(segment.source_link_id))]
+            source_length = float(source.geometry.length)
+            source_adjusted_length = pd.to_numeric(pd.Series([source.get("len_adj")]), errors="coerce").iloc[0]
+            if pd.notna(source_adjusted_length) and source_length > 0:
+                adjusted_length += float(source_adjusted_length) * float(segment.geometry.length) / source_length
+            width_pixel_value = source.get("wid_pix")
+            if pd.notna(width_pixel_value):
+                width_pixels.append(str(width_pixel_value))
+        record = {
+            "id_link": int(row.global_link_id),
+            # Global raster indices do not exist for a panelized handoff.
+            # Keep RivGraph's string field type and mark the value unavailable.
+            "idx_link": "",
+            "id_nodes": f"{int(row.id_node_a)}, {int(row.id_node_b)}",
+            "n_nodes": 2,
+            "id_us_node": int(row.id_us_node),
+            "id_ds_node": int(row.id_ds_node),
+            "_node_a": int(row.id_node_a),
+            "_node_b": int(row.id_node_b),
+            "schema_rg": "rg-v1",
+            "wid_pix": "; ".join(width_pixels),
+            "len": float(row.geometry.length),
+            "len_adj": adjusted_length if adjusted_length > 0 else float(row.geometry.length),
+            "certain": 1.0,
+            "certain_order": 0.0,
+            "certain_alg": 0.0,
+            "guess": "",
+            "guess_alg": "panelized-global",
+            "maxang": float("nan"),
+            "cldists": "",
+            "clangs": "",
+            "wid_pctdiff": None,
+            "geometry": row.geometry,
+        }
         for field, weighted in values.items():
             record[field] = sum(value * weight for value, weight in weighted) / sum(weight for _, weight in weighted) if weighted else None
         enriched_records.append(record)
@@ -438,6 +481,19 @@ def publish_panelized_rivgraph_handoff(
     published_nodes.loc[published_nodes.is_inlet, "type_io"] = "inlet"
     published_nodes.loc[published_nodes.is_outlet, "type_io"] = "outlet"
     published_nodes["schema_rg"] = "panelized-rivgraph-v1"
+
+    # The standard run/rivgraph files intentionally contain only RivGraph's
+    # normal fields. Panel provenance remains available in merged_network.
+    published_links["link_conn"] = published_links.apply(
+        lambda row: ", ".join(
+            str(link_id) for node_id in (int(row["_node_a"]), int(row["_node_b"]))
+            for link_id in node_links[node_id] if link_id != int(row.id_link)
+        ),
+        axis=1,
+    )
+    published_links = published_links.reindex(columns=STANDARD_LINK_COLUMNS)
+    published_nodes["schema_rg"] = "rg-v1"
+    published_nodes = published_nodes.reindex(columns=STANDARD_NODE_COLUMNS)
 
     # Preserve the normal file name while honestly representing a branched
     # network as a MultiLineString rather than pretending it is one main line.
