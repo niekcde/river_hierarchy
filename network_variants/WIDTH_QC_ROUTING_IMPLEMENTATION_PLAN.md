@@ -144,6 +144,19 @@ top-level `width_review` directory.
 
 ## Phase 4 — Consolidated supervised-learning dataset
 
+**Status: complete (2026-07-31).** A deterministic, versioned dataset builder
+now reads only permanent run-level archives, validates their Phase 2 freshness,
+maps every good/bad decision to one canonical example/link row, derives the
+agreed primary and secondary predictors, and writes a dataset, validation
+report, and content manifest. Missing predictors remain explicit rather than
+causing silent row removal.
+
+Build or refresh the dataset with:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -m network_variants.width_review_dataset
+```
+
 Combine all permanent review archives into one reproducible training table.
 Each row represents one manually classified candidate link.
 
