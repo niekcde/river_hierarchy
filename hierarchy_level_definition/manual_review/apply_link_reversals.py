@@ -364,8 +364,11 @@ def process_example(
 
     if old_backup_mode == "use":
         links_backup = backup_path(paths.links_path)
-        ensure_exists(links_backup, label="Original links backup")
         manual_link_backup = backup_path(paths.manual_link_csv_path)
+        if not links_backup.exists():
+            copy_backup(paths.links_path, overwrite=False)
+        if paths.manual_link_csv_path.exists() and not manual_link_backup.exists():
+            copy_backup(paths.manual_link_csv_path, overwrite=False)
         links_source_path = links_backup
         manual_link_source_path = manual_link_backup if manual_link_backup.exists() else None
     else:
@@ -470,7 +473,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "How to handle *_old files: error (default) refuses an existing backup; "
             "overwrite replaces it from the current working files; use reads it as the "
-            "immutable baseline and regenerates the current working files."
+            "immutable baseline (creating it from the current working files if absent) "
+            "and regenerates the current working files."
         ),
     )
     parser.add_argument(

@@ -190,6 +190,53 @@ def test_process_example_use_mode_rebuilds_from_original_backup(tmp_path: Path) 
     assert (int(manual["usnode"]), int(manual["dsnode"])) == (2, 1)
 
 
+def test_process_example_use_mode_creates_missing_original_backups(tmp_path: Path) -> None:
+    review_root = tmp_path / "manual_review_outputs"
+    validation_root = tmp_path / "validation_outputs"
+    links_path, _, manual_csv_path = _write_review_network(
+        review_root,
+        example_id="first_use",
+        links_rows=[
+            {
+                "id_link": 1,
+                "id_nodes": "1, 2",
+                "id_us_node": 1,
+                "id_ds_node": 2,
+                "manual_direction_reviewed": True,
+                "manual_us_node": 1,
+                "manual_ds_node": 2,
+                "geometry_reversed_manual": False,
+                "is_inlet": False,
+                "is_outlet": False,
+                "geometry": LineString([(0, 0), (1, 0)]),
+            }
+        ],
+        node_rows=[
+            {"id_node": 1, "is_inlet": True, "is_outlet": False, "geometry": Point(0, 0)},
+            {"id_node": 2, "is_inlet": False, "is_outlet": True, "geometry": Point(1, 0)},
+        ],
+    )
+
+    result = process_example(
+        "first_use",
+        [1],
+        review_root=review_root,
+        validation_root=validation_root,
+        old_backup_mode="use",
+    )
+
+    links_backup = links_path.with_name("directed_links_old.gpkg")
+    manual_backup = manual_csv_path.with_name("manual_link_directions_old.csv")
+    assert links_backup.exists()
+    assert manual_backup.exists()
+    assert result["links_source_path"] == str(links_backup)
+    assert result["manual_link_csv_backup_path"] == str(manual_backup)
+    edited = gpd.read_file(links_path).iloc[0]
+    original = gpd.read_file(links_backup).iloc[0]
+    assert (int(edited["id_us_node"]), int(edited["id_ds_node"])) == (2, 1)
+    assert (int(original["id_us_node"]), int(original["id_ds_node"])) == (1, 2)
+
+
 def test_process_example_writes_invalid_validation_report(tmp_path: Path) -> None:
     review_root = tmp_path / "manual_review_outputs"
     validation_root = tmp_path / "validation_outputs"
