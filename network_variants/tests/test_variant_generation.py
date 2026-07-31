@@ -1043,6 +1043,21 @@ def test_segment_collapsed_links_to_anchor_nodes_splits_link_at_nominal_parent_n
         "20.000000,30.000000",
         "30.000000,40.000000",
     }
+    legacy_widths_by_samples = {
+        row.wid_pix: (
+            float(row.wid),
+            float(row.wid_adj),
+            float(row.wid_med),
+            float(row.len_adj),
+            float(row.sinuosity),
+        )
+        for row in updated_links.itertuples(index=False)
+    }
+    assert legacy_widths_by_samples == {
+        "10.000000,20.000000": (15.0, 15.0, 15.0, 10.0, 1.0),
+        "20.000000,30.000000": (25.0, 25.0, 25.0, 10.0, 1.0),
+        "30.000000,40.000000": (35.0, 35.0, 35.0, 10.0, 1.0),
+    }
 
     kept = updated_links.loc[updated_links["id_link"] == 20].iloc[0]
     assert np.isclose(float(kept["len"]), 10.0)

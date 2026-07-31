@@ -52,8 +52,8 @@ from network_variants.sword_matching import match_variant_nodes_to_sword
 from network_variants.width_two_bank import build_state_bank_labels, compute_two_bank_width_families
 
 
-DEFAULT_FOOTPRINT_WIDTH_FIELD = "wid_adj"
-WIDTH_FALLBACK_FIELDS = ("wid_adj", "wid", "wid_med")
+DEFAULT_FOOTPRINT_WIDTH_FIELD = "wid_adj_wet"
+WIDTH_FALLBACK_FIELDS = ("wid_adj_wet", "wid_adj", "wid", "wid_med")
 DEFAULT_FOOTPRINT_BUFFER_SCALE = 0.5
 DEFAULT_TRANSECT_SCALE = 1.5
 DEFAULT_MIN_TRANSECT_PIXELS = 5.0
@@ -852,7 +852,10 @@ def _local_width_corridor(
     if geometry is None or geometry.is_empty:
         return GeometryCollection()
 
-    local_width = _width_from_row(row, preferred_field="wid_adj")
+    local_width = _width_from_row(
+        row,
+        preferred_field=DEFAULT_FOOTPRINT_WIDTH_FIELD,
+    )
     radius = max(float(local_width) * DEFAULT_FOOTPRINT_BUFFER_SCALE, pixel_length)
     if not math.isfinite(radius) or radius <= 0:
         radius = pixel_length
@@ -2167,32 +2170,135 @@ def _split_ordered_samples(
     return segments
 
 
+def _split_ordered_geometry_samples(
+    values: Sequence[Any],
+    *,
+    geometry: LineString,
+    cut_distances: Sequence[float],
+) -> list[list[Any]]:
+    """Split vertex-aligned samples at their nearest along-line cut vertices."""
+    coordinates = np.asarray(geometry.coords, dtype=float)
+    if len(values) != len(coordinates) or len(coordinates) < 2:
+        total_length = float(geometry.length)
+        cut_fractions = [
+            max(0.0, min(float(distance) / total_length, 1.0))
+            if total_length > 0
+            else 0.5
+            for distance in cut_distances
+        ]
+        return _split_ordered_samples(values, cut_fractions=cut_fractions)
+
+    step_lengths = np.linalg.norm(np.diff(coordinates, axis=0), axis=1)
+    sample_distances = np.concatenate(([0.0], np.cumsum(step_lengths)))
+    ordered_cuts = sorted(
+        {
+            max(0.0, min(float(distance), float(sample_distances[-1])))
+            for distance in cut_distances
+        }
+    )
+    cut_fractions = [
+        float(np.argmin(np.abs(sample_distances - distance))) / float(len(values) - 1)
+        for distance in ordered_cuts
+    ]
+    return _split_ordered_samples(values, cut_fractions=cut_fractions)
+
+
 def _split_serialized_link_samples(
     row_data: Mapping[str, Any],
     *,
+    geometry: LineString,
     cut_distances: Sequence[float],
-    total_geometry_length: float,
-) -> dict[str, list[str]]:
-    if total_geometry_length <= 0:
-        cut_fractions = [0.5 for _ in cut_distances]
-    else:
-        cut_fractions = [
-            max(0.0, min(float(distance) / float(total_geometry_length), 1.0))
-            for distance in cut_distances
-        ]
-
-    idx_link_segments = _split_ordered_samples(
+) -> dict[str, Any]:
+    idx_link_segments = _split_ordered_geometry_samples(
         _parse_int_list(row_data.get("idx_link")),
-        cut_fractions=cut_fractions,
+        geometry=geometry,
+        cut_distances=cut_distances,
     )
-    wid_pix_segments = _split_ordered_samples(
+    wid_pix_segments = _split_ordered_geometry_samples(
         _parse_float_list(row_data.get("wid_pix")),
-        cut_fractions=cut_fractions,
+        geometry=geometry,
+        cut_distances=cut_distances,
     )
     return {
         "idx_link": [_serialize_int_list(segment) for segment in idx_link_segments],
         "wid_pix": [_serialize_float_array(segment) for segment in wid_pix_segments],
+        "wid_pix_values": wid_pix_segments,
     }
+
+
+def _refresh_segmented_legacy_width_fields(
+    row_data: Mapping[str, Any],
+    *,
+    geometry: LineString,
+    width_values: Sequence[float],
+) -> dict[str, Any]:
+    """Recompute RivGraph legacy width/length summaries for one split link."""
+    updated = dict(row_data)
+    widths = np.asarray(width_values, dtype=float)
+    valid_widths = np.isfinite(widths) & (widths > 0)
+    if widths.size == 0 or not valid_widths.any():
+        return updated
+    if not valid_widths.all():
+        fallback_width = float(np.median(widths[valid_widths]))
+        widths = np.where(valid_widths, widths, fallback_width)
+
+    coordinates = np.asarray(geometry.coords, dtype=float)
+    if len(coordinates) == len(widths):
+        step_lengths = np.linalg.norm(np.diff(coordinates, axis=0), axis=1)
+        distances = np.concatenate(([0.0], np.cumsum(step_lengths)))
+        sample_points = coordinates
+    else:
+        distances = np.linspace(0.0, float(geometry.length), len(widths))
+        sample_points = np.asarray(
+            [
+                geometry.interpolate(float(distance)).coords[0]
+                for distance in distances
+            ],
+            dtype=float,
+        )
+
+    total_distance = float(distances[-1]) if len(distances) else 0.0
+    reverse_distances = total_distance - distances[::-1]
+    start_index = int(
+        np.argmin(
+            np.abs(
+                distances
+                - widths[0] / 2.0 * RIVGRAPH_WIDTH_TRIM_MULTIPLIER
+            )
+        )
+    )
+    end_offset = int(
+        np.argmin(
+            np.abs(
+                reverse_distances
+                - widths[-1] / 2.0 * RIVGRAPH_WIDTH_TRIM_MULTIPLIER
+            )
+        )
+    )
+    end_index = len(distances) - end_offset - 1
+
+    if start_index >= end_index:
+        adjusted_widths = widths
+        adjusted_length = total_distance
+        start_point = sample_points[0]
+        end_point = sample_points[-1]
+    else:
+        adjusted_widths = widths[start_index:end_index]
+        adjusted_length = float(distances[end_index] - distances[start_index])
+        start_point = sample_points[start_index]
+        end_point = sample_points[end_index]
+
+    positive_steps = np.diff(distances)
+    positive_steps = positive_steps[positive_steps > 0]
+    pixel_length = float(np.median(positive_steps)) if positive_steps.size else 0.0
+    chord = float(np.linalg.norm(end_point - start_point))
+
+    updated["wid"] = max(pixel_length, float(np.mean(widths)))
+    updated["wid_adj"] = max(pixel_length, float(np.mean(adjusted_widths)))
+    updated["wid_med"] = float(np.median(adjusted_widths))
+    updated["len_adj"] = max(pixel_length, adjusted_length)
+    updated["sinuosity"] = adjusted_length / chord if chord > 0 else 1.0
+    return updated
 
 
 def _selected_parent_subpaths(
@@ -2629,11 +2735,12 @@ def _segment_collapsed_links_to_anchor_nodes(
 
         split_samples = _split_serialized_link_samples(
             row_data,
+            geometry=row.geometry,
             cut_distances=cut_distances,
-            total_geometry_length=float(row.geometry.length),
         )
         idx_link_segments = split_samples["idx_link"]
         wid_pix_segments = split_samples["wid_pix"]
+        wid_pix_value_segments = split_samples["wid_pix_values"]
 
         split_node_ids: list[int] = []
         for point, parent_node_id in zip(points, cut_parent_nodes):
@@ -2688,6 +2795,12 @@ def _segment_collapsed_links_to_anchor_nodes(
                 new_row["idx_link"] = idx_link_segments[index]
             if "wid_pix" in new_row and index < len(wid_pix_segments):
                 new_row["wid_pix"] = wid_pix_segments[index]
+            if index < len(wid_pix_value_segments):
+                new_row = _refresh_segmented_legacy_width_fields(
+                    new_row,
+                    geometry=segment_geometry,
+                    width_values=wid_pix_value_segments[index],
+                )
             new_row["id_us_node"] = int(segment_node_ids[index])
             new_row["id_ds_node"] = int(segment_node_ids[index + 1])
             new_row["id_nodes"] = f"{int(segment_node_ids[index])}, {int(segment_node_ids[index + 1])}"
@@ -4251,6 +4364,7 @@ def derive_anchored_variant_from_realized(
         raise FileNotFoundError(f"Realized variant manifest not found: {source_manifest_path}")
 
     source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    panelized_execution = str(source_manifest.get("execution_mode", "")) == "panelized"
     selected_unit_ids = [int(unit_id) for unit_id in source_manifest.get("selected_unit_ids", [])]
     if not selected_unit_ids:
         raise ValueError("Realized variant manifest does not contain selected_unit_ids for anchored derivation.")
@@ -4280,6 +4394,11 @@ def derive_anchored_variant_from_realized(
     origin_mask_path = output_paths.get("origin_mask") or output_paths.get("width_scope_mask")
     rivgraph_distance_path = output_paths.get("rivgraph_distance")
     source_cleaned_mask = source_manifest.get("source_paths", {}).get("cleaned_mask")
+    if source_cleaned_mask is None and panelized_execution:
+        source_cleaned_mask = (
+            source_manifest.get("source_paths", {}).get("wet_reference_mask")
+            or collapsed_mask_path
+        )
     if source_cleaned_mask is None:
         raise FileNotFoundError("Could not resolve source cleaned mask path for anchored derivation.")
     boundary_output_dir = Path(boundary_component_output_dir) if boundary_component_output_dir is not None else (output_path / "boundary_components")
@@ -4315,6 +4434,22 @@ def derive_anchored_variant_from_realized(
 
     directed_links = gpd.read_file(directed_links_path)
     directed_nodes = gpd.read_file(directed_nodes_path)
+    realized_directed_links = directed_links.copy() if panelized_execution else None
+    realized_width_links = None
+    realized_width_samples = None
+    if panelized_execution:
+        realized_width_links_path = output_paths.get("links_with_width_families")
+        realized_width_samples_path = output_paths.get("link_width_samples")
+        if realized_width_links_path is None or not realized_width_links_path.exists():
+            raise FileNotFoundError(
+                "Panelized anchored derivation requires the realized links-with-width-families product."
+            )
+        if realized_width_samples_path is None or not realized_width_samples_path.exists():
+            raise FileNotFoundError(
+                "Panelized anchored derivation requires the realized link-width samples."
+            )
+        realized_width_links = gpd.read_file(realized_width_links_path)
+        realized_width_samples = pd.read_csv(realized_width_samples_path)
     node_match = pd.read_csv(node_match_path)
     link_match = pd.read_csv(link_match_path)
     link_lineage = pd.read_csv(link_lineage_path)
@@ -4353,14 +4488,24 @@ def derive_anchored_variant_from_realized(
         origin_mask_path = _write_mask(mask_dir / "origin_mask.tif", origin_mask, collapsed_profile)
         collapse_components.to_csv(summary_dir / "collapse_components.csv", index=False)
         edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
-    with rasterio.open(origin_mask_path) as origin_src:
-        origin_mask_array = origin_src.read(1).astype(np.uint16)
-    bank_labels_path, removed_bank_labels = _write_state_bank_labels(
-        boundary_component_labels_path=resolved_boundary_component_labels_path,
-        origin_mask=origin_mask_array,
-        output_path=mask_dir / "bank_labels.tif",
-        profile=collapsed_profile,
-    )
+    bank_labels_path = mask_dir / "bank_labels.tif"
+    if panelized_execution:
+        from network_variants.panelized_raster import write_state_bank_labels_windowed
+
+        removed_bank_labels = write_state_bank_labels_windowed(
+            boundary_component_labels_path=resolved_boundary_component_labels_path,
+            origin_mask_path=origin_mask_path,
+            output_path=bank_labels_path,
+        )
+    else:
+        with rasterio.open(origin_mask_path) as origin_src:
+            origin_mask_array = origin_src.read(1).astype(np.uint16)
+        bank_labels_path, removed_bank_labels = _write_state_bank_labels(
+            boundary_component_labels_path=resolved_boundary_component_labels_path,
+            origin_mask=origin_mask_array,
+            output_path=bank_labels_path,
+            profile=collapsed_profile,
+        )
 
     parent_node_order, _, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
     _, parent_graph, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
@@ -4460,15 +4605,37 @@ def derive_anchored_variant_from_realized(
         errors="ignore",
     ).merge(link_lineage, on="id_link", how="left", validate="1:1")
 
-    enriched_links, anchored_link_width_samples = compute_width_families(
-        directed_links,
-        collapsed_mask_path=collapsed_mask_path,
-        wet_reference_mask_path=wet_reference_mask_path,
-        origin_mask_path=origin_mask_path,
-        rivgraph_distance_path=rivgraph_distance_path,
-        bank_labels_path=bank_labels_path,
-        bank_candidate_neighbors_max=bank_candidate_neighbors_max,
-    )
+    anchored_width_patch_summary = None
+    if panelized_execution:
+        from network_variants.panelized_raster import compute_panelized_segmented_width_patch
+
+        if (
+            realized_directed_links is None
+            or realized_width_links is None
+            or realized_width_samples is None
+        ):
+            raise RuntimeError("Panelized realized width inputs were not initialized.")
+        enriched_links, anchored_link_width_samples, anchored_width_patch_summary = (
+            compute_panelized_segmented_width_patch(
+                segmented_links=directed_links,
+                source_links=realized_directed_links,
+                source_width_links=realized_width_links,
+                source_width_samples=realized_width_samples,
+                bank_labels_path=bank_labels_path,
+                origin_mask_path=origin_mask_path,
+                bank_candidate_neighbors_max=bank_candidate_neighbors_max,
+            )
+        )
+    else:
+        enriched_links, anchored_link_width_samples = compute_width_families(
+            directed_links,
+            collapsed_mask_path=collapsed_mask_path,
+            wet_reference_mask_path=wet_reference_mask_path,
+            origin_mask_path=origin_mask_path,
+            rivgraph_distance_path=rivgraph_distance_path,
+            bank_labels_path=bank_labels_path,
+            bank_candidate_neighbors_max=bank_candidate_neighbors_max,
+        )
     link_width_samples = _apply_collapsed_selection_metadata(
         anchored_link_width_samples,
         unit_ids=selected_unit_ids,
@@ -4499,14 +4666,21 @@ def derive_anchored_variant_from_realized(
     manifest = dict(source_manifest)
     manifest["collapse_corridor_mode"] = "anchored"
     manifest["anchor_segmentation"] = anchor_segmentation_summary
+    width_scope_description = (
+        "targeted anchored-link width patch with exact unchanged-link reuse"
+        if anchored_width_patch_summary is not None
+        else "total/wet/dry width-family recomputation"
+    )
     manifest["scope"] = [
         "collapsed mask reuse from realized variant",
         "anchored corridor segmentation",
         "parent-child graph rematching",
-        "total/wet/dry width-family recomputation",
+        width_scope_description,
         "SWORD node matching/propagation",
     ]
     manifest["segmented_stub_inheritance"] = segmented_stub_inheritance_summary
+    if anchored_width_patch_summary is not None:
+        manifest["anchored_width_patch"] = anchored_width_patch_summary
     manifest["ready_for_rapid"] = bool(direction_summary.get("is_valid", False))
     manifest["bank_candidate_neighbors_max"] = int(bank_candidate_neighbors_max)
     manifest["source_paths"] = dict(manifest.get("source_paths", {}))

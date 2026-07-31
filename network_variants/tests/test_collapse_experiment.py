@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -14,8 +15,10 @@ from network_variants.collapse_experiment import (
     BaseStateVariantOutputs,
     ExperimentStateContext,
     _build_unit_link_membership,
+    _copy_boundary_component_artifacts,
     _ensure_seed_direction_columns,
     _normalize_numeric_id_columns,
+    _variant_analysis_links_path,
     _write_equivalent_transition_outputs,
     main,
     run_collapse_experiment,
@@ -174,6 +177,26 @@ def _make_workflow_runner(outputs: list[UnitWorkflowOutputs]):
     runner.calls = calls
     runner.remaining = remaining
     return runner
+
+
+def test_variant_analysis_links_prefer_width_family_product(tmp_path: Path) -> None:
+    variant_dir = tmp_path / "variant"
+    directed_path = variant_dir / "directed" / "state_directed_links.gpkg"
+    width_family_path = variant_dir / "widths" / "links_with_width_families.gpkg"
+    directed_path.parent.mkdir(parents=True)
+    directed_path.touch()
+
+    assert _variant_analysis_links_path(
+        variant_output_dir=variant_dir,
+        directed_links_path=directed_path,
+    ) == directed_path
+
+    width_family_path.parent.mkdir(parents=True)
+    width_family_path.touch()
+    assert _variant_analysis_links_path(
+        variant_output_dir=variant_dir,
+        directed_links_path=directed_path,
+    ) == width_family_path
 
 
 def _make_variant_runner():
@@ -505,6 +528,36 @@ def test_independent_units_creates_one_child_per_base_unit(tmp_path: Path) -> No
     assert list(results.state_registry["parent_state_id"]) == ["", "S000_base", "S000_base", "S000_base"]
     assert list(results.state_registry["depth"]) == [0, 1, 1, 1]
     assert results.manifest["stop_reason"] == "all_base_units_processed"
+
+
+def test_independent_units_can_filter_to_requested_unit_ids(tmp_path: Path) -> None:
+    workflow_runner = _make_workflow_runner(
+        [
+            _workflow_outputs([5, 7, 2]),
+            _workflow_outputs([1]),
+            _workflow_outputs([1]),
+        ]
+    )
+    variant_runner = _make_variant_runner()
+
+    results = run_collapse_experiment(
+        "independent-units",
+        cleaned_mask_path=tmp_path / "base_cleaned.tif",
+        reviewed_links_path=tmp_path / "base_links.gpkg",
+        reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=tmp_path / "experiment",
+        requested_unit_ids=[7, 2],
+        unit_workflow_runner=workflow_runner,
+        unit_workflow_writer=write_unit_workflow_outputs,
+        variant_runner=variant_runner,
+        base_state_variant_materializer=_make_base_state_materializer(),
+        state_hydraulic_context_runner=_make_state_hydraulic_context_runner(),
+    )
+
+    assert [call["unit_ids"] for call in variant_runner.calls] == [[7], [2]]
+    assert list(results.state_registry["state_id"]) == ["S000_base", "S001_unit_7", "S002_unit_2"]
+    assert results.manifest["options"]["variant"]["requested_unit_ids"] == [7, 2]
 
 
 def test_compound_bubbles_creates_one_child_per_compound_bubble(tmp_path: Path) -> None:
@@ -855,6 +908,86 @@ def test_main_runs_both_collapse_corridor_modes_with_suffixed_outputs(
     assert [Path(call["output_dir"]).name for call in calls] == ["demo_output__realized", "demo_output__anchored"]
     assert "variant_runner" not in calls[0]
     assert callable(calls[1]["variant_runner"])
+    assert Path(calls[1]["boundary_component_artifact_source_dir"]) == (
+        tmp_path / "demo_output__realized" / "boundary_components"
+    ).resolve()
+
+
+def test_copy_boundary_component_artifacts_localizes_panelized_manifest(tmp_path: Path) -> None:
+    source = tmp_path / "realized" / "boundary_components"
+    source.mkdir(parents=True)
+    labels = source / "46_full_extent_land_water_labels_with_snapped_buffered_border_cut.tif"
+    summary = source / "46_full_extent_land_component_summary_with_snapped_buffered_border_cut.csv"
+    extensions = source / "46_centerline_border_extensions_snapped.gpkg"
+    labels.write_bytes(b"labels")
+    summary.write_text("land_component_id,raster_value\n1,2\n", encoding="utf-8")
+    extensions.write_bytes(b"extensions")
+    manifest_path = source / "46_panelized_boundary_component_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "algorithm": "panelwise_local_labels_overlap_union",
+                "labels": str(labels.resolve()),
+                "summary": str(summary.resolve()),
+                "extensions": str(extensions.resolve()),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    destination = tmp_path / "anchored" / "boundary_components"
+    copied_labels = _copy_boundary_component_artifacts(
+        source_dir=source,
+        output_dir=destination,
+        example_id="46",
+    )
+
+    assert copied_labels == destination.resolve() / labels.name
+    assert copied_labels.read_bytes() == b"labels"
+    copied_manifest = json.loads(
+        (destination / "46_panelized_boundary_component_manifest.json").read_text(encoding="utf-8")
+    )
+    assert copied_manifest["labels"] == str((destination / labels.name).resolve())
+    assert copied_manifest["summary"] == str((destination / summary.name).resolve())
+    assert copied_manifest["extensions"] == str((destination / extensions.name).resolve())
+
+
+def test_run_copies_boundary_artifacts_before_base_materialization(tmp_path: Path) -> None:
+    source = tmp_path / "realized" / "boundary_components"
+    source.mkdir(parents=True)
+    source_labels = source / "46_full_extent_land_water_labels_with_snapped_buffered_border_cut.tif"
+    source_labels.write_bytes(b"labels")
+    (source / "46_full_extent_land_component_summary_with_snapped_buffered_border_cut.csv").write_text(
+        "land_component_id,raster_value\n1,2\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "anchored"
+    workflow_runner = _make_workflow_runner([_workflow_outputs([])])
+    base_materializer = _make_base_state_materializer()
+
+    run_collapse_experiment(
+        "independent-units",
+        cleaned_mask_path=tmp_path / "46_cleaned.tif",
+        reviewed_links_path=tmp_path / "46_links.gpkg",
+        reviewed_nodes_path=tmp_path / "46_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=output_dir,
+        collapse_corridor_mode="anchored",
+        base_only=True,
+        boundary_component_artifact_source_dir=source,
+        unit_workflow_runner=workflow_runner,
+        unit_workflow_writer=write_unit_workflow_outputs,
+        base_state_variant_materializer=base_materializer,
+        state_hydraulic_context_runner=_make_state_hydraulic_context_runner(),
+    )
+
+    copied_labels = (
+        output_dir
+        / "boundary_components"
+        / "46_full_extent_land_water_labels_with_snapped_buffered_border_cut.tif"
+    )
+    assert copied_labels.read_bytes() == b"labels"
+    assert Path(base_materializer.calls[0]["boundary_component_labels_path"]) == copied_labels.resolve()
 
 
 def test_main_passes_base_only_into_run_collapse_experiment(

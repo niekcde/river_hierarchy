@@ -21,6 +21,9 @@ repo_root = Path(__file__).resolve().parents[1]
 rapid_src = repo_root / "RAPID" / "src"
 if str(rapid_src) not in sys.path:
     sys.path.insert(0, str(rapid_src))
+rivgraph_src = repo_root / "rivgraph_centerline" / "src"
+if str(rivgraph_src) not in sys.path:
+    sys.path.insert(0, str(rivgraph_src))
 
 if __package__ is None or __package__ == "":
     if str(repo_root) not in sys.path:
@@ -47,14 +50,31 @@ from network_variants.variant_generation import (
     COLLAPSE_CORRIDOR_MODES,
     NetworkVariantOutputs,
     VariantDirectionValidationError,
+    _apply_width_sample_flow_alignment,
     _apply_collapsed_selection_metadata,
+    _assign_variant_directions,
     _collapsed_selection_metadata,
     _ensure_boundary_component_mask,
+    _infer_parent_node_order,
+    _match_child_links_to_parent_links,
+    _match_child_nodes_to_parent_nodes,
+    _merge_width_families_onto_links,
+    _resolve_link_lineage,
+    _write_width_family_outputs,
     _write_state_bank_labels,
     compute_width_families,
     derive_anchored_variant_from_realized,
     generate_network_variant,
 )
+from network_variants.build_boundary_component_mask import build_panelized_boundary_component_labels
+from network_variants.panelized_raster import (
+    compute_panelized_base_width_families,
+    compute_panelized_child_width_patch,
+    materialize_panelized_child_state,
+    write_state_bank_labels_windowed,
+    write_state_origin_mask_windowed,
+)
+from rivgraph_centerline.workflow import run_rivgraph_for_run
 from rapid_tools.forcing import ForcingConfig, prepare_forcing_table
 from rapid_tools.reference_section import compute_reference_section_kb
 
@@ -65,6 +85,7 @@ EXPERIMENT_MODES = (
     "sequential-units",
     "sequential-groups",
 )
+EXECUTION_MODES = ("full_raster", "panelized")
 COLLAPSE_CORRIDOR_MODE_CHOICES = COLLAPSE_CORRIDOR_MODES + ("both",)
 
 
@@ -99,6 +120,7 @@ class ExperimentStateContext:
     reviewed_links_path: Path
     reviewed_nodes_path: Path
     workflow: UnitWorkflowOutputs
+    analysis_links_path: Path | None = None
     variant_output_dir: Path | None = None
     hydraulic_context_output_dir: Path | None = None
     equivalent_transition_output_dir: Path | None = None
@@ -125,6 +147,368 @@ class BaseStateVariantOutputs:
     directed_nodes_path: Path
     bank_labels_path: Path | None = None
     boundary_component_labels_path: Path | None = None
+
+
+@dataclass
+class PanelizedChildVariantOutputs:
+    """Minimal state-output contract consumed by the shared child builder."""
+    output_dir: Path
+    collapsed_mask_path: Path
+    directed_links_path: Path
+    directed_nodes_path: Path
+    panelized_result: dict[str, Any]
+
+
+def _variant_analysis_links_path(
+    *,
+    variant_output_dir: str | Path,
+    directed_links_path: str | Path,
+) -> Path:
+    """Prefer the directed link product carrying the complete width families."""
+    width_family_links = (
+        Path(variant_output_dir) / "widths" / "links_with_width_families.gpkg"
+    )
+    if width_family_links.exists():
+        return width_family_links
+    return Path(directed_links_path)
+
+
+def _finalize_panelized_child_result(
+    *,
+    panelized_result: Mapping[str, Any],
+    state_dir: Path,
+    parent_mask_path: Path,
+    parent_links_path: Path,
+    parent_nodes_path: Path,
+    parent_merged_links_path: Path,
+    boundary_component_labels_path: Path,
+    footprint: Any,
+    unit_ids: Sequence[int],
+    group_label: str | None,
+    example_id: str,
+    variant_id: str,
+    collapse_corridor_mode: str,
+    bank_candidate_neighbors_max: int,
+    sword_node_source_path: str | Path | None,
+    sword_wse_field: str | None,
+    sword_match_tolerance: float | None,
+    sword_example_station_source_path: str | Path | None,
+    sword_station_match_source_path: str | Path | None,
+    sword_reach_buffer_steps: int,
+) -> NetworkVariantOutputs:
+    """Finalize a panelized patch into the regular child-variant contract."""
+    merged = panelized_result.get("merged", {})
+    raw_links_path = Path(str(merged["directed_links"]))
+    raw_nodes_path = Path(str(merged["directed_nodes"]))
+    if not raw_links_path.exists() or not raw_nodes_path.exists():
+        raise FileNotFoundError("Panelized child merge did not produce directed links and nodes.")
+    collapsed_mask = Path(str(panelized_result["collapsed_mask"]))
+    if not collapsed_mask.exists():
+        raise FileNotFoundError("Panelized child merge did not produce a collapsed state mask.")
+
+    variant_dir = state_dir / "variant"
+    summary_dir = variant_dir / "summary"
+    mask_dir = variant_dir / "mask"
+    matching_dir = variant_dir / "matching"
+    directed_dir = variant_dir / "directed"
+    width_dir = variant_dir / "widths"
+    rivgraph_dir = variant_dir / "rivgraph"
+    for directory in (summary_dir, mask_dir, matching_dir, directed_dir, width_dir, rivgraph_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    run_name = f"{example_id}__{variant_id}"
+    collapsed_mask_path = mask_dir / f"{run_name}_collapsed.tif"
+    shutil.copy2(collapsed_mask, collapsed_mask_path)
+    origin_mask_path = write_state_origin_mask_windowed(
+        base_mask_path=parent_mask_path,
+        collapsed_mask_path=collapsed_mask_path,
+        output_path=mask_dir / "origin_mask.tif",
+    )
+    bank_labels_path = mask_dir / "bank_labels.tif"
+    removed_bank_labels = write_state_bank_labels_windowed(
+        boundary_component_labels_path=boundary_component_labels_path,
+        origin_mask_path=origin_mask_path,
+        output_path=bank_labels_path,
+    )
+
+    raw_links = _normalize_numeric_id_columns(gpd.read_file(raw_links_path))
+    raw_nodes = _normalize_numeric_id_columns(gpd.read_file(raw_nodes_path))
+    parent_links = _normalize_numeric_id_columns(gpd.read_file(parent_links_path))
+    parent_nodes = _normalize_numeric_id_columns(gpd.read_file(parent_nodes_path))
+    parent_variant_dir = parent_links_path.parent.parent
+    parent_width_links = gpd.read_file(parent_variant_dir / "widths" / "links_with_width_families.gpkg")
+    parent_width_samples = pd.read_csv(parent_variant_dir / "widths" / "link_width_samples.csv")
+    child_source_samples = pd.read_csv(str(merged["width_samples"]))
+    child_merged_links = gpd.read_file(
+        Path(str(merged["core_dir"])) / "merged_links.gpkg",
+        layer="merged_links",
+    )
+    parent_merged_links = gpd.read_file(parent_merged_links_path, layer="merged_links")
+    enriched_raw_links, link_width_samples, width_patch_summary = compute_panelized_child_width_patch(
+        child_links=raw_links,
+        child_source_samples=child_source_samples,
+        child_merged_links=child_merged_links,
+        parent_merged_links=parent_merged_links,
+        parent_width_links=parent_width_links,
+        parent_width_samples=parent_width_samples,
+        affected_panel_ids=list(panelized_result["panel_plan"]["affected"]),
+        bank_labels_path=bank_labels_path,
+        origin_mask_path=origin_mask_path,
+        bank_candidate_neighbors_max=bank_candidate_neighbors_max,
+    )
+
+    with rasterio.open(collapsed_mask_path) as source:
+        pixel_length = float(max(abs(source.transform.a), abs(source.transform.e)))
+    match_tolerance = pixel_length * 1.25
+    parent_node_order, parent_graph, _ = _infer_parent_node_order(parent_links, parent_nodes)
+    node_match = _match_child_nodes_to_parent_nodes(
+        parent_nodes,
+        raw_nodes,
+        match_tolerance=match_tolerance,
+        parent_node_order=parent_node_order,
+    )
+    link_match = _match_child_links_to_parent_links(
+        parent_links,
+        raw_links,
+        match_tolerance=match_tolerance,
+    )
+    directed_links, directed_nodes, direction_summary = _assign_variant_directions(
+        child_links=raw_links,
+        child_nodes=raw_nodes,
+        parent_links=parent_links,
+        parent_nodes=parent_nodes,
+        node_match=node_match,
+        link_match=link_match,
+    )
+    link_lineage = _resolve_link_lineage(
+        parent_graph=parent_graph,
+        directed_child_links=directed_links,
+        node_match=node_match,
+        link_match=link_match,
+        match_tolerance=match_tolerance,
+    )
+    directed_nodes, node_sword_match, sword_match_summary = match_variant_nodes_to_sword(
+        directed_nodes=directed_nodes,
+        parent_nodes=parent_nodes,
+        node_match=node_match,
+        sword_node_source_path=sword_node_source_path,
+        sword_wse_field=sword_wse_field,
+        sword_match_tolerance=sword_match_tolerance,
+        example_id=example_id,
+        sword_example_station_source_path=sword_example_station_source_path,
+        sword_station_match_source_path=sword_station_match_source_path,
+        sword_reach_buffer_steps=sword_reach_buffer_steps,
+    )
+
+    frames = (node_match, link_match, link_lineage, directed_links, directed_nodes, node_sword_match)
+    frames = tuple(
+        _apply_collapsed_selection_metadata(frame, unit_ids=unit_ids, group_label=group_label)
+        for frame in frames
+    )
+    node_match, link_match, link_lineage, directed_links, directed_nodes, node_sword_match = frames
+    link_width_samples = _apply_collapsed_selection_metadata(
+        link_width_samples,
+        unit_ids=unit_ids,
+        group_label=group_label,
+    )
+    for frame in (
+        node_match,
+        link_match,
+        link_lineage,
+        directed_links,
+        directed_nodes,
+        node_sword_match,
+        link_width_samples,
+    ):
+        frame["example_id"] = example_id
+        frame["variant_id"] = variant_id
+    directed_links = directed_links.drop(
+        columns=[
+            column
+            for column in link_lineage.columns
+            if column in directed_links.columns and column != "id_link"
+        ],
+        errors="ignore",
+    ).merge(link_lineage, on="id_link", how="left", validate="1:1")
+    directed_enriched_links = _merge_width_families_onto_links(directed_links, enriched_raw_links)
+    directed_enriched_links = _apply_width_sample_flow_alignment(
+        directed_enriched_links,
+        collapse_corridor_mode=collapse_corridor_mode,
+    )
+    link_width_families = _write_width_family_outputs(
+        width_dir=width_dir,
+        link_width_samples=link_width_samples,
+        directed_enriched_links=directed_enriched_links,
+    )
+
+    selection_metadata = _collapsed_selection_metadata(unit_ids, group_label)
+    added_pixels = int(
+        sum(int(edit.get("added_pixels", 0)) for edit in panelized_result.get("edits", {}).values())
+    )
+    pixel_area = pixel_length * pixel_length
+    collapse_components = pd.DataFrame(
+        [
+            {
+                "component_id": 1,
+                "unit_ids": _serialize_int_list(unit_ids),
+                "link_ids": "",
+                "node_ids": "",
+                "compound_bubble_ids": "",
+                "n_units": len(unit_ids),
+                "n_links": 0,
+                "n_nodes": 0,
+                "footprint_area": float(footprint.area),
+                "added_pixels": added_pixels,
+                "added_area": float(added_pixels * pixel_area),
+            }
+        ]
+    )
+    collapse_components = _apply_collapsed_selection_metadata(
+        collapse_components,
+        unit_ids=unit_ids,
+        group_label=group_label,
+    )
+    collapse_components["example_id"] = example_id
+    collapse_components["variant_id"] = variant_id
+    edit_geometries = gpd.GeoDataFrame(
+        {
+            "component_id": [1],
+            "geometry_role": ["collapse_footprint"],
+            "action": ["fill"],
+            "unit_ids": [_serialize_int_list(unit_ids)],
+        },
+        geometry=[footprint],
+        crs=parent_links.crs,
+    )
+    edit_geometries = _apply_collapsed_selection_metadata(
+        edit_geometries,
+        unit_ids=unit_ids,
+        group_label=group_label,
+    )
+    edit_geometries["example_id"] = example_id
+    edit_geometries["variant_id"] = variant_id
+
+    collapse_components.to_csv(summary_dir / "collapse_components.csv", index=False)
+    edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
+    node_match.to_csv(matching_dir / "node_match.csv", index=False)
+    node_sword_match.to_csv(matching_dir / "node_sword_match.csv", index=False)
+    link_match.to_csv(matching_dir / "link_match.csv", index=False)
+    link_lineage.to_csv(matching_dir / "link_lineage.csv", index=False)
+    directed_links_path = directed_dir / f"{run_name}_directed_links.gpkg"
+    directed_nodes_path = directed_dir / f"{run_name}_directed_nodes.gpkg"
+    directed_links.to_file(directed_links_path, driver="GPKG")
+    directed_nodes.to_file(directed_nodes_path, driver="GPKG")
+    validation_report = dict(direction_summary.get("validation_report", {}))
+    with (directed_dir / "direction_validation_report.json").open("w", encoding="utf-8") as handle:
+        json.dump(validation_report, handle, indent=2)
+
+    rivgraph_links_path = rivgraph_dir / f"{run_name}_links.gpkg"
+    rivgraph_nodes_path = rivgraph_dir / f"{run_name}_nodes.gpkg"
+    raw_links.to_file(rivgraph_links_path, driver="GPKG")
+    raw_nodes.to_file(rivgraph_nodes_path, driver="GPKG")
+    child_source_samples.to_csv(rivgraph_dir / f"{run_name}_link_width_samples.csv", index=False)
+    source_centerline = raw_links_path.with_name(f"{example_id}_centerline.gpkg")
+    rivgraph_centerline_path = rivgraph_dir / f"{run_name}_centerline.gpkg"
+    if source_centerline.exists():
+        shutil.copy2(source_centerline, rivgraph_centerline_path)
+    else:
+        rivgraph_centerline_path = None
+
+    manifest = {
+        "example_id": example_id,
+        "variant_id": variant_id,
+        "execution_mode": "panelized",
+        "selection_source": "group_label" if group_label is not None else "unit_ids",
+        "selected_unit_ids": [int(unit_id) for unit_id in unit_ids],
+        "group_label": group_label,
+        "collapsed_selection": selection_metadata,
+        "collapse_corridor_mode": collapse_corridor_mode,
+        "n_components": 1,
+        "component_ids": [1],
+        "ready_for_graph_matching": True,
+        "ready_for_rapid": bool(direction_summary.get("is_valid", False)),
+        "mask_summary": {
+            "pixels_added": added_pixels,
+            "pixels_removed": 0,
+            "changed_pixels": added_pixels,
+        },
+        "panelized_patch": {
+            **width_patch_summary,
+            "panel_plan": panelized_result["panel_plan"],
+            "workspace": panelized_result.get("workspace", {}),
+        },
+        "bank_label_summary": {
+            "removed_land_labels": removed_bank_labels,
+            "n_removed_land_labels": int(len(removed_bank_labels)),
+        },
+        "sword_matching": sword_match_summary,
+        "source_paths": {
+            "cleaned_mask": str(parent_mask_path.resolve()),
+            "wet_reference_mask": str(parent_mask_path.resolve()),
+            "reviewed_links": str(parent_links_path.resolve()),
+            "reviewed_nodes": str(parent_nodes_path.resolve()),
+            "boundary_component_labels": str(
+                boundary_component_labels_path.resolve()
+            ),
+        },
+        "output_paths": {
+            "output_dir": str(variant_dir.resolve()),
+            "collapsed_mask": str(collapsed_mask_path.resolve()),
+            "origin_mask": str(origin_mask_path.resolve()),
+            "width_scope_mask": str(origin_mask_path.resolve()),
+            "bank_labels": str(bank_labels_path.resolve()),
+            "boundary_component_labels": str(boundary_component_labels_path.resolve()),
+            "collapse_components": str((summary_dir / "collapse_components.csv").resolve()),
+            "edit_geometries": str((mask_dir / "collapse_edit_geometries.gpkg").resolve()),
+            "link_width_families": str((width_dir / "link_width_families.csv").resolve()),
+            "link_width_samples": str((width_dir / "link_width_samples.csv").resolve()),
+            "links_with_width_families": str((width_dir / "links_with_width_families.gpkg").resolve()),
+            "node_match": str((matching_dir / "node_match.csv").resolve()),
+            "node_sword_match": str((matching_dir / "node_sword_match.csv").resolve()),
+            "link_match": str((matching_dir / "link_match.csv").resolve()),
+            "link_lineage": str((matching_dir / "link_lineage.csv").resolve()),
+            "directed_links": str(directed_links_path.resolve()),
+            "directed_nodes": str(directed_nodes_path.resolve()),
+            "direction_validation_report": str(
+                (directed_dir / "direction_validation_report.json").resolve()
+            ),
+            "rivgraph_links": str(rivgraph_links_path.resolve()),
+            "rivgraph_nodes": str(rivgraph_nodes_path.resolve()),
+        },
+        "direction_summary": direction_summary,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "code_version": _git_revision(),
+    }
+    with (summary_dir / "variant_manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+
+    return NetworkVariantOutputs(
+        collapse_components=collapse_components,
+        edit_geometries=edit_geometries,
+        node_match=node_match,
+        node_sword_match=node_sword_match,
+        link_match=link_match,
+        link_lineage=link_lineage,
+        link_width_families=link_width_families,
+        link_width_samples=link_width_samples,
+        enriched_links=directed_enriched_links,
+        directed_links=directed_links,
+        directed_nodes=directed_nodes,
+        output_dir=variant_dir,
+        collapsed_mask_path=collapsed_mask_path,
+        width_scope_mask_path=origin_mask_path,
+        bank_labels_path=bank_labels_path,
+        boundary_component_labels_path=boundary_component_labels_path,
+        origin_mask_path=origin_mask_path,
+        rivgraph_links_path=rivgraph_links_path,
+        rivgraph_nodes_path=rivgraph_nodes_path,
+        directed_links_path=directed_links_path,
+        directed_nodes_path=directed_nodes_path,
+        rivgraph_centerline_path=rivgraph_centerline_path,
+        sword_reaches_path=None,
+        sword_nodes_path=None,
+        manifest=manifest,
+    )
 
 
 def _git_revision() -> str | None:
@@ -179,6 +563,57 @@ def _suffix_output_dir_for_collapse_mode(output_dir: str | Path, collapse_corrid
     if path.name.endswith(suffix):
         return path
     return path.with_name(f"{path.name}{suffix}")
+
+
+def _copy_boundary_component_artifacts(
+    *,
+    source_dir: str | Path,
+    output_dir: str | Path,
+    example_id: str,
+) -> Path:
+    """Copy a complete boundary-component product and localize manifest paths."""
+    source = Path(source_dir).resolve()
+    destination = Path(output_dir).resolve()
+    if source == destination:
+        raise ValueError(
+            "Boundary-component reuse source must be outside the experiment output "
+            f"directory that will be reset: {source}"
+        )
+    if not source.is_dir():
+        raise FileNotFoundError(f"Boundary-component artifact directory does not exist: {source}")
+
+    destination.mkdir(parents=True, exist_ok=True)
+    for source_path in source.iterdir():
+        destination_path = destination / source_path.name
+        if source_path.is_dir():
+            shutil.copytree(source_path, destination_path, dirs_exist_ok=True)
+        else:
+            shutil.copy2(source_path, destination_path)
+
+    labels_path = (
+        destination
+        / f"{example_id}_full_extent_land_water_labels_with_snapped_buffered_border_cut.tif"
+    )
+    if not labels_path.exists():
+        raise FileNotFoundError(
+            "Copied boundary-component artifacts do not contain the expected labels: "
+            f"{labels_path}"
+        )
+
+    for manifest_path in destination.glob("*boundary_component_manifest.json"):
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        for key in ("labels", "extensions", "summary"):
+            value = manifest.get(key)
+            if not value:
+                continue
+            local_path = destination / Path(str(value)).name
+            if local_path.exists():
+                manifest[key] = str(local_path.resolve())
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2)
+
+    return labels_path
 
 
 def _supports_realized_reuse_speedup(mode: str) -> bool:
@@ -906,6 +1341,9 @@ def _state_record(context: ExperimentStateContext, mode: str) -> dict[str, Any]:
         ),
         "cleaned_mask_path": str(context.cleaned_mask_path.resolve()),
         "directed_links_path": str(context.reviewed_links_path.resolve()),
+        "analysis_links_path": str(
+            (context.analysis_links_path or context.reviewed_links_path).resolve()
+        ),
         "directed_nodes_path": str(context.reviewed_nodes_path.resolve()),
         "n_units_detected": int(len(context.workflow.unit_metrics)),
         "n_paths_detected": int(len(context.workflow.path_metrics)),
@@ -1192,6 +1630,7 @@ def _run_state_hierarchy(
     cleaned_mask_path: str | Path,
     reviewed_links_path: str | Path,
     reviewed_nodes_path: str | Path,
+    directed_links_path: str | Path | None = None,
     selection: ExperimentSelection | None,
     unit_workflow_runner: Callable[..., UnitWorkflowOutputs],
     unit_workflow_writer: Callable[..., None],
@@ -1219,9 +1658,10 @@ def _run_state_hierarchy(
         state_dir=state_dir,
         hierarchy_output_dir=hierarchy_dir,
         cleaned_mask_path=Path(cleaned_mask_path),
-        reviewed_links_path=Path(reviewed_links_path),
+        reviewed_links_path=Path(directed_links_path or reviewed_links_path),
         reviewed_nodes_path=Path(reviewed_nodes_path),
         workflow=workflow,
+        analysis_links_path=Path(reviewed_links_path),
         selection=selection,
     )
 
@@ -1233,7 +1673,7 @@ def _run_state_hydraulic_context(
     hydraulic_context_kwargs: Mapping[str, Any] | None = None,
 ) -> ExperimentStateContext:
     outputs = hydraulic_context_runner(
-        directed_links_path=context.reviewed_links_path,
+        directed_links_path=context.analysis_links_path or context.reviewed_links_path,
         directed_nodes_path=context.reviewed_nodes_path,
         hierarchy_output_dir=context.hierarchy_output_dir,
         output_dir=context.state_dir / "hydraulic_context",
@@ -1552,6 +1992,154 @@ def _build_unit_link_membership(
     return membership, link_summary
 
 
+def _selected_unit_link_ids(path_metrics: pd.DataFrame, unit_ids: Sequence[int]) -> list[int]:
+    """Resolve selected units to the reviewed-link IDs recorded by hierarchy paths."""
+    selected = path_metrics.loc[path_metrics["unit_id"].astype(int).isin([int(unit_id) for unit_id in unit_ids])]
+    result: set[int] = set()
+    for value in selected.get("id_links", pd.Series(dtype=object)):
+        result.update(int(item.strip()) for item in str(value).split(",") if item.strip())
+    if not result:
+        raise ValueError(f"No reviewed link IDs were found for selected unit IDs {list(unit_ids)}.")
+    return sorted(result)
+
+
+def _materialize_copied_base_state_variant(
+    *,
+    context: ExperimentStateContext,
+    source_variant_dir: str | Path,
+    example_id: str,
+    collapse_corridor_mode: str,
+    boundary_component_labels_path: str | Path | None,
+) -> BaseStateVariantOutputs:
+    """Copy a validated base variant into a new self-contained experiment."""
+    source = Path(source_variant_dir).resolve()
+    if not source.is_dir():
+        raise FileNotFoundError(f"Base-state variant source does not exist: {source}")
+    destination = (context.state_dir / "variant").resolve()
+    if source == destination:
+        raise ValueError("Base-state variant source and destination must differ.")
+    shutil.copytree(source, destination, dirs_exist_ok=True)
+
+    manifest_path = destination / "summary" / "variant_manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        def localize(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {key: localize(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [localize(item) for item in value]
+            if isinstance(value, str):
+                try:
+                    relative = Path(value).resolve().relative_to(source)
+                except (OSError, ValueError):
+                    return value
+                return str((destination / relative).resolve())
+            return value
+
+        manifest = localize(manifest)
+        manifest["collapse_corridor_mode"] = collapse_corridor_mode
+        manifest["base_state_copy"] = {
+            "copied": True,
+            "source_variant_dir": str(source),
+        }
+        if boundary_component_labels_path is not None:
+            local_boundary = str(Path(boundary_component_labels_path).resolve())
+            manifest.setdefault("output_paths", {})["boundary_component_labels"] = local_boundary
+            manifest.setdefault("source_paths", {})["boundary_component_labels"] = local_boundary
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    directed_links = next((destination / "directed").glob("*S000_base_directed_links.gpkg"), None)
+    directed_nodes = next((destination / "directed").glob("*S000_base_directed_nodes.gpkg"), None)
+    collapsed_mask = next((destination / "mask").glob("*S000_base_collapsed.tif"), None)
+    if directed_links is None or directed_nodes is None or collapsed_mask is None:
+        raise FileNotFoundError(
+            f"Copied base variant is missing required S000_base artifacts in {destination}."
+        )
+    bank_labels = destination / "mask" / "bank_labels.tif"
+    return BaseStateVariantOutputs(
+        output_dir=destination,
+        collapsed_mask_path=collapsed_mask,
+        directed_links_path=directed_links,
+        directed_nodes_path=directed_nodes,
+        bank_labels_path=bank_labels if bank_labels.exists() else None,
+        boundary_component_labels_path=(
+            Path(boundary_component_labels_path)
+            if boundary_component_labels_path is not None
+            else None
+        ),
+    )
+
+
+def _make_panelized_child_runner(
+    *,
+    source_panel_root: Path,
+    panel_plan_path: Path,
+    panel_breaks_path: Path,
+    boundary_match_plan_path: Path,
+    parent_merged_links_path: Path,
+    boundary_component_labels_path: Path,
+    exit_sides_by_panel: Mapping[str, str],
+    run_name: str,
+) -> Callable[..., PanelizedChildVariantOutputs]:
+    """Return the guarded single-unit panelized child variant runner."""
+    def runner(**kwargs: Any) -> PanelizedChildVariantOutputs:
+        unit_ids = list(kwargs.get("unit_ids") or [])
+        if len(unit_ids) != 1 or kwargs.get("group_label") is not None:
+            raise NotImplementedError("Panelized child execution currently supports one unit at a time.")
+        links = gpd.read_file(kwargs["reviewed_links_path"])
+        link_ids = _selected_unit_link_ids(pd.read_csv(kwargs["panelized_path_metrics"]), unit_ids)
+        selected = links.loc[links["id_link"].astype(int).isin(link_ids)]
+        if selected.empty:
+            raise ValueError("Selected unit links are not present in the panelized parent state.")
+        preferred_widths = (
+            pd.to_numeric(selected["wid_adj_wet"], errors="coerce")
+            if "wid_adj_wet" in selected.columns
+            else pd.Series(np.nan, index=selected.index, dtype=float)
+        )
+        legacy_widths = (
+            pd.to_numeric(selected["wid_adj"], errors="coerce")
+            if "wid_adj" in selected.columns
+            else pd.Series(np.nan, index=selected.index, dtype=float)
+        )
+        width = preferred_widths.where(
+            np.isfinite(preferred_widths) & (preferred_widths > 0),
+            legacy_widths,
+        ).fillna(0).max()
+        footprint = selected.geometry.unary_union.buffer(max(float(width) * 0.5, 1.0))
+        state_root = Path(kwargs["output_dir"]) / "panelized_state"
+        result = materialize_panelized_child_state(
+            parent_mask_path=kwargs["cleaned_mask_path"], source_panel_root=source_panel_root,
+            state_root=state_root, panel_plan_path=panel_plan_path, panel_breaks_path=panel_breaks_path,
+            boundary_match_plan_path=boundary_match_plan_path, boundary_component_labels_path=boundary_component_labels_path,
+            footprint=footprint, halo_distance=max(float(width), 1.0), run_name=run_name,
+            exit_sides_by_panel=dict(exit_sides_by_panel), panel_runner=run_rivgraph_for_run,
+        )
+        return _finalize_panelized_child_result(
+            panelized_result=result,
+            state_dir=Path(kwargs["output_dir"]).parent,
+            parent_mask_path=Path(kwargs["cleaned_mask_path"]),
+            parent_links_path=Path(kwargs["reviewed_links_path"]),
+            parent_nodes_path=Path(kwargs["reviewed_nodes_path"]),
+            parent_merged_links_path=parent_merged_links_path,
+            boundary_component_labels_path=boundary_component_labels_path,
+            footprint=footprint,
+            unit_ids=unit_ids,
+            group_label=kwargs.get("group_label"),
+            example_id=str(kwargs.get("example_id") or run_name),
+            variant_id=str(kwargs["variant_id"]),
+            collapse_corridor_mode=str(kwargs.get("collapse_corridor_mode", "realized")),
+            bank_candidate_neighbors_max=int(kwargs.get("bank_candidate_neighbors_max", 2048)),
+            sword_node_source_path=kwargs.get("sword_node_source_path"),
+            sword_wse_field=kwargs.get("sword_wse_field"),
+            sword_match_tolerance=kwargs.get("sword_match_tolerance"),
+            sword_example_station_source_path=kwargs.get("sword_example_station_source_path"),
+            sword_station_match_source_path=kwargs.get("sword_station_match_source_path"),
+            sword_reach_buffer_steps=int(kwargs.get("sword_reach_buffer_steps", 2)),
+        )
+    return runner
+
+
 def _materialize_base_state_variant(
     *,
     context: ExperimentStateContext,
@@ -1570,6 +2158,8 @@ def _materialize_base_state_variant(
     sword_reach_buffer_steps: int,
     boundary_component_labels_path: str | Path | None = None,
     boundary_component_output_dir: str | Path | None = None,
+    panelized_width_samples_path: str | Path | None = None,
+    panelized_boundary_component_labels_path: str | Path | None = None,
 ) -> BaseStateVariantOutputs:
     variant_dir = context.state_dir / "variant"
     summary_dir = variant_dir / "summary"
@@ -1852,6 +2442,320 @@ def _materialize_base_state_variant(
     )
 
 
+def _materialize_panelized_base_state_variant(
+    *,
+    context: ExperimentStateContext,
+    example_id: str,
+    exit_sides: str,
+    collapse_corridor_mode: str,
+    panelized_width_samples_path: str | Path | None = None,
+    boundary_component_labels_path: str | Path | None = None,
+    boundary_component_output_dir: str | Path | None = None,
+    sword_node_source_path: str | Path | None = None,
+    sword_wse_field: str | None = None,
+    sword_match_tolerance: float | None = None,
+    sword_example_station_source_path: str | Path | None = None,
+    sword_station_match_source_path: str | Path | None = None,
+    sword_reach_buffer_steps: int = 2,
+    bank_candidate_neighbors_max: int = 2048,
+    **_: Any,
+) -> BaseStateVariantOutputs:
+    """Materialize a schema-compatible S000_base from the panelized handoff."""
+    if panelized_width_samples_path is None:
+        candidate = context.reviewed_links_path.with_name(
+            f"{_infer_example_id(context.reviewed_links_path)}_link_width_samples.csv"
+        )
+        panelized_width_samples_path = candidate
+    sample_path = Path(panelized_width_samples_path)
+    if not sample_path.exists():
+        raise FileNotFoundError(f"Panelized width samples do not exist: {sample_path}")
+
+    # Keep the standard experiment-level boundary-component product.  The
+    # canonical panelized handoff supplies the required single centerline.
+    boundary_output_dir = Path(boundary_component_output_dir) if boundary_component_output_dir else context.state_dir.parent.parent / "boundary_components"
+    if boundary_component_labels_path is not None:
+        boundary_outputs = _ensure_boundary_component_mask(
+            cleaned_mask_path=context.cleaned_mask_path,
+            reviewed_links_path=context.reviewed_links_path,
+            output_dir=boundary_output_dir,
+            boundary_component_labels_path=boundary_component_labels_path,
+        )
+    else:
+        run_root = context.reviewed_links_path.resolve().parent.parent
+        boundary_outputs = build_panelized_boundary_component_labels(
+            cleaned_mask_path=context.cleaned_mask_path,
+            centerline_path=context.reviewed_links_path.with_name(f"{example_id}_centerline.gpkg"),
+            panel_plan_path=run_root / "panels" / "panel_plan.gpkg",
+            panel_root=run_root / "panels",
+            output_dir=boundary_output_dir,
+        )
+    resolved_boundary_labels = Path(boundary_outputs["labels"])
+
+    variant_dir = context.state_dir / "variant"
+    summary_dir, mask_dir, matching_dir, directed_dir, width_dir = (
+        variant_dir / "summary", variant_dir / "mask", variant_dir / "matching", variant_dir / "directed", variant_dir / "widths"
+    )
+    for directory in (summary_dir, mask_dir, matching_dir, directed_dir, width_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    base_run_name = f"{example_id}__{context.state_id}"
+    collapsed_mask_path = mask_dir / f"{base_run_name}_collapsed.tif"
+    origin_mask_path = mask_dir / "origin_mask.tif"
+    shutil.copy2(context.cleaned_mask_path, collapsed_mask_path)
+    shutil.copy2(context.cleaned_mask_path, origin_mask_path)
+
+    base_variant_id = context.state_id
+    selection_metadata = _collapsed_selection_metadata([], None)
+    reviewed_nodes = _normalize_numeric_id_columns(gpd.read_file(context.reviewed_nodes_path))
+    reviewed_links = _normalize_numeric_id_columns(
+        _ensure_seed_direction_columns(gpd.read_file(context.reviewed_links_path), reviewed_nodes)
+    )
+    directed_links = _apply_collapsed_selection_metadata(reviewed_links, unit_ids=[], group_label=None)
+    directed_nodes = _apply_collapsed_selection_metadata(reviewed_nodes, unit_ids=[], group_label=None)
+    for frame in (directed_links, directed_nodes):
+        frame["example_id"] = example_id
+        frame["variant_id"] = base_variant_id
+
+    unit_link_membership, unit_link_summary = _build_unit_link_membership(
+        path_metrics=context.workflow.path_metrics,
+        unit_metrics=context.workflow.unit_metrics,
+    )
+    unit_link_membership.to_csv(summary_dir / "unit_link_membership.csv", index=False)
+    if not unit_link_summary.empty:
+        directed_links = directed_links.merge(unit_link_summary, on="id_link", how="left", validate="1:1")
+    for column, default in (
+        ("unit_ids", ""),
+        ("n_units", 0),
+        ("root_unit_ids", ""),
+        ("collapse_levels", ""),
+        ("compound_unit_ids", ""),
+        ("compound_bubble_ids", ""),
+        ("unit_classes", ""),
+        ("unit_topodynamic_classes", ""),
+    ):
+        if column not in directed_links.columns:
+            directed_links[column] = default
+        elif column != "n_units":
+            directed_links[column] = directed_links[column].astype("string").fillna(default)
+    directed_links["n_units"] = pd.to_numeric(directed_links["n_units"], errors="coerce").fillna(0).astype(int)
+    directed_links = _normalize_numeric_id_columns(directed_links)
+
+    bank_labels_path = mask_dir / "bank_labels.tif"
+    removed_bank_labels = write_state_bank_labels_windowed(
+        boundary_component_labels_path=resolved_boundary_labels,
+        origin_mask_path=origin_mask_path,
+        output_path=bank_labels_path,
+    )
+
+    source_width_samples = pd.read_csv(sample_path)
+    source_width_samples.to_csv(width_dir / "panelized_source_width_samples.csv", index=False)
+    enriched_links, link_width_samples = compute_panelized_base_width_families(
+        directed_links,
+        source_width_samples,
+        bank_labels_path=bank_labels_path,
+        origin_mask_path=origin_mask_path,
+        bank_candidate_neighbors_max=bank_candidate_neighbors_max,
+    )
+    enriched_links = _apply_collapsed_selection_metadata(enriched_links, unit_ids=[], group_label=None)
+    enriched_links = _normalize_numeric_id_columns(enriched_links)
+    enriched_links["example_id"] = example_id
+    enriched_links["variant_id"] = base_variant_id
+    link_width_samples = _apply_collapsed_selection_metadata(link_width_samples, unit_ids=[], group_label=None)
+    link_width_samples = _normalize_numeric_id_columns(link_width_samples)
+    link_width_samples["example_id"] = example_id
+    link_width_samples["variant_id"] = base_variant_id
+
+    node_match = _apply_collapsed_selection_metadata(
+        _build_identity_node_match(reviewed_nodes), unit_ids=[], group_label=None
+    )
+    link_match = _apply_collapsed_selection_metadata(
+        _build_identity_link_match(reviewed_links), unit_ids=[], group_label=None
+    )
+    link_lineage = _apply_collapsed_selection_metadata(
+        _build_identity_link_lineage(reviewed_links), unit_ids=[], group_label=None
+    )
+    for frame in (node_match, link_match, link_lineage):
+        frame["example_id"] = example_id
+        frame["variant_id"] = base_variant_id
+
+    directed_nodes, node_sword_match, sword_match_summary = match_variant_nodes_to_sword(
+        directed_nodes=directed_nodes,
+        parent_nodes=reviewed_nodes,
+        node_match=node_match,
+        sword_node_source_path=sword_node_source_path,
+        sword_wse_field=sword_wse_field,
+        sword_match_tolerance=sword_match_tolerance,
+        example_id=example_id,
+        sword_example_station_source_path=sword_example_station_source_path,
+        sword_station_match_source_path=sword_station_match_source_path,
+        sword_reach_buffer_steps=sword_reach_buffer_steps,
+    )
+    directed_nodes = _apply_collapsed_selection_metadata(directed_nodes, unit_ids=[], group_label=None)
+    directed_nodes = _normalize_numeric_id_columns(directed_nodes)
+    directed_nodes["example_id"] = example_id
+    directed_nodes["variant_id"] = base_variant_id
+    node_sword_match = _apply_collapsed_selection_metadata(node_sword_match, unit_ids=[], group_label=None)
+    node_sword_match["example_id"] = example_id
+    node_sword_match["variant_id"] = base_variant_id
+
+    directed_links_path = directed_dir / f"{base_run_name}_directed_links.gpkg"
+    directed_nodes_path = directed_dir / f"{base_run_name}_directed_nodes.gpkg"
+    links_with_widths_path = width_dir / "links_with_width_families.gpkg"
+
+    empty_components = _apply_collapsed_selection_metadata(
+        pd.DataFrame(
+            columns=[
+                "component_id",
+                "unit_ids",
+                "link_ids",
+                "node_ids",
+                "compound_bubble_ids",
+                "n_units",
+                "n_links",
+                "n_nodes",
+                "footprint_area",
+                "added_pixels",
+                "added_area",
+            ]
+        ),
+        unit_ids=[],
+        group_label=None,
+    )
+    empty_components["example_id"] = example_id
+    empty_components["variant_id"] = base_variant_id
+    empty_edit_geometries = gpd.GeoDataFrame(
+        {
+            "component_id": pd.Series(dtype="string"),
+            "geometry_role": pd.Series(dtype="string"),
+            "action": pd.Series(dtype="string"),
+            "unit_ids": pd.Series(dtype="string"),
+            "collapsed_selection_type": pd.Series(dtype="string"),
+            "collapsed_selection_label": pd.Series(dtype="string"),
+            "collapsed_unit_ids": pd.Series(dtype="string"),
+            "collapsed_group_label": pd.Series(dtype="string"),
+            "collapsed_unit_count": pd.Series(dtype="int64"),
+            "example_id": pd.Series(dtype="string"),
+            "variant_id": pd.Series(dtype="string"),
+        },
+        geometry=gpd.GeoSeries([], crs=reviewed_links.crs),
+        crs=reviewed_links.crs,
+    )
+
+    empty_components.to_csv(summary_dir / "collapse_components.csv", index=False)
+    empty_edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
+    pd.DataFrame(enriched_links.drop(columns=enriched_links.geometry.name)).to_csv(
+        width_dir / "link_width_families.csv", index=False
+    )
+    link_width_samples.to_csv(width_dir / "link_width_samples.csv", index=False)
+    enriched_links.to_file(links_with_widths_path, driver="GPKG")
+    node_match.to_csv(matching_dir / "node_match.csv", index=False)
+    node_sword_match.to_csv(matching_dir / "node_sword_match.csv", index=False)
+    link_match.to_csv(matching_dir / "link_match.csv", index=False)
+    link_lineage.to_csv(matching_dir / "link_lineage.csv", index=False)
+    directed_links.to_file(directed_links_path, driver="GPKG")
+    directed_nodes.to_file(directed_nodes_path, driver="GPKG")
+    with (directed_dir / "direction_validation_report.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "method": "panelized_base_reuse",
+                "is_valid": True,
+                "issues": [],
+                "source_nodes": reviewed_nodes.loc[
+                    reviewed_nodes["is_inlet"].fillna(False), "id_node"
+                ].astype(int).tolist(),
+                "sink_nodes": reviewed_nodes.loc[
+                    reviewed_nodes["is_outlet"].fillna(False), "id_node"
+                ].astype(int).tolist(),
+            },
+            handle,
+            indent=2,
+        )
+
+    manifest = {
+        "example_id": example_id,
+        "variant_id": base_variant_id,
+        "execution_mode": "panelized",
+        "exit_sides": exit_sides,
+        "collapse_corridor_mode": collapse_corridor_mode,
+        "selection_source": "base_state",
+        "selected_unit_ids": [],
+        "group_label": None,
+        "collapsed_selection": selection_metadata,
+        "n_components": 0,
+        "component_ids": [],
+        "base_state_materialized": True,
+        "mask_summary": {
+            "base_water_pixels": None,
+            "collapsed_water_pixels": None,
+            "pixels_added": 0,
+            "pixels_removed": 0,
+            "changed_pixels": 0,
+        },
+        "sword_matching": {
+            "wse_field": sword_wse_field,
+            "match_tolerance": sword_match_tolerance,
+            "reach_buffer_steps": int(sword_reach_buffer_steps),
+            "n_matched_nodes": int(node_sword_match["sword_node_id"].notna().sum())
+            if not node_sword_match.empty
+            else 0,
+            "n_propagated_matches": int(node_sword_match["sword_match_from_parent"].fillna(False).sum())
+            if not node_sword_match.empty
+            else 0,
+            "candidate_scope": sword_match_summary.get("scope"),
+            "candidate_region": sword_match_summary.get("candidate_region"),
+            "candidate_reach_count": sword_match_summary.get("candidate_reach_count"),
+            "candidate_reach_ids": sword_match_summary.get("candidate_reach_ids", []),
+        },
+        "output_paths": {
+            "output_dir": str(variant_dir.resolve()),
+            "collapsed_mask": str(collapsed_mask_path.resolve()),
+            "origin_mask": str(origin_mask_path.resolve()),
+            "width_scope_mask": str(origin_mask_path.resolve()),
+            "bank_labels": str(bank_labels_path.resolve()),
+            "boundary_component_labels": str(resolved_boundary_labels.resolve()),
+            "collapse_components": str((summary_dir / "collapse_components.csv").resolve()),
+            "unit_link_membership": str((summary_dir / "unit_link_membership.csv").resolve()),
+            "edit_geometries": str((mask_dir / "collapse_edit_geometries.gpkg").resolve()),
+            "link_width_families": str((width_dir / "link_width_families.csv").resolve()),
+            "link_width_samples": str((width_dir / "link_width_samples.csv").resolve()),
+            "links_with_width_families": str(links_with_widths_path.resolve()),
+            "panelized_source_width_samples": str(
+                (width_dir / "panelized_source_width_samples.csv").resolve()
+            ),
+            "node_match": str((matching_dir / "node_match.csv").resolve()),
+            "node_sword_match": str((matching_dir / "node_sword_match.csv").resolve()),
+            "link_match": str((matching_dir / "link_match.csv").resolve()),
+            "link_lineage": str((matching_dir / "link_lineage.csv").resolve()),
+            "directed_links": str(directed_links_path.resolve()),
+            "directed_nodes": str(directed_nodes_path.resolve()),
+            "direction_validation_report": str(
+                (directed_dir / "direction_validation_report.json").resolve()
+            ),
+        },
+        "source_paths": {
+            "cleaned_mask": str(context.cleaned_mask_path.resolve()),
+            "reviewed_links": str(context.reviewed_links_path.resolve()),
+            "reviewed_nodes": str(context.reviewed_nodes_path.resolve()),
+            "panelized_width_samples": str(sample_path.resolve()),
+            "boundary_component_labels": str(resolved_boundary_labels.resolve()),
+        },
+        "bank_label_summary": {
+            "removed_land_labels": removed_bank_labels,
+            "n_removed_land_labels": int(len(removed_bank_labels)),
+        },
+        "bank_candidate_neighbors_max": int(bank_candidate_neighbors_max),
+    }
+    with (summary_dir / "variant_manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+    return BaseStateVariantOutputs(
+        output_dir=variant_dir,
+        collapsed_mask_path=collapsed_mask_path,
+        directed_links_path=directed_links_path,
+        directed_nodes_path=directed_nodes_path,
+        bank_labels_path=bank_labels_path,
+        boundary_component_labels_path=resolved_boundary_labels,
+    )
+
+
 def _build_child_state(
     *,
     parent_context: ExperimentStateContext,
@@ -1873,7 +2777,10 @@ def _build_child_state(
     variant_call_kwargs.update(
         {
             "cleaned_mask_path": parent_context.cleaned_mask_path,
-            "reviewed_links_path": parent_context.reviewed_links_path,
+            "reviewed_links_path": (
+                parent_context.analysis_links_path
+                or parent_context.reviewed_links_path
+            ),
             "reviewed_nodes_path": parent_context.reviewed_nodes_path,
             "exit_sides": exit_sides,
             "variant_id": state_id,
@@ -1891,14 +2798,19 @@ def _build_child_state(
 
     variant_outputs = variant_runner(**variant_call_kwargs)
 
+    analysis_links_path = _variant_analysis_links_path(
+        variant_output_dir=variant_outputs.output_dir,
+        directed_links_path=variant_outputs.directed_links_path,
+    )
     child_context = _run_state_hierarchy(
         state_id=state_id,
         parent_state_id=parent_context.state_id,
         depth=parent_context.depth + 1,
         state_dir=state_dir,
         cleaned_mask_path=variant_outputs.collapsed_mask_path,
-        reviewed_links_path=variant_outputs.directed_links_path,
+        reviewed_links_path=analysis_links_path,
         reviewed_nodes_path=variant_outputs.directed_nodes_path,
+        directed_links_path=variant_outputs.directed_links_path,
         selection=selection,
         unit_workflow_runner=unit_workflow_runner,
         unit_workflow_writer=unit_workflow_writer,
@@ -1935,7 +2847,7 @@ def run_collapse_experiment(
     pixel_width_percentiles: Sequence[float] | None = None,
     use_pixel_widths_for_extremes: bool = True,
     debug_hierarchy: bool = False,
-    preferred_width_field: str = "wid_adj",
+    preferred_width_field: str = "wid_adj_wet",
     footprint_buffer_scale: float = 0.5,
     all_touched: bool = True,
     allow_noop: bool = False,
@@ -1960,9 +2872,19 @@ def run_collapse_experiment(
     equivalent_kb_width_sample_field: str = "wid_adj_wet",
     equivalent_kb_width_percentile: float = 90.0,
     base_only: bool = False,
+    requested_unit_ids: Sequence[int] | None = None,
+    execution_mode: str = "full_raster",
+    panelized_width_samples_path: str | Path | None = None,
+    panelized_boundary_component_labels_path: str | Path | None = None,
+    boundary_component_artifact_source_dir: str | Path | None = None,
+    base_state_variant_source_dir: str | Path | None = None,
     equivalent_forcing_table_runner: Callable[..., tuple[pd.DataFrame, dict[str, object]]] = prepare_forcing_table,
     equivalent_reference_kb_summary_runner: Callable[..., dict[str, Any]] = compute_reference_section_kb,
 ) -> CollapseExperimentOutputs:
+    if execution_mode not in EXECUTION_MODES:
+        raise ValueError(f"Unsupported execution mode {execution_mode!r}. Expected one of {EXECUTION_MODES}.")
+    if execution_mode == "panelized":
+        base_state_variant_materializer = _materialize_panelized_base_state_variant
     if mode not in EXPERIMENT_MODES:
         raise ValueError(f"Unsupported mode {mode!r}. Expected one of {EXPERIMENT_MODES}.")
     if collapse_corridor_mode not in COLLAPSE_CORRIDOR_MODES:
@@ -1974,11 +2896,40 @@ def run_collapse_experiment(
     root_example_id = _infer_example_id(cleaned_mask_path)
     experiment_id = experiment_id or _default_experiment_id(cleaned_mask_path, mode)
     output_path = Path(output_dir) if output_dir is not None else _default_output_dir(cleaned_mask_path, experiment_id)
+    boundary_component_output_dir = output_path / "boundary_components"
+    if (
+        boundary_component_artifact_source_dir is not None
+        and Path(boundary_component_artifact_source_dir).resolve()
+        == boundary_component_output_dir.resolve()
+    ):
+        raise ValueError(
+            "Boundary-component reuse source must be outside the experiment output "
+            f"directory that will be reset: {boundary_component_output_dir.resolve()}"
+        )
+    if (
+        base_state_variant_source_dir is not None
+        and Path(base_state_variant_source_dir).resolve()
+        == (output_path / "states" / "S000_base" / "variant").resolve()
+    ):
+        raise ValueError(
+            "Base-state reuse source must be outside the experiment output directory "
+            f"that will be reset: {Path(base_state_variant_source_dir).resolve()}"
+        )
     _reset_experiment_output_dir(output_path)
     states_dir = output_path / "states"
     states_dir.mkdir(parents=True, exist_ok=True)
-    boundary_component_output_dir = output_path / "boundary_components"
-    boundary_component_labels_path: Path | None = None
+    if boundary_component_artifact_source_dir is not None:
+        boundary_component_labels_path: Path | None = _copy_boundary_component_artifacts(
+            source_dir=boundary_component_artifact_source_dir,
+            output_dir=boundary_component_output_dir,
+            example_id=root_example_id,
+        )
+    else:
+        boundary_component_labels_path = (
+            Path(panelized_boundary_component_labels_path)
+            if execution_mode == "panelized" and panelized_boundary_component_labels_path is not None
+            else None
+        )
 
     active_equivalent_resistance_config = equivalent_resistance_config
     base_equivalent_resistance_config = active_equivalent_resistance_config
@@ -2035,36 +2986,83 @@ def run_collapse_experiment(
         unit_workflow_writer=unit_workflow_writer,
         unit_workflow_kwargs=unit_workflow_kwargs,
     )
-    base_variant_outputs = base_state_variant_materializer(
-        context=base_context,
-        example_id=root_example_id,
-        exit_sides=exit_sides,
-        collapse_corridor_mode=collapse_corridor_mode,
-        preferred_width_field=preferred_width_field,
-        transect_scale=transect_scale,
-        min_transect_pixels=min_transect_pixels,
-        sword_node_source_path=sword_node_source_path,
-        sword_wse_field=sword_wse_field,
-        sword_match_tolerance=sword_match_tolerance,
-        sword_example_station_source_path=sword_example_station_source_path,
-        sword_station_match_source_path=sword_station_match_source_path,
-        sword_reach_buffer_steps=sword_reach_buffer_steps,
-        boundary_component_labels_path=boundary_component_labels_path,
-        boundary_component_output_dir=boundary_component_output_dir,
-        bank_candidate_neighbors_max=bank_candidate_neighbors_max,
-    )
+    if base_state_variant_source_dir is not None:
+        base_variant_outputs = _materialize_copied_base_state_variant(
+            context=base_context,
+            source_variant_dir=base_state_variant_source_dir,
+            example_id=root_example_id,
+            collapse_corridor_mode=collapse_corridor_mode,
+            boundary_component_labels_path=boundary_component_labels_path,
+        )
+    else:
+        base_variant_outputs = base_state_variant_materializer(
+            context=base_context,
+            example_id=root_example_id,
+            exit_sides=exit_sides,
+            collapse_corridor_mode=collapse_corridor_mode,
+            preferred_width_field=preferred_width_field,
+            transect_scale=transect_scale,
+            min_transect_pixels=min_transect_pixels,
+            sword_node_source_path=sword_node_source_path,
+            sword_wse_field=sword_wse_field,
+            sword_match_tolerance=sword_match_tolerance,
+            sword_example_station_source_path=sword_example_station_source_path,
+            sword_station_match_source_path=sword_station_match_source_path,
+            sword_reach_buffer_steps=sword_reach_buffer_steps,
+            boundary_component_labels_path=boundary_component_labels_path,
+            boundary_component_output_dir=boundary_component_output_dir,
+            bank_candidate_neighbors_max=bank_candidate_neighbors_max,
+            panelized_width_samples_path=panelized_width_samples_path,
+        )
     if base_variant_outputs.boundary_component_labels_path is not None:
         boundary_component_labels_path = base_variant_outputs.boundary_component_labels_path
         variant_kwargs["boundary_component_labels_path"] = boundary_component_labels_path
+    base_analysis_links_path = _variant_analysis_links_path(
+        variant_output_dir=base_variant_outputs.output_dir,
+        directed_links_path=base_variant_outputs.directed_links_path,
+    )
+    if base_analysis_links_path != Path(base_variant_outputs.directed_links_path):
+        base_context = _run_state_hierarchy(
+            state_id=base_state_id,
+            parent_state_id=None,
+            depth=0,
+            state_dir=states_dir / base_state_id,
+            cleaned_mask_path=base_variant_outputs.collapsed_mask_path,
+            reviewed_links_path=base_analysis_links_path,
+            reviewed_nodes_path=base_variant_outputs.directed_nodes_path,
+            directed_links_path=base_variant_outputs.directed_links_path,
+            selection=None,
+            unit_workflow_runner=unit_workflow_runner,
+            unit_workflow_writer=unit_workflow_writer,
+            unit_workflow_kwargs=unit_workflow_kwargs,
+        )
+    else:
+        base_context.cleaned_mask_path = base_variant_outputs.collapsed_mask_path
+        base_context.reviewed_links_path = base_variant_outputs.directed_links_path
+        base_context.reviewed_nodes_path = base_variant_outputs.directed_nodes_path
+        base_context.analysis_links_path = base_analysis_links_path
     base_context.variant_output_dir = base_variant_outputs.output_dir
-    base_context.cleaned_mask_path = base_variant_outputs.collapsed_mask_path
-    base_context.reviewed_links_path = base_variant_outputs.directed_links_path
-    base_context.reviewed_nodes_path = base_variant_outputs.directed_nodes_path
     base_context = _run_state_hydraulic_context(
         context=base_context,
         hydraulic_context_runner=state_hydraulic_context_runner,
         hydraulic_context_kwargs=state_hydraulic_context_kwargs,
     )
+    if execution_mode == "panelized" and not base_only and variant_runner is generate_network_variant:
+        child_boundary_labels = Path(panelized_boundary_component_labels_path) if panelized_boundary_component_labels_path else boundary_component_labels_path
+        if child_boundary_labels is None:
+            raise ValueError("Panelized child execution could not resolve base boundary-component labels.")
+        run_root = Path(reviewed_links_path).resolve().parent.parent
+        exits = json.loads((run_root / "panel_matching" / "panel_exit_sides.json").read_text())
+        variant_runner = _make_panelized_child_runner(
+            source_panel_root=run_root / "panels", panel_plan_path=run_root / "panels" / "panel_plan.gpkg",
+            panel_breaks_path=run_root / "manual_edits" / f"{root_example_id}_panel_breaks.gpkg",
+            boundary_match_plan_path=run_root / "panel_matching" / "boundary_match_plan.json",
+            parent_merged_links_path=run_root / "merged_network" / "core_boundary" / "merged_links.gpkg",
+            boundary_component_labels_path=child_boundary_labels,
+            exit_sides_by_panel={key: value["exit_sides"] for key, value in exits.items()},
+            run_name=root_example_id,
+        )
+        variant_kwargs["panelized_path_metrics"] = base_context.hierarchy_output_dir / "path_metrics.csv"
 
     state_records: list[dict[str, Any]] = [_state_record(base_context, mode)]
     transition_records: list[dict[str, Any]] = []
@@ -2150,9 +3148,14 @@ def run_collapse_experiment(
                     "equivalent_kb_width_percentile": float(equivalent_kb_width_percentile),
                     "debug_hierarchy": bool(debug_hierarchy),
                 },
-                "variant": {
-                    "base_only": bool(base_only),
-                    "collapse_corridor_mode": collapse_corridor_mode,
+            "variant": {
+                "base_only": bool(base_only),
+                "requested_unit_ids": (
+                    [int(unit_id) for unit_id in requested_unit_ids]
+                    if requested_unit_ids is not None
+                    else None
+                ),
+                "collapse_corridor_mode": collapse_corridor_mode,
                     "exit_sides": exit_sides,
                     "preferred_width_field": preferred_width_field,
                     "footprint_buffer_scale": float(footprint_buffer_scale),
@@ -2209,7 +3212,7 @@ def run_collapse_experiment(
         )
         unit_workflow_kwargs["equivalent_resistance_config"] = active_equivalent_resistance_config
         base_context.workflow = unit_workflow_runner(
-            base_context.reviewed_links_path,
+            base_context.analysis_links_path or base_context.reviewed_links_path,
             base_context.reviewed_nodes_path,
             **dict(unit_workflow_kwargs),
         )
@@ -2239,9 +3242,25 @@ def run_collapse_experiment(
 
     if mode in {"independent-units", "compound-bubbles"}:
         if mode == "compound-bubbles":
+            if requested_unit_ids is not None:
+                raise ValueError("--unit-id is currently supported only with independent-units.")
             selections = _select_compound_bubbles_from_workflow(base_context.workflow)
         else:
             selections = _select_all_units_from_ranking(base_context.workflow.collapse_ranking, base_context.workflow.unit_metrics)
+            if requested_unit_ids is not None:
+                requested_ids = {int(unit_id) for unit_id in requested_unit_ids}
+                available_ids = {selection.selected_unit_ids[0] for selection in selections}
+                unknown_ids = sorted(requested_ids - available_ids)
+                if unknown_ids:
+                    raise ValueError(
+                        "Requested unit ID(s) are not present in the base-state collapse ranking: "
+                        f"{unknown_ids}."
+                    )
+                selections = [
+                    selection
+                    for selection in selections
+                    if selection.selected_unit_ids[0] in requested_ids
+                ]
         if not selections:
             stop_reason = "no_compound_bubbles_in_base_state" if mode == "compound-bubbles" else "no_units_in_base_state"
             write_metadata()
@@ -2529,6 +3548,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--max-steps", type=int, default=None, help="Optional maximum number of sequential collapse steps.")
+    parser.add_argument(
+        "--unit-id",
+        dest="requested_unit_ids",
+        action="append",
+        type=int,
+        default=None,
+        help="Optional independent-units filter; repeat to run several unit IDs. Omit to run all units.",
+    )
     parser.add_argument("--max-path-cutoff", type=int, default=100, help="Maximum edge-count cutoff for unit path enumeration.")
     parser.add_argument("--max-paths", type=int, default=5000, help="Maximum number of simple paths per unit.")
     parser.add_argument(
@@ -2659,7 +3686,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Discharge column in the equivalent-resistance forcing file.",
     )
     parser.add_argument("--debug-hierarchy", action="store_true", help="Enable hierarchy/unit-detection debug output.")
-    parser.add_argument("--preferred-width-field", default="wid_adj", help="Preferred reviewed-link width field for collapse-footprint buffering.")
+    parser.add_argument(
+        "--preferred-width-field",
+        default="wid_adj_wet",
+        help="Preferred reviewed-link width field for collapse-footprint buffering.",
+    )
     parser.add_argument("--footprint-buffer-scale", type=float, default=0.5, help="Multiplier applied to footprint width / 2 buffering.")
     parser.add_argument("--disable-all-touched", action="store_true", help="Disable all_touched rasterization when creating collapse footprints.")
     parser.add_argument("--allow-noop", action="store_true", help="Allow variants that produce no added pixels.")
@@ -2707,6 +3738,17 @@ def build_parser() -> argparse.ArgumentParser:
             "then stop before building derived unit/group states."
         ),
     )
+    parser.add_argument("--execution-mode", choices=EXECUTION_MODES, default="full_raster", help="Use full-raster processing or the panelized base-state materializer.")
+    parser.add_argument(
+        "--base-state-source",
+        default=None,
+        help=(
+            "Optional completed experiment directory (or S000_base/variant directory) whose "
+            "base variant should be copied instead of recomputing base widths."
+        ),
+    )
+    parser.add_argument("--panelized-width-samples", default=None, help="Optional merged panelized width-samples CSV; defaults beside --reviewed-links.")
+    parser.add_argument("--panelized-boundary-component-labels", default=None, help="Required global boundary-component labels for panelized child states.")
     return parser
 
 
@@ -2786,7 +3828,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         "equivalent_kb_width_sample_field": args.equivalent_kb_width_sample_field,
         "equivalent_kb_width_percentile": args.equivalent_kb_width_percentile,
         "base_only": args.base_only,
+        "requested_unit_ids": args.requested_unit_ids,
+        "execution_mode": args.execution_mode,
+        "panelized_width_samples_path": args.panelized_width_samples,
+        "panelized_boundary_component_labels_path": args.panelized_boundary_component_labels,
     }
+    if args.base_state_source is not None:
+        base_source = Path(args.base_state_source).resolve()
+        if base_source.name != "variant":
+            base_source = base_source / "states" / "S000_base" / "variant"
+        run_kwargs["base_state_variant_source_dir"] = str(base_source)
+    if args.panelized_boundary_component_labels is not None:
+        run_kwargs["boundary_component_artifact_source_dir"] = str(
+            Path(args.panelized_boundary_component_labels).resolve().parent
+        )
 
     persist_realized_and_anchored = args.collapse_corridor_mode in {"both", "anchored"}
     requested_modes = COLLAPSE_CORRIDOR_MODES if persist_realized_and_anchored else (args.collapse_corridor_mode,)
@@ -2810,6 +3865,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             and realized_output_dir_for_reuse is not None
             and _supports_realized_reuse_speedup(args.mode)
         ):
+            current_run_kwargs["boundary_component_artifact_source_dir"] = str(
+                (realized_output_dir_for_reuse / "boundary_components").resolve()
+            )
+            current_run_kwargs["base_state_variant_source_dir"] = str(
+                (realized_output_dir_for_reuse / "states" / "S000_base" / "variant").resolve()
+            )
             current_run_kwargs["variant_runner"] = _make_realized_reuse_variant_runner(
                 realized_experiment_output_dir=realized_output_dir_for_reuse,
                 fallback_variant_runner=generate_network_variant,
