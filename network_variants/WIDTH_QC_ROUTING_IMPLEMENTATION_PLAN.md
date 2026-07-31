@@ -298,6 +298,29 @@ validation summary.
 
 ## Phase 6 — Algorithm-review notebook
 
+**Status: complete (2026-07-31).** The review notebook reads only the
+versioned Phase 4/5 artifacts and covers review balance, missingness,
+predictor distributions, collinearity, linear coefficients and odds ratios,
+model and per-example performance, ROC/PR curves, calibration, threshold and
+split-sensitive trade-offs, partial SVM/logistic decision surfaces,
+disagreements, routing-impact ranking, and archived-link context maps. It has
+been executed successfully from a clean project kernel with all 14 code cells
+completing and no errors.
+
+Execute a versioned copy with:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-width-qc-review \
+IPYTHONDIR=/tmp/ipython-width-qc \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/jupyter nbconvert \
+  --to notebook --execute \
+  network_variants/notebooks/width_qc_model_review.ipynb \
+  --output-dir network_variants/output/width_qc_model_review \
+  --output width_qc_model_review_executed_v1.ipynb \
+  --ExecutePreprocessor.timeout=300 \
+  --ExecutePreprocessor.kernel_name=python3
+```
+
 Create a reproducible notebook, suggested location:
 
 ```text
