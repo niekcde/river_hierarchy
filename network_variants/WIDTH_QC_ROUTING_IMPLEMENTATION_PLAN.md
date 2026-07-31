@@ -20,7 +20,8 @@ The implementation must:
 
 ## Phase 1 — Permanently archive existing reviews
 
-**Priority: immediate; complete before full experiment reruns.**
+**Status: complete (2026-07-31).** All 16 reviews were copied and verified
+before full experiment reruns.
 
 Create the following durable directory for every reviewed example:
 
@@ -57,6 +58,10 @@ Existing artifacts are copied, not moved, during initial migration.
 - Archived decisions agree with review metadata in the source-link files.
 
 ## Phase 2 — Review fingerprints and stale-review protection
+
+**Status: complete (2026-07-31).** All 16 archives have current mask,
+network, link-identity, and width-method fingerprints. Validation distinguishes
+mask, topology, ID-only, width-method, missing, and corrupt-archive states.
 
 Record the following in every review manifest:
 
@@ -102,6 +107,8 @@ Rules:
 - Stale reviews cannot silently affect an experiment.
 
 ## Phase 3 — Permanent GUI save contract
+
+**Status: pending.**
 
 Change the GUI default review location to:
 
