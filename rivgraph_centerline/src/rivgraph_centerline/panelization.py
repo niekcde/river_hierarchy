@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import rasterio
 from rasterio.features import rasterize
@@ -56,6 +57,190 @@ def _concatenate_two_lines(first: LineString, second: LineString) -> LineString:
     join_y = (left[-1][1] + right[0][1]) / 2
     join = (join_x, join_y)
     return LineString(left[:-1] + [join] + right[1:])
+
+
+def _parse_numeric_values(value: object, *, dtype: type[float] | type[int]) -> list[float] | list[int]:
+    if value is None or pd.isna(value) or str(value).strip() == "":
+        return []
+    return [dtype(item.strip()) for item in str(value).split(",") if item.strip()]
+
+
+def _rivgraph_width_metrics(widths: list[float], coordinates: list[tuple[float, float]]) -> dict[str, float]:
+    """Apply RivGraph's endpoint-width trimming to an ordered sample series."""
+    if len(widths) != len(coordinates) or not widths:
+        raise ValueError("Width values and sample coordinates must be non-empty and have equal length.")
+    values = np.asarray(widths, dtype=float)
+    xy = np.asarray(coordinates, dtype=float)
+    dists = np.insert(np.cumsum(np.hypot(np.diff(xy[:, 0]), np.diff(xy[:, 1]))), 0, 0.0)
+    revdists = np.insert(np.cumsum(np.hypot(np.diff(xy[::-1, 0]), np.diff(xy[::-1, 1]))), 0, 0.0)
+    width_mult = 1.1
+    start = int(np.argmin(np.abs(dists - values[0] / 2 * width_mult)))
+    end = len(dists) - int(np.argmin(np.abs(revdists - values[-1] / 2 * width_mult))) - 1
+    if start >= end:
+        adjusted = values
+        adjusted_length = float(dists[-1])
+        endpoints = (0, len(values) - 1)
+    else:
+        adjusted = values[start:end]
+        adjusted_length = float(dists[end] - dists[start])
+        endpoints = (start, end)
+    straight_length = float(np.hypot(*(xy[endpoints[0]] - xy[endpoints[1]])))
+    return {
+        "wid": max(1.0, float(np.mean(values))),
+        "wid_adj": max(1.0, float(np.mean(adjusted))),
+        "wid_med": float(np.median(adjusted)),
+        "len": max(1.0, float(dists[-1])),
+        "len_adj": max(1.0, adjusted_length),
+        "sinuosity": adjusted_length / straight_length if straight_length > 0 else 1.0,
+    }
+
+
+def _core_owned_width_samples(
+    *,
+    merged_geometry: LineString,
+    source_segments: list[object],
+    source_rows: dict[tuple[str, int], object],
+    panel_root: Path,
+) -> tuple[list[float], list[tuple[float, float]], list[dict[str, object]]]:
+    """Return ordered, core-owned RivGraph width samples for one merged link."""
+    pieces: list[tuple[float, list[float], list[tuple[float, float]], list[dict[str, object]]]] = []
+    for segment in source_segments:
+        panel = str(segment.panel_id)
+        source_link_id = int(segment.source_link_id)
+        source = source_rows[(panel, source_link_id)]
+        widths = _parse_numeric_values(source["wid_pix"], dtype=float)
+        indices = _parse_numeric_values(source["idx_link"], dtype=int)
+        if len(widths) != len(indices):
+            raise ValueError(f"Panel {panel} link {source_link_id} has mismatched wid_pix and idx_link lengths.")
+        with rasterio.open(panel_root / panel / "mask.tif") as mask:
+            rows = np.asarray(indices, dtype=np.int64) // mask.width
+            cols = np.asarray(indices, dtype=np.int64) % mask.width
+            xs, ys = rasterio.transform.xy(mask.transform, rows, cols, offset="center")
+            pixel_size = max(abs(float(mask.transform.a)), abs(float(mask.transform.e)))
+        coordinates = list(zip(map(float, xs), map(float, ys)))
+        owned = [Point(coordinate).distance(segment.geometry) <= pixel_size * 0.75 for coordinate in coordinates]
+        selected = [(width, coordinate, index) for width, coordinate, index, keep in zip(widths, coordinates, indices, owned) if keep]
+        if not selected:
+            continue
+        selected_widths = [float(item[0]) for item in selected]
+        selected_coordinates = [item[1] for item in selected]
+        projections = [merged_geometry.project(Point(coordinate)) for coordinate in selected_coordinates]
+        if projections[0] > projections[-1]:
+            selected_widths.reverse()
+            selected_coordinates.reverse()
+            selected.reverse()
+            projections.reverse()
+        provenance = [
+            {"panel_id": panel, "source_link_id": source_link_id, "source_segment_id": str(segment["segment_id"]), "source_pixel_index": int(item[2])}
+            for item in selected
+        ]
+        pieces.append((float(np.mean(projections)), selected_widths, selected_coordinates, provenance))
+    if not pieces:
+        raise ValueError("No core-owned width samples were found for a merged link.")
+    pieces.sort(key=lambda item: item[0])
+    return (
+        [width for _, widths, _, _ in pieces for width in widths],
+        [coordinate for _, _, coordinates, _ in pieces for coordinate in coordinates],
+        [record for _, _, _, records in pieces for record in records],
+    )
+
+
+def _build_panelized_reference_centerline(
+    *,
+    plan_path: Path,
+    panel_root: Path,
+    run_name: str,
+    endpoint_tolerance_m: float = 10,
+) -> gpd.GeoDataFrame:
+    """Stitch core-owned per-panel reference centerlines into one LineString."""
+    cores = gpd.read_file(plan_path, layer="panel_cores")
+    parts: list[LineString] = []
+    for core in cores.itertuples(index=False):
+        panel = str(core.panel_id)
+        centerline_path = panel_root / panel / "rivgraph" / f"{run_name}_{panel}_centerline.gpkg"
+        if not centerline_path.exists():
+            # Panels without core water do not have a RivGraph output, just as
+            # they do not contribute source links to the assembled network.
+            continue
+        panel_centerline = gpd.read_file(centerline_path)
+        if len(panel_centerline) != 1:
+            raise ValueError(
+                f"Expected exactly one reference centerline feature for panel {panel}, "
+                f"found {len(panel_centerline)} in {centerline_path}."
+            )
+        core_parts = _line_parts(panel_centerline.geometry.iloc[0].intersection(core.geometry))
+        if len(core_parts) != 1:
+            raise ValueError(
+                f"Expected one core-owned reference centerline part for panel {panel}, "
+                f"found {len(core_parts)} in {centerline_path}."
+            )
+        parts.append(core_parts[0])
+
+    if not parts:
+        raise ValueError("No panel reference centerlines were found for the panelized handoff.")
+
+    endpoint_groups: list[list[Point]] = []
+    part_endpoints: list[tuple[int, int]] = []
+    for part in parts:
+        endpoint_ids: list[int] = []
+        for coordinate in (part.coords[0], part.coords[-1]):
+            point = Point(coordinate)
+            matching = next(
+                (
+                    index
+                    for index, group in enumerate(endpoint_groups)
+                    if any(point.distance(existing) <= endpoint_tolerance_m for existing in group)
+                ),
+                None,
+            )
+            if matching is None:
+                matching = len(endpoint_groups)
+                endpoint_groups.append([])
+            endpoint_groups[matching].append(point)
+            endpoint_ids.append(matching)
+        if endpoint_ids[0] == endpoint_ids[1]:
+            raise ValueError("A panel reference centerline collapses to the same endpoint cluster at both ends.")
+        part_endpoints.append((endpoint_ids[0], endpoint_ids[1]))
+
+    incident: dict[int, list[int]] = {index: [] for index in range(len(endpoint_groups))}
+    for part_index, (start, end) in enumerate(part_endpoints):
+        incident[start].append(part_index)
+        incident[end].append(part_index)
+    endpoint_nodes = sorted(node for node, linked_parts in incident.items() if len(linked_parts) == 1)
+    if len(endpoint_nodes) != 2 or any(len(linked_parts) > 2 for linked_parts in incident.values()):
+        raise ValueError(
+            "Core-owned panel reference centerlines must form one unbranched path; "
+            f"found endpoint degrees {[len(incident[index]) for index in sorted(incident)]}."
+        )
+
+    current_node = endpoint_nodes[0]
+    used_parts: set[int] = set()
+    stitched_coordinates: list[tuple[float, float]] = []
+    while len(used_parts) < len(parts):
+        candidates = [part_index for part_index in incident[current_node] if part_index not in used_parts]
+        if len(candidates) != 1:
+            raise ValueError("Panel reference centerlines do not form one connected path.")
+        part_index = candidates[0]
+        start_node, end_node = part_endpoints[part_index]
+        coordinates = list(parts[part_index].coords)
+        if start_node != current_node:
+            coordinates.reverse()
+            start_node, end_node = end_node, start_node
+        if stitched_coordinates:
+            previous = stitched_coordinates[-1]
+            join = ((previous[0] + coordinates[0][0]) / 2, (previous[1] + coordinates[0][1]) / 2)
+            stitched_coordinates[-1] = join
+            stitched_coordinates.extend(coordinates[1:])
+        else:
+            stitched_coordinates.extend(coordinates)
+        used_parts.add(part_index)
+        current_node = end_node
+
+    return gpd.GeoDataFrame(
+        {"schema_rg": ["panelized-reference-centerline-v1"]},
+        geometry=[LineString(stitched_coordinates)],
+        crs=cores.crs,
+    )
 
 
 def build_core_boundary_network(*, plan_path: Path, breaks_path: Path, panel_root: Path, run_name: str, output_dir: Path, tolerance_m: float = 10, overwrite: bool = False, boundary_match_plan_path: Path | None = None) -> dict[str, object]:
@@ -375,6 +560,7 @@ def publish_panelized_rivgraph_handoff(
     directed_links_path: Path,
     nodes_path: Path,
     core_segments_path: Path,
+    plan_path: Path,
     panel_root: Path,
     run_name: str,
     rivgraph_dir: Path,
@@ -394,7 +580,8 @@ def publish_panelized_rivgraph_handoff(
     output_links = rivgraph_dir / f"{run_name}_links.gpkg"
     output_nodes = rivgraph_dir / f"{run_name}_nodes.gpkg"
     output_centerline = rivgraph_dir / f"{run_name}_centerline.gpkg"
-    if not overwrite and any(path.exists() for path in (output_links, output_nodes, output_centerline)):
+    output_network_centerlines = rivgraph_dir / f"{run_name}_network_centerlines.gpkg"
+    if not overwrite and any(path.exists() for path in (output_links, output_nodes, output_centerline, output_network_centerlines)):
         raise FileExistsError(f"Panelized RivGraph handoff already exists in {rivgraph_dir}; use --overwrite to replace it.")
 
     source_rows: dict[tuple[str, int], object] = {}
@@ -403,30 +590,21 @@ def publish_panelized_rivgraph_handoff(
         for source_link_id, source in panel_links.iterrows():
             source_rows[(panel, int(source_link_id))] = source
     segment_by_id = segments.set_index("segment_id")
-    width_fields = ("wid", "wid_adj", "wid_med", "sinuosity")
     enriched_records: list[dict[str, object]] = []
+    width_sample_records: list[dict[str, object]] = []
     for row in links.itertuples(index=False):
-        values: dict[str, list[tuple[float, float]]] = {field: [] for field in width_fields}
+        source_segments = []
         for segment_id in str(row.source_segments).split(";"):
-            segment = segment_by_id.loc[segment_id]
-            source = source_rows[(segment.panel_id, int(segment.source_link_id))]
-            weight = float(segment.geometry.length)
-            for field in width_fields:
-                value = source.get(field)
-                if pd.notna(value):
-                    values[field].append((float(value), weight))
-        source_segments = [segment_by_id.loc[segment_id] for segment_id in str(row.source_segments).split(";")]
-        adjusted_length = 0.0
-        width_pixels: list[str] = []
-        for segment in source_segments:
-            source = source_rows[(segment.panel_id, int(segment.source_link_id))]
-            source_length = float(source.geometry.length)
-            source_adjusted_length = pd.to_numeric(pd.Series([source.get("len_adj")]), errors="coerce").iloc[0]
-            if pd.notna(source_adjusted_length) and source_length > 0:
-                adjusted_length += float(source_adjusted_length) * float(segment.geometry.length) / source_length
-            width_pixel_value = source.get("wid_pix")
-            if pd.notna(width_pixel_value):
-                width_pixels.append(str(width_pixel_value))
+            segment = segment_by_id.loc[segment_id].copy()
+            segment["segment_id"] = segment_id
+            source_segments.append(segment)
+        widths, coordinates, provenance = _core_owned_width_samples(
+            merged_geometry=row.geometry,
+            source_segments=source_segments,
+            source_rows=source_rows,
+            panel_root=panel_root,
+        )
+        metrics = _rivgraph_width_metrics(widths, coordinates)
         record = {
             "id_link": int(row.global_link_id),
             # Global raster indices do not exist for a panelized handoff.
@@ -439,9 +617,9 @@ def publish_panelized_rivgraph_handoff(
             "_node_a": int(row.id_node_a),
             "_node_b": int(row.id_node_b),
             "schema_rg": "rg-v1",
-            "wid_pix": "; ".join(width_pixels),
-            "len": float(row.geometry.length),
-            "len_adj": adjusted_length if adjusted_length > 0 else float(row.geometry.length),
+            "wid_pix": ", ".join(str(value) for value in widths),
+            "len": metrics["len"],
+            "len_adj": metrics["len_adj"],
             "certain": 1.0,
             "certain_order": 0.0,
             "certain_alg": 0.0,
@@ -453,9 +631,11 @@ def publish_panelized_rivgraph_handoff(
             "wid_pctdiff": None,
             "geometry": row.geometry,
         }
-        for field, weighted in values.items():
-            record[field] = sum(value * weight for value, weight in weighted) / sum(weight for _, weight in weighted) if weighted else None
+        for field in ("wid", "wid_adj", "wid_med", "sinuosity"):
+            record[field] = metrics[field]
         enriched_records.append(record)
+        for sample_index, (width, coordinate, source) in enumerate(zip(widths, coordinates, provenance)):
+            width_sample_records.append({"id_link": int(row.global_link_id), "sample_index": sample_index, "width": width, "x": coordinate[0], "y": coordinate[1], **source})
     published_links = gpd.GeoDataFrame(enriched_records, geometry="geometry", crs=links.crs)
     incoming = published_links["id_ds_node"].astype(int).value_counts()
     outgoing = published_links["id_us_node"].astype(int).value_counts()
@@ -495,22 +675,187 @@ def publish_panelized_rivgraph_handoff(
     published_nodes["schema_rg"] = "rg-v1"
     published_nodes = published_nodes.reindex(columns=STANDARD_NODE_COLUMNS)
 
-    # Preserve the normal file name while honestly representing a branched
-    # network as a MultiLineString rather than pretending it is one main line.
-    centerline = gpd.GeoDataFrame({"schema_rg": ["panelized-rivgraph-v1"]}, geometry=[unary_union(published_links.geometry.tolist())], crs=links.crs)
+    reference_centerline = _build_panelized_reference_centerline(
+        plan_path=plan_path,
+        panel_root=panel_root,
+        run_name=run_name,
+    )
+    network_centerlines = gpd.GeoDataFrame(
+        {"schema_rg": ["panelized-network-centerlines-v1"]},
+        geometry=[unary_union(published_links.geometry.tolist())],
+        crs=links.crs,
+    )
     rivgraph_dir.mkdir(parents=True, exist_ok=True)
     published_links.to_file(output_links, driver="GPKG")
     published_nodes.to_file(output_nodes, driver="GPKG")
-    centerline.to_file(output_centerline, driver="GPKG")
+    reference_centerline.to_file(output_centerline, driver="GPKG")
+    network_centerlines.to_file(output_network_centerlines, driver="GPKG")
+    pd.DataFrame.from_records(width_sample_records).to_csv(rivgraph_dir / f"{run_name}_link_width_samples.csv", index=False)
     manifest = {
         "mode": "panelized",
         "links": str(output_links),
         "nodes": str(output_nodes),
         "centerline": str(output_centerline),
+        "network_centerlines": str(output_network_centerlines),
+        "link_width_samples": str(rivgraph_dir / f"{run_name}_link_width_samples.csv"),
         "unavailable_full_mask_products": ["skeleton", "distance_transform", "link_directions_raster"],
     }
     (rivgraph_dir / f"{run_name}_panelized_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
+
+
+def _ordered_panel_exit_config(
+    *,
+    cores: gpd.GeoDataFrame,
+    pairs: list[dict[str, object]],
+    active_panels: set[str],
+    global_exit_sides: str,
+) -> dict[str, dict[str, object]]:
+    """Order local panel sides by traversing from the global inlet to outlet."""
+    ordered_global_sides = global_exit_sides.upper()
+    if (
+        len(ordered_global_sides) != 2
+        or len(set(ordered_global_sides)) != 2
+        or any(side not in "NSEW" for side in ordered_global_sides)
+    ):
+        raise ValueError(
+            "global_exit_sides must contain exactly two distinct sides from N, S, E, and W, "
+            "ordered upstream first."
+        )
+    if not active_panels:
+        return {}
+
+    cores_by_id = cores.set_index("panel_id").geometry
+    unknown_panels = active_panels.difference(cores_by_id.index.astype(str))
+    if unknown_panels:
+        raise ValueError(f"Active panels are missing from the panel plan: {sorted(unknown_panels)}")
+
+    adjacency: dict[str, dict[str, str]] = {panel: {} for panel in active_panels}
+    for pair in pairs:
+        left = str(pair["left_panel"])
+        right = str(pair["right_panel"])
+        if left not in active_panels or right not in active_panels:
+            continue
+        a = cores_by_id[left].centroid
+        b = cores_by_id[right].centroid
+        if str(pair["break_id"]).upper().startswith("V"):
+            left_side, right_side = ("E", "W") if a.x < b.x else ("W", "E")
+        else:
+            left_side, right_side = ("N", "S") if a.y < b.y else ("S", "N")
+        for panel, neighbor, side in (
+            (left, right, left_side),
+            (right, left, right_side),
+        ):
+            previous = adjacency[panel].get(neighbor)
+            if previous is not None and previous != side:
+                raise ValueError(
+                    f"Panel pair {panel}/{neighbor} was assigned conflicting boundary sides "
+                    f"{previous} and {side}."
+                )
+            adjacency[panel][neighbor] = side
+
+    extent = cores.geometry.union_all().bounds
+
+    def touches_global_side(panel: str, side: str) -> bool:
+        minx, miny, maxx, maxy = cores_by_id[panel].bounds
+        return {
+            "W": abs(minx - extent[0]) < 2,
+            "E": abs(maxx - extent[2]) < 2,
+            "S": abs(miny - extent[1]) < 2,
+            "N": abs(maxy - extent[3]) < 2,
+        }[side]
+
+    upstream_side, downstream_side = ordered_global_sides
+    start_candidates = sorted(
+        panel for panel in active_panels if touches_global_side(panel, upstream_side)
+    )
+    end_candidates = sorted(
+        panel for panel in active_panels if touches_global_side(panel, downstream_side)
+    )
+    if len(start_candidates) != 1 or len(end_candidates) != 1:
+        raise ValueError(
+            "The active panel chain must touch each requested global side exactly once; "
+            f"{upstream_side} candidates={start_candidates}, "
+            f"{downstream_side} candidates={end_candidates}."
+        )
+    start = start_candidates[0]
+    end = end_candidates[0]
+
+    if len(active_panels) == 1:
+        if start != end:
+            raise ValueError("A single active panel must touch both requested global sides.")
+        ordered_exits = {start: ordered_global_sides}
+    else:
+        if start == end:
+            raise ValueError(
+                "The same panel touches both requested global sides, but additional active panels exist."
+            )
+        invalid_degrees = {
+            panel: len(neighbors)
+            for panel, neighbors in adjacency.items()
+            if len(neighbors) != (1 if panel in {start, end} else 2)
+        }
+        if invalid_degrees:
+            raise ValueError(
+                "Active panels must form one unbranched inlet-to-outlet chain; "
+                f"invalid panel degrees={invalid_degrees}."
+            )
+
+        opposite = {"N": "S", "S": "N", "E": "W", "W": "E"}
+        ordered_exits: dict[str, str] = {}
+        previous_panel: str | None = None
+        current_panel = start
+        entry_side = upstream_side
+        visited: set[str] = set()
+        while current_panel != end:
+            if current_panel in visited:
+                raise ValueError("The active panel adjacency contains a cycle.")
+            visited.add(current_panel)
+            next_candidates = [
+                panel for panel in adjacency[current_panel] if panel != previous_panel
+            ]
+            if len(next_candidates) != 1:
+                raise ValueError(
+                    f"Expected one downstream neighbor for {current_panel}, found {next_candidates}."
+                )
+            next_panel = next_candidates[0]
+            exit_side = adjacency[current_panel][next_panel]
+            next_entry_side = adjacency[next_panel][current_panel]
+            if next_entry_side != opposite[exit_side]:
+                raise ValueError(
+                    f"Panel boundary {current_panel}/{next_panel} has inconsistent sides "
+                    f"{exit_side}/{next_entry_side}."
+                )
+            if entry_side == exit_side:
+                raise ValueError(
+                    f"Panel {current_panel} enters and exits through the same side {entry_side}."
+                )
+            ordered_exits[current_panel] = entry_side + exit_side
+            previous_panel, current_panel = current_panel, next_panel
+            entry_side = next_entry_side
+
+        if entry_side == downstream_side:
+            raise ValueError(f"Panel {end} enters and exits through the same side {entry_side}.")
+        ordered_exits[end] = entry_side + downstream_side
+        visited.add(end)
+        if visited != active_panels:
+            raise ValueError(
+                "The active panel adjacency is disconnected from the requested global path; "
+                f"unvisited panels={sorted(active_panels.difference(visited))}."
+            )
+
+    exit_config: dict[str, dict[str, object]] = {}
+    for panel in sorted(active_panels):
+        global_contacts = [
+            side for side in ordered_global_sides if touches_global_side(panel, side)
+        ]
+        exit_config[panel] = {
+            "boundary_sides": "".join(sorted(set(adjacency[panel].values()))),
+            "global_sides": "".join(global_contacts),
+            "exit_sides": ordered_exits[panel],
+            "review_required": False,
+        }
+    return exit_config
 
 
 def plan_boundary_matches(*, plan_path: Path, breaks_path: Path, mask_path: Path, output_path: Path, global_exit_sides: str = "SE") -> dict[str, object]:
@@ -519,8 +864,14 @@ def plan_boundary_matches(*, plan_path: Path, breaks_path: Path, mask_path: Path
     water_panels = set()
     for panel_id in cores["panel_id"]:
         summary_path = plan_path.parent / panel_id / "summary.json"
-        if summary_path.exists() and json.loads(summary_path.read_text(encoding="utf-8")).get("water_pixels", 0) > 0:
-            water_panels.add(panel_id)
+        if summary_path.exists():
+            panel_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            core_water_pixels = panel_summary.get(
+                "core_water_pixels",
+                panel_summary.get("water_pixels", 0),
+            )
+            if core_water_pixels > 0:
+                water_panels.add(str(panel_id))
     pairs = []
     with rasterio.open(mask_path) as src:
         step = abs(src.transform.a) / 2
@@ -546,48 +897,12 @@ def plan_boundary_matches(*, plan_path: Path, breaks_path: Path, mask_path: Path
                     pairs.append({"break_id": br.break_id, "left_panel": ids[0], "right_panel": ids[1]})
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps({"pairs": pairs}, indent=2), encoding="utf-8")
-    cores_by_id = cores.set_index("panel_id").geometry
-    proposals: dict[str, set[str]] = {}
-    for pair in pairs:
-        left, right = pair["left_panel"], pair["right_panel"]
-        a, b = cores_by_id[left].centroid, cores_by_id[right].centroid
-        if pair["break_id"].upper().startswith("V"):
-            left_side, right_side = ("E", "W") if a.x < b.x else ("W", "E")
-        else:
-            left_side, right_side = ("N", "S") if a.y < b.y else ("S", "N")
-        proposals.setdefault(left, set()).add(left_side); proposals.setdefault(right, set()).add(right_side)
-    extent = cores.unary_union.bounds
-    exit_config = {}
-    for panel, sides in sorted(proposals.items()):
-        geom = cores_by_id[panel]
-        inferred = set(sides)
-        if len(inferred) == 1:
-            minx, miny, maxx, maxy = geom.bounds
-            if "S" in global_exit_sides and abs(miny - extent[1]) < 2: inferred.add("S")
-            if "E" in global_exit_sides and abs(maxx - extent[2]) < 2: inferred.add("E")
-        exit_config[panel] = {"boundary_sides": "".join(sorted(sides)), "exit_sides": "", "review_required": True}
-    # Traverse the (single-thread) panel graph from the global upstream side.
-    start = next((p for p in exit_config if abs(cores_by_id[p].bounds[1] - extent[1]) < 2), None)
-    current, entry, visited = start, "S", set()
-    while current is not None and current not in visited:
-        visited.add(current)
-        sides = set(exit_config[current]["boundary_sides"])
-        exit_side = next((s for s in sides if s != entry), None)
-        if exit_side is None and "E" in global_exit_sides and abs(cores_by_id[current].bounds[2] - extent[2]) < 2:
-            exit_side = "E"
-        if exit_side is None: break
-        exit_config[current]["exit_sides"] = entry + exit_side
-        exit_config[current]["review_required"] = False
-        nxt = None
-        for pair in pairs:
-            if pair["left_panel"] == current or pair["right_panel"] == current:
-                other = pair["right_panel"] if pair["left_panel"] == current else pair["left_panel"]
-                if other not in visited:
-                    nxt = other; break
-        if nxt is None: break
-        # The next panel enters from the opposite side of this exit.
-        entry = {"N":"S", "S":"N", "E":"W", "W":"E"}[exit_side]
-        current = nxt
+    exit_config = _ordered_panel_exit_config(
+        cores=cores,
+        pairs=pairs,
+        active_panels=water_panels,
+        global_exit_sides=global_exit_sides,
+    )
     output_path.with_name("panel_exit_sides.json").write_text(json.dumps(exit_config, indent=2), encoding="utf-8")
     return {"output": str(output_path), "pair_count": len(pairs)}
 
@@ -685,7 +1000,7 @@ def plan_panels(
     return summary
 
 
-def prepare_panel_masks(*, mask_path: Path, plan_path: Path, output_dir: Path, panel_ids: set[str] | None = None, overwrite: bool = False) -> dict[str, object]:
+def prepare_panel_masks(*, mask_path: Path, plan_path: Path, output_dir: Path, panel_ids: set[str] | None = None, overwrite: bool = False, crop: bool = True) -> dict[str, object]:
     """Clip buffered processing areas to independently runnable binary masks."""
     cores = gpd.read_file(plan_path, layer="panel_cores")
     processing = gpd.read_file(plan_path, layer="processing_areas")
@@ -711,7 +1026,7 @@ def prepare_panel_masks(*, mask_path: Path, plan_path: Path, output_dir: Path, p
             core = cores.loc[cores["panel_id"] == record.panel_id].geometry.iloc[0]
             core_keep = rasterize([(core, 1)], out_shape=data.shape, transform=local_transform, fill=0, dtype="uint8").astype(bool)
             core_water_pixels = int(((data > 0) & core_keep).sum())
-            cropped, cropped_transform, crop_window = crop_binary_mask(clipped, local_transform)
+            cropped, cropped_transform, crop_window = crop_binary_mask(clipped, local_transform) if crop else (clipped, local_transform, {"row_min": 0, "row_max": int(clipped.shape[0]), "col_min": 0, "col_max": int(clipped.shape[1])})
             profile = src.profile.copy()
             profile.update(driver="GTiff", dtype="uint8", count=1, nodata=0, compress="lzw", height=cropped.shape[0], width=cropped.shape[1], transform=cropped_transform)
             panel_dir.mkdir(parents=True, exist_ok=True)
@@ -726,6 +1041,57 @@ def prepare_panel_masks(*, mask_path: Path, plan_path: Path, output_dir: Path, p
     manifest_path = output_dir / "panel_mask_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return {"output_dir": str(output_dir), "manifest": str(manifest_path), "prepared_panel_ids": [item["panel_id"] for item in manifest]}
+
+
+def write_panelized_mask_mosaic(
+    *,
+    template_mask_path: Path,
+    plan_path: Path,
+    panel_root: Path,
+    output_mask_path: Path,
+    overwrite: bool = False,
+    chunk_pixels: int = 2048,
+) -> Path:
+    """Write a core-owned full mask from cropped, overlapping panel masks.
+
+    Only modest chunks are held in memory. Overlap is resolved by assigning
+    each output pixel to its panel core, so it never duplicates water from two
+    buffered panel masks.
+    """
+    if chunk_pixels <= 0:
+        raise ValueError("chunk_pixels must be positive.")
+    template_mask_path, plan_path, panel_root, output_mask_path = map(Path, (template_mask_path, plan_path, panel_root, output_mask_path))
+    if output_mask_path.exists() and not overwrite:
+        raise FileExistsError(f"Output mask already exists: {output_mask_path}")
+    cores = gpd.read_file(plan_path, layer="panel_cores")
+    with rasterio.open(template_mask_path) as template:
+        profile = template.profile.copy()
+        profile.update(driver="GTiff", dtype="uint8", count=1, nodata=0, compress="lzw")
+        output_mask_path.parent.mkdir(parents=True, exist_ok=True)
+        with rasterio.open(output_mask_path, "w+", **profile) as output:
+            for core_row in cores.itertuples(index=False):
+                panel_path = panel_root / str(core_row.panel_id) / "mask.tif"
+                if not panel_path.exists():
+                    raise FileNotFoundError(f"Cleaned panel mask does not exist: {panel_path}")
+                core_window = from_bounds(*core_row.geometry.bounds, transform=template.transform).round_offsets().round_lengths()
+                core_window = core_window.intersection(rasterio.windows.Window(0, 0, template.width, template.height))
+                with rasterio.open(panel_path) as panel:
+                    for row in range(int(core_window.row_off), int(core_window.row_off + core_window.height), chunk_pixels):
+                        height = min(chunk_pixels, int(core_window.row_off + core_window.height) - row)
+                        for col in range(int(core_window.col_off), int(core_window.col_off + core_window.width), chunk_pixels):
+                            width = min(chunk_pixels, int(core_window.col_off + core_window.width) - col)
+                            window = rasterio.windows.Window(col, row, width, height)
+                            bounds = rasterio.windows.bounds(window, template.transform)
+                            panel_window = from_bounds(*bounds, transform=panel.transform).round_offsets().round_lengths()
+                            values = panel.read(1, window=panel_window, out_shape=(height, width), boundless=True, fill_value=0)
+                            core_mask = rasterize(
+                                [(core_row.geometry, 1)], out_shape=(height, width),
+                                transform=rasterio.windows.transform(window, template.transform), fill=0, dtype="uint8",
+                            ).astype(bool)
+                            existing = output.read(1, window=window)
+                            existing[core_mask] = values[core_mask]
+                            output.write(existing, 1, window=window)
+    return output_mask_path
 
 
 def match_panel_boundary_links(*, breaks_path: Path, left_links_path: Path, right_links_path: Path, break_id: str, left_panel: str, right_panel: str, output_path: Path, tolerance_m: float = 10, overwrite: bool = False) -> dict[str, object]:

@@ -19,7 +19,7 @@ from rasterio.warp import calculate_default_transform, reproject
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPoint, Point, Polygon
 from shapely.geometry.base import BaseGeometry
 
-from rivgraph_centerline.manual_edits import apply_manual_edits
+from rivgraph_centerline.manual_edits import apply_manual_edits, apply_manual_edits_to_panels
 from rivgraph_centerline.raster_mask import crop_binary_mask
 
 
@@ -214,6 +214,83 @@ def apply_edits_for_run(
         }
     )
     write_json(paths.manual_edits_summary, summary)
+    return paths, summary
+
+
+def apply_panelized_edits_for_run(
+    *,
+    name: str,
+    run_dir: Path | None = None,
+    base_mask: Path | None = None,
+    plan_path: Path | None = None,
+    edits: Path | None = None,
+    layer: str | None = None,
+    action_field: str = "action",
+    all_touched: bool = True,
+    tiny_land_remove_max_pixels: int = 3,
+    tiny_land_export_min_pixels: int = 4,
+    tiny_land_export_max_pixels: int = 10,
+    keep_largest_water_component: bool = False,
+    overwrite: bool = False,
+) -> tuple[WorkflowPaths, dict[str, object]]:
+    """Create prepared panels, then apply manual edits and cleanup locally.
+
+    The source is normally the run's prepared mask. The output masks are the
+    standard ``panels/P###/mask.tif`` inputs used by panelized RivGraph.
+    """
+    from rivgraph_centerline.panelization import prepare_panel_masks, write_panelized_mask_mosaic
+
+    paths = WorkflowPaths.from_name(name, run_dir)
+    paths.ensure_dirs()
+    source_mask = paths.prepared_mask if base_mask is None else Path(base_mask).expanduser().resolve()
+    plan = paths.run_dir / "panels" / "panel_plan.gpkg" if plan_path is None else Path(plan_path).expanduser().resolve()
+    edits_path = paths.manual_edits_path if edits is None else Path(edits).expanduser().resolve()
+    if not source_mask.exists():
+        raise FileNotFoundError(f"Prepared mask not found: {source_mask}")
+    if not plan.exists():
+        raise FileNotFoundError(f"Panel plan not found: {plan}. Create and review panel breaks, then run plan-panels first.")
+    source_panel_root = paths.run_dir / "panels" / "_prepared_for_edits"
+    # Do not crop the staged inputs to existing water: add polygons may fall in
+    # dry parts of a processing area. The final edited masks are cropped later.
+    prepare_panel_masks(mask_path=source_mask, plan_path=plan, output_dir=source_panel_root, overwrite=overwrite, crop=False)
+    processing = gpd.read_file(plan, layer="processing_areas")
+    panel_footprints = dict(zip(processing["panel_id"].astype(str), processing.geometry))
+    small_land_export = paths.manual_edits_dir / f"{paths.name}_main_river_small_land_{tiny_land_export_min_pixels}_to_{tiny_land_export_max_pixels}px.gpkg"
+    diagonal_export = paths.manual_edits_dir / f"{paths.name}_main_river_diagonal_passages.gpkg"
+    summary = apply_manual_edits_to_panels(
+        source_panel_root=source_panel_root,
+        output_panel_root=paths.run_dir / "panels",
+        edits=edits_path,
+        layer=layer,
+        action_field=action_field,
+        all_touched=all_touched,
+        tiny_land_remove_max_pixels=tiny_land_remove_max_pixels,
+        tiny_land_export_min_pixels=tiny_land_export_min_pixels,
+        tiny_land_export_max_pixels=tiny_land_export_max_pixels,
+        tiny_land_export_path=small_land_export,
+        diagonal_passage_export_path=diagonal_export,
+        keep_largest_water_component=keep_largest_water_component,
+        panel_footprints=panel_footprints,
+        overwrite=overwrite,
+    )
+    cleaned_mask = write_panelized_mask_mosaic(
+        template_mask_path=source_mask,
+        plan_path=plan,
+        panel_root=paths.run_dir / "panels",
+        output_mask_path=paths.cleaned_mask,
+        overwrite=overwrite,
+    )
+    summary.update({
+        "run_name": paths.name,
+        "run_dir": str(paths.run_dir),
+        "base_mask": str(source_mask),
+        "plan": str(plan),
+        "cleaned_mask": str(cleaned_mask),
+        "requirement": "When local largest-component filtering is enabled, the intended river must be the largest 8-connected water component in every buffered processing area.",
+    })
+    output = paths.run_dir / "panelized_manual_edits_summary.json"
+    write_json(output, summary)
+    summary["summary_path"] = str(output)
     return paths, summary
 
 

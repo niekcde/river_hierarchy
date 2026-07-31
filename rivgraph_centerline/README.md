@@ -171,10 +171,44 @@ so you do not need to rebuild the binary mask after making manual edits.
 
 ## Panelized fallback for masks that exceed local memory
 
-When whole-mask RivGraph is killed during skeletonization, create and manually
-review V/H panel-break lines, then run `run-panelized-rivgraph`. The command
-creates the panel plan from those reviewed breaks, runs directed RivGraph per
-panel, reconciles the global topology, and writes `merged_links_directed.gpkg`.
+When whole-mask editing or RivGraph is killed for memory, make the reviewed
+panel layout from the prepared mask, then apply manual edits locally to its
+buffered panels:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  rivgraph_centerline/run_workflow.py create-panel-breaks \
+  --name my_test_01 --max-panel-pixels 120000000 --overwrite
+
+# Review and move the resulting manual_edits/my_test_01_panel_breaks.gpkg.
+
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  rivgraph_centerline/run_workflow.py plan-panels \
+  --name my_test_01 \
+  --mask rivgraph_centerline/outputs/runs/my_test_01/masks_prepared/my_test_01_binary_projected.tif \
+  --overwrite
+
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  rivgraph_centerline/run_workflow.py apply-panelized-edits \
+  --name my_test_01 --keep-largest-water-component --overwrite
+```
+
+`apply-panelized-edits` creates buffered source panels below
+`panels/_prepared_for_edits`, applies only polygons intersecting each panel,
+and writes the cleaned masks to `panels/P###/mask.tif`. It also streams a
+core-owned mosaic to `masks_cleaned/<name>_cleaned.tif`, without loading the
+full raster into memory. Those masks can then be used by the existing
+per-panel RivGraph and core-owned merge commands.
+
+It also writes core-owned, merged QA layers to `manual_edits/` using the same
+names as whole-mask editing: `<name>_main_river_small_land_4_to_10px.gpkg` and
+`<name>_main_river_diagonal_passages.gpkg`. Their component interpretation is
+local to each buffered panel.
+
+With `--keep-largest-water-component`, filtering is deliberately local: after
+the add/remove edits, the intended river must be the largest 8-connected water
+component within **every buffered processing area**. Inspect
+`panelized_manual_edits_summary.json` before running RivGraph.
 
 Follow-up still required: `network_variants/variant_generation.py` currently
 always reruns RivGraph on a full collapsed mask. Add a panelized backend there

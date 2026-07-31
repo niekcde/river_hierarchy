@@ -15,7 +15,7 @@ SRC_ROOT = PROJECT_ROOT / "rivgraph_centerline" / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from rivgraph_centerline.manual_edits import apply_manual_edits
+from rivgraph_centerline.manual_edits import apply_manual_edits, apply_manual_edits_to_panels
 
 
 def test_apply_manual_edits_can_keep_only_largest_water_component(tmp_path) -> None:
@@ -46,6 +46,46 @@ def test_apply_manual_edits_can_keep_only_largest_water_component(tmp_path) -> N
     assert component_filter["enabled"] is True
     assert component_filter["removed_component_count"] == 1
     assert component_filter["removed_water_pixels"] == 4
+
+
+def test_apply_manual_edits_to_panels_filters_edits_and_keeps_largest_locally(tmp_path) -> None:
+    source_root = tmp_path / "prepared_panels"
+    output_root = tmp_path / "cleaned_panels"
+    source = source_root / "P001" / "mask.tif"
+    source.parent.mkdir(parents=True)
+    data = np.zeros((12, 12), dtype="uint8")
+    data[2:8, 2:8] = 1  # 36-pixel intended river.
+    data[9:11, 9:11] = 1  # Detached clutter.
+    profile = {
+        "driver": "GTiff", "height": 12, "width": 12, "count": 1, "dtype": "uint8",
+        "crs": "EPSG:32631", "transform": from_origin(0, 12, 1, 1), "nodata": 0,
+    }
+    with rasterio.open(source, "w", **profile) as dst:
+        dst.write(data, 1)
+    edits_path = tmp_path / "edits.gpkg"
+    gpd.GeoDataFrame(
+        {"action": ["add", "remove"]},
+        geometry=[box(0, 10, 1, 11), box(100, 100, 101, 101)],
+        crs="EPSG:32631",
+    ).to_file(edits_path, driver="GPKG")
+
+    summary = apply_manual_edits_to_panels(
+        source_panel_root=source_root,
+        output_panel_root=output_root,
+        edits=edits_path,
+        keep_largest_water_component=True,
+        tiny_land_export_path=tmp_path / "small_land.gpkg",
+        diagonal_passage_export_path=tmp_path / "diagonal.gpkg",
+    )
+
+    panel = summary["panels"]["P001"]
+    assert panel["intersecting_edit_count"] == 1
+    assert panel["largest_water_component_filter"]["removed_water_pixels"] == 5
+    with rasterio.open(output_root / "P001" / "mask.tif") as cleaned:
+        assert int(cleaned.read(1).sum()) == 36
+    assert (tmp_path / "small_land.gpkg").exists()
+    assert (tmp_path / "diagonal.gpkg").exists()
+    assert summary["main_river_small_land"]["count"] == 0
 
 
 def test_apply_manual_edits_crops_output_mask(tmp_path) -> None:

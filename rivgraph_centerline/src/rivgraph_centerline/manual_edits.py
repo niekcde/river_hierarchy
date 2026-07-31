@@ -21,7 +21,7 @@ import pandas as pd
 import rasterio
 from rasterio.features import rasterize, shapes
 from scipy import ndimage
-from shapely.geometry import Point, shape
+from shapely.geometry import Point, box, shape
 from shapely.ops import unary_union
 
 from rivgraph_centerline.raster_mask import crop_binary_mask
@@ -235,6 +235,156 @@ def apply_manual_edits(
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
+
+
+def apply_manual_edits_to_panels(
+    *,
+    source_panel_root: Path,
+    output_panel_root: Path,
+    edits: Path,
+    layer: str | None = None,
+    action_field: str = "action",
+    all_touched: bool = True,
+    tiny_land_remove_max_pixels: int = 3,
+    tiny_land_export_min_pixels: int = 4,
+    tiny_land_export_max_pixels: int = 10,
+    tiny_land_export_path: Path | None = None,
+    diagonal_passage_export_path: Path | None = None,
+    keep_largest_water_component: bool = False,
+    panel_footprints: dict[str, object] | None = None,
+    overwrite: bool = False,
+) -> dict[str, object]:
+    """Apply vector edits and local cleanup to each buffered panel mask.
+
+    The largest-water-component filter is intentionally local to each panel.
+    Callers must ensure the intended river is the largest 8-connected component
+    in every buffered processing area.
+    """
+    source_panel_root = Path(source_panel_root).expanduser().resolve()
+    output_panel_root = Path(output_panel_root).expanduser().resolve()
+    edits = Path(edits).expanduser().resolve()
+    edit_gdf = gpd.read_file(edits, layer=layer)
+    if action_field not in edit_gdf.columns:
+        raise ValueError(f"Edit layer must contain an '{action_field}' field.")
+    panel_dirs = sorted(path for path in source_panel_root.iterdir() if path.is_dir() and path.name.startswith("P"))
+    if not panel_dirs:
+        raise FileNotFoundError(f"No panel directories found in {source_panel_root}")
+
+    summaries: dict[str, object] = {}
+    for panel_dir in panel_dirs:
+        source = panel_dir / "mask.tif"
+        output = output_panel_root / panel_dir.name / "mask.tif"
+        if not source.exists():
+            raise FileNotFoundError(f"Panel mask does not exist: {source}")
+        if output.exists() and not overwrite:
+            raise FileExistsError(f"Panel output already exists: {output}")
+        with rasterio.open(source) as src:
+            base = (src.read(1, masked=True).filled(0) > 0).astype("uint8")
+            profile, raster_crs, transform, out_shape = src.profile.copy(), src.crs, src.transform, src.shape
+        local_edits = edit_gdf
+        if local_edits.crs is None:
+            raise ValueError("Edit layer has no CRS. Set it to match the panel masks.")
+        if raster_crs is not None and local_edits.crs != raster_crs:
+            local_edits = local_edits.to_crs(raster_crs)
+        footprint = None if panel_footprints is None else panel_footprints.get(panel_dir.name)
+        selection_geometry = box(*rasterio.transform.array_bounds(*out_shape, transform)) if footprint is None else footprint
+        local_edits = local_edits.loc[local_edits.geometry.intersects(selection_geometry)]
+        cleaned = base.copy()
+        action_counts = {"add": 0, "remove": 0}
+        for idx, row in local_edits.iterrows():
+            action = normalize_action(row[action_field])
+            geometry = row.geometry
+            if geometry is None or geometry.is_empty:
+                continue
+            burn = rasterize([(geometry, 1)], out_shape=out_shape, transform=transform, fill=0, dtype="uint8", all_touched=all_touched).astype(bool)
+            cleaned[burn] = 1 if action == "add" else 0
+            action_counts[action] += 1
+        if footprint is not None:
+            allowed = rasterize([(footprint, 1)], out_shape=out_shape, transform=transform, fill=0, dtype="uint8").astype(bool)
+            cleaned[~allowed] = 0
+        cleaned, largest = keep_largest_water_component_only(cleaned, enabled=keep_largest_water_component)
+        qa_dir = output.parent / "manual_edit_qa"
+        panel_small_land = qa_dir / "main_river_small_land.gpkg" if tiny_land_export_path is not None else None
+        panel_diagonal = qa_dir / "diagonal_passages.gpkg" if diagonal_passage_export_path is not None else None
+        cleaned, tiny_land = cleanup_and_export_main_river_small_land(
+            cleaned, transform=transform, crs=raster_crs,
+            tiny_land_remove_max_pixels=tiny_land_remove_max_pixels,
+            tiny_land_export_min_pixels=tiny_land_export_min_pixels,
+            tiny_land_export_max_pixels=tiny_land_export_max_pixels,
+            tiny_land_export_path=panel_small_land,
+        )
+        diagonal = export_main_river_diagonal_passage_points(
+            cleaned, transform=transform, crs=raster_crs, export_path=panel_diagonal,
+        )
+        cropped, cropped_transform, crop_window = crop_binary_mask(cleaned, transform)
+        profile.update(driver="GTiff", dtype="uint8", count=1, nodata=0, compress="lzw", transform=cropped_transform, width=int(cropped.shape[1]), height=int(cropped.shape[0]))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with rasterio.open(output, "w", **profile) as dst:
+            dst.write(cropped.astype("uint8"), 1)
+        summaries[panel_dir.name] = {
+            "source_mask": str(source), "output_mask": str(output), "intersecting_edit_count": int(len(local_edits)),
+            "actions": action_counts, "base_water_pixels": int(base.sum()), "cleaned_water_pixels": int(cleaned.sum()),
+            "largest_water_component_filter": largest, "main_river_small_land_cleanup": tiny_land,
+            "main_river_diagonal_passages": diagonal, "crop_window": crop_window,
+        }
+    small_land_summary = _merge_panel_diagnostic_layers(
+        panel_root=output_panel_root, panel_footprints=panel_footprints, source_name="main_river_small_land.gpkg",
+        source_layer="main_river_small_land", output_path=tiny_land_export_path, output_layer="main_river_small_land",
+        empty_factory=_empty_small_land_gdf,
+    )
+    diagonal_summary = _merge_panel_diagnostic_layers(
+        panel_root=output_panel_root, panel_footprints=panel_footprints, source_name="diagonal_passages.gpkg",
+        source_layer="main_river_diagonal_passages", output_path=diagonal_passage_export_path,
+        output_layer="main_river_diagonal_passages", empty_factory=_empty_diagonal_passage_gdf,
+    )
+    return {
+        "source_panel_root": str(source_panel_root), "output_panel_root": str(output_panel_root), "edits": str(edits),
+        "local_largest_component_filter": keep_largest_water_component, "panels": summaries,
+        "main_river_small_land": small_land_summary, "main_river_diagonal_passages": diagonal_summary,
+    }
+
+
+def _merge_panel_diagnostic_layers(
+    *,
+    panel_root: Path,
+    panel_footprints: dict[str, object] | None,
+    source_name: str,
+    source_layer: str,
+    output_path: Path | None,
+    output_layer: str,
+    empty_factory: object,
+) -> dict[str, object]:
+    """Merge panel diagnostics, assigning overlap features to their core."""
+    if output_path is None:
+        return {"enabled": False, "count": 0, "output_path": None}
+    records: list[gpd.GeoDataFrame] = []
+    crs = None
+    for panel_dir in sorted(path for path in panel_root.iterdir() if path.is_dir() and path.name.startswith("P")):
+        if crs is None:
+            with rasterio.open(panel_dir / "mask.tif") as panel_mask:
+                crs = panel_mask.crs
+        source = panel_dir / "manual_edit_qa" / source_name
+        if not source.exists():
+            continue
+        frame = gpd.read_file(source, layer=source_layer)
+        crs = frame.crs if frame.crs is not None else crs
+        core = None if panel_footprints is None else panel_footprints.get(panel_dir.name)
+        if core is not None and not frame.empty:
+            frame = frame.loc[frame.geometry.representative_point().map(core.covers)].copy()
+        if not frame.empty:
+            frame["panel_id"] = panel_dir.name
+            records.append(frame)
+    if records:
+        merged = gpd.GeoDataFrame(pd.concat(records, ignore_index=True), geometry="geometry", crs=records[0].crs)
+    else:
+        merged = empty_factory(crs)
+        merged["panel_id"] = pd.Series(dtype="object")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        output_path.unlink()
+    merged.to_file(output_path, layer=output_layer, driver="GPKG")
+    return {"enabled": True, "count": int(len(merged)), "output_path": str(output_path)}
 
 
 def keep_largest_water_component_only(

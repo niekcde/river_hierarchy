@@ -16,6 +16,7 @@ if str(SRC_ROOT) not in sys.path:
 from rivgraph_centerline.workflow import (  # noqa: E402
     WorkflowPaths,
     apply_edits_for_run,
+    apply_panelized_edits_for_run,
     run_all_for_run,
     run_rivgraph_for_run,
     prepare_mask_for_run,
@@ -66,9 +67,23 @@ def parse_args() -> argparse.Namespace:
     edits_parser.add_argument("--diagonal-passage-export-path", type=Path, default=None, help="Optional GeoPackage path for the post-cleanup main-river diagonal-passage diagnostic points.")
     edits_parser.add_argument("--keep-largest-water-component", action="store_true", help="Discard all 8-connected water components except the largest after manual edits.")
 
+    panel_edits_parser = subparsers.add_parser("apply-panelized-edits", help="Prepare buffered panels from the prepared mask, then apply manual edits locally to each panel.")
+    add_run_identity_args(panel_edits_parser)
+    panel_edits_parser.add_argument("--mask", type=Path, default=None, help="Prepared mask override.")
+    panel_edits_parser.add_argument("--plan", type=Path, default=None, help="Panel-plan GeoPackage override.")
+    panel_edits_parser.add_argument("--edits", type=Path, default=None, help="Vector edits file. Defaults to run-dir/manual_edits/<name>_manual_edits.gpkg.")
+    panel_edits_parser.add_argument("--layer", default=None, help="Vector layer name. Defaults to the first layer.")
+    panel_edits_parser.add_argument("--action-field", default="action", help="Field containing add/remove values.")
+    panel_edits_parser.add_argument("--center-only", action="store_true", help="Only edit pixels whose centers fall inside polygons.")
+    panel_edits_parser.add_argument("--tiny-land-remove-max-pixels", type=int, default=3, help="Remove main-river land components with this many pixels or fewer in each panel. Use a negative value to disable.")
+    panel_edits_parser.add_argument("--tiny-land-export-min-pixels", type=int, default=4, help="Minimum local main-river land-component size for the merged QA layer.")
+    panel_edits_parser.add_argument("--tiny-land-export-max-pixels", type=int, default=10, help="Maximum local main-river land-component size for the merged QA layer.")
+    panel_edits_parser.add_argument("--keep-largest-water-component", action="store_true", help="Locally retain only the largest 8-connected water component in every buffered panel.")
+    panel_edits_parser.add_argument("--overwrite", action="store_true", help="Replace staged prepared panels and cleaned panel masks.")
+
     breaks_parser = subparsers.add_parser("create-panel-breaks", help="Create an editable provisional panel-break GeoPackage.")
     add_run_identity_args(breaks_parser)
-    breaks_parser.add_argument("--mask", type=Path, default=None, help="Cleaned mask override.")
+    breaks_parser.add_argument("--mask", type=Path, default=None, help="Prepared mask override. Defaults to the run's prepared mask.")
     breaks_parser.add_argument("--output", type=Path, default=None, help="GeoPackage output override.")
     breaks_parser.add_argument("--rows", type=int, default=None, help="Optional provisional row count; otherwise computed from the pixel budget.")
     breaks_parser.add_argument("--columns", type=int, default=None, help="Optional provisional column count; otherwise computed from the pixel budget.")
@@ -243,6 +258,23 @@ def add_run_identity_args(parser: argparse.ArgumentParser) -> None:
 
 
 def dispatch(args: argparse.Namespace) -> dict[str, object]:
+    if args.command == "apply-panelized-edits":
+        _, summary = apply_panelized_edits_for_run(
+            name=args.name,
+            run_dir=args.run_dir,
+            base_mask=args.mask,
+            plan_path=args.plan,
+            edits=args.edits,
+            layer=args.layer,
+            action_field=args.action_field,
+            all_touched=not args.center_only,
+            tiny_land_remove_max_pixels=args.tiny_land_remove_max_pixels,
+            tiny_land_export_min_pixels=args.tiny_land_export_min_pixels,
+            tiny_land_export_max_pixels=args.tiny_land_export_max_pixels,
+            keep_largest_water_component=args.keep_largest_water_component,
+            overwrite=args.overwrite,
+        )
+        return {"command": args.command, "summary": summary}
     if args.command == "run-panelized-rivgraph":
         parent = WorkflowPaths.from_name(args.name, args.run_dir)
         mask = parent.cleaned_mask if args.mask is None else args.mask
@@ -272,7 +304,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, object]:
         core = build_core_boundary_network(plan_path=plan, breaks_path=breaks, panel_root=parent.run_dir / "panels", run_name=parent.name, output_dir=core_dir, tolerance_m=args.boundary_tolerance_m, overwrite=args.overwrite, boundary_match_plan_path=match_plan)
         nodes = rebuild_core_network_nodes(merged_links_path=core_dir / "merged_core_links.gpkg", output_dir=core_dir, endpoint_tolerance_m=args.endpoint_tolerance_m, overwrite=args.overwrite)
         direction = assign_core_network_direction(merged_links_path=core_dir / "merged_links.gpkg", core_segments_path=core_dir / "core_segments.gpkg", panel_root=parent.run_dir / "panels", run_name=parent.name, output_dir=core_dir, endpoint_tolerance_m=args.endpoint_tolerance_m, overwrite=args.overwrite)
-        handoff = publish_panelized_rivgraph_handoff(directed_links_path=core_dir / "merged_links_directed.gpkg", nodes_path=core_dir / "merged_nodes.gpkg", core_segments_path=core_dir / "core_segments.gpkg", panel_root=parent.run_dir / "panels", run_name=parent.name, rivgraph_dir=parent.rivgraph_dir, overwrite=args.overwrite)
+        handoff = publish_panelized_rivgraph_handoff(directed_links_path=core_dir / "merged_links_directed.gpkg", nodes_path=core_dir / "merged_nodes.gpkg", core_segments_path=core_dir / "core_segments.gpkg", plan_path=plan, panel_root=parent.run_dir / "panels", run_name=parent.name, rivgraph_dir=parent.rivgraph_dir, overwrite=args.overwrite)
         summary_path = parent.run_dir / "merged_network" / "panelized_workflow_summary.json"
         summary = {"mask": str(mask), "plan": planned, "breaks": str(breaks), "global_exit_sides": args.exit_sides.upper(), "prepared": prepared, "boundary_plan": boundary_plan, "panels": panel_results, "core_network": core, "nodes": nodes, "direction": direction, "handoff": handoff}
         summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -281,7 +313,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, object]:
     if args.command == "publish-panelized-rivgraph":
         parent = WorkflowPaths.from_name(args.name, args.run_dir)
         core_dir = parent.run_dir / "merged_network" / "core_boundary"
-        return {"command": args.command, "summary": publish_panelized_rivgraph_handoff(directed_links_path=core_dir / "merged_links_directed.gpkg", nodes_path=core_dir / "merged_nodes.gpkg", core_segments_path=core_dir / "core_segments.gpkg", panel_root=parent.run_dir / "panels", run_name=parent.name, rivgraph_dir=parent.rivgraph_dir, overwrite=args.overwrite)}
+        return {"command": args.command, "summary": publish_panelized_rivgraph_handoff(directed_links_path=core_dir / "merged_links_directed.gpkg", nodes_path=core_dir / "merged_nodes.gpkg", core_segments_path=core_dir / "core_segments.gpkg", plan_path=parent.run_dir / "panels" / "panel_plan.gpkg", panel_root=parent.run_dir / "panels", run_name=parent.name, rivgraph_dir=parent.rivgraph_dir, overwrite=args.overwrite)}
     if args.command == "assign-core-network-direction":
         parent = WorkflowPaths.from_name(args.name, args.run_dir)
         output_dir = parent.run_dir / "merged_network" / "core_boundary"
@@ -341,7 +373,7 @@ def dispatch(args: argparse.Namespace) -> dict[str, object]:
         return {"command": args.command, "run_paths": paths_to_dict(paths), "summary": summary}
     if args.command in {"create-panel-breaks", "plan-panels", "prepare-panel-masks"}:
         paths = WorkflowPaths.from_name(args.name, args.run_dir)
-        mask = paths.cleaned_mask if args.mask is None else args.mask
+        mask = (paths.prepared_mask if args.command == "create-panel-breaks" else paths.cleaned_mask) if args.mask is None else args.mask
         breaks = paths.manual_edits_dir / f"{paths.name}_panel_breaks.gpkg" if getattr(args, "panel_breaks", None) is None else args.panel_breaks
         if args.command == "create-panel-breaks":
             summary = create_panel_breaks(mask_path=mask, output_path=(paths.manual_edits_dir / f"{paths.name}_panel_breaks.gpkg") if args.output is None else args.output, rows=args.rows, columns=args.columns, max_panel_pixels=args.max_panel_pixels, overwrite=args.overwrite)
