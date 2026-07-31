@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import geopandas as gpd
@@ -14,6 +15,7 @@ from network_variants.width_review_gui import (
     build_parser,
     build_candidate_frame,
     compute_sample_qc_frame,
+    resolve_variant_review_paths,
     solve_continuity_replacement,
 )
 
@@ -307,3 +309,32 @@ def test_build_parser_supports_start_over_flag() -> None:
     parser = build_parser()
     args = parser.parse_args(["/tmp/variant", "--start-over"])
     assert args.start_over is True
+
+
+def test_review_paths_default_to_permanent_run_archive(tmp_path: Path) -> None:
+    run = tmp_path / "rivgraph_centerline" / "outputs" / "runs" / "02"
+    source_links = run / "rivgraph" / "02_links.gpkg"
+    variant = tmp_path / "network_variants" / "output" / "02" / "states" / "S000_base" / "variant"
+    (variant / "summary").mkdir(parents=True)
+    (variant / "widths").mkdir(parents=True)
+    families = variant / "widths" / "link_width_families.csv"
+    pd.DataFrame(
+        {"example_id": ["02"], "variant_id": ["S000_base"], "id_link": [1]}
+    ).to_csv(families, index=False)
+    outputs = {
+        "directed_links": str(variant / "directed_links.gpkg"),
+        "directed_nodes": str(variant / "directed_nodes.gpkg"),
+        "collapsed_mask": str(variant / "collapsed_mask.tif"),
+        "link_width_families": str(families),
+        "link_width_samples": str(variant / "widths" / "link_width_samples.csv"),
+    }
+    (variant / "summary" / "variant_manifest.json").write_text(
+        json.dumps({"output_paths": outputs}), encoding="utf-8"
+    )
+
+    paths = resolve_variant_review_paths(variant, source_links_path=source_links)
+
+    assert paths.review_output_dir == (run / "width_review").resolve()
+    assert paths.review_csv_path.name == "base_width_review_decisions.csv"
+    assert paths.review_summary_path.name == "base_width_review_apply_summary.json"
+    assert paths.source_nodes_path == (run / "rivgraph" / "02_nodes.gpkg").resolve()

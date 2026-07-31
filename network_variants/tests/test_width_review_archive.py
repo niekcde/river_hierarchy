@@ -15,7 +15,9 @@ from network_variants.width_review_archive import (
     ARCHIVE_SUMMARY_NAME,
     ARCHIVE_TARGETS_NAME,
     archive_base_width_review,
+    finalize_width_review_archive,
     review_archive_dir,
+    version_existing_review_archive,
 )
 
 
@@ -127,3 +129,42 @@ def test_archive_rejects_incomplete_review(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="complete"):
         archive_base_width_review(variant, source_links_path=source_links)
+
+
+def test_gui_finalizer_records_resumable_incomplete_review(tmp_path: Path) -> None:
+    variant, source_links = _write_review_fixture(tmp_path)
+    archive = review_archive_dir(source_links)
+    archive.mkdir(parents=True)
+    decisions = pd.read_csv(variant / "width_review" / "width_review_decisions.csv")
+    decisions.loc[0, "review_decision"] = pd.NA
+    decisions.to_csv(archive / ARCHIVE_DECISIONS_NAME, index=False)
+    summary = archive / ARCHIVE_SUMMARY_NAME
+    summary.write_text("{}", encoding="utf-8")
+
+    result = finalize_width_review_archive(
+        archive_dir=archive,
+        decisions_path=archive / ARCHIVE_DECISIONS_NAME,
+        summary_path=summary,
+        source_links_path=source_links,
+        example_id="02",
+        variant_output_dir=variant,
+        variant_manifest_path=variant / "summary" / "variant_manifest.json",
+    )
+
+    assert result["review_completion_status"] == "incomplete"
+    assert result["undecided"] == 1
+    manifest = json.loads((archive / ARCHIVE_MANIFEST_NAME).read_text(encoding="utf-8"))
+    assert manifest["counts"]["undecided"] == 1
+    assert manifest["review_completion_status"] == "incomplete"
+
+
+def test_version_existing_archive_preserves_previous_files(tmp_path: Path) -> None:
+    variant, source_links = _write_review_fixture(tmp_path)
+    result = archive_base_width_review(variant, source_links_path=source_links)
+    archive = Path(result["archive_dir"])
+    previous_decisions = (archive / ARCHIVE_DECISIONS_NAME).read_bytes()
+
+    version_dir = version_existing_review_archive(archive)
+    assert version_dir is not None
+    assert (version_dir / ARCHIVE_DECISIONS_NAME).read_bytes() == previous_decisions
+    assert (version_dir / ARCHIVE_MANIFEST_NAME).exists()

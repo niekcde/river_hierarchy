@@ -83,12 +83,15 @@ def test_clear_rivgraph_outputs_removes_only_run_prefixed_files(tmp_path) -> Non
     unrelated = paths.rivgraph_dir / "notes.txt"
     nested = paths.rivgraph_dir / "02_debug"
     nested_file = nested / "payload.txt"
+    permanent_review = paths.run_dir / "width_review" / "base_width_review_decisions.csv"
 
     stale_fixlinks.write_text("old", encoding="utf-8")
     stale_links.write_text("old", encoding="utf-8")
     unrelated.write_text("keep", encoding="utf-8")
     nested.mkdir()
     nested_file.write_text("nested", encoding="utf-8")
+    permanent_review.parent.mkdir(parents=True)
+    permanent_review.write_text("id_link,review_decision\n1,good\n", encoding="utf-8")
 
     deleted = _clear_rivgraph_outputs(paths)
 
@@ -99,6 +102,7 @@ def test_clear_rivgraph_outputs_removes_only_run_prefixed_files(tmp_path) -> Non
     assert not stale_links.exists()
     assert not nested.exists()
     assert unrelated.exists()
+    assert permanent_review.exists()
 
 
 def test_sanitize_rivgraph_centerline_link_fields_drops_scalar_metadata() -> None:

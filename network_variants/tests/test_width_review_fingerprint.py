@@ -14,6 +14,7 @@ from network_variants.width_review_archive import archive_base_width_review
 from network_variants.width_review_fingerprint import (
     CORRUPT_STATUS,
     CURRENT_STATUS,
+    INCOMPLETE_REVIEW_STATUS,
     STALE_LINK_IDS_STATUS,
     STALE_MASK_STATUS,
     STALE_TOPOLOGY_STATUS,
@@ -202,3 +203,21 @@ def test_archive_hash_change_is_reported_as_corrupt(tmp_path: Path) -> None:
     )
 
     assert result["status"] == CORRUPT_STATUS
+
+
+def test_incomplete_review_is_fresh_but_not_current(tmp_path: Path) -> None:
+    archive, mask, links_path, nodes_path, _ = _review_fixture(tmp_path)
+    manifest_path = archive / "base_width_review_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["review_completion_status"] = "incomplete"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    upgraded = upgrade_review_fingerprints(
+        archive, mask_path=mask, links_path=links_path, nodes_path=nodes_path
+    )
+    validated = validate_review_fingerprints(
+        archive, mask_path=mask, links_path=links_path, nodes_path=nodes_path
+    )
+
+    assert upgraded["status"] == INCOMPLETE_REVIEW_STATUS
+    assert validated["status"] == INCOMPLETE_REVIEW_STATUS

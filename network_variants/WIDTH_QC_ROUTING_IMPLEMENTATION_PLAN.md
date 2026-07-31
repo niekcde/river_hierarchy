@@ -108,7 +108,12 @@ Rules:
 
 ## Phase 3 — Permanent GUI save contract
 
-**Status: pending.**
+**Status: complete (2026-07-31).** The GUI now defaults to the durable
+run-level archive, writes decisions and summaries atomically, resumes partial
+reviews with an explicit `incomplete_review` status, validates freshness before
+reusing link IDs, and versions existing archive files before replacement.
+RivGraph overwrite behavior is covered by a regression test that preserves the
+top-level `width_review/` directory.
 
 Change the GUI default review location to:
 

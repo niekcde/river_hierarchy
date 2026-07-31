@@ -21,6 +21,7 @@ from network_variants.width_review_archive import (
 FINGERPRINT_SCHEMA_VERSION = "width-review-fingerprint-v1"
 WIDTH_REVIEW_INPUT_VERSION = "two-bank-width-review-input-v1"
 CURRENT_STATUS = "current"
+INCOMPLETE_REVIEW_STATUS = "incomplete_review"
 MISSING_STATUS = "missing"
 CORRUPT_STATUS = "corrupt_archive"
 STALE_MASK_STATUS = "stale_mask"
@@ -271,14 +272,16 @@ def upgrade_review_fingerprints(
         "mask": fingerprint_mask(current_mask),
         "network": fingerprint_network(current_links, current_nodes),
     }
-    manifest["review_status"] = CURRENT_STATUS
+    completion_status = str(manifest.get("review_completion_status", "complete"))
+    review_status = INCOMPLETE_REVIEW_STATUS if completion_status == "incomplete" else CURRENT_STATUS
+    manifest["review_status"] = review_status
     manifest.pop("notes", None)
     _atomic_write_json(manifest, manifest_path)
     return {
         "example_id": str(manifest["example_id"]),
         "archive_dir": str(archive),
         "manifest": str(manifest_path),
-        "status": CURRENT_STATUS,
+        "status": review_status,
     }
 
 
@@ -370,7 +373,8 @@ def validate_review_fingerprints(
     elif stale_width_method:
         status = STALE_WIDTH_METHOD_STATUS
     else:
-        status = CURRENT_STATUS
+        completion_status = str(manifest.get("review_completion_status", "complete"))
+        status = INCOMPLETE_REVIEW_STATUS if completion_status == "incomplete" else CURRENT_STATUS
     result = {
         "example_id": str(manifest.get("example_id", archive.parent.name)),
         "archive_dir": str(archive),

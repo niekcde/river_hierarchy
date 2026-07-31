@@ -140,15 +140,21 @@ def _variant_review_inputs(variant_output_dir: Path) -> dict[str, Path | str]:
 def _build_review_targets(
     decisions: pd.DataFrame,
     source_links: gpd.GeoDataFrame,
+    *,
+    require_complete: bool = True,
 ) -> pd.DataFrame:
     if "id_link" not in decisions.columns or "review_decision" not in decisions.columns:
         raise ValueError("Review decisions must contain id_link and review_decision.")
     targets = decisions.copy()
     targets["id_link"] = pd.to_numeric(targets["id_link"], errors="raise").astype(int)
     decisions_normalized = targets["review_decision"].astype("string").str.strip().str.lower()
-    if decisions_normalized.isna().any() or (~decisions_normalized.isin(["good", "bad"])).any():
-        invalid = sorted(decisions_normalized.loc[~decisions_normalized.isin(["good", "bad"])].dropna().unique())
-        raise ValueError(f"The review must be complete and contain only good/bad decisions; invalid={invalid}")
+    decisions_normalized = decisions_normalized.mask(decisions_normalized.isin(["", "skip"]), pd.NA)
+    invalid_mask = decisions_normalized.notna() & ~decisions_normalized.isin(["good", "bad"])
+    if invalid_mask.any():
+        invalid = sorted(decisions_normalized.loc[invalid_mask].dropna().unique())
+        raise ValueError(f"Review decisions must contain only good/bad or be undecided; invalid={invalid}")
+    if require_complete and decisions_normalized.isna().any():
+        raise ValueError("The review must be complete and contain only good/bad decisions.")
     targets["review_decision"] = decisions_normalized
 
     source = source_links.copy()
@@ -171,6 +177,110 @@ def _build_review_targets(
     if missing:
         raise ValueError(f"Reviewed candidate IDs are absent from the source links: {missing}")
     return targets.drop(columns="_merge").sort_values("id_link", kind="mergesort").reset_index(drop=True)
+
+
+def _archive_paths(archive_dir: Path) -> dict[str, Path]:
+    return {
+        "decisions": archive_dir / ARCHIVE_DECISIONS_NAME,
+        "summary": archive_dir / ARCHIVE_SUMMARY_NAME,
+        "targets": archive_dir / ARCHIVE_TARGETS_NAME,
+        "links_snapshot": archive_dir / ARCHIVE_LINKS_SNAPSHOT_NAME,
+        "manifest": archive_dir / ARCHIVE_MANIFEST_NAME,
+    }
+
+
+def version_existing_review_archive(archive_dir: str | Path) -> Path | None:
+    """Preserve the current archive files before a GUI save or start-over save."""
+    archive = Path(archive_dir).expanduser().resolve()
+    paths = _archive_paths(archive)
+    existing = [path for path in paths.values() if path.exists()]
+    if not existing:
+        return None
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    version_dir = archive / "versions" / timestamp
+    version_dir.mkdir(parents=True, exist_ok=False)
+    for source in existing:
+        _atomic_copy(source, version_dir / source.name)
+    return version_dir
+
+
+def finalize_width_review_archive(
+    *,
+    archive_dir: str | Path,
+    decisions_path: str | Path,
+    summary_path: str | Path,
+    source_links_path: str | Path,
+    example_id: str,
+    variant_output_dir: str | Path,
+    variant_manifest_path: str | Path,
+) -> dict[str, Any]:
+    """Regenerate durable derived review artifacts after a GUI save."""
+    archive = Path(archive_dir).expanduser().resolve()
+    decisions_file = Path(decisions_path).expanduser().resolve()
+    summary_file = Path(summary_path).expanduser().resolve()
+    source_links_file = Path(source_links_path).expanduser().resolve()
+    for label, path in {
+        "decisions": decisions_file,
+        "summary": summary_file,
+        "source links": source_links_file,
+    }.items():
+        if not path.exists():
+            raise FileNotFoundError(f"Required {label} artifact does not exist: {path}")
+
+    paths = _archive_paths(archive)
+    archive.mkdir(parents=True, exist_ok=True)
+    if decisions_file != paths["decisions"]:
+        _atomic_copy(decisions_file, paths["decisions"])
+    if summary_file != paths["summary"]:
+        _atomic_copy(summary_file, paths["summary"])
+
+    decisions = pd.read_csv(paths["decisions"])
+    source_frame = gpd.read_file(source_links_file)
+    targets = _build_review_targets(decisions, source_frame, require_complete=False)
+    _atomic_copy(source_links_file, paths["links_snapshot"])
+    _atomic_write_csv(targets, paths["targets"])
+
+    normalized = targets["review_decision"].astype("string").str.strip().str.lower()
+    counts = normalized.value_counts().to_dict()
+    undecided = int(normalized.isna().sum())
+    completion = "complete" if undecided == 0 else "incomplete"
+    manifest = {
+        "schema_version": ARCHIVE_SCHEMA_VERSION,
+        "example_id": normalize_example_id(example_id),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": {
+            "variant_output_dir": str(Path(variant_output_dir).expanduser().resolve()),
+            "variant_manifest": str(Path(variant_manifest_path).expanduser().resolve()),
+            "decisions": str(paths["decisions"]),
+            "apply_summary": str(paths["summary"]),
+            "reviewed_links": str(source_links_file),
+        },
+        "files": {key: path.name for key, path in paths.items() if key != "manifest"},
+        "counts": {
+            "review_rows": int(len(targets)),
+            "good": int(counts.get("good", 0)),
+            "bad": int(counts.get("bad", 0)),
+            "undecided": undecided,
+            "source_links": int(len(source_frame)),
+        },
+        "review_completion_status": completion,
+        "archive_file_sha256": {
+            key: _sha256(path) for key, path in paths.items() if key != "manifest"
+        },
+        "review_status": "archived_unfingerprinted",
+    }
+    _atomic_write_json(manifest, paths["manifest"])
+    return {
+        "example_id": normalize_example_id(example_id),
+        "archive_dir": str(archive),
+        "manifest": str(paths["manifest"]),
+        "review_rows": int(len(targets)),
+        "good": int(counts.get("good", 0)),
+        "bad": int(counts.get("bad", 0)),
+        "undecided": undecided,
+        "review_completion_status": completion,
+    }
 
 
 def archive_base_width_review(
@@ -203,13 +313,7 @@ def archive_base_width_review(
             raise FileNotFoundError(f"Required {label} artifact does not exist: {path}")
 
     archive_dir = review_archive_dir(source_links)
-    archive_paths = {
-        "decisions": archive_dir / ARCHIVE_DECISIONS_NAME,
-        "summary": archive_dir / ARCHIVE_SUMMARY_NAME,
-        "targets": archive_dir / ARCHIVE_TARGETS_NAME,
-        "links_snapshot": archive_dir / ARCHIVE_LINKS_SNAPSHOT_NAME,
-        "manifest": archive_dir / ARCHIVE_MANIFEST_NAME,
-    }
+    archive_paths = _archive_paths(archive_dir)
     existing = [path for path in archive_paths.values() if path.exists()]
     if existing and not overwrite:
         raise FileExistsError(

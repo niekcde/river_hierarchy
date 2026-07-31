@@ -25,13 +25,32 @@ if __package__ is None or __package__ == "":
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
+from network_variants.width_review_archive import (
+    ARCHIVE_DECISIONS_NAME,
+    ARCHIVE_MANIFEST_NAME,
+    ARCHIVE_SUMMARY_NAME,
+    _atomic_write_csv,
+    _atomic_write_json,
+    finalize_width_review_archive,
+    review_archive_dir,
+    version_existing_review_archive,
+)
+from network_variants.width_review_fingerprint import (
+    CORRUPT_STATUS,
+    CURRENT_STATUS,
+    INCOMPLETE_REVIEW_STATUS,
+    MISSING_STATUS,
+    upgrade_review_fingerprints,
+    validate_review_fingerprints,
+)
+
 
 RIVGRAPH_WIDTH_TRIM_MULTIPLIER = 1.1
 DEFAULT_WIDTH_FIELD = "wid_adj_wet"
 DEFAULT_LEN_OVER_WIDTH_THRESHOLD = 1.5
 CORE_WIDTH_FIELDS = ("wid", "wid_adj", "wid_med")
-DEFAULT_REVIEW_CSV_NAME = "width_review_decisions.csv"
-DEFAULT_REVIEW_SUMMARY_NAME = "width_review_apply_summary.json"
+DEFAULT_REVIEW_CSV_NAME = ARCHIVE_DECISIONS_NAME
+DEFAULT_REVIEW_SUMMARY_NAME = ARCHIVE_SUMMARY_NAME
 QC_TRIMMED_FIELD = "qc_mean_opposition_cos_trimmed"
 QC_TRIMMED_FALLBACK_FIELD = "qc_mean_opposition_cos_trimmed_from_samples"
 QC_MEDIAN_FALLBACK_FIELD = "qc_median_opposition_cos_trimmed_from_samples"
@@ -61,6 +80,8 @@ class VariantReviewPaths:
     review_csv_path: Path
     review_summary_path: Path
     source_links_path: Path
+    source_nodes_path: Path
+    review_mask_path: Path
     example_id: str
     variant_id: str
 
@@ -359,7 +380,7 @@ def solve_continuity_replacement(
 def _copy_backup(path: Path, *, suffix: str, overwrite: bool) -> Path:
     destination = path.with_name(f"{path.stem}{suffix}{path.suffix}")
     if destination.exists() and not overwrite:
-        raise FileExistsError(f"Backup already exists: {destination}")
+        return destination
     shutil.copy2(path, destination)
     return destination
 
@@ -399,7 +420,7 @@ def resolve_variant_review_paths(
     resolved_review_output_dir = (
         Path(review_output_dir).expanduser().resolve()
         if review_output_dir is not None
-        else (variant_output_dir / "width_review").resolve()
+        else review_archive_dir(resolved_source_links_path)
     )
     resolved_review_csv_path = (
         Path(review_csv_path).expanduser().resolve()
@@ -411,6 +432,15 @@ def resolve_variant_review_paths(
         if review_summary_path is not None
         else (resolved_review_output_dir / DEFAULT_REVIEW_SUMMARY_NAME).resolve()
     )
+    source_nodes_path = resolved_source_links_path.with_name(
+        resolved_source_links_path.name.replace("_links.gpkg", "_nodes.gpkg")
+    )
+    cleaned_mask_path = (
+        resolved_source_links_path.parent.parent
+        / "masks_cleaned"
+        / f"{example_id}_cleaned.tif"
+    )
+    review_mask_path = cleaned_mask_path if cleaned_mask_path.exists() else collapsed_mask_path
 
     return VariantReviewPaths(
         variant_output_dir=variant_output_dir,
@@ -425,6 +455,8 @@ def resolve_variant_review_paths(
         review_csv_path=resolved_review_csv_path,
         review_summary_path=resolved_review_summary_path,
         source_links_path=resolved_source_links_path,
+        source_nodes_path=source_nodes_path,
+        review_mask_path=review_mask_path,
         example_id=example_id,
         variant_id=variant_id,
     )
@@ -647,7 +679,10 @@ class WidthReviewGui:
             initial = initial.dropna(subset=["id_link"]).copy()
             initial["id_link"] = initial["id_link"].astype(int)
             if "review_decision" in initial.columns:
-                initial["review_decision"] = initial["review_decision"].astype("string")
+                initial["review_decision"] = initial["review_decision"].astype("string").str.strip().str.lower()
+                initial["review_decision"] = initial["review_decision"].mask(
+                    initial["review_decision"].isin(["", "skip"]), pd.NA
+                )
                 initial = initial.loc[initial["review_decision"].notna(), ["id_link", "review_decision"]]
                 initial = initial.drop_duplicates(subset=["id_link"], keep="last")
                 self.decisions = self.decisions.drop(columns=["review_decision"]).merge(
@@ -1202,7 +1237,17 @@ class WidthReviewGui:
         self.canvas.draw_idle()
 
     def _save_and_close(self) -> None:
-        undecided = self.decisions["review_decision"].isna().sum()
+        normalized = self.decisions["review_decision"].astype("string").str.strip().str.lower()
+        normalized = normalized.mask(normalized.isin(["", "skip"]), pd.NA)
+        invalid = normalized.notna() & ~normalized.isin(["good", "bad"])
+        if invalid.any():
+            messagebox.showerror(
+                "Invalid review decision",
+                "Review decisions must be good, bad, or undecided.",
+            )
+            return
+        self.decisions["review_decision"] = normalized
+        undecided = normalized.isna().sum()
         if undecided:
             if not messagebox.askyesno(
                 "Save partial review",
@@ -1212,7 +1257,8 @@ class WidthReviewGui:
 
         output = self.candidate_frame.merge(self.decisions, on="id_link", how="left", validate="1:1")
         self.paths.review_output_dir.mkdir(parents=True, exist_ok=True)
-        output.to_csv(self.paths.review_csv_path, index=False)
+        version_existing_review_archive(self.paths.review_output_dir)
+        _atomic_write_csv(output, self.paths.review_csv_path)
         self.saved = True
         self.root.destroy()
 
@@ -1238,6 +1284,47 @@ def load_review_context(
     return candidate_frame, marked_samples, sample_qc, directed_links, parent_link_mapping
 
 
+def inspect_existing_review(paths: VariantReviewPaths) -> dict[str, Any]:
+    """Validate a permanent review before its decisions are joined by link ID."""
+    manifest_path = paths.review_output_dir / ARCHIVE_MANIFEST_NAME
+    if not manifest_path.exists():
+        return {
+            "archive_dir": str(paths.review_output_dir),
+            "status": MISSING_STATUS,
+            "issues": ["No permanent review manifest exists yet."],
+        }
+    return validate_review_fingerprints(
+        paths.review_output_dir,
+        mask_path=paths.review_mask_path,
+        links_path=paths.source_links_path,
+        nodes_path=paths.source_nodes_path,
+    )
+
+
+def _allow_existing_review(root: tk.Tk, inspection: dict[str, Any]) -> bool:
+    """Return whether saved decisions may be resumed after freshness inspection."""
+    status = str(inspection.get("status", MISSING_STATUS))
+    if status in {CURRENT_STATUS, INCOMPLETE_REVIEW_STATUS, MISSING_STATUS}:
+        return True
+    issues = inspection.get("issues", []) or []
+    detail = "\n".join(f"- {issue}" for issue in issues)
+    if status == CORRUPT_STATUS:
+        title = "Damaged width-review archive"
+        prompt = (
+            "The existing archive failed its integrity check and cannot safely be resumed. "
+            "Start a fresh review? The prior files will be preserved in versions/ when you save."
+        )
+    else:
+        title = "Stale width review"
+        prompt = (
+            f"The existing width review is {status} and cannot safely be joined to the current links by ID. "
+            "Start a fresh review? The prior files will be preserved in versions/ when you save."
+        )
+    if detail:
+        prompt += f"\n\n{detail}"
+    return bool(messagebox.askyesno(title, prompt, parent=root))
+
+
 def run_width_review_gui(
     paths: VariantReviewPaths,
     *,
@@ -1247,6 +1334,17 @@ def run_width_review_gui(
     show_dt_points: bool,
     start_over: bool,
 ) -> dict[str, Any] | None:
+    root = tk.Tk()
+    inspection = inspect_existing_review(paths)
+    resume_existing = not start_over
+    if resume_existing and paths.review_csv_path.exists():
+        status = str(inspection.get("status", MISSING_STATUS))
+        if status not in {CURRENT_STATUS, INCOMPLETE_REVIEW_STATUS, MISSING_STATUS}:
+            if not _allow_existing_review(root, inspection):
+                root.destroy()
+                return None
+            resume_existing = False
+
     candidate_frame, marked_samples, _, directed_links, parent_link_mapping = load_review_context(
         paths,
         width_field=width_field,
@@ -1254,10 +1352,9 @@ def run_width_review_gui(
     )
     resolved_width_field = width_field if width_field in candidate_frame.columns else "wid_adj"
     initial_decisions = None
-    if not start_over and paths.review_csv_path.exists():
+    if resume_existing and paths.review_csv_path.exists():
         initial_decisions = pd.read_csv(paths.review_csv_path)
 
-    root = tk.Tk()
     gui = WidthReviewGui(
         root,
         paths=paths,
@@ -1275,8 +1372,10 @@ def run_width_review_gui(
         return None
 
     review_decisions = pd.read_csv(paths.review_csv_path)
-    review_decisions["review_decision"] = review_decisions["review_decision"].astype("string")
-    reviewed = review_decisions.loc[review_decisions["review_decision"].notna()].copy()
+    review_decisions["review_decision"] = review_decisions["review_decision"].astype("string").str.strip().str.lower()
+    reviewed = review_decisions.loc[
+        review_decisions["review_decision"].isin(["good", "bad"])
+    ].copy()
     apply_summary = apply_width_review_updates(
         review_decisions=reviewed,
         candidate_frame=candidate_frame,
@@ -1293,11 +1392,31 @@ def run_width_review_gui(
         "source_links_path": str(paths.source_links_path),
         "width_field": resolved_width_field,
         "len_over_width_threshold": float(len_over_width_threshold),
+        "review_completion_status": (
+            "complete" if len(reviewed) == len(review_decisions) else "incomplete"
+        ),
+        "reviewed_candidate_count": int(len(reviewed)),
+        "candidate_count": int(len(review_decisions)),
         "apply_summary": apply_summary,
     }
-    paths.review_summary_path.parent.mkdir(parents=True, exist_ok=True)
-    with paths.review_summary_path.open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2)
+    _atomic_write_json(summary, paths.review_summary_path)
+    archive_result = finalize_width_review_archive(
+        archive_dir=paths.review_output_dir,
+        decisions_path=paths.review_csv_path,
+        summary_path=paths.review_summary_path,
+        source_links_path=paths.source_links_path,
+        example_id=paths.example_id,
+        variant_output_dir=paths.variant_output_dir,
+        variant_manifest_path=paths.manifest_path,
+    )
+    fingerprint_result = upgrade_review_fingerprints(
+        paths.review_output_dir,
+        mask_path=paths.review_mask_path,
+        links_path=paths.source_links_path,
+        nodes_path=paths.source_nodes_path,
+    )
+    summary["archive"] = archive_result
+    summary["review_status"] = fingerprint_result["status"]
     return summary
 
 
@@ -1317,14 +1436,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Candidate filter threshold: only review links with n_units > 0 and len / width_field below this value.",
     )
     parser.add_argument("--source-links", default=None, help="Optional path to the source RivGraph links GeoPackage to update in place.")
-    parser.add_argument("--review-output-dir", default=None, help="Optional directory for review CSV and apply summary outputs.")
+    parser.add_argument(
+        "--review-output-dir",
+        default=None,
+        help=(
+            "Optional debugging/export directory. By default reviews are saved permanently under "
+            "rivgraph_centerline/outputs/runs/<example>/width_review/."
+        ),
+    )
     parser.add_argument("--review-csv", default=None, help="Optional explicit review CSV output path.")
     parser.add_argument("--review-summary-json", default=None, help="Optional explicit apply-summary JSON output path.")
-    parser.add_argument("--overwrite-backup", action="store_true", help="Overwrite an existing *_width_review_old.gpkg backup.")
+    parser.add_argument(
+        "--overwrite-backup",
+        action="store_true",
+        help=(
+            "Replace the existing *_width_review_old.gpkg source backup. By default an existing "
+            "original backup is retained and reused across partial-review saves."
+        ),
+    )
     parser.add_argument(
         "--start-over",
         action="store_true",
-        help="Ignore any existing saved review CSV and start the GUI with all links undecided.",
+        help=(
+            "Start with all links undecided. Existing permanent review files are retained and are "
+            "copied to width_review/versions/ when the new review is saved."
+        ),
     )
     parser.add_argument(
         "--dt-points",
