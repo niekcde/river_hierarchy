@@ -185,7 +185,9 @@ def _build_reference_section_variant(
         variant_id=REFERENCE_SECTION_VARIANT_ID,
         example_id=example_id,
         output_dir=reference_paths["variant"],
-        preferred_width_field=str(variant_options.get("preferred_width_field", "wid_adj")),
+        preferred_width_field=str(
+            variant_options.get("preferred_width_field", "wid_adj_wet")
+        ),
         footprint_buffer_scale=float(variant_options.get("footprint_buffer_scale", 0.5)),
         all_touched=bool(variant_options.get("all_touched", True)),
         allow_noop=bool(variant_options.get("allow_noop", False)),

@@ -28,8 +28,15 @@ from hierarchy_level_definition.unit_detection.bifurcation_confluence_units impo
 
 
 LENGTH_COLUMNS = ("len_adj", "len")
-REPRESENTATIVE_WIDTH_COLUMNS = ("wid_adj", "wid", "wid_med")
-DEFAULT_PIXEL_WIDTH_FIELDS = ("width_samples", "width_px", "pixel_widths", "wid_pix", "wid_samples")
+REPRESENTATIVE_WIDTH_COLUMNS = ("wid_adj_wet", "wid_adj", "wid", "wid_med")
+DEFAULT_PIXEL_WIDTH_FIELDS = (
+    "wid_pix_wet",
+    "width_samples",
+    "width_px",
+    "pixel_widths",
+    "wid_pix",
+    "wid_samples",
+)
 DEFAULT_PIXEL_WIDTH_PERCENTILES = (5.0, 50.0, 95.0)
 DEFAULT_CLASSIFICATION_THRESHOLDS = {
     "high_evenness_threshold": 0.75,

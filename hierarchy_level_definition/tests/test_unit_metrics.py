@@ -86,6 +86,30 @@ def test_unit_equivalent_width_and_length() -> None:
     assert row["equivalent_length"] == pytest.approx((50.0 * 100.0 + 100.0 * 200.0) / 150.0)
 
 
+def test_wet_width_families_take_precedence_over_legacy_widths() -> None:
+    links = _make_links(
+        [
+            {
+                "id_link": 1,
+                "len_adj": 100.0,
+                "wid_adj_wet": 30.0,
+                "wid_adj": 80.0,
+                "wid_pix_wet": "20,30,40",
+                "wid_pix": "70,80,90",
+            }
+        ]
+    )
+    unit = _make_unit([_make_parallel_path(1, 1, total_length=100.0)])
+
+    _, path_metrics = compute_unit_metrics_from_units(links, [unit])
+    row = path_metrics.iloc[0]
+
+    assert row["path_width_eq"] == pytest.approx(30.0)
+    assert row["path_width_min"] == pytest.approx(20.0)
+    assert row["path_width_p50"] == pytest.approx(30.0)
+    assert row["path_width_max"] == pytest.approx(40.0)
+
+
 def test_entropy_metrics_for_equal_paths() -> None:
     entropy, evenness, effective_n = normalized_entropy([1.0, 1.0, 1.0, 1.0])
     assert entropy == pytest.approx(math.log(4.0))
