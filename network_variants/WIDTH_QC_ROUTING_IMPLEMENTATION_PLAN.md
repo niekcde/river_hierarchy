@@ -306,6 +306,10 @@ split-sensitive trade-offs, partial SVM/logistic decision surfaces,
 disagreements, routing-impact ranking, and archived-link context maps. It has
 been executed successfully from a clean project kernel with all 14 code cells
 completing and no errors.
+Portable coefficient-based diagnostic surfaces allow the notebook to run in
+other analysis environments while warning about scikit-learn bundle-version
+mismatches; direct candidate-bundle inference remains restricted to the
+training environment.
 
 Execute a versioned copy with:
 

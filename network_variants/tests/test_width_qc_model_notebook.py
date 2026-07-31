@@ -42,3 +42,6 @@ def test_width_qc_review_notebook_covers_required_review_contract() -> None:
     assert "width_qc_loeo_predictions_v1.csv" in contents
     assert "reviewed_links_snapshot.gpkg" in contents
     assert "production_authorized" in contents
+    assert "scikit-learn version mismatch" in contents
+    assert "portable_linear_surface" in contents
+    assert "joblib.load" not in contents
