@@ -204,6 +204,21 @@ the target wet/routing width.
 
 ## Phase 5 — Supervised algorithm development
 
+**Status: complete (2026-07-31).** Candidate logistic-regression, linear-SVM,
+and exploratory RBF-SVM pipelines now use fold-local median imputation and
+standardization with leave-one-complete-example-out validation. The generated
+artifacts include held-out probabilities, per-example metrics, threshold
+trade-offs, calibration bins, disagreement/routing-impact tables, fitted
+candidate bundles, dataset fingerprints, coefficients, parameters, and
+software/code provenance. Logistic regression is the provisional review
+candidate; neither it nor its threshold is production-authorized.
+
+Build or refresh the candidate-model comparison with:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -m network_variants.width_qc_model
+```
+
 The width-QC algorithm is a supervised probabilistic classifier, not a
 hand-written stepwise decision tree.
 
