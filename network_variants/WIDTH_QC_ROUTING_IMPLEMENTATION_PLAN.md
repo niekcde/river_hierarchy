@@ -313,6 +313,9 @@ training environment.
 The ranked disagreement tables expose every classifier input alongside
 interpretive width/QC context, with color-coded false-correction and
 missed-correction predictor plots.
+Pairwise matrices cover all classifier inputs for the complete reviewed
+population and for disagreements, plus the important interpretation-only
+variables for disagreements.
 
 Execute a versioned copy with:
 
@@ -323,7 +326,7 @@ IPYTHONDIR=/tmp/ipython-width-qc \
   --to notebook --execute \
   network_variants/notebooks/width_qc_model_review.ipynb \
   --output-dir network_variants/output/width_qc_model_review \
-  --output width_qc_model_review_executed_v2.ipynb \
+  --output width_qc_model_review_executed_v3.ipynb \
   --ExecutePreprocessor.timeout=300 \
   --ExecutePreprocessor.kernel_name=python3
 ```

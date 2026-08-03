@@ -25,6 +25,7 @@ def test_width_qc_review_notebook_covers_required_review_contract() -> None:
     required_topics = (
         "Manual-review counts and missingness",
         "Predictor distributions",
+        "Pairwise relationships among all classifier and interpretation variables",
         "Correlation and collinearity",
         "Logistic coefficients",
         "Candidate-model comparison",
@@ -34,6 +35,7 @@ def test_width_qc_review_notebook_covers_required_review_contract() -> None:
         "Partial decision-surface diagnostics",
         "Manual/model disagreements",
         "Disagreement predictor plots",
+        "Pairwise disagreement matrices",
         "Local geometry inspection",
         "Provisional recommendation",
     )
@@ -50,3 +52,5 @@ def test_width_qc_review_notebook_covers_required_review_contract() -> None:
     assert "classification_columns = list(features)" in contents
     assert "false_correction': '#E66101'" in contents
     assert "missed_correction': '#0571B0'" in contents
+    assert "pairwise_review_matrix" in contents
+    assert "important_context_variables" in contents
