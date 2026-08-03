@@ -316,6 +316,9 @@ missed-correction predictor plots.
 Pairwise matrices cover all classifier inputs for the complete reviewed
 population and for disagreements, plus the important interpretation-only
 variables for disagreements.
+They use interactive Plotly scatter panels with network/link hover labels;
+classifier-input panels include the partial logistic decision boundary with
+all remaining classifier inputs fixed at their medians.
 
 Execute a versioned copy with:
 
@@ -326,7 +329,7 @@ IPYTHONDIR=/tmp/ipython-width-qc \
   --to notebook --execute \
   network_variants/notebooks/width_qc_model_review.ipynb \
   --output-dir network_variants/output/width_qc_model_review \
-  --output width_qc_model_review_executed_v3.ipynb \
+  --output width_qc_model_review_executed_v4.ipynb \
   --ExecutePreprocessor.timeout=300 \
   --ExecutePreprocessor.kernel_name=python3
 ```
