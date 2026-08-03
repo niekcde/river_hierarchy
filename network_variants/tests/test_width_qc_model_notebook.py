@@ -55,6 +55,6 @@ def test_width_qc_review_notebook_covers_required_review_contract() -> None:
     assert "pairwise_review_matrix" in contents
     assert "important_context_variables" in contents
     assert "plotly.graph_objects" in contents
-    assert "partial_logistic_boundary" in contents
-    assert "Partial logistic boundary" in contents
     assert "network %{customdata[0]}<br>link %{customdata[1]}" in contents
+    assert "partial_logistic_boundary" not in contents
+    assert "Partial logistic boundary" not in contents
