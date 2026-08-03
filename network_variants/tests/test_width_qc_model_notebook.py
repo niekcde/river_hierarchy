@@ -33,6 +33,7 @@ def test_width_qc_review_notebook_covers_required_review_contract() -> None:
         "Threshold trade-offs and split-sensitive risk",
         "Partial decision-surface diagnostics",
         "Manual/model disagreements",
+        "Disagreement predictor plots",
         "Local geometry inspection",
         "Provisional recommendation",
     )
@@ -45,3 +46,7 @@ def test_width_qc_review_notebook_covers_required_review_contract() -> None:
     assert "scikit-learn version mismatch" in contents
     assert "portable_linear_surface" in contents
     assert "joblib.load" not in contents
+    assert "disagreement_table_columns" in contents
+    assert "classification_columns = list(features)" in contents
+    assert "false_correction': '#E66101'" in contents
+    assert "missed_correction': '#0571B0'" in contents

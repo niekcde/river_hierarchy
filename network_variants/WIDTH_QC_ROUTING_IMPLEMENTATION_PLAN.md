@@ -310,6 +310,9 @@ Portable coefficient-based diagnostic surfaces allow the notebook to run in
 other analysis environments while warning about scikit-learn bundle-version
 mismatches; direct candidate-bundle inference remains restricted to the
 training environment.
+The ranked disagreement tables expose every classifier input alongside
+interpretive width/QC context, with color-coded false-correction and
+missed-correction predictor plots.
 
 Execute a versioned copy with:
 
@@ -320,7 +323,7 @@ IPYTHONDIR=/tmp/ipython-width-qc \
   --to notebook --execute \
   network_variants/notebooks/width_qc_model_review.ipynb \
   --output-dir network_variants/output/width_qc_model_review \
-  --output width_qc_model_review_executed_v1.ipynb \
+  --output width_qc_model_review_executed_v2.ipynb \
   --ExecutePreprocessor.timeout=300 \
   --ExecutePreprocessor.kernel_name=python3
 ```
