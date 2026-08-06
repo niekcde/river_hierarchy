@@ -7,6 +7,8 @@ from typing import Any
 import geopandas as gpd
 import pandas as pd
 import pytest
+from shapely.geometry import LineString
+from shapely.ops import unary_union
 
 from hierarchy_level_definition.metrics import BubbleEquivalentResistanceConfig
 from hierarchy_level_definition.run_unit_workflow import UnitWorkflowOutputs, write_unit_workflow_outputs
@@ -26,6 +28,48 @@ from network_variants.collapse_experiment import (
 from network_variants.hydraulic_context import StateHydraulicContextOutputs
 from network_variants.variant_generation import NetworkVariantOutputs, VariantDirectionValidationError
 from rapid_tools.forcing import ForcingConfig
+
+
+@pytest.mark.parametrize("reset_name", ["_reset_state_dir", "_reset_experiment_output_dir"])
+def test_reset_directory_ignores_missing_entry_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_name: str,
+) -> None:
+    target = tmp_path / "output"
+    target.mkdir()
+    (target / "stale.txt").write_text("stale", encoding="utf-8")
+    real_rmtree = collapse_experiment_module.shutil.rmtree
+
+    def racing_rmtree(path: Path, *, onexc: Any) -> None:
+        onexc(Path.unlink, str(Path(path) / "already-gone"), FileNotFoundError("gone"))
+        real_rmtree(path)
+
+    monkeypatch.setattr(collapse_experiment_module.shutil, "rmtree", racing_rmtree)
+
+    getattr(collapse_experiment_module, reset_name)(target)
+
+    assert target.is_dir()
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.parametrize("reset_name", ["_reset_state_dir", "_reset_experiment_output_dir"])
+def test_reset_directory_does_not_hide_permission_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_name: str,
+) -> None:
+    target = tmp_path / "output"
+    target.mkdir()
+
+    def failing_rmtree(path: Path, *, onexc: Any) -> None:
+        del path
+        onexc(Path.unlink, "protected", PermissionError("denied"))
+
+    monkeypatch.setattr(collapse_experiment_module.shutil, "rmtree", failing_rmtree)
+
+    with pytest.raises(PermissionError, match="denied"):
+        getattr(collapse_experiment_module, reset_name)(target)
 
 
 def _workflow_outputs(
@@ -197,6 +241,54 @@ def test_variant_analysis_links_prefer_width_family_product(tmp_path: Path) -> N
         variant_output_dir=variant_dir,
         directed_links_path=directed_path,
     ) == width_family_path
+
+
+def test_copied_base_localizes_nested_routing_audit_reference(tmp_path: Path) -> None:
+    source = tmp_path / "source" / "variant"
+    for directory in ("summary", "widths", "directed", "mask"):
+        (source / directory).mkdir(parents=True, exist_ok=True)
+    (source / "summary" / "variant_manifest.json").write_text(
+        json.dumps({"output_paths": {"output_dir": str(source.resolve())}}),
+        encoding="utf-8",
+    )
+    (source / "widths" / "routing_width_application.csv").write_text(
+        "id_link,wid_adj_routing\n1,10\n", encoding="utf-8"
+    )
+    (source / "widths" / "routing_width_application_manifest.json").write_text(
+        json.dumps(
+            {
+                "files": {
+                    "link_audit": str(
+                        (source / "widths" / "routing_width_application.csv").resolve()
+                    )
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "directed" / "99__S000_base_directed_links.gpkg").touch()
+    (source / "directed" / "99__S000_base_directed_nodes.gpkg").touch()
+    (source / "mask" / "99__S000_base_collapsed.tif").touch()
+    state_dir = tmp_path / "destination" / "S000_base"
+    context = SimpleNamespace(state_dir=state_dir)
+
+    collapse_experiment_module._materialize_copied_base_state_variant(
+        context=context,
+        source_variant_dir=source,
+        example_id="99",
+        collapse_corridor_mode="anchored",
+        boundary_component_labels_path=None,
+    )
+
+    copied_manifest = json.loads(
+        (
+            state_dir
+            / "variant"
+            / "widths"
+            / "routing_width_application_manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert copied_manifest["files"]["link_audit"] == "routing_width_application.csv"
 
 
 def _make_variant_runner():
@@ -626,6 +718,11 @@ def test_compound_bubbles_creates_one_child_per_compound_bubble(tmp_path: Path) 
     )
 
     assert [call["unit_ids"] for call in variant_runner.calls] == [[5, 7], [2, 9]]
+    assert [call["selection_type"] for call in variant_runner.calls] == [
+        "compound_bubble",
+        "compound_bubble",
+    ]
+    assert [call["compound_bubble_id"] for call in variant_runner.calls] == [13, 8]
     assert list(results.state_registry["state_id"]) == ["S000_base", "CB001_bubble_13", "CB002_bubble_8"]
     derived = results.state_registry.loc[results.state_registry["state_role"] == "derived"].copy()
     assert derived["selection_type"].tolist() == ["compound_bubble", "compound_bubble"]
@@ -635,6 +732,142 @@ def test_compound_bubbles_creates_one_child_per_compound_bubble(tmp_path: Path) 
     assert derived["total_unit_nodes_selected"].astype(int).tolist() == [21, 13]
     assert results.manifest["stop_reason"] == "all_compound_bubbles_processed"
     assert results.manifest["n_compound_states"] == 2
+
+
+def test_compound_bubbles_can_filter_to_requested_bubble_ids(tmp_path: Path) -> None:
+    compound_rows = [
+        {
+            "unit_id": unit_id,
+            "compound_bubble_id": bubble_id,
+            "in_compound_bubble": True,
+            "compound_bubble_role": role,
+            "unit_node_count": 4,
+        }
+        for unit_id, bubble_id, role in [
+            (5, 13, "bubble_root"),
+            (7, 13, "bubble_member"),
+            (2, 8, "bubble_root"),
+            (9, 8, "bubble_member"),
+        ]
+    ]
+    workflow_runner = _make_workflow_runner(
+        [
+            _workflow_outputs([5, 7, 2, 9], compound_rows=compound_rows),
+            _workflow_outputs([1]),
+        ]
+    )
+    variant_runner = _make_variant_runner()
+
+    results = run_collapse_experiment(
+        "compound-bubbles",
+        cleaned_mask_path=tmp_path / "base_cleaned.tif",
+        reviewed_links_path=tmp_path / "base_links.gpkg",
+        reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=tmp_path / "experiment",
+        requested_compound_bubble_ids=[8],
+        unit_workflow_runner=workflow_runner,
+        unit_workflow_writer=write_unit_workflow_outputs,
+        variant_runner=variant_runner,
+        base_state_variant_materializer=_make_base_state_materializer(),
+        state_hydraulic_context_runner=_make_state_hydraulic_context_runner(),
+    )
+
+    assert [call["unit_ids"] for call in variant_runner.calls] == [[2, 9]]
+    assert list(results.state_registry["state_id"]) == ["S000_base", "CB001_bubble_8"]
+    assert results.manifest["options"]["variant"]["requested_compound_bubble_ids"] == [8]
+
+
+def test_panelized_runner_accepts_multi_unit_compound_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    links_path = tmp_path / "links.gpkg"
+    links = gpd.GeoDataFrame(
+        {
+            "id_link": [1, 2],
+            "id_nodes": ["10,11", "11,12"],
+            "wid_adj_routing": [2.0, 10.0],
+            "wid_adj_wet": [2.0, 10.0],
+            "wid_adj": [2.0, 10.0],
+            "geometry": [
+                LineString([(0.0, 0.0), (2.0, 0.0)]),
+                LineString([(20.0, 0.0), (22.0, 0.0)]),
+            ],
+        },
+        crs="EPSG:3857",
+    )
+    links.to_file(links_path, driver="GPKG")
+    path_metrics = tmp_path / "path_metrics.csv"
+    pd.DataFrame(
+        [
+            {"unit_id": 112, "path_id": 1, "id_links": "1"},
+            {"unit_id": 113, "path_id": 1, "id_links": "2"},
+        ]
+    ).to_csv(path_metrics, index=False)
+    captured: dict[str, Any] = {}
+
+    def fake_materialize(**kwargs: Any) -> dict[str, Any]:
+        captured["materialize"] = kwargs
+        return {
+            "panel_plan": {"affected": ["P009"]},
+            "merged": {},
+            "collapsed_mask": str(tmp_path / "collapsed.tif"),
+        }
+
+    def fake_finalize(**kwargs: Any) -> SimpleNamespace:
+        captured["finalize"] = kwargs
+        return SimpleNamespace(output_dir=Path(kwargs["state_dir"]) / "variant")
+
+    monkeypatch.setattr(
+        collapse_experiment_module,
+        "materialize_panelized_child_state",
+        fake_materialize,
+    )
+    monkeypatch.setattr(
+        collapse_experiment_module,
+        "_finalize_panelized_child_result",
+        fake_finalize,
+    )
+    runner = collapse_experiment_module._make_panelized_child_runner(
+        source_panel_root=tmp_path / "panels",
+        panel_plan_path=tmp_path / "panel_plan.gpkg",
+        panel_breaks_path=tmp_path / "panel_breaks.gpkg",
+        boundary_match_plan_path=tmp_path / "boundary_match_plan.json",
+        parent_merged_links_path=tmp_path / "merged_links.gpkg",
+        boundary_component_labels_path=tmp_path / "labels.tif",
+        exit_sides_by_panel={"P009": "SE"},
+        run_name="46",
+    )
+
+    runner(
+        unit_ids=[112, 113],
+        group_label=None,
+        selection_type="compound_bubble",
+        compound_bubble_id=7,
+        bubble_root_unit_id=112,
+        reviewed_links_path=links_path,
+        reviewed_nodes_path=tmp_path / "nodes.gpkg",
+        cleaned_mask_path=tmp_path / "mask.tif",
+        panelized_path_metrics=path_metrics,
+        output_dir=tmp_path / "state" / "variant",
+        variant_id="CB001_bubble_7",
+        example_id="46",
+        preferred_width_field="wid_adj_routing",
+        footprint_buffer_scale=0.5,
+        all_touched=False,
+    )
+
+    expected = unary_union(
+        [links.geometry.iloc[0].buffer(1.0), links.geometry.iloc[1].buffer(5.0)]
+    )
+    assert captured["materialize"]["footprint"].symmetric_difference(expected).area == pytest.approx(0.0)
+    assert captured["materialize"]["all_touched"] is False
+    assert captured["finalize"]["unit_ids"] == [112, 113]
+    assert captured["finalize"]["selected_link_ids"] == [1, 2]
+    assert captured["finalize"]["selected_node_ids"] == [10, 11, 12]
+    assert captured["finalize"]["selection_type"] == "compound_bubble"
+    assert captured["finalize"]["compound_bubble_id"] == 7
 
 
 def test_base_state_is_materialized_as_local_variant_outputs(tmp_path: Path) -> None:
@@ -950,6 +1183,20 @@ def test_copy_boundary_component_artifacts_localizes_panelized_manifest(tmp_path
     assert copied_manifest["labels"] == str((destination / labels.name).resolve())
     assert copied_manifest["summary"] == str((destination / summary.name).resolve())
     assert copied_manifest["extensions"] == str((destination / extensions.name).resolve())
+
+
+def test_infer_boundary_artifacts_from_reused_base_variant(tmp_path: Path) -> None:
+    experiment = tmp_path / "panelized_base__realized"
+    source_variant = experiment / "states" / "S000_base" / "variant"
+    boundary_components = experiment / "boundary_components"
+    source_variant.mkdir(parents=True)
+    boundary_components.mkdir()
+
+    inferred = collapse_experiment_module._infer_boundary_component_artifact_source_dir(
+        source_variant
+    )
+
+    assert inferred == boundary_components.resolve()
 
 
 def test_run_copies_boundary_artifacts_before_base_materialization(tmp_path: Path) -> None:

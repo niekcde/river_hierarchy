@@ -457,6 +457,7 @@ def assign_core_network_direction(
     panel_root: Path,
     run_name: str,
     output_dir: Path,
+    fallback_directed_links_path: Path | None = None,
     endpoint_tolerance_m: float = 0.01,
     overwrite: bool = False,
 ) -> dict[str, object]:
@@ -465,8 +466,9 @@ def assign_core_network_direction(
     Each clipped core segment inherits an upstream/downstream direction from its
     source RivGraph link.  Segments that reach a global-link endpoint vote for
     which endpoint is upstream; a unanimous (or majority) vote orients the
-    global link.  Ambiguous links are exported unchanged and reported instead
-    of being silently guessed.
+    global link. Ambiguous links are exported unchanged and reported instead
+    of being silently guessed. If a directed parent network is supplied, a
+    tied vote may inherit direction from one uniquely matching parent link.
     """
     links = gpd.read_file(merged_links_path, layer="merged_links")
     segments = gpd.read_file(core_segments_path, layer="core_segments")
@@ -496,6 +498,20 @@ def assign_core_network_direction(
                 local_nodes.loc[int(row.id_ds_node)].geometry,
             )
 
+    fallback_links: gpd.GeoDataFrame | None = None
+    if fallback_directed_links_path is not None:
+        fallback_links = gpd.read_file(fallback_directed_links_path)
+        fallback_required = {"id_us_node", "id_ds_node"}
+        fallback_missing = fallback_required.difference(fallback_links.columns)
+        if fallback_missing:
+            raise ValueError(
+                f"{fallback_directed_links_path} is missing required columns: {sorted(fallback_missing)}"
+            )
+        if fallback_links["id_us_node"].isna().any() or fallback_links["id_ds_node"].isna().any():
+            raise ValueError(f"Fallback directed links are not fully directed: {fallback_directed_links_path}")
+        if fallback_links.crs != links.crs:
+            fallback_links = fallback_links.to_crs(links.crs)
+
     segment_by_id = segments.set_index("segment_id")
     result = links.copy()
     upstream_ids: list[int | None] = []
@@ -503,6 +519,7 @@ def assign_core_network_direction(
     status: list[str] = []
     geometries: list[LineString] = []
     ambiguous: list[int] = []
+    inherited: list[int] = []
     for row in result.itertuples(index=False):
         endpoints = (Point(row.geometry.coords[0]), Point(row.geometry.coords[-1]))
         votes = [0, 0]  # votes that endpoint 0 / 1 is upstream
@@ -526,6 +543,27 @@ def assign_core_network_direction(
                             votes[global_endpoint_id] += 1
                         else:
                             votes[1 - global_endpoint_id] += 1
+        if votes[0] == votes[1] and fallback_links is not None:
+            matches = fallback_links.loc[
+                fallback_links.geometry.apply(
+                    lambda geometry: (
+                        abs(float(geometry.length) - float(row.geometry.length)) <= endpoint_tolerance_m
+                        and geometry.hausdorff_distance(row.geometry) <= endpoint_tolerance_m
+                    )
+                )
+            ]
+            if len(matches) == 1:
+                parent_upstream = Point(matches.iloc[0].geometry.coords[0])
+                distances = [parent_upstream.distance(endpoint) for endpoint in endpoints]
+                upstream_endpoint = 0 if distances[0] <= distances[1] else 1
+                downstream_endpoint = 1 - upstream_endpoint
+                upstream_ids.append(int(row.id_node_a) if upstream_endpoint == 0 else int(row.id_node_b))
+                downstream_ids.append(int(row.id_node_a) if downstream_endpoint == 0 else int(row.id_node_b))
+                status.append("inherited_parent")
+                coordinates = list(row.geometry.coords)
+                geometries.append(row.geometry if upstream_endpoint == 0 else LineString(coordinates[::-1]))
+                inherited.append(int(row.global_link_id))
+                continue
         if votes[0] == votes[1]:
             upstream_ids.append(None); downstream_ids.append(None); status.append("ambiguous")
             geometries.append(row.geometry); ambiguous.append(int(row.global_link_id))
@@ -546,7 +584,10 @@ def assign_core_network_direction(
     result.to_file(directed_output, layer="merged_links", driver="GPKG")
     report = {
         "link_count": len(result),
-        "assigned_link_count": int((result.direction_status == "assigned").sum()),
+        "assigned_link_count": int(result["id_us_node"].notna().sum()),
+        "panel_vote_assigned_link_count": int((result.direction_status == "assigned").sum()),
+        "parent_inherited_link_count": len(inherited),
+        "parent_inherited_global_link_ids": inherited,
         "ambiguous_link_count": len(ambiguous),
         "ambiguous_global_link_ids": ambiguous,
         "output": str(directed_output),

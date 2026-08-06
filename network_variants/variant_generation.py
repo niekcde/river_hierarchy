@@ -49,11 +49,16 @@ from hierarchy_level_definition.unit_detection.bifurcation_confluence_units impo
 )
 from network_variants.build_boundary_component_mask import build_boundary_component_mask
 from network_variants.sword_matching import match_variant_nodes_to_sword
+from network_variants.routing_width_application import (
+    apply_routing_width_model,
+    write_routing_width_audit,
+)
 from network_variants.width_two_bank import build_state_bank_labels, compute_two_bank_width_families
+from network_variants.width_product_inheritance import inherit_unchanged_link_width_products
 
 
-DEFAULT_FOOTPRINT_WIDTH_FIELD = "wid_adj_wet"
-WIDTH_FALLBACK_FIELDS = ("wid_adj_wet", "wid_adj", "wid", "wid_med")
+DEFAULT_FOOTPRINT_WIDTH_FIELD = "wid_adj_routing"
+WIDTH_FALLBACK_FIELDS = ("wid_adj_routing", "wid_adj_wet", "wid_adj", "wid", "wid_med")
 DEFAULT_FOOTPRINT_BUFFER_SCALE = 0.5
 DEFAULT_TRANSECT_SCALE = 1.5
 DEFAULT_MIN_TRANSECT_PIXELS = 5.0
@@ -1390,12 +1395,61 @@ def _write_width_family_outputs(
     link_width_samples: pd.DataFrame,
     directed_enriched_links: gpd.GeoDataFrame,
 ) -> pd.DataFrame:
+    directed_enriched_links = _normalize_width_boolean_fields(directed_enriched_links)
     link_width_families = pd.DataFrame(directed_enriched_links.drop(columns=directed_enriched_links.geometry.name))
     width_dir.mkdir(parents=True, exist_ok=True)
     link_width_families.to_csv(width_dir / "link_width_families.csv", index=False)
     link_width_samples.to_csv(width_dir / "link_width_samples.csv", index=False)
     directed_enriched_links.to_file(width_dir / "links_with_width_families.gpkg", driver="GPKG")
     return link_width_families
+
+
+WIDTH_BOOLEAN_FIELDS = (
+    "width_reviewed_flag",
+    "width_update_applied",
+    "manual_width_review_candidate",
+    "manual_width_review_requires_correction",
+    "width_model_candidate",
+    "split_sensitive",
+    "width_model_excluded",
+    "routing_context_uses_endpoint",
+    "comparison_flag",
+    "width_correction_applied",
+    "width_correction_flag",
+    "dry_corridor_meaningful",
+    "measured_wet_exceeds_total_corridor",
+    "routing_exceeds_total_corridor",
+    "routing_corridor_consistency_flag",
+    "width_model_evaluation_scope",
+)
+
+
+def _normalize_width_boolean_fields(
+    links: gpd.GeoDataFrame,
+) -> gpd.GeoDataFrame:
+    """Keep inherited boolean provenance typed through GeoPackage writes."""
+    result = links.copy()
+
+    def normalize(value: Any) -> Any:
+        if pd.isna(value):
+            return pd.NA
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        if isinstance(value, (int, float, np.integer, np.floating)) and float(value) in {0.0, 1.0}:
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"true", "1"}:
+            return True
+        if text in {"false", "0"}:
+            return False
+        raise ValueError(f"Cannot normalize boolean width provenance value {value!r}.")
+
+    for field in WIDTH_BOOLEAN_FIELDS:
+        if field not in result.columns:
+            continue
+        normalized = result[field].map(normalize)
+        result[field] = normalized.astype("boolean" if normalized.isna().any() else bool)
+    return result
 
 
 def _apply_width_sample_flow_alignment(
@@ -1957,25 +2011,47 @@ def _resolve_link_lineage(
                             kind="mergesort",
                         ).reset_index(drop=True)
                         dominant = primary_rows.iloc[0]
+                        resolved_primary_ids = list(primary_ids)
+                        lineage_method = "matched_parent_node_path"
+                        exact_parent_ids = []
+                        for parent_id in primary_ids:
+                            parent_geometry = parent_edge_by_link_id.get(int(parent_id), {}).get("geometry")
+                            if parent_geometry is not None and row.geometry.equals(parent_geometry):
+                                exact_parent_ids.append(int(parent_id))
+                        # A node path through parallel edges includes every
+                        # edge key between the same two nodes. If exactly one
+                        # of those edges is geometrically identical to the
+                        # child, that equality is definitive one-to-one
+                        # evidence and must override the ambiguous node path.
+                        if len(primary_ids) > 1 and len(exact_parent_ids) == 1:
+                            resolved_primary_ids = exact_parent_ids
+                            dominant = primary_rows.loc[
+                                primary_rows["parent_id_link"].astype(int).eq(exact_parent_ids[0])
+                            ].iloc[0]
+                            lineage_method = "exact_geometry_override_parent_node_path"
                         matched_metrics = _compute_matched_set_overlap_metrics(
                             child_geometry=row.geometry,
-                            parent_link_ids=primary_ids,
+                            parent_link_ids=resolved_primary_ids,
                             parent_edge_by_link_id=parent_edge_by_link_id,
                             match_tolerance=match_tolerance,
                         )
                         touch_ids = [
                             int(parent_id)
                             for parent_id in ordered["parent_id_link"]
-                            if int(parent_id) not in set(primary_ids)
+                            if int(parent_id) not in set(resolved_primary_ids)
                         ]
-                        lineage_type = "unchanged_1to1" if len(primary_ids) == 1 else "collapsed_many_to_one"
+                        lineage_type = (
+                            "unchanged_1to1"
+                            if len(resolved_primary_ids) == 1
+                            else "collapsed_many_to_one"
+                        )
                         records.append(
                             {
                                 "id_link": child_id,
                                 "lineage_type": lineage_type,
                                 "dominant_parent_link_id": int(dominant["parent_id_link"]),
-                                "matched_parent_link_ids": _serialize_int_list(primary_ids),
-                                "primary_parent_link_ids": _serialize_int_list(primary_ids),
+                                "matched_parent_link_ids": _serialize_int_list(resolved_primary_ids),
+                                "primary_parent_link_ids": _serialize_int_list(resolved_primary_ids),
                                 "secondary_parent_link_ids": "",
                                 "touch_parent_link_ids": _serialize_int_list(touch_ids),
                                 "candidate_parent_link_ids": _serialize_int_list(
@@ -1983,8 +2059,8 @@ def _resolve_link_lineage(
                                         list(primary_ids) + [int(value) for value in ordered["parent_id_link"]]
                                     )
                                 ),
-                                "matched_parent_link_count": int(len(primary_ids)),
-                                "primary_parent_link_count": int(len(primary_ids)),
+                                "matched_parent_link_count": int(len(resolved_primary_ids)),
+                                "primary_parent_link_count": int(len(resolved_primary_ids)),
                                 "secondary_parent_link_count": 0,
                                 "touch_parent_link_count": int(len(touch_ids)),
                                 "dominant_parent_overlap_fraction": float(dominant["child_overlap_fraction"]),
@@ -1992,7 +2068,7 @@ def _resolve_link_lineage(
                                 "dominant_parent_core_overlap_fraction": float(dominant["child_core_overlap_fraction"]),
                                 "dominant_parent_core_overlap_length": float(dominant["child_core_overlap_length"]),
                                 **matched_metrics,
-                                "lineage_method": "matched_parent_node_path",
+                                "lineage_method": lineage_method,
                                 "matched_parent_us_node": int(up_parent),
                                 "matched_parent_ds_node": int(ds_parent),
                                 "matched_parent_node_path": parent_node_path_text,
@@ -3847,6 +3923,9 @@ def generate_network_variant(
     workflow_output_dir: str | Path | None = None,
     group_label: str | None = None,
     unit_ids: Sequence[int] | None = None,
+    selection_type: str | None = None,
+    compound_bubble_id: int | None = None,
+    bubble_root_unit_id: int | None = None,
     variant_id: str | None = None,
     example_id: str | None = None,
     output_dir: str | Path | None = None,
@@ -4177,6 +4256,51 @@ def generate_network_variant(
         collapse_corridor_mode=collapse_corridor_mode,
     )
 
+    parent_width_samples_path = Path(reviewed_links_path).with_name("link_width_samples.csv")
+    parent_width_samples = (
+        pd.read_csv(parent_width_samples_path)
+        if parent_width_samples_path.exists()
+        else pd.DataFrame()
+    )
+    directed_enriched_links, link_width_samples, width_product_inheritance = (
+        inherit_unchanged_link_width_products(
+            child_links=directed_enriched_links,
+            child_width_samples=link_width_samples,
+            parent_links=reviewed_links,
+            parent_width_samples=parent_width_samples,
+            link_lineage=link_lineage,
+        )
+    )
+    link_width_samples = _apply_collapsed_selection_metadata(
+        link_width_samples,
+        unit_ids=resolved_unit_ids,
+        group_label=group_label,
+    )
+    link_width_samples["example_id"] = example_id
+    link_width_samples["variant_id"] = variant_id
+    changed_width_link_ids = directed_enriched_links.loc[
+        directed_enriched_links["width_inheritance_status"].eq("changed_requires_evaluation"),
+        "id_link",
+    ].astype(int).tolist()
+    directed_enriched_links, routing_width_audit, routing_width_application = apply_routing_width_model(
+        directed_enriched_links,
+        link_width_samples,
+        directed_nodes,
+        example_id=example_id,
+        variant_id=variant_id,
+        apply_known_base_exclusions=False,
+        evaluation_link_ids=changed_width_link_ids,
+    )
+    directed_enriched_links.loc[
+        directed_enriched_links["id_link"].astype(int).isin(changed_width_link_ids),
+        "width_inheritance_status",
+    ] = "changed_evaluated"
+    routing_width_paths = write_routing_width_audit(
+        routing_width_audit,
+        routing_width_application,
+        output_dir=width_dir,
+    )
+
     link_width_families = _write_width_family_outputs(
         width_dir=width_dir,
         link_width_samples=link_width_samples,
@@ -4196,6 +4320,9 @@ def generate_network_variant(
         "example_id": example_id,
         "variant_id": variant_id,
         "selection_source": "group_label" if group_label is not None else "unit_ids",
+        "selection_type": selection_type,
+        "compound_bubble_id": compound_bubble_id,
+        "bubble_root_unit_id": bubble_root_unit_id,
         "selected_unit_ids": resolved_unit_ids,
         "group_label": group_label,
         "collapsed_selection": selection_metadata,
@@ -4250,6 +4377,8 @@ def generate_network_variant(
             "n_removed_land_labels": int(len(removed_bank_labels)),
         },
         "segmented_stub_inheritance": segmented_stub_inheritance_summary,
+        "width_product_inheritance": width_product_inheritance,
+        "routing_width_application": routing_width_application,
         "anchor_segmentation": anchor_segmentation_summary,
         "sword_matching": {
             "wse_field": sword_wse_field,
@@ -4279,6 +4408,8 @@ def generate_network_variant(
             "link_width_families": str((width_dir / "link_width_families.csv").resolve()),
             "link_width_samples": str((width_dir / "link_width_samples.csv").resolve()),
             "links_with_width_families": str((width_dir / "links_with_width_families.gpkg").resolve()),
+            "routing_width_application": routing_width_paths["link_audit"],
+            "routing_width_application_manifest": routing_width_paths["manifest"],
             "node_match": str((matching_dir / "node_match.csv").resolve()),
             "node_sword_match": str((matching_dir / "node_sword_match.csv").resolve()),
             "link_match": str((matching_dir / "link_match.csv").resolve()),
@@ -4648,6 +4779,50 @@ def derive_anchored_variant_from_realized(
     )
 
     directed_enriched_links = _merge_width_families_onto_links(directed_links, enriched_links)
+    parent_width_samples_path = Path(reviewed_links_path).with_name("link_width_samples.csv")
+    parent_width_samples = (
+        pd.read_csv(parent_width_samples_path)
+        if parent_width_samples_path.exists()
+        else pd.DataFrame()
+    )
+    directed_enriched_links, link_width_samples, width_product_inheritance = (
+        inherit_unchanged_link_width_products(
+            child_links=directed_enriched_links,
+            child_width_samples=link_width_samples,
+            parent_links=reviewed_links,
+            parent_width_samples=parent_width_samples,
+            link_lineage=link_lineage,
+        )
+    )
+    link_width_samples = _apply_collapsed_selection_metadata(
+        link_width_samples,
+        unit_ids=selected_unit_ids,
+        group_label=group_label,
+    )
+    link_width_samples["example_id"] = example_id
+    link_width_samples["variant_id"] = variant_id
+    changed_width_link_ids = directed_enriched_links.loc[
+        directed_enriched_links["width_inheritance_status"].eq("changed_requires_evaluation"),
+        "id_link",
+    ].astype(int).tolist()
+    directed_enriched_links, routing_width_audit, routing_width_application = apply_routing_width_model(
+        directed_enriched_links,
+        link_width_samples,
+        directed_nodes,
+        example_id=example_id,
+        variant_id=variant_id,
+        apply_known_base_exclusions=False,
+        evaluation_link_ids=changed_width_link_ids,
+    )
+    directed_enriched_links.loc[
+        directed_enriched_links["id_link"].astype(int).isin(changed_width_link_ids),
+        "width_inheritance_status",
+    ] = "changed_evaluated"
+    routing_width_paths = write_routing_width_audit(
+        routing_width_audit,
+        routing_width_application,
+        output_dir=width_dir,
+    )
     link_width_families = _write_width_family_outputs(
         width_dir=width_dir,
         link_width_samples=link_width_samples,
@@ -4679,6 +4854,8 @@ def derive_anchored_variant_from_realized(
         "SWORD node matching/propagation",
     ]
     manifest["segmented_stub_inheritance"] = segmented_stub_inheritance_summary
+    manifest["width_product_inheritance"] = width_product_inheritance
+    manifest["routing_width_application"] = routing_width_application
     if anchored_width_patch_summary is not None:
         manifest["anchored_width_patch"] = anchored_width_patch_summary
     manifest["ready_for_rapid"] = bool(direction_summary.get("is_valid", False))
@@ -4717,6 +4894,8 @@ def derive_anchored_variant_from_realized(
     manifest["output_paths"]["width_scope_mask"] = str(Path(origin_mask_path).resolve()) if origin_mask_path is not None else None
     manifest["output_paths"]["bank_labels"] = str(bank_labels_path.resolve())
     manifest["output_paths"]["boundary_component_labels"] = str(resolved_boundary_component_labels_path.resolve())
+    manifest["output_paths"]["routing_width_application"] = routing_width_paths["link_audit"]
+    manifest["output_paths"]["routing_width_application_manifest"] = routing_width_paths["manifest"]
     manifest["direction_summary"] = direction_summary
     manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
     manifest["code_version"] = _git_revision()

@@ -550,6 +550,76 @@ Important interpretation:
 This avoids maintaining separate manual edits in both the parent network and a
 derived base-state product.
 
+After model validation, review the union of held-out manual/model disagreements
+and high-priority near-junction audit cases without changing the permanent
+reviews or any width files:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-width-qc-disagreements \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -m \
+  network_variants.width_qc_disagreement_gui \
+  --reviewer "<reviewer name>"
+```
+
+The adjudication is resumable and is saved separately under
+`network_variants/output/width_qc_disagreement_review/` with hashes of the
+training dataset, held-out predictions, and selected near-junction audit. By
+default the GUI displays the exploratory 10%/250–1,000 m junction window;
+generate it first with `python -m network_variants.width_junction_audit`.
+
+After completing that review, compare hybrid whole-link/near-junction
+continuity rules without changing labels, models, or network widths:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-width-junction-hybrid \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -m \
+  network_variants.width_junction_hybrid_audit
+```
+
+This tests endpoint substitution independently for every adjacent incoming
+and outgoing reach at length/wet-width thresholds 3, 5, and 10, both with and
+without a non-overlapping-window requirement. Results and exact input hashes
+are written to `network_variants/output/width_qc_junction_hybrid_audit/`.
+
+Fit the terminal adjudicated model after that audit with:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-width-qc-final \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -m \
+  network_variants.width_qc_final_model
+```
+
+This freezes the conservative `L/W >= 10` plus non-overlapping endpoint rule,
+uses the completed adjudications once, excludes ambiguous cases, and writes
+old/new held-out probability and decision comparisons under
+`network_variants/output/width_qc_final_model/`. It does not change source
+network widths. Numeric correction targets remain the responsibility of the
+joint upstream-continuity solver so sibling outgoing corrections are not
+calculated independently.
+
+Evaluate that standalone joint solver with:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-width-routing-solver \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -m \
+  network_variants.width_routing_solver
+```
+
+The solver preserves measured `wid_adj_wet`, writes
+`wid_adj_routing`, allocates multiple predicted-bad outgoing links jointly,
+propagates correction scales downstream, and retains unsafe cases raw with an
+explicit reason. Its outputs under
+`network_variants/output/width_routing_solver/` remain evaluation artifacts.
+The selected logistic model and adaptive 2:1 two-ended solver are now wired
+into regular and panelized base materialization. Durable manual-review
+archives contribute labels and provenance only; historical numeric review
+targets are not reapplied. Each base writes a separate effective
+`wid_adj_routing` plus a per-link audit and manifest under `widths/`.
+The solver additionally writes a single combined
+`width_routing_solver_rejected_corrections_v1.csv` for inspecting every
+predicted correction that was retained raw, including its rejected candidate
+width and complete junction accounting.
+
 ### Future Width-Review Automation
 
 The current width workflow is intentionally manual:

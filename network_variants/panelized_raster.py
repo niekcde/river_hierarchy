@@ -892,6 +892,7 @@ def merge_panelized_state(
     state_panel_root: str | Path,
     run_name: str,
     output_root: str | Path,
+    parent_directed_links_path: str | Path | None = None,
 ) -> dict[str, str]:
     """Merge a mixed reused/regenerated panel workspace into a directed state."""
     from rivgraph_centerline.panelization import (
@@ -911,6 +912,9 @@ def merge_panelized_state(
         panel_root=state_panel_root,
         run_name=run_name,
         output_dir=core_dir,
+        fallback_directed_links_path=(
+            Path(parent_directed_links_path) if parent_directed_links_path is not None else None
+        ),
         overwrite=True,
         boundary_match_plan_path=Path(boundary_match_plan_path),
     )
@@ -1073,16 +1077,32 @@ def materialize_panelized_child_state(
     run_name: str,
     exit_sides_by_panel: dict[str, str],
     panel_runner: Callable[..., Any],
+    parent_directed_links_path: str | Path | None = None,
     materialize_full_mask: bool = True,
+    all_touched: bool = True,
 ) -> dict[str, object]:
     """Materialize one child state from a footprint using only affected panels."""
     source_panel_root, state_root = Path(source_panel_root), Path(state_root)
     plan = classify_panels_for_footprint(panel_plan_path=panel_plan_path, footprint=footprint, halo_distance=halo_distance)
     state_panels = state_root / "panels"
     workspace = prepare_panel_state_workspace(source_panel_root=source_panel_root, state_panel_root=state_panels, affected_panel_ids=plan["affected"])
-    edits = materialize_affected_panel_masks(panel_root=source_panel_root, output_root=state_panels, panel_ids=plan["affected"], footprint=footprint)
+    edits = materialize_affected_panel_masks(
+        panel_root=source_panel_root,
+        output_root=state_panels,
+        panel_ids=plan["affected"],
+        footprint=footprint,
+        all_touched=all_touched,
+    )
     regenerate_affected_panels(state_panel_root=state_panels, affected_panel_ids=plan["affected"], run_name=run_name, exit_sides_by_panel=exit_sides_by_panel, panel_runner=panel_runner)
-    merged = merge_panelized_state(panel_plan_path=panel_plan_path, panel_breaks_path=panel_breaks_path, boundary_match_plan_path=boundary_match_plan_path, state_panel_root=state_panels, run_name=run_name, output_root=state_root / "merged")
+    merged = merge_panelized_state(
+        panel_plan_path=panel_plan_path,
+        panel_breaks_path=panel_breaks_path,
+        boundary_match_plan_path=boundary_match_plan_path,
+        state_panel_root=state_panels,
+        run_name=run_name,
+        output_root=state_root / "merged",
+        parent_directed_links_path=parent_directed_links_path,
+    )
     if not materialize_full_mask:
         raise NotImplementedError(
             "Virtual panelized states are not yet accepted by the shared child-state contract."

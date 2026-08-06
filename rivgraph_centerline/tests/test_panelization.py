@@ -257,3 +257,66 @@ def test_assign_core_network_direction_uses_distinct_downstream_node(tmp_path: P
     directed = gpd.read_file(core_dir / "merged_links_directed.gpkg", layer="merged_links")
     assert directed.loc[0, "id_us_node"] == 10
     assert directed.loc[0, "id_ds_node"] == 11
+
+
+def test_assign_core_network_direction_inherits_exact_parent_when_panel_votes_tie(tmp_path: Path) -> None:
+    core_dir = tmp_path / "core"
+    core_dir.mkdir(parents=True)
+    crs = "EPSG:32611"
+    merged_geometry = LineString([(0, 0), (5, 0), (10, 0)])
+    gpd.GeoDataFrame(
+        {
+            "global_link_id": [7],
+            "source_segments": ["P001:1:0;P002:2:0"],
+            "id_node_a": [20],
+            "id_node_b": [21],
+        },
+        geometry=[merged_geometry],
+        crs=crs,
+    ).to_file(core_dir / "merged_links.gpkg", layer="merged_links", driver="GPKG")
+    gpd.GeoDataFrame(
+        {
+            "segment_id": ["P001:1:0", "P002:2:0"],
+            "panel_id": ["P001", "P002"],
+            "source_link_id": [1, 2],
+        },
+        geometry=[LineString([(0, 0), (5, 0)]), LineString([(10, 0), (5, 0)])],
+        crs=crs,
+    ).to_file(core_dir / "core_segments.gpkg", layer="core_segments", driver="GPKG")
+    for panel_id, link_id, geometry, upstream, downstream in (
+        ("P001", 1, LineString([(0, 0), (10, 0)]), Point(0, 0), Point(10, 0)),
+        ("P002", 2, LineString([(10, 0), (0, 0)]), Point(10, 0), Point(0, 0)),
+    ):
+        panel_dir = tmp_path / "panels" / panel_id / "rivgraph"
+        panel_dir.mkdir(parents=True)
+        gpd.GeoDataFrame(
+            {"id_link": [link_id], "id_us_node": [1], "id_ds_node": [2]},
+            geometry=[geometry],
+            crs=crs,
+        ).to_file(panel_dir / f"x_{panel_id}_links.gpkg", driver="GPKG")
+        gpd.GeoDataFrame(
+            {"id_node": [1, 2]}, geometry=[upstream, downstream], crs=crs,
+        ).to_file(panel_dir / f"x_{panel_id}_nodes.gpkg", driver="GPKG")
+    parent_path = tmp_path / "parent_directed_links.gpkg"
+    gpd.GeoDataFrame(
+        {"id_link": [99], "id_us_node": [100], "id_ds_node": [101]},
+        geometry=[merged_geometry],
+        crs=crs,
+    ).to_file(parent_path, driver="GPKG")
+
+    summary = assign_core_network_direction(
+        merged_links_path=core_dir / "merged_links.gpkg",
+        core_segments_path=core_dir / "core_segments.gpkg",
+        panel_root=tmp_path / "panels",
+        run_name="x",
+        output_dir=core_dir,
+        fallback_directed_links_path=parent_path,
+    )
+
+    assert summary["ambiguous_link_count"] == 0
+    assert summary["parent_inherited_link_count"] == 1
+    assert summary["parent_inherited_global_link_ids"] == [7]
+    directed = gpd.read_file(core_dir / "merged_links_directed.gpkg", layer="merged_links")
+    assert directed.loc[0, "id_us_node"] == 20
+    assert directed.loc[0, "id_ds_node"] == 21
+    assert directed.loc[0, "direction_status"] == "inherited_parent"

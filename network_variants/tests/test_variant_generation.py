@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import geopandas as gpd
+import networkx as nx
 import numpy as np
 import pandas as pd
 import rasterio
@@ -23,6 +24,7 @@ from network_variants.variant_generation import (
     _infer_parent_node_order,
     _match_child_links_to_parent_links,
     _match_child_nodes_to_parent_nodes,
+    _normalize_width_boolean_fields,
     _repair_invalid_directionality,
     _repair_unresolved_link_components,
     _resolve_link_by_progression,
@@ -70,6 +72,27 @@ def test_componentize_units_groups_by_shared_nodes() -> None:
     assert [component["unit_ids"] for component in components] == [[1, 2], [3]]
     assert components[0]["link_ids"] == [10, 11]
     assert components[1]["link_ids"] == [12]
+
+
+def test_normalize_width_boolean_fields_preserves_text_identifiers() -> None:
+    links = gpd.GeoDataFrame(
+        {
+            "id_link": [1, 2],
+            "collapsed_unit_ids": ["1", "1"],
+            "width_correction_applied": pd.Series([True, False], dtype=object),
+            "dry_corridor_meaningful": ["False", "True"],
+            "geometry": [LineString([(0, 0), (1, 0)]), LineString([(0, 1), (1, 1)])],
+        },
+        crs="EPSG:3857",
+    )
+
+    normalized = _normalize_width_boolean_fields(links)
+
+    assert normalized["width_correction_applied"].dtype == bool
+    assert normalized["dry_corridor_meaningful"].dtype == bool
+    assert normalized["width_correction_applied"].tolist() == [True, False]
+    assert normalized["dry_corridor_meaningful"].tolist() == [False, True]
+    assert normalized["collapsed_unit_ids"].tolist() == ["1", "1"]
 
 
 def test_trim_slice_matches_rivgraph_style_end_trimming() -> None:
@@ -785,6 +808,59 @@ def test_resolved_lineage_uses_parent_node_path_and_keeps_parallel_edges() -> No
     assert lineage_row["secondary_parent_link_ids"] == ""
     assert lineage_row["lineage_type"] == "collapsed_many_to_one"
     assert np.isclose(lineage_row["matched_parent_overlap_fraction"], 1.0)
+
+
+def test_exact_geometry_overrides_ambiguous_parallel_parent_node_path() -> None:
+    upper = LineString([(0, 0), (5, 2), (10, 0)])
+    lower = LineString([(0, 0), (5, -2), (10, 0)])
+    parent_graph = nx.MultiDiGraph()
+    parent_graph.add_edge(0, 1, key=9, id_link=9, geometry=upper)
+    parent_graph.add_edge(0, 1, key=10, id_link=10, geometry=lower)
+    child_links = gpd.GeoDataFrame(
+        {
+            "id_link": [100],
+            "id_us_node": [20],
+            "id_ds_node": [21],
+        },
+        geometry=[upper],
+        crs="EPSG:3857",
+    )
+    node_match = pd.DataFrame(
+        {
+            "child_id_node": [20, 21],
+            "matched_parent_node_id": [0, 1],
+        }
+    )
+    link_match = pd.DataFrame(
+        {
+            "child_id_link": [100, 100],
+            "parent_id_link": [9, 10],
+            "candidate_rank": [1, 2],
+            "candidate_class": ["core_overlap", "touch_only"],
+            "child_overlap_fraction": [1.0, 0.0],
+            "child_overlap_length": [upper.length, 0.0],
+                "child_core_overlap_fraction": [1.0, 0.0],
+                "child_core_overlap_length": [upper.length, 0.0],
+                "parent_overlap_fraction": [1.0, 0.0],
+                "parent_overlap_length": [upper.length, 0.0],
+                "parent_core_overlap_fraction": [1.0, 0.0],
+                "parent_core_overlap_length": [upper.length, 0.0],
+            }
+        )
+
+    lineage = _resolve_link_lineage(
+        parent_graph=parent_graph,
+        directed_child_links=child_links,
+        node_match=node_match,
+        link_match=link_match,
+        match_tolerance=1.0,
+    ).iloc[0]
+
+    assert lineage["lineage_type"] == "unchanged_1to1"
+    assert lineage["dominant_parent_link_id"] == 9
+    assert lineage["matched_parent_link_ids"] == "9"
+    assert lineage["touch_parent_link_ids"] == "10"
+    assert lineage["lineage_method"] == "exact_geometry_override_parent_node_path"
 
 
 def test_assign_variant_directions_preserves_canonical_parent_outlet() -> None:
