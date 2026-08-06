@@ -8,6 +8,8 @@ __pycache__/
 tmp/
 **/output/
 **/outputs/
+# The network-variant output path may be a symlink to external storage.
+/network_variants/output
 **/experiments/
 **/configs/outputs/
 *.gpkg-shm
