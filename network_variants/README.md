@@ -153,6 +153,16 @@ and inflated width relative to a clean family representative, the final width
 summary can inherit from that representative. This inheritance is applied only
 to the final link-family outputs, not to the raw sample table.
 
+Anchored derivation reuses complete width products for links whose geometry is
+unchanged from the realized state. A newly numbered anchored stub may instead
+reuse one unique exact geometry from the reviewed base state. Only unmatched
+new or shortened segments are recalculated with link-local raster windows.
+The variant manifest records this classification under `anchored_width_patch`
+and its internal timings under `anchored_stage_timings`. Each completed child
+state also writes `stage_timings.json` for variant generation, hierarchy, and
+hydraulic-context timing. The downstream hierarchy, slope, hydraulic, and
+equivalent-resistance workflows still run on the complete anchored graph.
+
 These final family-summary width fields now also matter downstream in RAPID
 prep and equivalent-resistance workflows. The current default reference-width
 choice for derived `kb` calculations is `wid_adj_wet`, and the reference-

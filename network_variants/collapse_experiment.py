@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -2946,6 +2947,11 @@ def _build_child_state(
     hydraulic_context_runner: Callable[..., StateHydraulicContextOutputs],
     hydraulic_context_kwargs: Mapping[str, Any] | None = None,
 ) -> ExperimentStateContext:
+    state_started = time.perf_counter()
+    stage_timings: dict[str, float | str] = {
+        "schema_version": "collapse-state-stage-timings-v1",
+        "state_id": state_id,
+    }
     _reset_state_dir(state_dir)
     variant_dir = state_dir / "variant"
     variant_call_kwargs = dict(variant_kwargs)
@@ -2974,12 +2980,15 @@ def _build_child_state(
         variant_call_kwargs["group_label"] = None
         variant_call_kwargs["unit_ids"] = list(selection.selected_unit_ids)
 
+    variant_started = time.perf_counter()
     variant_outputs = variant_runner(**variant_call_kwargs)
+    stage_timings["variant_generation_seconds"] = time.perf_counter() - variant_started
 
     analysis_links_path = _variant_analysis_links_path(
         variant_output_dir=variant_outputs.output_dir,
         directed_links_path=variant_outputs.directed_links_path,
     )
+    hierarchy_started = time.perf_counter()
     child_context = _run_state_hierarchy(
         state_id=state_id,
         parent_state_id=parent_context.state_id,
@@ -2994,11 +3003,25 @@ def _build_child_state(
         unit_workflow_writer=unit_workflow_writer,
         unit_workflow_kwargs=unit_workflow_kwargs,
     )
+    stage_timings["hierarchy_seconds"] = time.perf_counter() - hierarchy_started
     child_context.variant_output_dir = variant_outputs.output_dir
+    hydraulic_started = time.perf_counter()
     child_context = _run_state_hydraulic_context(
         context=child_context,
         hydraulic_context_runner=hydraulic_context_runner,
         hydraulic_context_kwargs=hydraulic_context_kwargs,
+    )
+    stage_timings["hydraulic_context_seconds"] = time.perf_counter() - hydraulic_started
+    stage_timings["state_total_seconds"] = time.perf_counter() - state_started
+    (state_dir / "stage_timings.json").write_text(
+        json.dumps(
+            {
+                key: round(float(value), 6) if isinstance(value, float) else value
+                for key, value in stage_timings.items()
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
     )
     return child_context
 

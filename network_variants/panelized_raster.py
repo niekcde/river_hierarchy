@@ -43,6 +43,7 @@ def compute_panelized_base_width_families(
     bank_labels_path: str | Path,
     origin_mask_path: str | Path,
     bank_candidate_neighbors_max: int = 2048,
+    width_method: str = "two_bank_panelized_windowed",
 ) -> tuple[Any, pd.DataFrame]:
     """Compute regular two-bank base widths from bounded link-local raster windows."""
     required = {"id_link", "sample_index", "width", "x", "y"}
@@ -64,7 +65,7 @@ def compute_panelized_base_width_families(
     summary_records: list[dict[str, object]] = []
     n_links = int(len(links))
     print(
-        f"Computing panelized two-bank widths for {n_links} links "
+        f"Computing windowed two-bank widths for {n_links} links "
         f"and {len(source_samples)} samples...",
         flush=True,
     )
@@ -167,7 +168,7 @@ def compute_panelized_base_width_families(
                             "qc_relative_dt_diff": float("nan"),
                             "qc_opposition_cos": float("nan"),
                             "qc_width_chord_diff": float("nan"),
-                            "width_method": "two_bank_panelized_windowed",
+                            "width_method": width_method,
                             "width_invalid": True,
                         }
                     )
@@ -229,7 +230,7 @@ def compute_panelized_base_width_families(
                         "qc_relative_dt_diff": relative_dt_diff,
                         "qc_opposition_cos": opposition,
                         "qc_width_chord_diff": chord_diff,
-                        "width_method": "two_bank_panelized_windowed",
+                        "width_method": width_method,
                         "width_invalid": False,
                     }
                 )
@@ -292,11 +293,11 @@ def compute_panelized_base_width_families(
                     "qc_min_opposition_cos": (
                         float(np.nanmin(qc_opposition)) if np.isfinite(qc_opposition).any() else float("nan")
                     ),
-                    "width_method": "two_bank_panelized_windowed",
+                    "width_method": width_method,
                 }
             )
             if link_number % 25 == 0 or link_number == n_links:
-                print(f"  panelized widths: {link_number}/{n_links} links", flush=True)
+                print(f"  windowed widths: {link_number}/{n_links} links", flush=True)
 
     enriched = links.merge(pd.DataFrame.from_records(summary_records), on="id_link", how="left", validate="1:1")
     return enriched, pd.DataFrame.from_records(sample_records)
@@ -425,6 +426,7 @@ def compute_panelized_child_width_patch(
             bank_labels_path=bank_labels_path,
             origin_mask_path=origin_mask_path,
             bank_candidate_neighbors_max=bank_candidate_neighbors_max,
+            width_method="two_bank_segmented_windowed",
         )
     else:
         changed_enriched = changed_links.copy()
@@ -483,12 +485,24 @@ def compute_panelized_child_width_patch(
     }
 
 
-def compute_panelized_segmented_width_patch(
+def _same_linear_geometry(left: Any, right: Any, *, tolerance: float = 1e-8) -> bool:
+    """Return whether two link geometries trace the same line in either direction."""
+    if left is None or right is None or left.is_empty or right.is_empty:
+        return False
+    if abs(float(left.length) - float(right.length)) > tolerance:
+        return False
+    return bool(left.equals(right) or left.hausdorff_distance(right) <= tolerance)
+
+
+def compute_segmented_width_patch(
     *,
     segmented_links: Any,
     source_links: Any,
     source_width_links: Any,
     source_width_samples: pd.DataFrame,
+    secondary_source_links: Any | None = None,
+    secondary_source_width_links: Any | None = None,
+    secondary_source_width_samples: pd.DataFrame | None = None,
     bank_labels_path: str | Path,
     origin_mask_path: str | Path,
     bank_candidate_neighbors_max: int = 2048,
@@ -496,9 +510,11 @@ def compute_panelized_segmented_width_patch(
     """Patch widths after links are split without changing the underlying mask.
 
     Links retaining both their identifier and geometry inherit their complete
-    source width products. New or shortened links receive the source link's raw
-    distance-transform samples partitioned by nearest segmented geometry and
-    are recomputed with bounded raster windows.
+    primary-source width products. Remaining links may inherit from one unique
+    exact geometry in the optional secondary source (normally the reviewed base
+    state). New or shortened links receive the primary source link's raw width
+    samples partitioned by nearest segmented geometry and are recomputed with
+    bounded raster windows.
     """
     import geopandas as gpd
 
@@ -527,17 +543,58 @@ def compute_panelized_segmented_width_patch(
         source_width_links["id_link"], errors="raise"
     ).astype(int)
 
+    secondary_links = None
+    secondary_width_links = None
+    secondary_width_samples = None
+    secondary_arguments = (
+        secondary_source_links,
+        secondary_source_width_links,
+        secondary_source_width_samples,
+    )
+    if any(value is not None for value in secondary_arguments):
+        if not all(value is not None for value in secondary_arguments):
+            raise ValueError(
+                "Secondary source links, width links, and width samples must be supplied together."
+            )
+        secondary_links = secondary_source_links.copy()
+        secondary_links["id_link"] = pd.to_numeric(
+            secondary_links["id_link"], errors="raise"
+        ).astype(int)
+        if secondary_links.crs != segmented.crs:
+            secondary_links = secondary_links.to_crs(segmented.crs)
+        secondary_width_links = secondary_source_width_links.copy()
+        secondary_width_links["id_link"] = pd.to_numeric(
+            secondary_width_links["id_link"], errors="raise"
+        ).astype(int)
+        secondary_width_samples = secondary_source_width_samples.copy()
+
     source_by_id = source.set_index("id_link", drop=False)
     reused_source_by_segmented: dict[int, int] = {}
     changed_ids: set[int] = set()
     for row in segmented.itertuples(index=False):
         link_id = int(row.id_link)
-        if link_id in source_by_id.index and row.geometry.equals_exact(
-            source_by_id.loc[link_id].geometry, tolerance=1e-8
+        if link_id in source_by_id.index and _same_linear_geometry(
+            row.geometry, source_by_id.loc[link_id].geometry
         ):
             reused_source_by_segmented[link_id] = link_id
         else:
             changed_ids.add(link_id)
+
+    reused_secondary_by_segmented: dict[int, int] = {}
+    ambiguous_secondary_ids: list[int] = []
+    if secondary_links is not None:
+        for child_id in sorted(changed_ids):
+            geometry = segmented.loc[segmented["id_link"].eq(child_id)].geometry.iloc[0]
+            matches = secondary_links.loc[
+                secondary_links.geometry.apply(
+                    lambda candidate: _same_linear_geometry(geometry, candidate)
+                )
+            ]
+            if len(matches) == 1:
+                reused_secondary_by_segmented[child_id] = int(matches.iloc[0]["id_link"])
+            elif len(matches) > 1:
+                ambiguous_secondary_ids.append(child_id)
+        changed_ids.difference_update(reused_secondary_by_segmented)
 
     with rasterio.open(origin_mask_path) as origin:
         pixel_length = float(max(abs(origin.transform.a), abs(origin.transform.e)))
@@ -545,7 +602,9 @@ def compute_panelized_segmented_width_patch(
 
     changed = segmented.loc[segmented["id_link"].isin(changed_ids)].copy()
     changed_to_source: dict[int, int] = {}
-    for row in changed.itertuples(index=False):
+    partition_only_to_source: dict[int, int] = {}
+
+    def best_primary_source_id(row: Any) -> int:
         best_source_id: int | None = None
         best_score: tuple[float, float] | None = None
         for source_row in source.itertuples(index=False):
@@ -561,37 +620,77 @@ def compute_panelized_segmented_width_patch(
                 best_source_id = int(source_row.id_link)
         if best_source_id is None or best_score is None or best_score[0] <= 0:
             raise ValueError(f"Could not identify the source link for segmented link {row.id_link}.")
-        changed_to_source[int(row.id_link)] = best_source_id
+        return best_source_id
+
+    for row in changed.itertuples(index=False):
+        changed_to_source[int(row.id_link)] = best_primary_source_id(row)
+    for child_id in sorted(reused_secondary_by_segmented):
+        row = segmented.loc[segmented["id_link"].eq(child_id)].iloc[0]
+        partition_only_to_source[child_id] = best_primary_source_id(row)
+
+    ownership_to_source = {**changed_to_source, **partition_only_to_source}
 
     source_sample_ids = pd.to_numeric(
         source_width_samples["id_link"], errors="raise"
     ).astype(int)
     raw_records: list[dict[str, object]] = []
-    changed_by_id = changed.set_index("id_link", drop=False)
-    for source_id in sorted(set(changed_to_source.values())):
-        child_ids = sorted(
+    for source_id in sorted(set(ownership_to_source.values())):
+        ownership_child_ids = sorted(
             child_id
-            for child_id, mapped_source_id in changed_to_source.items()
+            for child_id, mapped_source_id in ownership_to_source.items()
             if mapped_source_id == source_id
+        )
+        recomputed_child_ids = sorted(
+            child_id for child_id in ownership_child_ids if child_id in changed_ids
         )
         samples = source_width_samples.loc[source_sample_ids == source_id].copy()
         if samples.empty:
             raise ValueError(f"Source width samples are unavailable for link {source_id}.")
 
         child_geometries = {
-            child_id: changed_by_id.loc[child_id].geometry for child_id in child_ids
+            child_id: segmented.loc[segmented["id_link"].eq(child_id)].geometry.iloc[0]
+            for child_id in ownership_child_ids
         }
-        assigned: dict[int, list[pd.Series]] = {child_id: [] for child_id in child_ids}
+        source_geometry = source_by_id.loc[source_id].geometry
+        child_order = {
+            child_id: order
+            for order, child_id in enumerate(
+                sorted(
+                    ownership_child_ids,
+                    key=lambda candidate: float(
+                        source_geometry.project(
+                            child_geometries[candidate].interpolate(0.5, normalized=True)
+                        )
+                    ),
+                )
+            )
+        }
+        assigned: dict[int, list[pd.Series]] = {
+            child_id: [] for child_id in ownership_child_ids
+        }
         for _, sample in samples.iterrows():
             point = Point(float(sample["x"]), float(sample["y"]))
+            distances = {
+                candidate: float(point.distance(child_geometries[candidate]))
+                for candidate in ownership_child_ids
+            }
             child_id = min(
-                child_ids,
+                ownership_child_ids,
                 key=lambda candidate: (
-                    float(point.distance(child_geometries[candidate])),
+                    distances[candidate],
                     candidate,
                 ),
             )
             assigned[child_id].append(sample)
+            # RivGraph's segmented pixel chains retain a boundary pixel on
+            # the upstream side of a cut. Mirror that behavior for
+            # recalculated segments so their summaries match a full rerun.
+            for adjacent_id in recomputed_child_ids:
+                if (
+                    child_order[adjacent_id] < child_order[child_id]
+                    and distances[adjacent_id] <= coverage_tolerance
+                ):
+                    assigned[adjacent_id].append(sample)
 
         finite_source_widths = pd.to_numeric(samples[raw_width_field], errors="coerce")
         finite_source_widths = finite_source_widths.loc[
@@ -601,7 +700,7 @@ def compute_panelized_segmented_width_patch(
             raise ValueError(f"Source link {source_id} has no finite positive raw widths.")
         fallback_width = float(finite_source_widths.median())
 
-        for child_id in child_ids:
+        for child_id in recomputed_child_ids:
             geometry = child_geometries[child_id]
             child_samples = assigned[child_id]
             if len(child_samples) < 2:
@@ -690,6 +789,15 @@ def compute_panelized_segmented_width_patch(
     missing_width_columns = sorted(set(width_columns).difference(source_width_links.columns))
     if missing_width_columns:
         raise ValueError(f"Source width links are missing patch fields: {missing_width_columns}")
+    if secondary_width_links is not None:
+        missing_secondary_width_columns = sorted(
+            set(width_columns).difference(secondary_width_links.columns)
+        )
+        if missing_secondary_width_columns:
+            raise ValueError(
+                "Secondary source width links are missing patch fields: "
+                f"{missing_secondary_width_columns}"
+            )
 
     summary_frames: list[pd.DataFrame] = []
     if changed_ids:
@@ -699,6 +807,11 @@ def compute_panelized_segmented_width_patch(
             ]
         )
     source_width_index = source_width_links.set_index("id_link", drop=False)
+    secondary_width_index = (
+        secondary_width_links.set_index("id_link", drop=False)
+        if secondary_width_links is not None
+        else None
+    )
     reused_records: list[dict[str, object]] = []
     for child_id, source_id in sorted(reused_source_by_segmented.items()):
         if source_id not in source_width_index.index:
@@ -716,6 +829,23 @@ def compute_panelized_segmented_width_patch(
                 reused_records, columns=["id_link", *width_columns]
             )
         )
+    secondary_reused_records: list[dict[str, object]] = []
+    for child_id, source_id in sorted(reused_secondary_by_segmented.items()):
+        if secondary_width_index is None or source_id not in secondary_width_index.index:
+            raise ValueError(f"Secondary source width link {source_id} is unavailable.")
+        source_row = secondary_width_index.loc[source_id]
+        secondary_reused_records.append(
+            {
+                "id_link": child_id,
+                **{column: source_row[column] for column in width_columns},
+            }
+        )
+    if secondary_reused_records:
+        summary_frames.append(
+            pd.DataFrame.from_records(
+                secondary_reused_records, columns=["id_link", *width_columns]
+            )
+        )
     summary = pd.concat(summary_frames, ignore_index=True)
     segmented_ids = set(segmented["id_link"].astype(int))
     if summary["id_link"].duplicated().any() or set(summary["id_link"].astype(int)) != segmented_ids:
@@ -731,6 +861,20 @@ def compute_panelized_segmented_width_patch(
             raise ValueError(f"Source width samples are unavailable for link {source_id}.")
         selected["id_link"] = child_id
         reused_samples.append(selected)
+    if secondary_width_samples is not None:
+        secondary_sample_ids = pd.to_numeric(
+            secondary_width_samples["id_link"], errors="raise"
+        ).astype(int)
+        for child_id, source_id in sorted(reused_secondary_by_segmented.items()):
+            selected = secondary_width_samples.loc[
+                secondary_sample_ids == source_id
+            ].copy()
+            if selected.empty:
+                raise ValueError(
+                    f"Secondary source width samples are unavailable for link {source_id}."
+                )
+            selected["id_link"] = child_id
+            reused_samples.append(selected)
     sample_frames = reused_samples + (
         [changed_width_samples] if not changed_width_samples.empty else []
     )
@@ -748,13 +892,35 @@ def compute_panelized_segmented_width_patch(
         "n_source_links": int(len(source)),
         "n_segmented_links": int(len(segmented)),
         "n_recomputed_links": int(len(changed_ids)),
-        "n_reused_links": int(len(reused_source_by_segmented)),
+        "n_reused_links": int(
+            len(reused_source_by_segmented) + len(reused_secondary_by_segmented)
+        ),
+        "n_reused_primary_links": int(len(reused_source_by_segmented)),
+        "n_reused_secondary_links": int(len(reused_secondary_by_segmented)),
         "recomputed_link_ids": sorted(changed_ids),
+        "primary_source_link_by_reused_link": {
+            str(child_id): int(source_id)
+            for child_id, source_id in sorted(reused_source_by_segmented.items())
+        },
+        "secondary_source_link_by_reused_link": {
+            str(child_id): int(source_id)
+            for child_id, source_id in sorted(reused_secondary_by_segmented.items())
+        },
+        "ambiguous_secondary_link_ids": sorted(ambiguous_secondary_ids),
         "source_link_by_recomputed_link": {
             str(child_id): int(source_id)
             for child_id, source_id in sorted(changed_to_source.items())
         },
+        "primary_partition_source_by_secondary_reused_link": {
+            str(child_id): int(source_id)
+            for child_id, source_id in sorted(partition_only_to_source.items())
+        },
     }
+
+
+def compute_panelized_segmented_width_patch(**kwargs: Any) -> tuple[Any, pd.DataFrame, dict[str, object]]:
+    """Backward-compatible name for the general segmented-width patch."""
+    return compute_segmented_width_patch(**kwargs)
 
 
 def write_panel_origin_and_bank_labels(

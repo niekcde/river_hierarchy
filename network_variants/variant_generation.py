@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -4488,6 +4489,8 @@ def derive_anchored_variant_from_realized(
     min_transect_pixels: float = DEFAULT_MIN_TRANSECT_PIXELS,
     match_tolerance: float | None = None,
 ) -> NetworkVariantOutputs:
+    derive_started = time.perf_counter()
+    stage_timings: dict[str, float] = {}
     source_output_path = Path(source_output_dir)
     output_path = Path(output_dir)
     source_manifest_path = source_output_path / "summary" / "variant_manifest.json"
@@ -4503,9 +4506,12 @@ def derive_anchored_variant_from_realized(
     example_id = str(example_id) if example_id is not None else str(source_manifest.get("example_id"))
     variant_id = str(variant_id) if variant_id is not None else str(source_manifest.get("variant_id"))
 
+    copy_started = time.perf_counter()
     if output_path.exists():
         shutil.rmtree(output_path)
     shutil.copytree(source_output_path, output_path)
+    stage_timings["copy_realized_variant_seconds"] = time.perf_counter() - copy_started
+    setup_started = time.perf_counter()
 
     output_paths = {
         key: _remap_copied_output_path(
@@ -4565,22 +4571,19 @@ def derive_anchored_variant_from_realized(
 
     directed_links = gpd.read_file(directed_links_path)
     directed_nodes = gpd.read_file(directed_nodes_path)
-    realized_directed_links = directed_links.copy() if panelized_execution else None
-    realized_width_links = None
-    realized_width_samples = None
-    if panelized_execution:
-        realized_width_links_path = output_paths.get("links_with_width_families")
-        realized_width_samples_path = output_paths.get("link_width_samples")
-        if realized_width_links_path is None or not realized_width_links_path.exists():
-            raise FileNotFoundError(
-                "Panelized anchored derivation requires the realized links-with-width-families product."
-            )
-        if realized_width_samples_path is None or not realized_width_samples_path.exists():
-            raise FileNotFoundError(
-                "Panelized anchored derivation requires the realized link-width samples."
-            )
-        realized_width_links = gpd.read_file(realized_width_links_path)
-        realized_width_samples = pd.read_csv(realized_width_samples_path)
+    realized_directed_links = directed_links.copy()
+    realized_width_links_path = output_paths.get("links_with_width_families")
+    realized_width_samples_path = output_paths.get("link_width_samples")
+    if realized_width_links_path is None or not realized_width_links_path.exists():
+        raise FileNotFoundError(
+            "Anchored derivation requires the realized links-with-width-families product."
+        )
+    if realized_width_samples_path is None or not realized_width_samples_path.exists():
+        raise FileNotFoundError(
+            "Anchored derivation requires the realized link-width samples."
+        )
+    realized_width_links = gpd.read_file(realized_width_links_path)
+    realized_width_samples = pd.read_csv(realized_width_samples_path)
     node_match = pd.read_csv(node_match_path)
     link_match = pd.read_csv(link_match_path)
     link_lineage = pd.read_csv(link_lineage_path)
@@ -4589,6 +4592,12 @@ def derive_anchored_variant_from_realized(
 
     reviewed_links = gpd.read_file(reviewed_links_path)
     reviewed_nodes = gpd.read_file(reviewed_nodes_path)
+    parent_width_samples_path = Path(reviewed_links_path).with_name("link_width_samples.csv")
+    parent_width_samples = (
+        pd.read_csv(parent_width_samples_path)
+        if parent_width_samples_path.exists()
+        else None
+    )
     with rasterio.open(collapsed_mask_path) as src:
         pixel_length = _pixel_length_from_transform(src.transform)
         collapsed_profile = src.profile.copy()
@@ -4637,7 +4646,9 @@ def derive_anchored_variant_from_realized(
             output_path=bank_labels_path,
             profile=collapsed_profile,
         )
+    stage_timings["load_and_bank_setup_seconds"] = time.perf_counter() - setup_started
 
+    segmentation_started = time.perf_counter()
     parent_node_order, _, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
     _, parent_graph, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
     nominal_upstream_node, nominal_downstream_node = _selection_anchor_nodes(
@@ -4685,7 +4696,11 @@ def derive_anchored_variant_from_realized(
         "issues": list(anchor_segmentation_summary.get("issues", [])),
         "validation_report": anchor_segmentation_summary.get("validation_report", {}),
     }
+    stage_timings["anchor_segmentation_and_matching_seconds"] = (
+        time.perf_counter() - segmentation_started
+    )
 
+    sword_started = time.perf_counter()
     effective_sword_wse_field = sword_wse_field or source_manifest.get("sword_matching", {}).get("wse_field")
     directed_nodes, node_sword_match, sword_match_summary = match_variant_nodes_to_sword(
         directed_nodes=directed_nodes,
@@ -4699,6 +4714,7 @@ def derive_anchored_variant_from_realized(
         sword_station_match_source_path=sword_station_match_source_path,
         sword_reach_buffer_steps=sword_reach_buffer_steps,
     )
+    stage_timings["sword_matching_seconds"] = time.perf_counter() - sword_started
 
     group_label = source_manifest.get("group_label")
     node_match = _apply_collapsed_selection_metadata(
@@ -4736,37 +4752,30 @@ def derive_anchored_variant_from_realized(
         errors="ignore",
     ).merge(link_lineage, on="id_link", how="left", validate="1:1")
 
-    anchored_width_patch_summary = None
-    if panelized_execution:
-        from network_variants.panelized_raster import compute_panelized_segmented_width_patch
+    width_patch_started = time.perf_counter()
+    from network_variants.panelized_raster import compute_segmented_width_patch
 
-        if (
-            realized_directed_links is None
-            or realized_width_links is None
-            or realized_width_samples is None
-        ):
-            raise RuntimeError("Panelized realized width inputs were not initialized.")
-        enriched_links, anchored_link_width_samples, anchored_width_patch_summary = (
-            compute_panelized_segmented_width_patch(
-                segmented_links=directed_links,
-                source_links=realized_directed_links,
-                source_width_links=realized_width_links,
-                source_width_samples=realized_width_samples,
-                bank_labels_path=bank_labels_path,
-                origin_mask_path=origin_mask_path,
-                bank_candidate_neighbors_max=bank_candidate_neighbors_max,
-            )
-        )
-    else:
-        enriched_links, anchored_link_width_samples = compute_width_families(
-            directed_links,
-            collapsed_mask_path=collapsed_mask_path,
-            wet_reference_mask_path=wet_reference_mask_path,
-            origin_mask_path=origin_mask_path,
-            rivgraph_distance_path=rivgraph_distance_path,
+    secondary_width_kwargs: dict[str, object] = {}
+    if parent_width_samples is not None:
+        secondary_width_kwargs = {
+            "secondary_source_links": reviewed_links,
+            "secondary_source_width_links": reviewed_links,
+            "secondary_source_width_samples": parent_width_samples,
+        }
+    enriched_links, anchored_link_width_samples, anchored_width_patch_summary = (
+        compute_segmented_width_patch(
+            segmented_links=directed_links,
+            source_links=realized_directed_links,
+            source_width_links=realized_width_links,
+            source_width_samples=realized_width_samples,
             bank_labels_path=bank_labels_path,
+            origin_mask_path=origin_mask_path,
             bank_candidate_neighbors_max=bank_candidate_neighbors_max,
+            **secondary_width_kwargs,
         )
+    )
+    stage_timings["targeted_width_patch_seconds"] = time.perf_counter() - width_patch_started
+    width_finalize_started = time.perf_counter()
     link_width_samples = _apply_collapsed_selection_metadata(
         anchored_link_width_samples,
         unit_ids=selected_unit_ids,
@@ -4779,18 +4788,15 @@ def derive_anchored_variant_from_realized(
     )
 
     directed_enriched_links = _merge_width_families_onto_links(directed_links, enriched_links)
-    parent_width_samples_path = Path(reviewed_links_path).with_name("link_width_samples.csv")
-    parent_width_samples = (
-        pd.read_csv(parent_width_samples_path)
-        if parent_width_samples_path.exists()
-        else pd.DataFrame()
+    parent_width_samples_for_inheritance = (
+        parent_width_samples if parent_width_samples is not None else pd.DataFrame()
     )
     directed_enriched_links, link_width_samples, width_product_inheritance = (
         inherit_unchanged_link_width_products(
             child_links=directed_enriched_links,
             child_width_samples=link_width_samples,
             parent_links=reviewed_links,
-            parent_width_samples=parent_width_samples,
+            parent_width_samples=parent_width_samples_for_inheritance,
             link_lineage=link_lineage,
         )
     )
@@ -4828,7 +4834,11 @@ def derive_anchored_variant_from_realized(
         link_width_samples=link_width_samples,
         directed_enriched_links=directed_enriched_links,
     )
+    stage_timings["width_inheritance_and_routing_seconds"] = (
+        time.perf_counter() - width_finalize_started
+    )
 
+    serialization_started = time.perf_counter()
     link_match.to_csv(matching_dir / "link_match.csv", index=False)
     link_lineage.to_csv(matching_dir / "link_lineage.csv", index=False)
     node_match.to_csv(matching_dir / "node_match.csv", index=False)
@@ -4837,15 +4847,15 @@ def derive_anchored_variant_from_realized(
     directed_nodes.to_file(directed_nodes_path, driver="GPKG")
     with (directed_dir / "direction_validation_report.json").open("w", encoding="utf-8") as handle:
         json.dump(direction_summary["validation_report"], handle, indent=2)
+    stage_timings["variant_output_serialization_seconds"] = (
+        time.perf_counter() - serialization_started
+    )
+    stage_timings["anchored_variant_total_seconds"] = time.perf_counter() - derive_started
 
     manifest = dict(source_manifest)
     manifest["collapse_corridor_mode"] = "anchored"
     manifest["anchor_segmentation"] = anchor_segmentation_summary
-    width_scope_description = (
-        "targeted anchored-link width patch with exact unchanged-link reuse"
-        if anchored_width_patch_summary is not None
-        else "total/wet/dry width-family recomputation"
-    )
+    width_scope_description = "targeted anchored-link width patch with exact unchanged-link reuse"
     manifest["scope"] = [
         "collapsed mask reuse from realized variant",
         "anchored corridor segmentation",
@@ -4856,6 +4866,9 @@ def derive_anchored_variant_from_realized(
     manifest["segmented_stub_inheritance"] = segmented_stub_inheritance_summary
     manifest["width_product_inheritance"] = width_product_inheritance
     manifest["routing_width_application"] = routing_width_application
+    manifest["anchored_stage_timings"] = {
+        key: round(float(value), 6) for key, value in stage_timings.items()
+    }
     if anchored_width_patch_summary is not None:
         manifest["anchored_width_patch"] = anchored_width_patch_summary
     manifest["ready_for_rapid"] = bool(direction_summary.get("is_valid", False))

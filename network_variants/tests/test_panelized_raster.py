@@ -9,7 +9,7 @@ from shapely.geometry import LineString, box
 import geopandas as gpd
 
 import network_variants.panelized_raster as panelized_raster_module
-from network_variants.panelized_raster import apply_panel_collapse_edit, classify_panels_for_footprint, compute_panelized_base_width_families, compute_panelized_child_width_patch, compute_panelized_segmented_width_patch, materialize_affected_panel_masks, merge_panel_two_bank_widths, prepare_panel_state_workspace, regenerate_affected_panels, write_panel_origin_and_bank_labels, write_panelized_state_mosaic, write_state_bank_labels_windowed
+from network_variants.panelized_raster import apply_panel_collapse_edit, classify_panels_for_footprint, compute_panelized_base_width_families, compute_panelized_child_width_patch, compute_panelized_segmented_width_patch, compute_segmented_width_patch, materialize_affected_panel_masks, merge_panel_two_bank_widths, prepare_panel_state_workspace, regenerate_affected_panels, write_panel_origin_and_bank_labels, write_panelized_state_mosaic, write_state_bank_labels_windowed
 
 
 def _write(path: Path, values: np.ndarray) -> None:
@@ -266,6 +266,94 @@ def test_segmented_width_patch_recomputes_only_split_links(
     assert summary["n_recomputed_links"] == 2
     assert summary["n_reused_links"] == 1
     assert summary["source_link_by_recomputed_link"] == {"0": 0, "2": 0}
+
+
+def test_segmented_width_patch_reuses_unique_exact_secondary_link(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source_links = gpd.GeoDataFrame(
+        {"id_link": [0, 1]},
+        geometry=[
+            LineString([(0, 0), (10, 0)]),
+            LineString([(0, 5), (10, 5)]),
+        ],
+        crs="EPSG:32611",
+    )
+    segmented_links = gpd.GeoDataFrame(
+        {"id_link": [0, 1, 2]},
+        geometry=[
+            LineString([(0, 0), (5, 0)]),
+            LineString([(0, 5), (10, 5)]),
+            LineString([(5, 0), (10, 0)]),
+        ],
+        crs=source_links.crs,
+    )
+    source_width_links = source_links.copy()
+    source_width_links["width_metric"] = [10.0, 20.0]
+    source_samples = pd.DataFrame(
+        {
+            "id_link": [0, 0, 0, 1, 1],
+            "sample_index": [0, 1, 2, 0, 1],
+            "x": [0.0, 5.0, 10.0, 0.0, 10.0],
+            "y": [0.0, 0.0, 0.0, 5.0, 5.0],
+            "dt_width_global": [10.0, 10.0, 10.0, 20.0, 20.0],
+            "width_metric_sample": [10.0, 10.0, 10.0, 20.0, 20.0],
+        }
+    )
+    secondary_links = gpd.GeoDataFrame(
+        {"id_link": [9], "width_metric": [42.0]},
+        geometry=[LineString([(10, 0), (5, 0)])],
+        crs=source_links.crs,
+    )
+    secondary_samples = pd.DataFrame(
+        {
+            "id_link": [9, 9],
+            "sample_index": [0, 1],
+            "x": [5.0, 10.0],
+            "y": [0.0, 0.0],
+            "dt_width_global": [42.0, 42.0],
+            "width_metric_sample": [42.0, 42.0],
+        }
+    )
+    origin_path = tmp_path / "origin.tif"
+    _write(origin_path, np.ones((12, 12), dtype="uint16"))
+    calls: list[list[int]] = []
+
+    def fake_widths(links, samples, **kwargs):
+        calls.append(sorted(links["id_link"].astype(int).tolist()))
+        enriched = links.copy()
+        enriched["width_metric"] = 99.0
+        return enriched, samples.rename(columns={"width": "width_metric_sample"})
+
+    monkeypatch.setattr(
+        panelized_raster_module,
+        "compute_panelized_base_width_families",
+        fake_widths,
+    )
+    enriched, samples, summary = compute_segmented_width_patch(
+        segmented_links=segmented_links,
+        source_links=source_links,
+        source_width_links=source_width_links,
+        source_width_samples=source_samples,
+        secondary_source_links=secondary_links,
+        secondary_source_width_links=secondary_links,
+        secondary_source_width_samples=secondary_samples,
+        bank_labels_path=tmp_path / "unused_banks.tif",
+        origin_mask_path=origin_path,
+    )
+
+    assert calls == [[0]]
+    assert enriched.set_index("id_link")["width_metric"].to_dict() == {
+        0: 99.0,
+        1: 20.0,
+        2: 42.0,
+    }
+    assert set(samples["id_link"].astype(int)) == {0, 1, 2}
+    assert summary["n_recomputed_links"] == 1
+    assert summary["n_reused_primary_links"] == 1
+    assert summary["n_reused_secondary_links"] == 1
+    assert summary["secondary_source_link_by_reused_link"] == {"2": 9}
 
 
 def test_state_mosaic_intersects_cropped_panel_bounds(tmp_path: Path) -> None:

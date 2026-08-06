@@ -620,6 +620,15 @@ def test_independent_units_creates_one_child_per_base_unit(tmp_path: Path) -> No
     assert list(results.state_registry["parent_state_id"]) == ["", "S000_base", "S000_base", "S000_base"]
     assert list(results.state_registry["depth"]) == [0, 1, 1, 1]
     assert results.manifest["stop_reason"] == "all_base_units_processed"
+    for state_id in ("S001_unit_5", "S002_unit_7", "S003_unit_2"):
+        timing_path = tmp_path / "experiment" / "states" / state_id / "stage_timings.json"
+        timing = json.loads(timing_path.read_text(encoding="utf-8"))
+        assert timing["schema_version"] == "collapse-state-stage-timings-v1"
+        assert timing["state_id"] == state_id
+        assert timing["variant_generation_seconds"] >= 0
+        assert timing["hierarchy_seconds"] >= 0
+        assert timing["hydraulic_context_seconds"] >= 0
+        assert timing["state_total_seconds"] >= 0
 
 
 def test_independent_units_can_filter_to_requested_unit_ids(tmp_path: Path) -> None:
