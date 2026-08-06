@@ -475,3 +475,20 @@ def test_write_wave_mp4_requires_ffmpeg(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr("rapid_tools.analysis.shutil.which", lambda _name: None)
     with pytest.raises(RuntimeError, match="ffmpeg"):
         write_wave_mp4(indep_dir, "S046_unit_10")
+
+
+def test_wave_peak_timing_uses_local_threshold_crossings() -> None:
+    stack = analysis.ReachWaveStack(
+        reaches=None,
+        time_seconds=np.arange(5, dtype=float) * 10.0,
+        reach_ids=np.array([1], dtype=int),
+        qout=np.array([[0.0], [2.0], [10.0], [8.0], [0.0]]),
+    )
+
+    rising, peaks, receding = analysis._wave_peak_timing(
+        stack, start_index=0, end_index=4, side_level=0.8
+    )
+
+    assert rising.tolist() == [20.0]
+    assert peaks.tolist() == [20.0]
+    assert receding.tolist() == [30.0]

@@ -67,6 +67,8 @@ _EXPORTS = {
     "plot_timestep_tail_suite": ("timestep_stability", "plot_timestep_tail_suite"),
     "summarize_outlet_hydrograph": ("hydrograph", "summarize_outlet_hydrograph"),
     "write_wave_comparison_mp4": ("analysis", "write_wave_comparison_mp4"),
+    "write_hydro_pulse_gif": ("analysis", "write_hydro_pulse_gif"),
+    "write_reference_peak_wave_gif": ("analysis", "write_reference_peak_wave_gif"),
     "write_wave_gif": ("analysis", "write_wave_gif"),
     "write_wave_mp4": ("analysis", "write_wave_mp4"),
     "write_hydrograph_outputs": ("hydrograph", "write_hydrograph_outputs"),

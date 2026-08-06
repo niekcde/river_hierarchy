@@ -811,12 +811,31 @@ def _load_wave_state(experiment_dir: str | Path, state_id: str) -> _LoadedWaveSt
     row = run_registry.loc[run_registry["state_id"].eq(state_id)]
     if row.empty:
         raise KeyError(f"State '{state_id}' was not found in {experiment_path / 'rapid_run_registry.csv'}.")
-    run_row = row.iloc[0]
+    run_row = row.iloc[0].copy()
 
-    prep_dir = _as_path(run_row["rapid_prep_dir"])
-    qout_path = _as_path(run_row["qout_nc"])
+    # Experiments are sometimes archived under a new directory while their run
+    # registry retains absolute paths from the original location.  Prefer those
+    # registered paths when valid, but transparently use the conventional
+    # state-relative locations when they have gone stale.
+    def resolve_state_artifact(column: str, *relative_parts: str) -> Path:
+        registered = _as_path(run_row[column])
+        if registered.exists():
+            return registered
+        fallback = experiment_path / "states" / state_id
+        for part in relative_parts:
+            fallback /= part
+        return fallback if fallback.exists() else registered
+
+    prep_dir = resolve_state_artifact("rapid_prep_dir", "rapid", "prep")
+    qout_path = resolve_state_artifact("qout_nc", "rapid", "run", "Qout_rapid_framework.nc")
+    hydro_path = resolve_state_artifact("outlet_hydrograph_csv", "rapid", "run", "outlet_hydrograph.csv")
+    run_row["rapid_prep_dir"] = str(prep_dir)
+    run_row["qout_nc"] = str(qout_path)
+    run_row["outlet_hydrograph_csv"] = str(hydro_path)
     wave_stack = load_reach_wave_stack(prep_dir, qout_path)
-    outlet_hydro = load_state_hydrograph(run_registry, state_id)
+    outlet_hydro = pd.read_csv(hydro_path)
+    if "time_utc" in outlet_hydro.columns:
+        outlet_hydro["time_utc"] = pd.to_datetime(outlet_hydro["time_utc"], utc=True, errors="coerce")
     return _LoadedWaveState(
         experiment_path=experiment_path,
         run_registry=run_registry,
@@ -2307,6 +2326,194 @@ def write_wave_gif(
     return output
 
 
+def _wave_peak_timing(
+    wave_stack: ReachWaveStack,
+    *,
+    start_index: int,
+    end_index: int,
+    side_level: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return peak and side-dot times for every RAPID reach.
+
+    The two side times are the threshold crossings around the local peak.  They
+    therefore describe the rising and receding shoulders of the *actual* local
+    RAPID hydrograph, rather than an arbitrary fixed time offset.
+    """
+    if not 0.0 < side_level < 1.0:
+        raise ValueError("side_level must be strictly between 0 and 1.")
+    values = np.asarray(wave_stack.qout[start_index : end_index + 1], dtype=float)
+    times = np.asarray(wave_stack.time_seconds[start_index : end_index + 1], dtype=float)
+    baseline = values[0]
+    peaks = np.nanmax(values, axis=0)
+    peak_indices = np.nanargmax(values, axis=0)
+    peak_times = times[peak_indices]
+    rise_times = peak_times.copy()
+    fall_times = peak_times.copy()
+    for reach_index in range(values.shape[1]):
+        if not np.isfinite(peaks[reach_index]) or peaks[reach_index] <= baseline[reach_index]:
+            continue
+        threshold = baseline[reach_index] + side_level * (peaks[reach_index] - baseline[reach_index])
+        above = values[:, reach_index] >= threshold
+        peak_index = int(peak_indices[reach_index])
+        left = peak_index
+        right = peak_index
+        while left > 0 and above[left - 1]:
+            left -= 1
+        while right < len(times) - 1 and above[right + 1]:
+            right += 1
+        rise_times[reach_index] = times[left]
+        fall_times[reach_index] = times[right]
+    return rise_times, peak_times, fall_times
+
+
+def _write_animation_gif(frame_paths: list[Path], output: Path, duration_ms: int) -> Path:
+    from PIL import Image
+
+    if not frame_paths:
+        raise ValueError("Cannot write an animation with no frames.")
+    images: list[Image.Image] = []
+    for frame_path in frame_paths:
+        with Image.open(frame_path) as frame_image:
+            images.append(frame_image.convert("RGB").copy())
+    images[0].save(
+        output,
+        save_all=True,
+        append_images=images[1:],
+        duration=max(1, int(duration_ms)),
+        loop=0,
+        disposal=2,
+        optimize=False,
+    )
+    return output
+
+
+def _dot_position(geometry: Any, current_time: float, centre_time: float, travel_seconds: float) -> Any | None:
+    fraction = 0.5 + (current_time - centre_time) / max(float(travel_seconds), 1.0)
+    if not 0.0 <= fraction <= 1.0:
+        return None
+    return geometry.interpolate(float(fraction), normalized=True)
+
+
+def write_hydro_pulse_gif(
+    experiment_dir: str | Path,
+    state_id: str = "S000_base",
+    *,
+    output_path: str | Path | None = None,
+    frame_stride: int = 1,
+    duration_ms: int = 100,
+    side_level: float = 0.8,
+    peak_dot_size: float = 42.0,
+    side_dot_size: float = 22.0,
+    linewidth_field: str = "rapid_branch_width_m",
+    use_event_window: bool = True,
+) -> Path:
+    """Write a three-dot hydro-pulse GIF for one network.
+
+    Each active RAPID reach has a large red dot at its local peak and smaller
+    red dots at the rising and receding ``side_level`` crossings (0.8 by
+    default). Dots travel from the upstream to downstream end using the reach's
+    configured RAPID K, centred on each crossing time.
+    """
+    import matplotlib.pyplot as plt
+
+    experiment_path = _as_path(experiment_dir)
+    output = _as_path(output_path) if output_path is not None else experiment_path / f"{state_id}_hydro_pulse.gif"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    render_state = _build_wave_render_state(
+        experiment_path, state_id, frame_stride=frame_stride,
+        linewidth_field=linewidth_field, use_event_window=use_event_window, cmap_name="Reds",
+    )
+    reaches = render_state.reaches
+    start_index = render_state.start_index
+    end_index = render_state.frame_indices[-1]
+    rising, peaks, receding = _wave_peak_timing(
+        render_state.wave_stack, start_index=start_index, end_index=end_index, side_level=side_level,
+    )
+    travel = pd.to_numeric(reaches.get("rapid_k", pd.Series(1.0, index=reaches.index)), errors="coerce").fillna(1.0).to_numpy(float)
+    travel = np.maximum(travel, 1.0)
+    with TemporaryDirectory(prefix="rapid-hydro-pulse-") as tmp_dir_name:
+        tmp_dir = Path(tmp_dir_name)
+        frame_paths: list[Path] = []
+        for frame_position, time_index in enumerate(render_state.frame_indices):
+            current_time = float(render_state.wave_stack.time_seconds[time_index])
+            fig, ax = plt.subplots(figsize=(8, 7))
+            for geometry, width in zip(reaches.geometry, render_state.line_widths, strict=True):
+                for segment in _geometry_segments(geometry):
+                    ax.plot(segment[:, 0], segment[:, 1], color="#9bb7d4", linewidth=float(width), alpha=0.55, solid_capstyle="round")
+            for crossing_times, dot_size, alpha in ((rising, side_dot_size, 0.70), (receding, side_dot_size, 0.70), (peaks, peak_dot_size, 1.0)):
+                points = [
+                    _dot_position(geometry, current_time, float(centre), float(k))
+                    for geometry, centre, k in zip(reaches.geometry, crossing_times, travel, strict=True)
+                ]
+                points = [point for point in points if point is not None]
+                if points:
+                    ax.scatter([point.x for point in points], [point.y for point in points], s=dot_size, c="#d62728", alpha=alpha, edgecolors="white", linewidths=0.35, zorder=3)
+            ax.set(xlim=(render_state.bounds[0], render_state.bounds[2]), ylim=(render_state.bounds[1], render_state.bounds[3]), aspect="equal")
+            ax.set_axis_off()
+            ax.set_title(f"{state_id}: hydro pulse ({side_level:.0%} shoulders) | t = {current_time / SECONDS_PER_HOUR:.2f} h")
+            frame_path = tmp_dir / f"frame_{frame_position:04d}.png"
+            fig.tight_layout()
+            fig.savefig(frame_path, dpi=130)
+            plt.close(fig)
+            frame_paths.append(frame_path)
+        return _write_animation_gif(frame_paths, output, duration_ms)
+
+
+def write_reference_peak_wave_gif(
+    experiment_dir: str | Path,
+    *,
+    reference_state_id: str = "S000_base",
+    output_path: str | Path | None = None,
+    frame_stride: int = 1,
+    duration_ms: int = 100,
+    peak_dot_size: float = 48.0,
+    linewidth_field: str = "rapid_branch_width_m",
+    use_event_window: bool = True,
+) -> Path:
+    """Write a blue reference network with red peak fronts travelling downstream."""
+    import matplotlib.pyplot as plt
+
+    experiment_path = _as_path(experiment_dir)
+    output = _as_path(output_path) if output_path is not None else experiment_path / f"{reference_state_id}_reference_peak_wave.gif"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    render_state = _build_wave_render_state(
+        experiment_path, reference_state_id, frame_stride=frame_stride,
+        linewidth_field=linewidth_field, use_event_window=use_event_window, cmap_name="Reds",
+    )
+    reaches = render_state.reaches
+    _, peak_times, _ = _wave_peak_timing(
+        render_state.wave_stack, start_index=render_state.start_index,
+        end_index=render_state.frame_indices[-1], side_level=0.8,
+    )
+    travel = pd.to_numeric(reaches.get("rapid_k", pd.Series(1.0, index=reaches.index)), errors="coerce").fillna(1.0).to_numpy(float)
+    travel = np.maximum(travel, 1.0)
+    with TemporaryDirectory(prefix="rapid-reference-peak-") as tmp_dir_name:
+        tmp_dir = Path(tmp_dir_name)
+        frame_paths: list[Path] = []
+        for frame_position, time_index in enumerate(render_state.frame_indices):
+            current_time = float(render_state.wave_stack.time_seconds[time_index])
+            fig, ax = plt.subplots(figsize=(8, 7))
+            for geometry, width in zip(reaches.geometry, render_state.line_widths, strict=True):
+                for segment in _geometry_segments(geometry):
+                    ax.plot(segment[:, 0], segment[:, 1], color="#1976d2", linewidth=float(width), alpha=0.75, solid_capstyle="round", zorder=1)
+            points = [
+                _dot_position(geometry, current_time, float(peak_time), float(k))
+                for geometry, peak_time, k in zip(reaches.geometry, peak_times, travel, strict=True)
+            ]
+            points = [point for point in points if point is not None]
+            if points:
+                ax.scatter([point.x for point in points], [point.y for point in points], s=peak_dot_size, c="#d62728", edgecolors="white", linewidths=0.45, zorder=3)
+            ax.set(xlim=(render_state.bounds[0], render_state.bounds[2]), ylim=(render_state.bounds[1], render_state.bounds[3]), aspect="equal")
+            ax.set_axis_off()
+            ax.set_title(f"{reference_state_id}: blue base / red travelling peak | t = {current_time / SECONDS_PER_HOUR:.2f} h")
+            frame_path = tmp_dir / f"frame_{frame_position:04d}.png"
+            fig.tight_layout()
+            fig.savefig(frame_path, dpi=130)
+            plt.close(fig)
+            frame_paths.append(frame_path)
+        return _write_animation_gif(frame_paths, output, duration_ms)
+
+
 def _resolve_ffmpeg_executable(ffmpeg_path: str | Path | None = None) -> str:
     if ffmpeg_path is not None:
         path = _as_path(ffmpeg_path)
@@ -2481,6 +2688,8 @@ __all__ = [
     "plot_matched_corridor_hydrographs",
     "plot_reach_timing_map",
     "summarize_matched_corridor_peak_timing",
+    "write_hydro_pulse_gif",
+    "write_reference_peak_wave_gif",
     "write_wave_comparison_mp4",
     "write_wave_gif",
     "write_wave_mp4",
