@@ -304,7 +304,7 @@ predictor distributions, collinearity, linear coefficients and odds ratios,
 model and per-example performance, ROC/PR curves, calibration, threshold and
 split-sensitive trade-offs, partial SVM/logistic decision surfaces,
 disagreements, routing-impact ranking, and archived-link context maps. It has
-been executed successfully from a clean project kernel with all 14 code cells
+been executed successfully from a clean project kernel with all 17 code cells
 completing and no errors.
 Portable coefficient-based diagnostic surfaces allow the notebook to run in
 other analysis environments while warning about scikit-learn bundle-version
@@ -320,6 +320,155 @@ They use interactive Plotly scatter panels with network/link hover labels.
 The matrices are descriptive projections and intentionally omit a
 two-variable decision line because the classifier operates in seven
 dimensions and the held-out points come from different fitted folds.
+
+### Disagreement adjudication GUI
+
+**Status: implemented and human review complete (2026-08-03).**
+
+`network_variants/width_qc_disagreement_gui.py` creates a focused 63-link
+review queue: 54 provisional-model held-out disagreements plus 10 cross-window
+junction-audit priorities, with link 43 belonging to both sets. The resulting
+union adds nine links that the provisional model agrees with but whose historic
+label or interpretation may change under near-junction continuity. It
+shows the local directed network, cleaned-mask land context, optional two-bank
+transects, all classifier inputs, interpretation variables, the held-out
+probability, and the routing-impact proxy. It also loads the provisional
+10%/250–1,000 m near-junction audit, displays the plain incoming/outgoing
+whole-link and junction width sums, incoming reach length and length/width,
+and endpoint-locality flags, and colors upstream-junction incoming and
+outgoing links separately. It never modifies archived manual labels, source
+links, or width fields.
+
+Adjudications are written separately under:
+
+```text
+network_variants/output/width_qc_disagreement_review/
+```
+
+Every case records whether it was triggered by a model disagreement, the
+junction audit, or both. The review CSV preserves both original decisions and all displayed evidence,
+and records one of:
+`manual_upheld`, `model_upheld`, `ambiguous`,
+`measurement_valid_but_routing_unsuitable`, `data_or_geometry_problem`, or
+`exclude_from_training`. A manifest binds the review to exact dataset,
+prediction, validation-summary, and near-junction-audit hashes. Existing saves
+created before junction evidence remain resumable and are upgraded on save;
+superseded saves are copied into `versions/`.
+
+Launch it with:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-width-qc-disagreements \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -m \
+  network_variants.width_qc_disagreement_gui \
+  --reviewer "<reviewer name>"
+```
+
+### Near-junction width audit
+
+**Status: exploratory implementation complete (2026-08-03); window approval
+pending.**
+
+`network_variants/width_junction_audit.py` calculates upstream- and
+downstream-node wet widths for every link using medians of valid, trimmed
+two-bank samples inside physical along-link windows. Sample order is checked
+against directed node geometry link-by-link, so reversed sample sequences are
+handled explicitly. The audit compares plain incoming/outgoing whole-link
+width sums with incoming/outgoing near-junction width sums for all 1,269
+reviewed links. It does not alter the classifier, review archives, or widths.
+
+The exploratory defaults compare three percentage windows with physical
+minimum and maximum lengths:
+
+```text
+5%,  100–500 m
+10%, 250–1000 m
+15%, 250–1500 m
+```
+
+Run with:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-width-junction-audit \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -m \
+  network_variants.width_junction_audit
+```
+
+Outputs under `network_variants/output/width_qc_junction_audit/` include all
+endpoint widths, reviewed-link comparisons for every candidate window, an
+aggregate window profile, a cross-window targeted-review ranking, and a
+manifest containing exact source hashes. Automatic model integration remains
+blocked until one window definition and its use conditions are approved.
+
+### Hybrid near-junction rule audit
+
+**Status: implemented and executed (2026-08-03); production approval pending.**
+
+`network_variants/width_junction_hybrid_audit.py` tests the selected
+10%/250–1,000 m endpoint widths without modifying the completed adjudication,
+training data, model, or any network width. At every upstream junction, the
+incoming reach uses its downstream endpoint and each outgoing reach uses its
+upstream endpoint. Endpoint substitution is decided independently per adjacent
+reach.
+
+The audit compares whole-link means, endpoint widths for every link, and
+length/wet-width thresholds of 3, 5, and 10, each with and without requiring
+non-overlapping endpoint windows. Resolved adjudications become exploratory
+effective labels, while all 11 ambiguous adjudications remain unlabeled and
+are written to the follow-up set. The outputs include 1,269 links by eight
+variants, a variant profile, all ambiguous cases, a targeted follow-up list,
+and a manifest binding the exact dataset, endpoint-audit, and completed-review
+hashes.
+
+Run with:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-width-junction-hybrid \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -m \
+  network_variants.width_junction_hybrid_audit
+```
+
+Outputs are stored under
+`network_variants/output/width_qc_junction_hybrid_audit/`. This remains an
+audit stage: none of the candidate hybrid rules is yet authorized for
+production width correction.
+
+### Frozen adjudicated hybrid model
+
+**Status: implemented and executed (2026-08-03); routing-width integration
+pending.**
+
+`network_variants/width_qc_final_model.py` is the terminal model-development
+step. It freezes `lw_ge_10_nonoverlap`, adds its absolute upstream-continuity
+deviation to the original seven predictors, applies the completed adjudication
+once, and excludes the 11 ambiguous cases. It then repeats leave-one-complete-
+example-out validation for logistic regression, linear SVM, and RBF SVM using
+the same predefined threshold constraint. No new disagreement review feeds
+back into this dataset.
+
+The selected interpretable model is logistic regression at probability 0.40.
+Among 1,258 included reviewed candidates, its held-out predictions contain 533
+true corrections, 701 true accepts, 17 false corrections, and seven missed
+corrections. Relative to the original held-out logistic model, 27 decisions
+change: 26 accept-to-correct and one correct-to-accept. These are validation
+predictions, not edits to source networks.
+
+Run with:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-width-qc-final \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -m \
+  network_variants.width_qc_final_model
+```
+
+The workflow writes the final dataset, excluded cases, grouped-validation
+artifacts, candidate bundles, old/new prediction comparison, per-example
+decision summary, validation comparison, and exact source hashes under
+`network_variants/output/width_qc_final_model/`. The model specification is
+frozen, but `production_authorized` remains false until Phases 7–9 implement
+and validate the separate numeric correction solver. Numeric correction
+magnitudes are deliberately not inferred independently per link because
+multiple flagged outgoing links must be solved jointly.
 
 Execute a versioned copy with:
 
@@ -373,6 +522,9 @@ silently replacing production models.
 
 ## Phase 7 — Measured versus effective routing-width contract
 
+**Status: standalone contract implemented (2026-08-03); variant-output wiring
+remains Phase 9.**
+
 Keep wet, dry, and total width families as measured geometric products. Add a
 separate canonical effective width:
 
@@ -395,7 +547,6 @@ width_qc_flag
 width_correction_applied
 width_correction_source
 width_algorithm_version
-wid_adj_routing_raw
 ```
 
 Semantics:
@@ -414,6 +565,50 @@ Do not overwrite raw wet, dry, or total sample measurements.
 - Maps can still display the physical wet/dry/total decomposition.
 
 ## Phase 8 — Upstream-continuity correction solver
+
+**Status: selected adaptive joint solver implemented and evaluated
+(2026-08-05); Phase 9 base wiring is implemented and awaits a user-run base
+validation.**
+
+`network_variants/width_routing_solver.py` preserves `wid_adj_wet` and writes a
+separate `wid_adj_routing`. It processes directed junctions in topological
+order so an upstream correction propagates into the downstream endpoint
+context. At each junction it keeps accepted outgoing context fixed, allocates
+the remaining incoming context jointly across all predicted-bad outgoing
+links in proportion to their current local context, and converts those context
+targets to routing-width scale factors. The frozen `lw_ge_10_nonoverlap`
+endpoint rule supplies local US/DS context; all other links use whole-link wet
+width.
+
+The first evaluation uses explicit provisional scale bounds of 0.25–4.0. A
+whole sibling group is retained raw and flagged if the remaining width is
+nonpositive, the allocation lies outside those bounds, the source has no
+incoming context, or the directed graph is cyclic. Ambiguous training cases
+are also retained raw and flagged. No measured fields or source networks are
+edited.
+
+Run the evaluation with:
+
+```bash
+MPLCONFIGDIR=/tmp/matplotlib-width-routing-solver \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -m \
+  network_variants.width_routing_solver
+```
+
+Across the 16 current base examples, 550 held-out candidate decisions request
+correction. The provisional solver applies 393 bounded corrections and retains
+157 predicted corrections raw with a safety flag; the 11 excluded ambiguous
+links add 11 further flags. Of the 157 unresolved predicted corrections, 101
+exceed the scale bounds and 56 have no positive width remaining after accepted
+outgoing links. These evaluation results are diagnostic and remain
+`production_authorized: false`.
+
+For direct inspection, the evaluation also writes
+`width_routing_solver_rejected_corrections_v1.csv`: one row for each of the 157
+rejected predicted corrections. It combines link and junction evidence and
+retains the rejected candidate routing width, candidate scale factor, violated
+bound, sibling IDs, incoming/accepted/remaining context widths, and continuity
+diagnostics. No link/junction join is required.
 
 Classification and numeric correction are separate operations. The supervised
 model decides whether a candidate should be corrected. The correction solver
@@ -441,8 +636,11 @@ For multiple flagged outgoing links:
 - apply neighborhood-derived bounds;
 - flag infeasible or extreme targets.
 
-Downstream continuity is recorded as a diagnostic and does not drive the
-primary correction.
+The selected adaptive solver uses upstream and downstream continuity jointly,
+with frozen weights of 2:1. Accepted sibling links stay fixed. Classification
+confidence, upstream deviation, and opposition QC determine how far the soft
+scale bounds may relax; corrections beyond the normal 0.25–4 range are
+applied only with an explicit flag.
 
 Possible outcomes:
 
@@ -461,6 +659,19 @@ retain raw + flag
 
 ## Phase 9 — Base-state integration
 
+**Status: complete; routing behavior and the final provenance/path contract
+were validated by rerunning example 56 (2026-08-05).**
+
+Both regular and panelized base materializers now execute the same frozen
+logistic classifier and adaptive two-ended solver. They write
+`wid_adj_routing`, the predictor/model/solver fields,
+and a per-link CSV plus manifest in the state's `widths/` directory. The
+routing input is the freshly measured `wid_adj_wet`. Permanent review archives
+provide human labels and audit provenance only: their historical numeric
+targets are never reapplied to measured width-family fields. Realized and
+anchored copies use relative nested artifact references and are independently
+portable.
+
 After raw base width-family calculation:
 
 1. validate the permanent review archive;
@@ -474,10 +685,9 @@ After raw base width-family calculation:
 8. write manual/model disagreement and base width-QC reports before hierarchy
    analysis.
 
-During shadow rollout, predictions and suggested corrections are recorded but
-do not replace the approved routing width. After model review and approval,
-the versioned production model becomes authoritative while manual decisions
-remain permanently available as evidence.
+The versioned model and solver determine `wid_adj_routing`; manual decisions
+remain permanently available as evidence and never overwrite fresh measured
+width families.
 
 ### Acceptance criteria
 
@@ -488,6 +698,13 @@ remain permanently available as evidence.
 
 ## Phase 10 — Variant inheritance and changed-link evaluation
 
+**Status: complete and validated with synthetic/integration tests plus the
+final example-56 realized and anchored single-unit rerun (2026-08-05). The
+real validation exposed and led to fixes for missing regenerated-child
+`n_units` and ambiguous parallel-edge lineage. Current-state structural
+membership is derived directly from child topology; exact geometry overrides
+an ambiguous multi-edge parent-node path.**
+
 ### Unchanged links
 
 For `unchanged_1to1` lineage, inherit exactly from the immediate parent:
@@ -497,9 +714,13 @@ For `unchanged_1to1` lineage, inherit exactly from the immediate parent:
 - `wid_adj_routing`;
 - QC, model, and correction provenance.
 
-Panelized execution already reuses unchanged parent width records and must be
-extended to the new routing/model fields. Regular full-raster execution must
-gain equivalent exact inheritance after lineage resolution.
+Regular, panelized, and realized-to-anchored child paths now use one shared
+inheritance contract. `unchanged_1to1` is only a candidate classification:
+inheritance additionally requires topologically equal parent/child geometries
+and a unique child-to-parent mapping. This prevents anchored segments or other
+shortened links from inheriting whole-parent samples. Non-eligible links keep
+their newly measured physical widths, have stale routing/model values cleared,
+and receive `changed_requires_evaluation` status.
 
 ### Changed links
 
@@ -512,6 +733,15 @@ For split, merged, regenerated, or collapsed links:
 5. calculate and assign `wid_adj_routing`;
 6. record parent lineage and complete provenance.
 
+The child evaluator now runs the frozen classifier only for links marked
+`changed_requires_evaluation`. Inherited links remain fixed: neither their
+model decision nor their `wid_adj_routing` is recalculated. Their accepted
+effective widths (including scaled endpoint context for long links) still
+participate in the joint two-ended continuity objective. After evaluation,
+changed links receive `changed_evaluated`; the routing audit contains both
+`evaluated_changed_link` and `preserved_inherited_link` rows so every final
+child value has an explicit source.
+
 Sequential states inherit from their immediate parent state.
 
 ### Acceptance criteria
@@ -523,9 +753,15 @@ Sequential states inherit from their immediate parent state.
 
 ## Phase 11 — Dry collapse-corridor handling
 
+**Status: complete in code and validated with focused regression tests and a
+shadow audit of the final example-56 single-unit products (2026-08-05). The
+existing example-56 products contain no links above the meaningful-dry
+threshold; future runs will write the new provenance fields to their width
+products.**
+
 When dry width is negligible, measured wet width and effective routing width
-describe nearly the same cross-section. A correction may update routing and
-relevant no-dry compatibility summaries while preserving originals.
+describe nearly the same cross-section. A correction updates only the routing
+width; measured and legacy compatibility fields remain unchanged.
 
 When dry width is meaningful:
 
@@ -536,6 +772,13 @@ When dry width is meaningful:
   corridor geometry;
 - flag extreme routing targets relative to measured wet/total widths.
 
+The implemented audit records dry fraction, routing-to-wet and
+routing-to-total ratios, and separate physical-consistency flags. Dry width is
+meaningful at a fraction of 0.05 or greater. Measured wet or effective routing
+width exceeding measured total corridor width by more than 5% is flagged;
+extreme routing-to-wet corrections remain governed by the existing adaptive
+solver bounds.
+
 ### Acceptance criteria
 
 - Routing correction does not alter measured total or dry width.
@@ -544,6 +787,11 @@ When dry width is meaningful:
 
 ## Phase 12 — Downstream consumer migration
 
+**Status: complete and validated by the final example-56 single-unit rerun
+(2026-08-05). Written hierarchy path widths agree with independent
+`wid_adj_routing` harmonic-mean calculations to numerical precision and differ
+from the corresponding wet-width calculations where corrections apply.**
+
 Use `wid_adj_routing` for:
 
 - routing fractions;
@@ -551,6 +799,8 @@ Use `wid_adj_routing` for:
 - collapse prioritization where effective flow width is intended;
 - equivalent-resistance calculations;
 - collapse-footprint buffering derived from effective pre-collapse flow width.
+- RAPID branch allocation and K/celerity preparation when link-level widths
+  are used (physical subreach-sample mode remains an explicit alternative).
 
 Continue using measured fields for:
 
@@ -569,7 +819,9 @@ wid
 wid_med
 ```
 
-Every manifest records the resolved field.
+The hierarchy and resistance manifests record candidate precedence; variant
+manifests record the preferred footprint field; RAPID outputs record the
+resolved `rapid_width_source_field` and `rapid_branch_width_source_field`.
 
 ### Acceptance criteria
 

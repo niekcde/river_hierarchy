@@ -31,6 +31,7 @@ from network_variants.width_review_archive import (
     ARCHIVE_SUMMARY_NAME,
     _atomic_write_csv,
     _atomic_write_json,
+    _sha256,
     finalize_width_review_archive,
     review_archive_dir,
     version_existing_review_archive,
@@ -780,7 +781,19 @@ class WidthReviewGui:
 
     def _set_decision_and_advance(self, decision: str) -> None:
         self._set_decision(decision)
-        self._move_relative(1)
+        if self.current_pos is None:
+            return
+        undecided_positions = self.decisions.index[self.decisions["review_decision"].isna()].tolist()
+        later = [int(position) for position in undecided_positions if int(position) > self.current_pos]
+        earlier = [int(position) for position in undecided_positions if int(position) < self.current_pos]
+        if later:
+            self.current_pos = later[0]
+        elif earlier:
+            self.current_pos = earlier[0]
+        else:
+            self.current_pos = min(self.current_pos + 1, len(self.candidate_frame) - 1)
+        self.map_view_mode = "local"
+        self._draw()
 
     def _move_relative(self, step: int) -> None:
         if self.current_pos is None:
@@ -1333,10 +1346,30 @@ def run_width_review_gui(
     overwrite_backup: bool,
     show_dt_points: bool,
     start_over: bool,
+    direction_migration_manifest: str | Path | None = None,
 ) -> dict[str, Any] | None:
+    migration_seed: pd.DataFrame | None = None
+    migration_info: dict[str, Any] | None = None
+    migration_manifest_path: Path | None = None
+    if direction_migration_manifest is not None:
+        if start_over:
+            raise ValueError("--start-over cannot be combined with --direction-migration-manifest.")
+        from network_variants.width_review_direction_migration import validate_direction_migration
+
+        migration_manifest_path = Path(direction_migration_manifest).expanduser().resolve()
+        migration_seed, migration_info = validate_direction_migration(
+            migration_manifest_path,
+            variant_output_dir=paths.variant_output_dir,
+        )
+        migration_sources = migration_info.get("sources", {}) or {}
+        if Path(migration_sources["current_source_links"]).resolve() != paths.source_links_path:
+            raise ValueError("Direction migration was built for a different source links file.")
+        if Path(migration_sources["variant_manifest"]).resolve() != paths.manifest_path:
+            raise ValueError("Direction migration was built for a different variant manifest.")
+
     root = tk.Tk()
     inspection = inspect_existing_review(paths)
-    resume_existing = not start_over
+    resume_existing = not start_over and migration_seed is None
     if resume_existing and paths.review_csv_path.exists():
         status = str(inspection.get("status", MISSING_STATUS))
         if status not in {CURRENT_STATUS, INCOMPLETE_REVIEW_STATUS, MISSING_STATUS}:
@@ -1352,7 +1385,21 @@ def run_width_review_gui(
     )
     resolved_width_field = width_field if width_field in candidate_frame.columns else "wid_adj"
     initial_decisions = None
-    if resume_existing and paths.review_csv_path.exists():
+    if migration_seed is not None:
+        current_candidates = set(
+            pd.to_numeric(
+                candidate_frame.loc[candidate_frame["candidate_flag"], "id_link"], errors="coerce"
+            ).dropna().astype(int)
+        )
+        migrated_candidates = set(pd.to_numeric(migration_seed["id_link"], errors="coerce").dropna().astype(int))
+        if current_candidates != migrated_candidates:
+            raise ValueError("Direction-migration seed no longer matches the current candidate set.")
+        if str(migration_info.get("width_field")) != str(width_field):
+            raise ValueError("GUI width field differs from the direction-migration width field.")
+        if abs(float(migration_info["len_over_width_threshold"]) - float(len_over_width_threshold)) > 1e-12:
+            raise ValueError("GUI candidate threshold differs from the direction-migration threshold.")
+        initial_decisions = migration_seed
+    elif resume_existing and paths.review_csv_path.exists():
         initial_decisions = pd.read_csv(paths.review_csv_path)
 
     gui = WidthReviewGui(
@@ -1399,6 +1446,14 @@ def run_width_review_gui(
         "candidate_count": int(len(review_decisions)),
         "apply_summary": apply_summary,
     }
+    if migration_info is not None and migration_manifest_path is not None:
+        summary["direction_migration"] = {
+            "manifest": str(migration_manifest_path),
+            "manifest_sha256": _sha256(migration_manifest_path),
+            "impact": migration_info.get("impact", {}),
+            "carried_decision_count": int(migration_info["carried_decision_count"]),
+            "reopened_candidate_count": int(migration_info["undecided_candidate_count"]),
+        }
     _atomic_write_json(summary, paths.review_summary_path)
     archive_result = finalize_width_review_archive(
         archive_dir=paths.review_output_dir,
@@ -1463,6 +1518,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--direction-migration-manifest",
+        default=None,
+        help=(
+            "Validated migration manifest created by width_review_direction_migration. "
+            "This resumes unchanged decisions while reopening direction-affected candidates."
+        ),
+    )
+    parser.add_argument(
         "--dt-points",
         action="store_true",
         help="Overlay the trimmed distance-transform sample points used for the focal link width/QC computations.",
@@ -1486,6 +1549,7 @@ def main() -> None:
         overwrite_backup=args.overwrite_backup,
         show_dt_points=args.dt_points,
         start_over=args.start_over,
+        direction_migration_manifest=args.direction_migration_manifest,
     )
     if summary is None:
         print("Review closed without saving.")

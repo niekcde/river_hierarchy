@@ -292,19 +292,23 @@ def _predict_probability(model: Pipeline, x: pd.DataFrame) -> np.ndarray:
     return np.asarray(model.predict_proba(x)[:, positive_index], dtype=float)
 
 
-def full_fit_diagnostics(model: Pipeline) -> dict[str, Any]:
+def full_fit_diagnostics(
+    model: Pipeline,
+    *,
+    feature_columns: Sequence[str] = FEATURE_COLUMNS,
+) -> dict[str, Any]:
     imputer = model.named_steps["imputer"]
     scaler = model.named_steps["scaler"]
     estimator = model.named_steps["model"]
     diagnostics: dict[str, Any] = {
         "imputation_medians": {
-            feature: float(value) for feature, value in zip(FEATURE_COLUMNS, imputer.statistics_)
+            feature: float(value) for feature, value in zip(feature_columns, imputer.statistics_)
         },
         "standardization_means": {
-            feature: float(value) for feature, value in zip(FEATURE_COLUMNS, scaler.mean_)
+            feature: float(value) for feature, value in zip(feature_columns, scaler.mean_)
         },
         "standardization_scales": {
-            feature: float(value) for feature, value in zip(FEATURE_COLUMNS, scaler.scale_)
+            feature: float(value) for feature, value in zip(feature_columns, scaler.scale_)
         },
         "estimator_parameters": {
             key: value
@@ -315,12 +319,12 @@ def full_fit_diagnostics(model: Pipeline) -> dict[str, Any]:
     if hasattr(estimator, "coef_"):
         coefficients = np.asarray(estimator.coef_[0], dtype=float)
         diagnostics["standardized_coefficients"] = {
-            feature: float(value) for feature, value in zip(FEATURE_COLUMNS, coefficients)
+            feature: float(value) for feature, value in zip(feature_columns, coefficients)
         }
         diagnostics["intercept"] = float(np.asarray(estimator.intercept_).ravel()[0])
         if isinstance(estimator, LogisticRegression):
             diagnostics["standardized_odds_ratios"] = {
-                feature: float(np.exp(value)) for feature, value in zip(FEATURE_COLUMNS, coefficients)
+                feature: float(np.exp(value)) for feature, value in zip(feature_columns, coefficients)
             }
     return diagnostics
 
@@ -330,13 +334,21 @@ def run_leave_one_example_out(
     *,
     specifications: Sequence[ModelSpecification] | None = None,
     max_split_false_correction_rate: float = DEFAULT_MAX_SPLIT_FALSE_CORRECTION_RATE,
+    feature_columns: Sequence[str] = FEATURE_COLUMNS,
+    model_version: str = MODEL_VERSION,
 ) -> ModelDevelopmentResult:
     specs = tuple(specifications or model_specifications())
+    features = tuple(feature_columns)
+    if not features or len(set(features)) != len(features):
+        raise ValueError("Model feature columns must be non-empty and unique.")
+    missing_features = sorted(set(features).difference(frame.columns))
+    if missing_features:
+        raise ValueError(f"Model frame is missing feature columns: {missing_features}")
     groups = frame["example_id"].astype(str)
     examples = sorted(groups.unique())
     if len(examples) < 3:
         raise ValueError("Leave-one-example-out validation requires at least three examples.")
-    x = frame.loc[:, FEATURE_COLUMNS]
+    x = frame.loc[:, features]
     y = frame["requires_correction"].astype(int).to_numpy()
     split_sensitive = frame["split_sensitive"].fillna(0).astype(bool).to_numpy()
 
@@ -380,7 +392,7 @@ def run_leave_one_example_out(
         model_predictions["width_model_prediction"] = prediction.astype(int)
         model_predictions["width_model_threshold"] = recommended_threshold
         model_predictions["width_model_name"] = spec.name
-        model_predictions["width_model_version"] = MODEL_VERSION
+        model_predictions["width_model_version"] = model_version
         model_predictions["manual_model_disagreement"] = prediction.astype(int) != y
         model_predictions["routing_impact_score"] = routing_impact
         prediction_frames.append(model_predictions)
@@ -414,7 +426,10 @@ def run_leave_one_example_out(
         fitted = spec.factory()
         fitted.fit(x, y)
         fitted_models[spec.name] = fitted
-        aggregate_summaries[spec.name]["full_fit_diagnostics"] = full_fit_diagnostics(fitted)
+        aggregate_summaries[spec.name]["full_fit_diagnostics"] = full_fit_diagnostics(
+            fitted,
+            feature_columns=features,
+        )
 
     predictions = pd.concat(prediction_frames, ignore_index=True).sort_values(
         ["width_model_name", "example_id", "id_link"], kind="mergesort"
@@ -452,10 +467,10 @@ def run_leave_one_example_out(
     ].nlargest(20, "routing_impact_score")
 
     summary = {
-        "model_version": MODEL_VERSION,
+        "model_version": model_version,
         "validation_design": "leave_one_complete_example_out",
         "preprocessing_contract": "median imputation and standard scaling fitted inside every training fold",
-        "feature_columns": list(FEATURE_COLUMNS),
+        "feature_columns": list(features),
         "example_count": int(len(examples)),
         "row_count": int(len(frame)),
         "candidate_models": aggregate_summaries,
@@ -512,11 +527,18 @@ def write_model_development_outputs(
     dataset_path: str | Path,
     output_dir: str | Path = DEFAULT_MODEL_OUTPUT_DIR,
     dataset_manifest_path: str | Path | None = DEFAULT_DATASET_MANIFEST_PATH,
+    feature_columns: Sequence[str] = FEATURE_COLUMNS,
+    model_version: str = MODEL_VERSION,
 ) -> dict[str, Any]:
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     dataset = Path(dataset_path).expanduser().resolve()
     dataset_hash = _sha256(dataset)
+    features = tuple(feature_columns)
+    if list(result.summary.get("feature_columns", [])) != list(features):
+        raise ValueError("Requested output feature columns disagree with the fitted model result.")
+    if result.summary.get("model_version") != model_version:
+        raise ValueError("Requested output model version disagrees with the fitted model result.")
     dataset_manifest: dict[str, Any] = {}
     if dataset_manifest_path is not None:
         candidate = Path(dataset_manifest_path).expanduser().resolve()
@@ -558,9 +580,9 @@ def write_model_development_outputs(
         bundle = {
             "pipeline": model,
             "model_name": name,
-            "model_version": MODEL_VERSION,
+            "model_version": model_version,
             "production_authorized": False,
-            "feature_columns": list(FEATURE_COLUMNS),
+            "feature_columns": list(features),
             "threshold": float(result.summary["candidate_models"][name]["recommended_threshold"]),
             "dataset_sha256": dataset_hash,
             "dataset_id": dataset_manifest.get("dataset_id"),
@@ -578,12 +600,12 @@ def write_model_development_outputs(
         bundle_paths[name] = bundle_path
 
     manifest = {
-        "model_version": MODEL_VERSION,
+        "model_version": model_version,
         "production_authorized": False,
         "dataset_path": str(dataset),
         "dataset_sha256": dataset_hash,
         "dataset_id": dataset_manifest.get("dataset_id"),
-        "feature_columns": list(FEATURE_COLUMNS),
+        "feature_columns": list(features),
         "provisional_candidate_model": result.summary["provisional_candidate_model"],
         "files": {key: str(path) for key, path in paths.items() if key != "manifest"},
         "file_sha256": {key: _sha256(path) for key, path in paths.items() if key != "manifest"},
