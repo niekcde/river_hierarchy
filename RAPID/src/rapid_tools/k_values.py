@@ -8,7 +8,7 @@ import pandas as pd
 
 @dataclass(frozen=True, slots=True)
 class KValueConfig:
-    width_field: str = "wid_adj_wet"
+    width_field: str = "wid_adj_routing"
     x_value: float = 0.1
     kb_value: float = 20.0
     kb_source_method: str = "fixed_scalar"
@@ -25,8 +25,8 @@ class KValueConfig:
 
 
 WIDTH_FIELD_CANDIDATES = (
+    "wid_adj_routing",
     "wid_adj_wet",
-    "wid_adj_total",
     "wid_adj",
     "wid_wet",
     "wid",

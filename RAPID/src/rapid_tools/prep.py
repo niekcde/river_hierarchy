@@ -39,7 +39,7 @@ SECONDS_PER_HOUR = 3600.0
 
 @dataclass(frozen=True, slots=True)
 class RapidPrepConfig:
-    width_field: str = "wid_adj_wet"
+    width_field: str = "wid_adj_routing"
     vary_width_by_subreach: bool = False
     subreach_width_sample_field: str = "width_wet"
     slope_profile_mode: str = "network_dist"

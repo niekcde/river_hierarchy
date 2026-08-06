@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import geopandas as gpd
 import networkx as nx
@@ -28,7 +29,11 @@ from rapid_tools.k_values import (
     find_nearby_compatible_forcing_and_routing_dt,
 )
 from rapid_tools.prep import RapidPrepConfig, build_rapid_graph, compute_reach_ratios, create_conn_file, prepare_experiment
-from rapid_tools.reference_section import _load_width_summary
+from rapid_tools.reference_section import (
+    _build_reference_section_variant,
+    _load_width_summary,
+    _reference_section_paths,
+)
 from rapid_tools.slope import SlopeConfig, compute_link_slopes
 
 
@@ -255,6 +260,80 @@ def test_reference_section_width_summary_prefers_link_family_field(tmp_path: Pat
     assert summary["width_reference_m"] == 275.0
     assert summary["source"] == "link_width_families"
     assert summary["statistic"] == "direct_single_link"
+
+
+def test_reference_section_variant_reuses_base_boundary_component_labels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment_dir = tmp_path / "experiment"
+    base_dir = experiment_dir / "states" / "S000_base"
+    variant_dir = base_dir / "variant"
+    hierarchy_dir = base_dir / "hierarchy"
+    summary_dir = variant_dir / "summary"
+    summary_dir.mkdir(parents=True)
+    hierarchy_dir.mkdir(parents=True)
+
+    analysis_links = variant_dir / "widths" / "links_with_width_families.gpkg"
+    directed_nodes = variant_dir / "directed" / "base_nodes.gpkg"
+    cleaned_mask = variant_dir / "mask" / "base_collapsed.tif"
+    for path in (analysis_links, directed_nodes, cleaned_mask):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    pd.DataFrame({"unit_id": [1, 2]}).to_csv(hierarchy_dir / "unit_summary.csv", index=False)
+
+    labels = experiment_dir / "boundary_components" / "02_full_extent_land_water_labels_with_snapped_buffered_border_cut.tif"
+    labels.parent.mkdir(parents=True)
+    labels.touch()
+    (summary_dir / "variant_manifest.json").write_text(
+        json.dumps(
+            {
+                "exit_sides": "SN",
+                "output_paths": {"boundary_component_labels": str(labels)},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    registry = pd.DataFrame(
+        [
+            {
+                "state_role": "base",
+                "variant_output_dir": str(variant_dir),
+                "hierarchy_output_dir": str(hierarchy_dir),
+                "analysis_links_path": str(analysis_links),
+                "directed_nodes_path": str(directed_nodes),
+                "cleaned_mask_path": str(cleaned_mask),
+            }
+        ]
+    )
+    captured: dict[str, object] = {}
+
+    def fake_generate_network_variant(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        output_dir = Path(str(kwargs["output_dir"]))
+        return SimpleNamespace(
+            output_dir=output_dir,
+            directed_links_path=output_dir / "directed" / "links.gpkg",
+            directed_nodes_path=output_dir / "directed" / "nodes.gpkg",
+            rivgraph_centerline_path=None,
+            collapsed_mask_path=output_dir / "mask" / "collapsed.tif",
+        )
+
+    monkeypatch.setattr(
+        "network_variants.variant_generation.generate_network_variant",
+        fake_generate_network_variant,
+    )
+
+    result = _build_reference_section_variant(
+        experiment_dir=experiment_dir,
+        experiment_manifest={"example_id": "02", "options": {"variant": {}}},
+        registry=registry,
+        reference_paths=_reference_section_paths(experiment_dir),
+    )
+
+    assert captured["boundary_component_labels_path"] == labels.resolve()
+    assert result["boundary_component_labels_path"] == labels.resolve()
 
 
 def test_prepare_experiment_writes_state_outputs(tmp_path: Path) -> None:
@@ -703,6 +782,39 @@ def test_compute_k_values_exports_kb_provenance() -> None:
     assert prepared.loc[0, "rapid_kb_reference_width_m"] == 275.0
     assert prepared.loc[0, "rapid_kb_reference_slope"] == 2.5e-4
     assert prepared.loc[0, "rapid_kb_reference_depth_m"] == 15.2777778
+
+
+def test_compute_k_values_prefers_effective_routing_width() -> None:
+    frame = pd.DataFrame(
+        {
+            "link_length_m": [1000.0],
+            "wid_adj_routing": [30.0],
+            "wid_adj_wet": [50.0],
+            "wid_adj": [80.0],
+            "slope_used": [1e-3],
+        }
+    )
+
+    prepared = compute_k_values(frame, config=KValueConfig())
+
+    assert prepared.loc[0, "rapid_width_source_field"] == "wid_adj_routing"
+    assert prepared.loc[0, "rapid_width_m"] == 30.0
+
+
+def test_compute_k_values_does_not_silently_use_total_corridor_width() -> None:
+    frame = pd.DataFrame(
+        {
+            "link_length_m": [1000.0],
+            "wid_adj_total": [90.0],
+            "wid_adj": [40.0],
+            "slope_used": [1e-3],
+        }
+    )
+
+    prepared = compute_k_values(frame, config=KValueConfig())
+
+    assert prepared.loc[0, "rapid_width_source_field"] == "wid_adj"
+    assert prepared.loc[0, "rapid_width_m"] == 40.0
 
 
 def test_prepare_experiment_accepts_real_link_id_zero(tmp_path: Path) -> None:

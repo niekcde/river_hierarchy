@@ -93,6 +93,43 @@ def _load_reference_unit_ids(base_hierarchy_dir: Path) -> list[int]:
     return unit_ids
 
 
+def _resolve_base_boundary_component_labels(
+    *,
+    base_row: pd.Series,
+    experiment_dir: Path,
+    example_id: str,
+) -> Path | None:
+    """Resolve the global labels already published for the experiment base state."""
+    candidates: list[Path] = []
+    raw_variant_dir = base_row.get("variant_output_dir")
+    variant_dir: Path | None = None
+    if raw_variant_dir is not None and not pd.isna(raw_variant_dir):
+        variant_dir = Path(str(raw_variant_dir)).expanduser().resolve()
+        manifest_path = variant_dir / "summary" / "variant_manifest.json"
+        if manifest_path.exists():
+            manifest = _load_json(manifest_path)
+            for section_name in ("output_paths", "source_paths"):
+                section = manifest.get(section_name, {}) or {}
+                raw_labels = str(section.get("boundary_component_labels", "") or "").strip()
+                if raw_labels:
+                    candidates.append(Path(raw_labels).expanduser())
+
+    labels_name = f"{example_id}_full_extent_land_water_labels_with_snapped_buffered_border_cut.tif"
+    candidates.append(experiment_dir / "boundary_components" / labels_name)
+    if variant_dir is not None:
+        candidates.append(variant_dir / "boundary_components" / labels_name)
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file():
+            return resolved
+    return None
+
+
 def _reference_section_paths(experiment_dir: Path) -> dict[str, Path]:
     root = experiment_dir / REFERENCE_SECTION_DIRNAME
     return {
@@ -168,25 +205,40 @@ def _build_reference_section_variant(
 
     base_row = _resolve_base_state_row(registry)
     base_hierarchy_dir = Path(str(base_row["hierarchy_output_dir"])).expanduser().resolve()
+    base_analysis_links = Path(str(base_row["analysis_links_path"])).expanduser().resolve()
+    base_directed_nodes = Path(str(base_row["directed_nodes_path"])).expanduser().resolve()
+    base_cleaned_mask = Path(str(base_row["cleaned_mask_path"])).expanduser().resolve()
+    for label, path in (
+        ("base analysis links", base_analysis_links),
+        ("base directed nodes", base_directed_nodes),
+        ("base cleaned mask", base_cleaned_mask),
+    ):
+        if not path.exists():
+            raise FileNotFoundError(f"Registered {label} path does not exist: {path}")
     unit_ids = _load_reference_unit_ids(base_hierarchy_dir)
-    root_paths = experiment_manifest.get("root_paths", {})
     variant_options = (experiment_manifest.get("options", {}) or {}).get("variant", {}) or {}
     exit_sides = _resolve_exit_sides(experiment_dir, registry)
     example_id = str(experiment_manifest.get("example_id") or experiment_manifest.get("root_example_id") or "").strip()
     if not example_id:
         raise ValueError("Experiment manifest is missing example_id/root_example_id.")
+    boundary_component_labels = _resolve_base_boundary_component_labels(
+        base_row=base_row,
+        experiment_dir=experiment_dir,
+        example_id=example_id,
+    )
 
     outputs = generate_network_variant(
-        cleaned_mask_path=root_paths["cleaned_mask"],
-        reviewed_links_path=root_paths["reviewed_links"],
-        reviewed_nodes_path=root_paths["reviewed_nodes"],
+        cleaned_mask_path=base_cleaned_mask,
+        reviewed_links_path=base_analysis_links,
+        reviewed_nodes_path=base_directed_nodes,
         exit_sides=exit_sides,
         unit_ids=unit_ids,
         variant_id=REFERENCE_SECTION_VARIANT_ID,
         example_id=example_id,
         output_dir=reference_paths["variant"],
+        boundary_component_labels_path=boundary_component_labels,
         preferred_width_field=str(
-            variant_options.get("preferred_width_field", "wid_adj_wet")
+            variant_options.get("preferred_width_field", "wid_adj_routing")
         ),
         footprint_buffer_scale=float(variant_options.get("footprint_buffer_scale", 0.5)),
         all_touched=bool(variant_options.get("all_touched", True)),
@@ -214,6 +266,7 @@ def _build_reference_section_variant(
         "directed_nodes_path": outputs.directed_nodes_path,
         "centerline_path": outputs.rivgraph_centerline_path,
         "collapsed_mask_path": outputs.collapsed_mask_path,
+        "boundary_component_labels_path": boundary_component_labels,
         "link_width_samples_path": outputs.output_dir / "widths" / "link_width_samples.csv",
         "manifest_path": outputs.output_dir / "summary" / "variant_manifest.json",
     }
@@ -279,6 +332,11 @@ def ensure_reference_section_geometry(
             "directed_nodes_path": str(variant_summary["directed_nodes_path"]),
             "centerline_path": str(variant_summary["centerline_path"]) if variant_summary["centerline_path"] is not None else "",
             "collapsed_mask_path": str(variant_summary["collapsed_mask_path"]),
+            "boundary_component_labels_path": (
+                str(variant_summary["boundary_component_labels_path"])
+                if variant_summary["boundary_component_labels_path"] is not None
+                else ""
+            ),
             "link_width_samples_path": str(variant_summary["link_width_samples_path"]),
             "variant_manifest_path": str(variant_summary["manifest_path"]),
         },

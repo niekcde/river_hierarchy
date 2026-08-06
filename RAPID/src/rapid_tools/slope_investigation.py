@@ -289,7 +289,20 @@ def build_slope_link_frame(selection: pd.DataFrame) -> pd.DataFrame:
         geo = gpd.read_file(widths_path)
         geo["centroid_x"] = geo.geometry.centroid.x.astype(float)
         geo["centroid_y"] = geo.geometry.centroid.y.astype(float)
-        geo_cols = [c for c in ["id_link", "id_us_node", "id_ds_node", "wid_adj_wet", "len", "centroid_x", "centroid_y"] if c in geo.columns]
+        geo_cols = [
+            c
+            for c in [
+                "id_link",
+                "id_us_node",
+                "id_ds_node",
+                "wid_adj_routing",
+                "wid_adj_wet",
+                "len",
+                "centroid_x",
+                "centroid_y",
+            ]
+            if c in geo.columns
+        ]
         merged = link_frame.merge(geo[geo_cols], on=["id_link", "id_us_node", "id_ds_node"], how="left")
 
         if lineage_path.exists() and lineage_path.stat().st_size > 1:
@@ -389,11 +402,11 @@ def build_low_k_parent_summary(
                 prepared,
                 link_width_samples_path=_resolve_link_width_samples_path(widths_path),
                 sample_field=str(prep_config.get("subreach_width_sample_field", "width_wet")),
-                fallback_width_field=str(prep_config.get("width_field", "wid_adj_wet")),
+                fallback_width_field=str(prep_config.get("width_field", "wid_adj_routing")),
             )
             width_field = "rapid_subreach_width_m"
         else:
-            width_field = str(prep_config.get("width_field", "wid_adj_wet"))
+            width_field = str(prep_config.get("width_field", "wid_adj_routing"))
 
         rapid_links = compute_k_values(
             rapid_links,
@@ -441,6 +454,7 @@ def build_low_k_parent_summary(
                     "id_ds_node",
                     "link_length_m",
                     "len",
+                    "wid_adj_routing",
                     "wid_adj_wet",
                     "slope_used",
                     "parent_centroid_x",
@@ -789,6 +803,7 @@ def plot_slope_plan_view(
             "slope_used",
             "slope_section_ratio",
             "slope_neighbor_source_link_id",
+            "wid_adj_routing",
             "wid_adj_wet",
         ]
         if column in link_frame.columns

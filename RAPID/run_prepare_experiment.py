@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--time-column", default="time", help="Timestamp column in the forcing file.")
     parser.add_argument("--discharge-column", default="discharge", help="Discharge column in the forcing file.")
-    parser.add_argument("--width-field", default="wid_adj_wet", help="Preferred link width field for RAPID K preparation.")
+    parser.add_argument("--width-field", default="wid_adj_routing", help="Preferred effective link width field for RAPID K preparation.")
     parser.add_argument("--vary-width-by-subreach", action="store_true", help="Derive a width for each RAPID subreach from variant link_width_samples.csv instead of copying one parent-link width across all segments.")
     parser.add_argument("--subreach-width-sample-field", default="width_wet", help="Width sample field from link_width_samples.csv used when --vary-width-by-subreach is enabled.")
     parser.add_argument(
