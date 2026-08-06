@@ -78,6 +78,45 @@ def test_compute_bubble_equivalent_metrics_from_units_reduces_standalone_paralle
     assert set(bubble_nodes["node_id"].tolist()) == {1, 2}
 
 
+def test_bubble_resistance_prefers_effective_routing_width() -> None:
+    links = pd.DataFrame(
+        [
+            {
+                "id_link": 1,
+                "id_us_node": 1,
+                "id_ds_node": 2,
+                "len_adj": 100.0,
+                "wid_adj_routing": 25.0,
+                "wid_adj_wet": 50.0,
+                "wid_adj": 80.0,
+            },
+            {
+                "id_link": 2,
+                "id_us_node": 1,
+                "id_ds_node": 2,
+                "len_adj": 100.0,
+                "wid_adj_routing": 25.0,
+                "wid_adj_wet": 50.0,
+                "wid_adj": 80.0,
+            },
+        ]
+    )
+    nodes = pd.DataFrame(
+        [{"id_node": 1, "sword_wse": 10.0}, {"id_node": 2, "sword_wse": 9.0}]
+    )
+    unit = _parallel_unit(unit_id=10, edge_ids=[1, 2], upstream=1, downstream=2)
+
+    _, bubble_edges, _ = compute_bubble_equivalent_metrics_from_units(
+        links,
+        nodes,
+        [unit],
+        config=BubbleEquivalentResistanceConfig(kb_value=20.0, default_manning_n=0.035),
+    )
+
+    assert set(bubble_edges["width_source"]) == {"wid_adj_routing"}
+    assert set(bubble_edges["w"]) == {25.0}
+
+
 def test_compute_bubble_equivalent_metrics_from_units_groups_compound_bubbles() -> None:
     links = pd.DataFrame(
         [

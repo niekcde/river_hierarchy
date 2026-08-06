@@ -22,7 +22,13 @@ from hierarchy_level_definition.unit_detection.bifurcation_confluence_units impo
 )
 
 
-WIDTH_FIELD_CANDIDATES = ("wid_adj_wet", "wid_adj", "wid", "wid_med")
+WIDTH_FIELD_CANDIDATES = (
+    "wid_adj_routing",
+    "wid_adj_wet",
+    "wid_adj",
+    "wid",
+    "wid_med",
+)
 LENGTH_FIELD_CANDIDATES = ("len_adj", "len", "link_length_m")
 KB_FIELD_CANDIDATES = ("k_b", "kb", "rapid_kb_value")
 MANNING_N_FIELD_CANDIDATES = ("n", "manning_n", "rapid_n_manning")
@@ -280,7 +286,9 @@ def _empty_bubble_edge_frame() -> pd.DataFrame:
             "v",
             "L",
             "w",
+            "width_source",
             "k_b",
+            "kb_source",
             "d",
             "A",
             "R_h",
@@ -433,7 +441,9 @@ def compute_bubble_equivalent_metrics_from_units(
                     "v",
                     "L",
                     "w",
+                    "width_source",
                     "k_b",
+                    "kb_source",
                     "d",
                     "A",
                     "R_h",

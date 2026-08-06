@@ -28,7 +28,13 @@ from hierarchy_level_definition.unit_detection.bifurcation_confluence_units impo
 
 
 LENGTH_COLUMNS = ("len_adj", "len")
-REPRESENTATIVE_WIDTH_COLUMNS = ("wid_adj_wet", "wid_adj", "wid", "wid_med")
+REPRESENTATIVE_WIDTH_COLUMNS = (
+    "wid_adj_routing",
+    "wid_adj_wet",
+    "wid_adj",
+    "wid",
+    "wid_med",
+)
 DEFAULT_PIXEL_WIDTH_FIELDS = (
     "wid_pix_wet",
     "width_samples",

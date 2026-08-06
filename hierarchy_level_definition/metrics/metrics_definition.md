@@ -80,9 +80,11 @@ Per link:
 
 `W_i^{rep}` = first valid value from:
 
-1. `wid_adj`
-2. `wid`
-3. `wid_med`
+1. `wid_adj_routing`
+2. `wid_adj_wet`
+3. `wid_adj`
+4. `wid`
+5. `wid_med`
 
 Only finite values greater than zero are valid.
 
@@ -94,6 +96,10 @@ Representative widths are used for:
 - entropy metrics
 - effective-path metrics
 - dominance metrics
+
+`wid_adj_routing` is the effective flow width selected by the width-QC model
+and continuity solver. The measured pixel/sample fields remain separate and
+continue to supply physical width extremes and percentile diagnostics.
 
 ### 2. Pixel/sample width
 
