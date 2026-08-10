@@ -631,6 +631,50 @@ def test_independent_units_creates_one_child_per_base_unit(tmp_path: Path) -> No
         assert timing["state_total_seconds"] >= 0
 
 
+def test_independent_units_can_defer_child_hierarchy(tmp_path: Path) -> None:
+    workflow_runner = _make_workflow_runner([_workflow_outputs([5])])
+    state_hydraulic_context_runner = _make_state_hydraulic_context_runner()
+
+    results = run_collapse_experiment(
+        "independent-units",
+        cleaned_mask_path=tmp_path / "base_cleaned.tif",
+        reviewed_links_path=tmp_path / "base_links.gpkg",
+        reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=tmp_path / "experiment",
+        unit_workflow_runner=workflow_runner,
+        unit_workflow_writer=write_unit_workflow_outputs,
+        variant_runner=_make_variant_runner(),
+        base_state_variant_materializer=_make_base_state_materializer(),
+        state_hydraulic_context_runner=state_hydraulic_context_runner,
+        defer_child_hierarchy=True,
+    )
+
+    assert len(workflow_runner.calls) == 1
+    child = results.state_registry.loc[results.state_registry["state_id"].eq("S001_unit_5")].iloc[0]
+    assert child["hierarchy_status"] == "deferred"
+    assert child["status"] == "hydraulic_complete_hierarchy_deferred"
+    assert not (tmp_path / "experiment" / "states" / "S001_unit_5" / "hierarchy").exists()
+    assert results.transition_registry.iloc[0]["child_hierarchy_status"] == "deferred"
+    assert results.equivalent_transition_registry.empty
+    assert results.manifest["n_hierarchy_deferred_states"] == 1
+    assert results.manifest["options"]["hierarchy"]["defer_child_hierarchy"] is True
+    assert "parent_link_context_path" in state_hydraulic_context_runner.calls[1]
+
+
+def test_sequential_mode_rejects_deferred_child_hierarchy(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="sequential modes require"):
+        run_collapse_experiment(
+            "sequential-units",
+            cleaned_mask_path=tmp_path / "base_cleaned.tif",
+            reviewed_links_path=tmp_path / "base_links.gpkg",
+            reviewed_nodes_path=tmp_path / "base_nodes.gpkg",
+            exit_sides="NS",
+            output_dir=tmp_path / "experiment",
+            defer_child_hierarchy=True,
+        )
+
+
 def test_independent_units_can_filter_to_requested_unit_ids(tmp_path: Path) -> None:
     workflow_runner = _make_workflow_runner(
         [
@@ -1155,6 +1199,63 @@ def test_main_runs_both_collapse_corridor_modes_with_suffixed_outputs(
     ).resolve()
 
 
+def test_main_builds_only_anchored_from_completed_realized_experiment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    realized_source = tmp_path / "demo_output__realized"
+    (realized_source / "states" / "S000_base" / "variant").mkdir(parents=True)
+    (realized_source / "boundary_components").mkdir()
+
+    def fake_run_collapse_experiment(mode: str, **kwargs: Any) -> SimpleNamespace:
+        calls.append({"mode": mode, **dict(kwargs)})
+        return SimpleNamespace(
+            output_dir=Path(kwargs["output_dir"]),
+            state_registry=pd.DataFrame([{"state_id": "S000_base"}]),
+            transition_registry=pd.DataFrame(),
+            equivalent_transition_registry=pd.DataFrame(),
+            manifest={"mode": mode, "stop_reason": "test_complete", "terminal_state_id": "S000_base"},
+        )
+
+    monkeypatch.setattr(collapse_experiment_module, "run_collapse_experiment", fake_run_collapse_experiment)
+
+    exit_code = main(
+        [
+            "compound-bubbles",
+            "--cleaned-mask",
+            str(tmp_path / "base_cleaned.tif"),
+            "--reviewed-links",
+            str(tmp_path / "base_links.gpkg"),
+            "--reviewed-nodes",
+            str(tmp_path / "base_nodes.gpkg"),
+            "--exit-sides",
+            "NS",
+            "--experiment-id",
+            "demo",
+            "--output-dir",
+            str(tmp_path / "demo_output"),
+            "--collapse-corridor-mode",
+            "anchored",
+            "--anchored-source-experiment",
+            str(realized_source),
+        ]
+    )
+
+    assert exit_code == 0
+    assert len(calls) == 1
+    assert calls[0]["collapse_corridor_mode"] == "anchored"
+    assert calls[0]["experiment_id"] == "demo__anchored"
+    assert Path(calls[0]["output_dir"]).name == "demo_output__anchored"
+    assert callable(calls[0]["variant_runner"])
+    assert Path(calls[0]["base_state_variant_source_dir"]) == (
+        realized_source / "states" / "S000_base" / "variant"
+    ).resolve()
+    assert Path(calls[0]["boundary_component_artifact_source_dir"]) == (
+        realized_source / "boundary_components"
+    ).resolve()
+
+
 def test_copy_boundary_component_artifacts_localizes_panelized_manifest(tmp_path: Path) -> None:
     source = tmp_path / "realized" / "boundary_components"
     source.mkdir(parents=True)
@@ -1454,6 +1555,58 @@ def test_main_passes_equivalent_length_field_into_equivalent_resistance_config(
     assert config.length_field_candidates == ("len", "len_adj", "link_length_m")
 
 
+def test_main_passes_equivalent_forcing_resample_seconds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_collapse_experiment(mode: str, **kwargs: Any) -> SimpleNamespace:
+        calls.append({"mode": mode, **dict(kwargs)})
+        output_dir = Path(kwargs["output_dir"])
+        return SimpleNamespace(
+            output_dir=output_dir,
+            state_registry=pd.DataFrame([{"state_id": "S000_base"}]),
+            transition_registry=pd.DataFrame(),
+            equivalent_transition_registry=pd.DataFrame(),
+            manifest={"mode": mode, "stop_reason": "test_complete", "terminal_state_id": "S000_base"},
+        )
+
+    monkeypatch.setattr(collapse_experiment_module, "run_collapse_experiment", fake_run_collapse_experiment)
+
+    exit_code = main(
+        [
+            "independent-units",
+            "--cleaned-mask",
+            str(tmp_path / "base_cleaned.tif"),
+            "--reviewed-links",
+            str(tmp_path / "base_links.gpkg"),
+            "--reviewed-nodes",
+            str(tmp_path / "base_nodes.gpkg"),
+            "--exit-sides",
+            "NS",
+            "--experiment-id",
+            "demo",
+            "--output-dir",
+            str(tmp_path / "demo_output"),
+            "--compute-equivalent-resistance",
+            "--equivalent-kb-mode",
+            "based_reference_section",
+            "--equivalent-forcing-resample-seconds",
+            "980",
+        ]
+    )
+
+    assert exit_code == 0
+    assert len(calls) == 1
+    config = calls[0]["equivalent_forcing_config"]
+    assert config is not None
+    assert config.resample_seconds == 980
+    assert config.resample_minutes is None
+    assert calls[0]["equivalent_kb_width_sample_field"] == "wid_adj_routing"
+    assert calls[0]["equivalent_kb_width_percentile"] is None
+
+
 def test_independent_units_writes_equivalent_transition_comparisons(tmp_path: Path) -> None:
     workflow_runner = _make_workflow_runner(
         [
@@ -1688,6 +1841,106 @@ def test_equivalent_transition_matching_uses_parent_mapped_child_boundary_nodes(
     assert row["K_before"] == pytest.approx(10.0)
     assert row["K_after"] == pytest.approx(10.0)
     assert row["Lambda_K"] == pytest.approx(1.0)
+
+
+def test_selected_hydraulic_domain_replaces_primary_comparison_and_keeps_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_state_dir = tmp_path / "parent"
+    child_state_dir = tmp_path / "child"
+    parent = ExperimentStateContext(
+        state_id="S000_base",
+        parent_state_id=None,
+        depth=0,
+        state_dir=parent_state_dir,
+        hierarchy_output_dir=parent_state_dir / "hierarchy",
+        cleaned_mask_path=parent_state_dir / "mask.tif",
+        reviewed_links_path=parent_state_dir / "links.gpkg",
+        reviewed_nodes_path=parent_state_dir / "nodes.gpkg",
+        workflow=_workflow_outputs([]),
+    )
+    child = ExperimentStateContext(
+        state_id="S001_unit_7",
+        parent_state_id="S000_base",
+        depth=1,
+        state_dir=child_state_dir,
+        hierarchy_output_dir=child_state_dir / "hierarchy",
+        cleaned_mask_path=child_state_dir / "mask.tif",
+        reviewed_links_path=child_state_dir / "links.gpkg",
+        reviewed_nodes_path=child_state_dir / "nodes.gpkg",
+        workflow=_workflow_outputs([]),
+    )
+    selected = pd.DataFrame.from_records(
+        [
+            {
+                "transition_id": "T001",
+                "parent_state_id": "S000_base",
+                "child_state_id": "S001_unit_7",
+                "match_method": "smallest_closed_hydraulic_domain__matched_parent_anchors",
+                "comparison_scope": "selected_hydraulic_domain",
+                "hydraulic_domain_type": "containing_compound_context",
+                "K_before": 4.0,
+                "K_after": 2.0,
+                "Lambda_K": 0.5,
+                "Lambda_G": 2.0,
+                "percent_change_K": -50.0,
+                "percent_change_G": 100.0,
+            }
+        ]
+    )
+    audit = pd.DataFrame(
+        [{"transition_id": "T001", "domain_role": "parent", "id_link": 1}]
+    )
+    monkeypatch.setattr(
+        collapse_experiment_module,
+        "_selected_hydraulic_domain_comparison",
+        lambda **kwargs: (selected, audit),
+    )
+
+    comparison = _write_equivalent_transition_outputs(
+        transition_id="T001",
+        parent_context=parent,
+        child_context=child,
+        equivalent_resistance_config=BubbleEquivalentResistanceConfig(),
+    )
+
+    assert comparison.iloc[0]["comparison_scope"] == "selected_hydraulic_domain"
+    assert comparison.iloc[0]["Lambda_K"] == pytest.approx(0.5)
+    output_dir = child_state_dir / "equivalent_resistance"
+    assert (output_dir / "redetected_bubble_matches.csv").exists()
+    assert (output_dir / "selected_hydraulic_domain_links.csv").exists()
+    summary = json.loads(
+        (output_dir / "bubble_equivalent_state_comparison_summary.json").read_text()
+    )
+    assert summary["comparison_method"] == "smallest_closed_hydraulic_domain"
+    assert summary["n_selected_hydraulic_domain_comparisons"] == 1
+
+    failed_state_dir = tmp_path / "failed_child"
+    child.state_dir = failed_state_dir
+    monkeypatch.setattr(
+        collapse_experiment_module,
+        "_selected_hydraulic_domain_comparison",
+        lambda **kwargs: (_ for _ in ()).throw(
+            ValueError("No unambiguous child anchor")
+        ),
+    )
+    failed = _write_equivalent_transition_outputs(
+        transition_id="T002",
+        parent_context=parent,
+        child_context=child,
+        equivalent_resistance_config=BubbleEquivalentResistanceConfig(),
+    )
+    assert failed.iloc[0]["selected_domain_status"] == "failed"
+    assert "No unambiguous child anchor" in failed.iloc[0]["selected_domain_error"]
+    failed_summary = json.loads(
+        (
+            failed_state_dir
+            / "equivalent_resistance"
+            / "bubble_equivalent_state_comparison_summary.json"
+        ).read_text()
+    )
+    assert failed_summary["selected_hydraulic_domain_status"] == "failed"
 
 
 def test_independent_units_records_failed_variant_and_continues(tmp_path: Path) -> None:

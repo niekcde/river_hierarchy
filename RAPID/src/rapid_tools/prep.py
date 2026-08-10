@@ -26,12 +26,13 @@ from .forcing import ForcingConfig, _apply_constant_spinup, infer_forcing_dt_sec
 from .k_values import (
     KValueConfig,
     apply_stability_effective_length_cap,
+    compute_dt_bounds,
     compute_k_values,
     find_nearby_compatible_forcing_and_routing_dt,
     compute_routing_dt_seconds,
     resolve_width_field,
+    select_coordinated_routing_timesteps,
 )
-from .reference_section import compute_reference_section_kb
 from .registry import RapidStateContext, iter_preparable_states, load_state_registry
 
 SECONDS_PER_HOUR = 3600.0
@@ -48,8 +49,8 @@ class RapidPrepConfig:
     kb_value: float = 20.0
     kb_mode: str = "fixed"
     kb_model_path: str | None = None
-    kb_width_sample_field: str = "wid_adj_wet"
-    kb_width_percentile: float = 90.0
+    kb_width_sample_field: str = "wid_adj_routing"
+    kb_width_percentile: float | None = None
     n_manning: float = 0.35
     min_width: float = 1.0
     min_effective_length_for_k_m: float | None = None
@@ -108,6 +109,43 @@ def _apply_branch_widths(
 
 def _normalize_dir_path(raw: str | Path) -> Path:
     return Path(raw).expanduser().resolve()
+
+
+def _load_stored_reference_kb_summary(
+    experiment_dir: str | Path,
+) -> tuple[dict[str, object], str]:
+    """Load the canonical upstream BASED result without recalculating it."""
+    experiment_path = Path(experiment_dir).expanduser().resolve()
+    canonical_path = experiment_path / "reference_section" / "reference_kb_summary.json"
+    if canonical_path.exists():
+        summary = json.loads(canonical_path.read_text(encoding="utf-8"))
+        resolve_kb_context(
+            kb_mode="based_reference_section",
+            reference_kb_summary=summary,
+        )
+        return dict(summary), str(canonical_path)
+
+    equivalent_manifest_path = (
+        experiment_path
+        / "equivalent_resistance"
+        / "equivalent_resistance_manifest.json"
+    )
+    if equivalent_manifest_path.exists():
+        manifest = json.loads(equivalent_manifest_path.read_text(encoding="utf-8"))
+        summary = manifest.get("reference_kb_summary")
+        if isinstance(summary, dict):
+            resolve_kb_context(
+                kb_mode="based_reference_section",
+                reference_kb_summary=summary,
+            )
+            return dict(summary), str(equivalent_manifest_path)
+
+    raise FileNotFoundError(
+        "RAPID prep with kb_mode='based_reference_section' requires the stored "
+        "upstream BASED result at "
+        f"{canonical_path}. RAPID no longer recalculates BASED. Rebuild or refresh "
+        "equivalent resistance for this experiment first."
+    )
 
 
 def _load_link_hydraulic_context_if_exists(
@@ -884,6 +922,8 @@ def prepare_state(
     forcing_table: pd.DataFrame | None = None,
     forcing_metadata: Mapping[str, object] | None = None,
     reference_kb_summary: Mapping[str, object] | None = None,
+    planned_routing_dt_seconds: int | None = None,
+    timestep_selection: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     prep_config = prep_config or RapidPrepConfig()
     forcing_config = forcing_config or ForcingConfig()
@@ -993,7 +1033,11 @@ def prepare_state(
     inflow_path = None
     forcing_dt_seconds = None
     routing_dt_seconds = None
-    routing_dt_source = "forcing_dt_exact_divisor"
+    routing_dt_source = (
+        str(timestep_selection.get("selection_source"))
+        if timestep_selection is not None
+        else "forcing_dt_exact_divisor"
+    )
     resolved_forcing_metadata = dict(forcing_metadata) if forcing_metadata is not None else None
     resolved_forcing_config = replace(forcing_config)
     if forcing_table is not None:
@@ -1030,10 +1074,24 @@ def prepare_state(
                 rapid_links["rapid_k"],
                 x_value=prep_config.x_value,
                 forcing_dt_seconds=forcing_dt_seconds,
-                preferred_routing_dt_seconds=prep_config.preferred_routing_dt_seconds,
+                preferred_routing_dt_seconds=(
+                    int(planned_routing_dt_seconds)
+                    if planned_routing_dt_seconds is not None
+                    else prep_config.preferred_routing_dt_seconds
+                ),
             )
+            if (
+                planned_routing_dt_seconds is not None
+                and int(routing_dt_seconds) != int(planned_routing_dt_seconds)
+            ):
+                raise ValueError(
+                    f"State {context.state_id} resolved routing_dt_seconds={routing_dt_seconds}, "
+                    f"but the experiment timestep plan requires {planned_routing_dt_seconds}."
+                )
         except ValueError as exc:
             can_search_nearby_forcing_dt = (
+                planned_routing_dt_seconds is None
+                and
                 forcing_path is not None
                 and (
                     resolved_forcing_config.resample_seconds is not None
@@ -1155,6 +1213,11 @@ def prepare_state(
             "forcing_dt_seconds": forcing_dt_seconds,
             "routing_dt_seconds": routing_dt_seconds,
             "routing_dt_source": routing_dt_source,
+            "experiment_timestep_selection": (
+                dict(timestep_selection)
+                if timestep_selection is not None
+                else None
+            ),
         },
         "diagnostics": {
             "link_multiplier": float(len(rapid_links) / len(prepared_links)) if len(prepared_links) else float("nan"),
@@ -1242,6 +1305,12 @@ def prepare_state(
         "max_effective_length_m": float(rapid_links["rapid_effective_length_m"].max()) if "rapid_effective_length_m" in rapid_links.columns and len(rapid_links) else float("nan"),
         "rapid_k_min": float(rapid_links["rapid_k"].min()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
         "rapid_k_max": float(rapid_links["rapid_k"].max()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
+        "stability_length_cap_dt_min_after_seconds": float(
+            compute_dt_bounds(rapid_links["rapid_k"], x_value=prep_config.x_value)[0]
+        ),
+        "stability_length_cap_dt_max_after_seconds": float(
+            compute_dt_bounds(rapid_links["rapid_k"], x_value=prep_config.x_value)[1]
+        ),
         "status": "prepared",
     }
 
@@ -1260,31 +1329,15 @@ def prepare_experiment(
     forcing_config = forcing_config or ForcingConfig()
     resolved_prep_config = prep_config
 
-    forcing_table: pd.DataFrame | None = None
-    forcing_metadata: dict[str, object] | None = None
     reference_kb_summary: dict[str, object] | None = None
+    reference_kb_summary_source: str | None = None
     resolved_kb_summary: dict[str, object] | None = None
     experiment_prepass_error: str | None = None
 
     try:
-        if forcing_path is not None:
-            prepass_forcing_config = forcing_config
-            if forcing_config.auto_spinup_from_k:
-                prepass_forcing_config = replace(
-                    forcing_config,
-                    auto_spinup_from_k=False,
-                    spinup_hours=None,
-                )
-            forcing_table, forcing_metadata = prepare_forcing_table(forcing_path, config=prepass_forcing_config)
         if str(resolved_prep_config.kb_mode or "fixed") == "based_reference_section":
-            if forcing_table is None:
-                raise ValueError("based_reference_section kb mode requires forcing_path to be provided.")
-            reference_kb_summary = compute_reference_section_kb(
+            reference_kb_summary, reference_kb_summary_source = _load_stored_reference_kb_summary(
                 experiment_path,
-                forcing=forcing_table,
-                width_sample_field=resolved_prep_config.kb_width_sample_field,
-                width_percentile=resolved_prep_config.kb_width_percentile,
-                model_path=resolved_prep_config.kb_model_path,
             )
         resolved_kb_summary = resolve_kb_context(
             kb_mode=resolved_prep_config.kb_mode,
@@ -1294,11 +1347,97 @@ def prepare_experiment(
     except Exception as exc:  # pragma: no cover
         experiment_prepass_error = str(exc)
 
-    for context in iter_preparable_states(
-        registry,
-        include_base_state=prep_config.include_base_state,
-    ):
+    contexts = list(
+        iter_preparable_states(
+            registry,
+            include_base_state=prep_config.include_base_state,
+        )
+    )
+    network_prepass: dict[str, dict[str, object]] = {}
+    state_bounds: dict[str, tuple[float, float]] = {}
+
+    # First build every state's RAPID network without forcing. This obtains all
+    # post-cap K stability intervals before any state is assigned a clock.
+    for context in contexts:
         if experiment_prepass_error is not None:
+            network_prepass[context.state_id] = {
+                "state_id": context.state_id,
+                "state_role": context.state_role,
+                "rapid_prep_dir": str(context.rapid_prep_dir),
+                "rapid_prep_manifest": "",
+                "status": "failed",
+                "error": experiment_prepass_error,
+            }
+            continue
+        try:
+            result = prepare_state(
+                context,
+                forcing_path=None,
+                forcing_config=forcing_config,
+                prep_config=resolved_prep_config,
+                reference_kb_summary=reference_kb_summary,
+            )
+        except Exception as exc:  # pragma: no cover
+            result = {
+                "state_id": context.state_id,
+                "state_role": context.state_role,
+                "rapid_prep_dir": str(context.rapid_prep_dir),
+                "rapid_prep_manifest": "",
+                "status": "failed",
+                "error": str(exc),
+            }
+        network_prepass[context.state_id] = result
+        if result.get("status") == "prepared":
+            state_bounds[context.state_id] = (
+                float(result["stability_length_cap_dt_min_after_seconds"]),
+                float(result["stability_length_cap_dt_max_after_seconds"]),
+            )
+
+    timestep_plan: dict[str, object] | None = None
+    timestep_plan_error: str | None = None
+    coordinated_timestep_enabled = (
+        forcing_path is not None
+        and resolved_prep_config.preferred_routing_dt_seconds is not None
+    )
+    if coordinated_timestep_enabled and state_bounds:
+        try:
+            timestep_plan = select_coordinated_routing_timesteps(
+                state_bounds,
+                preferred_routing_dt_seconds=resolved_prep_config.preferred_routing_dt_seconds,
+                multiple_seconds=5,
+            )
+        except Exception as exc:  # pragma: no cover
+            timestep_plan_error = str(exc)
+
+    for context in contexts:
+        prepass_result = network_prepass[context.state_id]
+        if prepass_result.get("status") != "prepared":
+            prep_rows.append(prepass_result)
+            continue
+        if forcing_path is None:
+            prep_rows.append(prepass_result)
+            continue
+        if not coordinated_timestep_enabled:
+            try:
+                result = prepare_state(
+                    context,
+                    forcing_path=forcing_path,
+                    forcing_config=forcing_config,
+                    prep_config=resolved_prep_config,
+                    reference_kb_summary=reference_kb_summary,
+                )
+            except Exception as exc:  # pragma: no cover
+                result = {
+                    "state_id": context.state_id,
+                    "state_role": context.state_role,
+                    "rapid_prep_dir": str(context.rapid_prep_dir),
+                    "rapid_prep_manifest": "",
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            prep_rows.append(result)
+            continue
+        if timestep_plan_error is not None or timestep_plan is None:
             prep_rows.append(
                 {
                     "state_id": context.state_id,
@@ -1306,19 +1445,32 @@ def prepare_experiment(
                     "rapid_prep_dir": str(context.rapid_prep_dir),
                     "rapid_prep_manifest": "",
                     "status": "failed",
-                    "error": experiment_prepass_error,
+                    "error": timestep_plan_error or "Experiment timestep plan was not created.",
                 }
             )
             continue
+
+        state_selection = dict(timestep_plan["states"][context.state_id])
+        selected_dt = int(state_selection["routing_dt_seconds"])
+        state_forcing_config = replace(
+            forcing_config,
+            resample_seconds=selected_dt,
+            resample_minutes=None,
+        )
+        state_prep_config = replace(
+            resolved_prep_config,
+            preferred_routing_dt_seconds=selected_dt,
+            forcing_dt_search_max_offset_seconds=0,
+        )
         try:
             result = prepare_state(
                 context,
                 forcing_path=forcing_path,
-                forcing_config=forcing_config,
-                prep_config=resolved_prep_config,
-                forcing_table=forcing_table,
-                forcing_metadata=forcing_metadata,
+                forcing_config=state_forcing_config,
+                prep_config=state_prep_config,
                 reference_kb_summary=reference_kb_summary,
+                planned_routing_dt_seconds=selected_dt,
+                timestep_selection=state_selection,
             )
         except Exception as exc:  # pragma: no cover
             result = {
@@ -1343,8 +1495,13 @@ def prepare_experiment(
                 "forcing_config": asdict(forcing_config) if forcing_config is not None else None,
                 "prep_config": asdict(resolved_prep_config),
                 "reference_kb_summary": reference_kb_summary,
+                "reference_kb_summary_source": reference_kb_summary_source,
+                "reference_kb_recomputed": False,
                 "resolved_kb_summary": resolved_kb_summary,
                 "experiment_prepass_error": experiment_prepass_error,
+                "timestep_plan": timestep_plan,
+                "timestep_plan_error": timestep_plan_error,
+                "coordinated_timestep_enabled": bool(coordinated_timestep_enabled),
                 "states_total": int(len(prep_registry)),
                 "states_prepared": int(prep_registry["status"].eq("prepared").sum()) if not prep_registry.empty else 0,
                 "states_failed": int(prep_registry["status"].eq("failed").sum()) if not prep_registry.empty else 0,

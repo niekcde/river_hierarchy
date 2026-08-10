@@ -145,7 +145,7 @@ def _load_width_summary(
     link_width_families_path: Path,
     *,
     width_sample_field: str,
-    width_percentile: float,
+    width_percentile: float | None,
 ) -> dict[str, object]:
     if link_width_families_path.exists():
         families = pd.read_csv(link_width_families_path)
@@ -179,6 +179,12 @@ def _load_width_summary(
     if widths.empty:
         raise ValueError(
             f"Reference-section width samples did not contain any positive finite '{width_sample_field}' values."
+        )
+    if width_percentile is None:
+        raise ValueError(
+            "Reference-section width percentile must be provided when the selected width field "
+            "is available only in raw link-width samples. Summary width fields such as "
+            "'wid_adj_routing' do not require a percentile."
         )
     return {
         "sample_field": width_sample_field,
@@ -276,7 +282,7 @@ def ensure_reference_section_geometry(
     experiment_dir: str | Path,
     *,
     width_sample_field: str,
-    width_percentile: float,
+    width_percentile: float | None,
 ) -> dict[str, Any]:
     experiment_path = Path(experiment_dir).expanduser().resolve()
     registry_path = experiment_path / "state_registry.csv"
@@ -298,6 +304,16 @@ def ensure_reference_section_geometry(
                 break
             required.append(Path(raw))
         if required and all(path.exists() for path in required):
+            variant_output_dir = Path(str(cached_paths["variant_output_dir"])).expanduser().resolve()
+            refreshed_width_summary = _load_width_summary(
+                Path(str(cached_paths["link_width_samples_path"])).expanduser().resolve(),
+                variant_output_dir / "widths" / "link_width_families.csv",
+                width_sample_field=width_sample_field,
+                width_percentile=width_percentile,
+            )
+            if cached.get("width_summary") != refreshed_width_summary:
+                cached["width_summary"] = refreshed_width_summary
+                reference_paths["geometry_summary"].write_text(json.dumps(cached, indent=2))
             return cached
 
     variant_summary = _build_reference_section_variant(
@@ -406,7 +422,7 @@ def compute_reference_section_kb(
     *,
     forcing: pd.DataFrame,
     width_sample_field: str,
-    width_percentile: float,
+    width_percentile: float | None,
     model_path: str | Path | None = None,
 ) -> dict[str, Any]:
     experiment_path = Path(experiment_dir).expanduser().resolve()
@@ -432,6 +448,7 @@ def compute_reference_section_kb(
         )
     )
     kb_value = float(width_ref / depth_ref)
+    width_percentile_value = geometry_summary["width_summary"].get("percentile")
     summary = {
         "example_id": geometry_summary["example_id"],
         "kb_source_method": "based_reference_section",
@@ -441,7 +458,11 @@ def compute_reference_section_kb(
         "reference_slope": slope_ref,
         "reference_depth_m": depth_ref,
         "width_sample_field": str(geometry_summary["width_summary"]["sample_field"]),
-        "width_percentile": float(geometry_summary["width_summary"]["percentile"]),
+        "width_percentile": (
+            float(width_percentile_value)
+            if width_percentile_value is not None and np.isfinite(float(width_percentile_value))
+            else None
+        ),
         "slope_source_method": str(geometry_summary["slope_summary"]["source_method"]),
         "slope_anchor_count": int(geometry_summary["slope_summary"]["anchor_count"]),
         "based_model_path": str(resolve_based_model_path(model_path)),

@@ -163,12 +163,26 @@ state also writes `stage_timings.json` for variant generation, hierarchy, and
 hydraulic-context timing. The downstream hierarchy, slope, hydraulic, and
 equivalent-resistance workflows still run on the complete anchored graph.
 
+Full-raster child generation uses the same inheritance contract before width
+measurement. After RivGraph generation, direction assignment, and lineage
+resolution, an `unchanged_1to1` link is accepted for inheritance only when its
+geometry is topologically equal to one unique parent link. Its complete parent
+width fields and sample rows are copied. Only links that fail that strict test
+are passed to the raster-backed two-bank width calculation. The calculation
+currently retains the full-raster context, so this changes execution cost but
+not the bank-search or width semantics. The manifest records
+`measurement_scope=changed_links_only_full_raster_context` together with the
+measured and skipped link IDs and width-stage timings under
+`width_product_inheritance`.
+
 These final family-summary width fields now also matter downstream in RAPID
 prep and equivalent-resistance workflows. The current default reference-width
-choice for derived `kb` calculations is `wid_adj_wet`, and the reference-
+choice for derived `kb` calculations is `wid_adj_routing`, and the reference-
 section helper prefers the summary width already written to
 `link_width_families.csv` over recomputing a percentile from raw sample widths
-when that field is available.
+when that field is available. The percentile setting defaults to null and must
+be supplied explicitly only for a field that exists solely in raw samples;
+there is no implicit P90 fallback.
 
 Audit columns for this logic include:
 
@@ -291,13 +305,46 @@ Three head concepts are intentionally kept separate:
 - normalized solver heads for equivalent-resistance solves:
   not stored in `hydraulic_context/`; written separately by the solver workflow
 
+Derived states now inherit the final parent slope for direction-consistent
+`unchanged_1to1` links with at least 99.9% dominant-parent overlap. Raw child
+profile slopes remain available for provenance. Parent inheritance is recorded
+with:
+
+- `slope_parent_inheritance_applied`
+- `slope_inherited_from_parent_link`
+- `slope_parent_value`
+- `slope_preinheritance_value`
+- `slope_parent_inheritance_reason`
+
+Collapsed local links are excluded from direct inheritance. If a valid child
+direction maps to reversed parent endpoints and creates a nonpositive head
+drop, the changed links and their one-hop context are solved together using
+reliable parent-continuation slopes as targets.
+
+Ordinary collapsed components use a path-relative head optimizer. Every
+directed boundary-to-boundary path contributes its own target slope from the
+base-derived boundary-head drop divided by the child path length. Link terms
+are weighted by their share of path length, so a shared link participates in
+every path that contains it rather than being forced toward one component-wide
+mean slope. Boundary heads remain hard and every optimized link must satisfy
+the configured positive minimum slope. The link context records target paths,
+target slopes, optimized endpoint heads, and objective values before and after
+the solve.
+
 The hydraulic context can also inherit slope from a family representative when
-width inheritance was applied to an anchored segmented stub. This affects only
-the final link hydraulic context and is recorded with:
+width inheritance was applied to an anchored segmented stub. This is recorded
+with:
 
 - `family_slope_inheritance_applied`
 - `family_slope_inherited_from_link`
 - `family_slope_inheritance_reason`
+
+For independent-unit and compound-bubble runs,
+`--defer-child-hierarchy` skips the complete hierarchy rebuild for derived
+states. Variant and hydraulic artifacts are completed immediately; hierarchy,
+equivalent-transition comparison, and other hierarchy-dependent exports are
+marked deferred for later finalization. Sequential modes do not support this
+option because their next selection depends on the preceding child hierarchy.
 
 For downstream use:
 
@@ -728,6 +775,28 @@ This writes:
 - `network_variants/output/sarl_03_independent_units__realized/`
 - `network_variants/output/sarl_03_independent_units__anchored/`
 
+If the realized experiment already exists, build only its anchored sibling by
+supplying the completed realized output root:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  network_variants/run_collapse_experiment.py \
+  compound-bubbles \
+  --cleaned-mask rivgraph_centerline/outputs/runs/15/masks_cleaned/15_cleaned.tif \
+  --reviewed-links rivgraph_centerline/outputs/runs/15/rivgraph/15_links.gpkg \
+  --reviewed-nodes rivgraph_centerline/outputs/runs/15/rivgraph/15_nodes.gpkg \
+  --exit-sides NS \
+  --experiment-id 15_compound_bubbles \
+  --output-dir network_variants/output/15_compound_bubbles \
+  --collapse-corridor-mode anchored \
+  --anchored-source-experiment network_variants/output/15_compound_bubbles__realized
+```
+
+This validates and reuses the realized experiment's `S000_base` and
+`boundary_components`, then derives the anchored child states without rerunning
+the realized experiment. Other scientific and hydraulic CLI settings should be
+supplied as usual for the anchored run.
+
 The experiment runner writes:
 
 - `state_registry.csv`
@@ -748,8 +817,195 @@ contains:
   state-level slope/profile artifacts derived from the directed graph plus node
   WSE context
 - `equivalent_resistance/`
-  state-to-parent bubble-comparison outputs written by the collapse experiment
-  workflow when per-state equivalent resistance is enabled
+  state-to-parent equivalent-resistance outputs written by the collapse
+  experiment workflow. The primary
+  `bubble_equivalent_state_comparison.csv` evaluates the selected collapse in
+  its smallest hydraulically closed domain: the selected unit itself when it
+  is closed, otherwise its complete containing compound between stable outer
+  anchors. `selected_hydraulic_domain_links.csv` records every parent and child
+  link used by that solve. The previous independently re-detected bubble
+  matches remain available as the diagnostic `redetected_bubble_matches.csv`.
+
+Per-state hierarchy bubble solves derive their boundary nodes from the complete
+assembled directed edge set, not from the nominal root unit alone. The solver
+always fixes normalized source/sink heads to `1.0` and `0.0`. It first
+initializes internal heads from available node WSE and retries failed solves
+with every internal head initialized to `0.5`. Both attempts are recorded in
+`bubble_equivalent_metrics.csv`; if neither converges, provisional equivalent
+values and solved flows/heads are written as missing.
+
+### Equivalent-resistance nonlinear solver
+
+This section records both the hydraulic problem and the numerical algorithm so
+that solver changes can be audited without reconstructing the reasoning from
+code.
+
+#### Hydraulic problem
+
+For every two-terminal hydraulic domain, source and sink heads are normalized
+to
+
+```text
+H_source = 1
+H_sink   = 0
+```
+
+The internal node heads are unknown. For edge `e=(u,v)`, the signed unit-head
+flow is
+
+```text
+delta_H_e = H_u - H_v
+Q_e = sign(delta_H_e) * sqrt(abs(delta_H_e) / K_e)
+```
+
+The implementation uses a differentiable approximation near zero head
+difference:
+
+```text
+Q_e = delta_H_e /
+      (sqrt(K_e) * (delta_H_e^2 + epsilon^2)^(1/4))
+```
+
+At every internal node, signed incident flows must sum to zero. With internal
+incidence matrix `B_i`, the continuity residual is
+
+```text
+r(H) = B_i Q(H)
+```
+
+When this residual is sufficiently small, upstream unit-head inflow `Q_unit`
+defines
+
+```text
+K_eq = 1 / Q_unit^2
+G_eq = 1 / K_eq
+```
+
+These are normalized equivalent-resistance heads and flows. They are not
+absolute WSE values or routed RAPID flows.
+
+#### Legacy nonlinear least squares
+
+The original algorithm minimizes
+
+```text
+0.5 * ||r(H)||_2^2
+```
+
+It repeatedly linearizes the continuity residual around the current internal
+heads and chooses a bounded trust-region head update. `dense_legacy` obtains
+that update with dense SVD. `sparse_least_squares` uses the analytic sparse
+Jacobian
+
+```text
+J = B_i diag(dQ/d(delta_H)) B_i^T
+```
+
+and solves the trust-region linear system with LSMR. `sparse` remains a CLI
+alias for `sparse_least_squares` so older commands remain valid.
+
+Direct least squares can be poorly conditioned in a large graph when many
+initial edge head differences are close to zero. The square-root flow law then
+has a very large local derivative. Squaring the continuity residual further
+amplifies the conditioning problem, which can lead to many small steps and the
+maximum function-evaluation limit.
+
+#### Energy-sparse algorithm
+
+`energy_sparse` first minimizes the convex hydraulic energy whose gradient is
+exactly the continuity residual. For the smoothed flow law, edge energy is
+
+```text
+E_e(delta_H) = 2 / (3 * sqrt(K_e)) *
+               ((delta_H^2 + epsilon^2)^(3/4) - epsilon^(3/2))
+```
+
+and total energy is the sum over all edges:
+
+```text
+E(H) = sum_e E_e(delta_H_e)
+gradient(E) = r(H)
+```
+
+The algorithm is:
+
+1. Fix source and sink heads to `1` and `0`.
+2. Initialize internal heads from normalized available node WSE. Nodes without
+   a usable WSE value use resistance-weighted graph distances to source and
+   sink; the final fallback is `0.5`.
+3. Minimize `E(H)` within `[0,1]` using bounded L-BFGS-B and its analytic
+   gradient. L-BFGS-B stores only limited curvature history and therefore does
+   not factor a dense Hessian.
+4. Start sparse LSMR least squares from the energy solution. This is a
+   continuity-polishing step, rather than asking least squares to discover the
+   solution from a difficult initial state.
+5. Compare the energy and polish residuals and retain the better solution.
+6. Accept a solution only when its physical absolute or relative continuity
+   residual passes the configured tolerance and upstream unit-head inflow is
+   finite and positive. An optimizer success message alone is not sufficient.
+7. If the complete solve fails, the existing outer fallback retries with all
+   internal heads initialized to `0.5`. Failed values are written as missing;
+   failed solves are never cached.
+
+The energy formulation changes the numerical route, not the hydraulic model.
+For a connected two-terminal domain with fixed boundary heads, it has the same
+continuity solution as the original equations.
+
+#### Available backends
+
+- `dense_legacy`: original dense-SVD nonlinear least squares;
+- `sparse` or `sparse_least_squares`: direct sparse LSMR nonlinear least
+  squares, retained for regression and diagnosis;
+- `energy_sparse`: convex L-BFGS-B energy solve followed by sparse LSMR
+  polishing;
+- `auto`: `dense_legacy` below the internal-node threshold and
+  `energy_sparse` at or above it.
+
+Select the backend with `--equivalent-solver-backend`. The `auto` threshold
+defaults to 64 internal nodes and can be changed with
+`--equivalent-sparse-min-internal-nodes`. `dense_legacy` remains the default
+until the completed-run regression audit is accepted; production test runs
+should currently request `--equivalent-solver-backend energy_sparse`
+explicitly.
+
+`bubble_equivalent_metrics.csv` records the requested and resolved backend,
+algorithm version, selected solution stage, total evaluations, energy-stage
+iterations/evaluations/residual, polish evaluations/residual, final residual,
+optimizer messages, and cache provenance. Selected parent-child domain
+comparisons retain the corresponding backend, selected stage, and stage
+residual fields for both states.
+
+#### Example 15 validation case
+
+The direct sparse least-squares solver reached 4,000 evaluations for base
+bubbles 3 and 4 and failed with relative residuals `0.0888` and `0.1116`.
+Using `energy_sparse` on the production inputs produced:
+
+| Bubble | Nodes | Edges | Energy residual | Final residual | K_eq |
+|---|---:|---:|---:|---:|---:|
+| 3 | 124 | 186 | `1.26e-5` | `3.08e-7` | `7.95024e-5` |
+| 4 | 247 | 372 | `2.66e-6` | `3.88e-7` | `3.89581e-5` |
+
+All 11 base bubbles then passed the continuity acceptance criterion.
+
+#### Solve reuse and cache safety
+
+Completed successful solves are stored content-addressably in
+`equivalent_resistance/solve_cache`. The cache signature includes the complete
+directed topology, source/sink boundaries, every edge resistance, normalized
+head initialization, tolerances, smoothing settings, and backend. Exact
+`unchanged_1to1` lineage aliases allow an unchanged child bubble to reuse the
+base result even when child node or link IDs were renumbered; cached heads and
+flows are remapped onto the child IDs before writing. Changed, split, merged,
+or newly created links automatically miss the cache and are solved normally.
+`solver_cache_hit`, `solver_cache_key`, and `solver_cache_path` provide an
+audit trail in the bubble and selected-domain comparison outputs.
+
+The cache schema and algorithm version are part of the signature. Introducing
+the energy solver therefore invalidates incompatible older cache entries. A
+cache hit is permitted only for an identical hydraulic problem and solver
+configuration. A changed compound is solved completely, including its
+unchanged one-to-one links, because its full-domain signature changes.
 
 ### Geometry-Informed Equivalent Resistance
 
@@ -766,6 +1022,27 @@ Two related workflows now exist:
 2. Experiment-level matched comparison workflow
    Run separately with:
    - `network_variants/run_equivalent_resistance_experiment.py`
+
+   To regenerate equivalent resistance after a solver or hydraulic-domain
+   implementation change, without rerunning masks, RivGraph, widths, slopes,
+   or the other hierarchy metrics, use:
+
+   ```bash
+   /opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python \
+     network_variants/run_equivalent_resistance_experiment.py \
+     network_variants/output/<experiment> \
+     --recompute-state-hierarchy \
+     --reuse-manifest-config \
+     --equivalent-solver-backend energy_sparse
+   ```
+
+   This restores the resistance configuration from the collapse experiment
+   manifest and, in this example, explicitly overrides only its solver backend.
+   It atomically replaces each completed state's
+   `bubble_equivalent_metrics.csv`, `bubble_edge_resistance.csv`, and
+   `bubble_node_heads.csv`, updates the state registry counts, and then
+   refreshes experiment-level comparisons. An old-versus-new audit is written
+   to `equivalent_resistance/state_hierarchy_recompute_audit.csv`.
 
    The forcing normalization options used by this runner mirror RAPID prep and
    now accept either second-based resampling

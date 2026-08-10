@@ -275,6 +275,11 @@ def write_unit_workflow_outputs(
         "n_paths": int(len(results.path_metrics)),
         "n_group_rows": int(len(results.merge_tree)),
         "n_equivalent_bubbles": int(len(results.bubble_equivalent_metrics)),
+        "n_equivalent_solver_cache_hits": int(
+            results.bubble_equivalent_metrics.get(
+                "solver_cache_hit", pd.Series(dtype=bool)
+            ).fillna(False).astype(bool).sum()
+        ),
         "n_equivalent_edges": int(len(results.bubble_edge_resistance)),
         "n_equivalent_nodes": int(len(results.bubble_node_heads)),
         "n_selected_groups": int(len(results.selected_groups)),
@@ -356,6 +361,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=22.0,
         help="Default Chezy Cz used when the links do not provide one.",
     )
+    parser.add_argument(
+        "--equivalent-solver-backend",
+        choices=(
+            "dense_legacy", "sparse", "sparse_least_squares",
+            "energy_sparse", "auto",
+        ),
+        default="dense_legacy",
+        help=(
+            "Nonlinear equivalent-resistance backend. sparse is retained as an "
+            "alias for sparse_least_squares; energy_sparse uses convex energy "
+            "minimization followed by sparse least-squares polishing."
+        ),
+    )
+    parser.add_argument(
+        "--equivalent-sparse-min-internal-nodes",
+        type=int,
+        default=64,
+        help="Internal-node threshold at which auto selects energy_sparse.",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable unit-detection debug output.")
     return parser
 
@@ -372,6 +396,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             kb_value=args.equivalent_kb_value,
             default_manning_n=args.equivalent_manning_n,
             default_chezy_cz=args.equivalent_chezy_cz,
+            solver_backend=args.equivalent_solver_backend,
+            sparse_min_internal_nodes=args.equivalent_sparse_min_internal_nodes,
         )
 
     results = run_unit_workflow(

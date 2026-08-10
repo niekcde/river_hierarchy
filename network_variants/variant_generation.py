@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Collection, Iterable, Mapping, Sequence
+from typing import Any, Callable, Collection, Iterable, Mapping, Sequence
 
 import geopandas as gpd
 import networkx as nx
@@ -894,6 +894,82 @@ def compute_width_families(
         bank_candidate_neighbors_max=bank_candidate_neighbors_max,
     )
     return enriched, samples
+
+
+def _compute_changed_link_width_products(
+    directed_links: gpd.GeoDataFrame,
+    *,
+    parent_links: gpd.GeoDataFrame,
+    parent_width_samples: pd.DataFrame,
+    link_lineage: pd.DataFrame,
+    width_runner: Callable[..., tuple[gpd.GeoDataFrame, pd.DataFrame]] = compute_width_families,
+    **width_kwargs: Any,
+) -> tuple[gpd.GeoDataFrame, pd.DataFrame, list[int], dict[str, Any]]:
+    """Measure only links that cannot safely inherit their parent width product.
+
+    Lineage plus exact topological equality are resolved before raster-backed
+    width measurement.  Unchanged one-to-one links receive the complete parent
+    width fields and samples; only the remaining child links are passed to the
+    expensive width runner.  The current full-raster context is deliberately
+    retained so this optimization does not alter width semantics.
+    """
+
+    assembly_started = time.perf_counter()
+    classified_links, inherited_samples, classification_summary = (
+        inherit_unchanged_link_width_products(
+            child_links=directed_links,
+            child_width_samples=pd.DataFrame(),
+            parent_links=parent_links,
+            parent_width_samples=parent_width_samples,
+            link_lineage=link_lineage,
+        )
+    )
+    changed_link_ids = classified_links.loc[
+        classified_links["width_inheritance_status"].eq("changed_requires_evaluation"),
+        "id_link",
+    ].astype(int).tolist()
+    changed_id_set = set(changed_link_ids)
+    changed_links = directed_links.loc[
+        directed_links["id_link"].astype(int).isin(changed_id_set)
+    ].copy()
+
+    measurement_started = time.perf_counter()
+    if changed_links.empty:
+        measured_links = directed_links.copy()
+        changed_samples = pd.DataFrame()
+    else:
+        changed_enriched, changed_samples = width_runner(changed_links, **width_kwargs)
+        measured_links = _merge_width_families_onto_links(directed_links, changed_enriched)
+    measurement_seconds = time.perf_counter() - measurement_started
+
+    sample_frames = [frame for frame in (changed_samples, inherited_samples) if not frame.empty]
+    combined_samples = (
+        pd.concat(sample_frames, ignore_index=True, sort=False)
+        if sample_frames
+        else pd.DataFrame()
+    )
+    enriched_links, combined_samples, inheritance_summary = (
+        inherit_unchanged_link_width_products(
+            child_links=measured_links,
+            child_width_samples=combined_samples,
+            parent_links=parent_links,
+            parent_width_samples=parent_width_samples,
+            link_lineage=link_lineage,
+        )
+    )
+    inheritance_summary.update(
+        {
+            "measurement_scope": "changed_links_only_full_raster_context",
+            "measured_link_count": int(len(changed_link_ids)),
+            "measured_link_ids": sorted(changed_link_ids),
+            "skipped_measurement_link_count": int(
+                classification_summary["inherited_link_count"]
+            ),
+            "measurement_seconds": round(float(measurement_seconds), 6),
+            "assembly_seconds": round(float(time.perf_counter() - assembly_started), 6),
+        }
+    )
+    return enriched_links, combined_samples, changed_link_ids, inheritance_summary
 
 
 def _component_footprint_geometry(
@@ -4086,20 +4162,6 @@ def generate_network_variant(
         unit_ids=resolved_unit_ids,
         group_label=group_label,
     )
-    enriched_links, link_width_samples = compute_width_families(
-        raw_links,
-        collapsed_mask_path=collapsed_mask_path,
-        wet_reference_mask_path=wet_reference_mask_path,
-        origin_mask_path=origin_mask_path,
-        rivgraph_distance_path=rivgraph_paths.get("distance"),
-        bank_labels_path=bank_labels_path,
-        bank_candidate_neighbors_max=bank_candidate_neighbors_max,
-    )
-    link_width_samples = _apply_collapsed_selection_metadata(
-        link_width_samples,
-        unit_ids=resolved_unit_ids,
-        group_label=group_label,
-    )
     parent_node_order, _, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
     node_match = _match_child_nodes_to_parent_nodes(
         reviewed_nodes,
@@ -4227,50 +4289,49 @@ def generate_network_variant(
         errors="ignore",
     ).merge(link_lineage, on="id_link", how="left", validate="1:1")
 
-    if collapse_corridor_mode == "anchored":
-        anchored_enriched_links, anchored_link_width_samples = compute_width_families(
-            directed_links,
-            collapsed_mask_path=collapsed_mask_path,
-            wet_reference_mask_path=wet_reference_mask_path,
-            origin_mask_path=origin_mask_path,
-            rivgraph_distance_path=rivgraph_paths.get("distance"),
-            bank_labels_path=bank_labels_path,
-            bank_candidate_neighbors_max=bank_candidate_neighbors_max,
-        )
-        enriched_links = anchored_enriched_links
-        link_width_samples = _apply_collapsed_selection_metadata(
-            anchored_link_width_samples,
-            unit_ids=resolved_unit_ids,
-            group_label=group_label,
-        )
-        directed_links, enriched_links, segmented_stub_inheritance_summary = _apply_segmented_stub_width_inheritance(
-            directed_links=directed_links,
-            enriched_links=enriched_links,
-            link_width_samples=link_width_samples,
-        )
-    else:
-        segmented_stub_inheritance_summary = {"applied_count": 0, "applied_link_ids": [], "records": []}
-
-    directed_enriched_links = _merge_width_families_onto_links(directed_links, enriched_links)
-    directed_enriched_links = _apply_width_sample_flow_alignment(
-        directed_enriched_links,
-        collapse_corridor_mode=collapse_corridor_mode,
-    )
-
     parent_width_samples_path = Path(reviewed_links_path).with_name("link_width_samples.csv")
     parent_width_samples = (
         pd.read_csv(parent_width_samples_path)
         if parent_width_samples_path.exists()
         else pd.DataFrame()
     )
-    directed_enriched_links, link_width_samples, width_product_inheritance = (
-        inherit_unchanged_link_width_products(
-            child_links=directed_enriched_links,
-            child_width_samples=link_width_samples,
-            parent_links=reviewed_links,
-            parent_width_samples=parent_width_samples,
-            link_lineage=link_lineage,
+    (
+        directed_enriched_links,
+        link_width_samples,
+        changed_width_link_ids,
+        width_product_inheritance,
+    ) = _compute_changed_link_width_products(
+        directed_links,
+        parent_links=reviewed_links,
+        parent_width_samples=parent_width_samples,
+        link_lineage=link_lineage,
+        collapsed_mask_path=collapsed_mask_path,
+        wet_reference_mask_path=wet_reference_mask_path,
+        origin_mask_path=origin_mask_path,
+        rivgraph_distance_path=rivgraph_paths.get("distance"),
+        bank_labels_path=bank_labels_path,
+        bank_candidate_neighbors_max=bank_candidate_neighbors_max,
+    )
+
+    if collapse_corridor_mode == "anchored":
+        (
+            segmented_metadata_links,
+            directed_enriched_links,
+            segmented_stub_inheritance_summary,
+        ) = _apply_segmented_stub_width_inheritance(
+            directed_links=directed_links,
+            enriched_links=directed_enriched_links,
+            link_width_samples=link_width_samples,
         )
+        for column in segmented_metadata_links.columns:
+            if column.startswith("family_"):
+                directed_enriched_links[column] = segmented_metadata_links[column].to_numpy()
+    else:
+        segmented_stub_inheritance_summary = {"applied_count": 0, "applied_link_ids": [], "records": []}
+
+    directed_enriched_links = _apply_width_sample_flow_alignment(
+        directed_enriched_links,
+        collapse_corridor_mode=collapse_corridor_mode,
     )
     link_width_samples = _apply_collapsed_selection_metadata(
         link_width_samples,
@@ -4279,10 +4340,6 @@ def generate_network_variant(
     )
     link_width_samples["example_id"] = example_id
     link_width_samples["variant_id"] = variant_id
-    changed_width_link_ids = directed_enriched_links.loc[
-        directed_enriched_links["width_inheritance_status"].eq("changed_requires_evaluation"),
-        "id_link",
-    ].astype(int).tolist()
     directed_enriched_links, routing_width_audit, routing_width_application = apply_routing_width_model(
         directed_enriched_links,
         link_width_samples,

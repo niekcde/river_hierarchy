@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import hashlib
+import json
+from pathlib import Path
 from typing import Any
 
 import networkx as nx
 import numpy as np
 import pandas as pd
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, minimize
+from scipy.sparse import csr_matrix
 
 
 NODE_ID_CANDIDATES = ("node_id", "id_node", "id")
@@ -15,6 +19,204 @@ EDGE_U_CANDIDATES = ("u", "id_us_node", "source", "from_node")
 EDGE_V_CANDIDATES = ("v", "id_ds_node", "target", "to_node")
 EDGE_K_CANDIDATES = ("K_e", "K", "edge_resistance", "resistance")
 HEAD_VALUE_CANDIDATES = ("H", "head", "sword_wse", "wse", "h")
+SOLVER_BACKENDS = (
+    "dense_legacy",
+    "sparse",
+    "sparse_least_squares",
+    "energy_sparse",
+    "auto",
+)
+DEFAULT_SPARSE_MIN_INTERNAL_NODES = 64
+SOLVER_ALGORITHM_VERSION = "equivalent-resistance-energy-sparse-v1"
+SOLVER_CACHE_SCHEMA_VERSION = "equivalent-resistance-solve-cache-v2"
+
+
+def _cache_scalar(value: Any) -> Any:
+    if value is None or value is pd.NA:
+        return None
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        numeric = float(value)
+        return numeric.hex() if np.isfinite(numeric) else str(numeric)
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    return str(value)
+
+
+def _solver_cache_node_aliases(edge_frame: pd.DataFrame) -> dict[Any, Any]:
+    aliases: dict[Any, Any] = {}
+    for row in edge_frame.itertuples(index=False):
+        aliases[row.u] = getattr(row, "solver_cache_u_alias", row.u)
+        aliases[row.v] = getattr(row, "solver_cache_v_alias", row.v)
+    return aliases
+
+
+def _solver_cache_key(
+    *,
+    edge_frame: pd.DataFrame,
+    upstream_node: Any,
+    downstream_node: Any,
+    normalized_head_guess: Mapping[Any, float],
+    smooth: bool,
+    eps: float,
+    continuity_abs_tolerance: float,
+    continuity_rel_tolerance: float,
+    requested_solver_backend: str,
+    resolved_solver_backend: str,
+    sparse_min_internal_nodes: int,
+) -> str:
+    edge_records = [
+        (
+            _cache_scalar(
+                getattr(row, "solver_cache_u_alias", row.u)
+            ),
+            _cache_scalar(
+                getattr(row, "solver_cache_v_alias", row.v)
+            ),
+            _cache_scalar(
+                getattr(row, "solver_cache_edge_alias", row.edge_id)
+            ),
+            float(row.K).hex(),
+        )
+        for row in edge_frame.itertuples(index=False)
+    ]
+    edge_records.sort(key=lambda record: tuple(str(value) for value in record))
+    node_aliases = _solver_cache_node_aliases(edge_frame)
+    head_records = [
+        (
+            _cache_scalar(node_aliases.get(node_id, node_id)),
+            float(value).hex(),
+        )
+        for node_id, value in normalized_head_guess.items()
+    ]
+    head_records.sort(key=lambda record: tuple(str(value) for value in record))
+    payload = {
+        "schema_version": SOLVER_CACHE_SCHEMA_VERSION,
+        "solver_algorithm_version": SOLVER_ALGORITHM_VERSION,
+        "upstream_node": _cache_scalar(node_aliases.get(upstream_node, upstream_node)),
+        "downstream_node": _cache_scalar(node_aliases.get(downstream_node, downstream_node)),
+        "edges": edge_records,
+        "normalized_head_guess": head_records,
+        "smooth": bool(smooth),
+        "eps": float(eps).hex(),
+        "continuity_abs_tolerance": float(continuity_abs_tolerance).hex(),
+        "continuity_rel_tolerance": float(continuity_rel_tolerance).hex(),
+        "solver_backend_requested": requested_solver_backend,
+        "solver_backend_resolved": resolved_solver_backend,
+        "sparse_min_internal_nodes": int(sparse_min_internal_nodes),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_cached_solver_result(
+    cache_path: Path,
+    cache_key: str,
+    *,
+    edge_frame: pd.DataFrame,
+    node_ids: Sequence[Any],
+    upstream_node: Any,
+    downstream_node: Any,
+) -> dict[str, Any] | None:
+    summary_path = cache_path / "summary.json"
+    node_path = cache_path / "node_heads.csv"
+    edge_path = cache_path / "edge_flows.csv"
+    if not (summary_path.exists() and node_path.exists() and edge_path.exists()):
+        return None
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        if (
+            summary.get("cache_schema_version") != SOLVER_CACHE_SCHEMA_VERSION
+            or summary.get("solver_cache_key") != cache_key
+            or not bool(summary.get("solver_success", False))
+        ):
+            return None
+        node_heads = pd.read_csv(node_path)
+        edge_flows = pd.read_csv(edge_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if "solver_cache_edge_alias" in edge_frame.columns:
+        if "solver_cache_edge_alias" not in edge_flows.columns:
+            return None
+        current_edges = edge_frame[
+            ["edge_id", "u", "v", "solver_cache_edge_alias"]
+        ].copy()
+        if (
+            current_edges["solver_cache_edge_alias"].duplicated().any()
+            or edge_flows["solver_cache_edge_alias"].duplicated().any()
+        ):
+            return None
+        current_lookup = current_edges.set_index("solver_cache_edge_alias")
+        cached_aliases = edge_flows["solver_cache_edge_alias"]
+        if not cached_aliases.isin(current_lookup.index).all():
+            return None
+        edge_flows["edge_id"] = cached_aliases.map(current_lookup["edge_id"])
+        edge_flows["u"] = cached_aliases.map(current_lookup["u"])
+        edge_flows["v"] = cached_aliases.map(current_lookup["v"])
+        edge_flows["flow_from_node"] = np.where(
+            edge_flows["q_unit"] >= 0.0, edge_flows["u"], edge_flows["v"]
+        )
+        edge_flows["flow_to_node"] = np.where(
+            edge_flows["q_unit"] >= 0.0, edge_flows["v"], edge_flows["u"]
+        )
+
+    node_aliases = _solver_cache_node_aliases(edge_frame)
+    if "solver_cache_node_alias" in node_heads.columns:
+        alias_to_current: dict[Any, Any] = {}
+        for node_id in node_ids:
+            alias = node_aliases.get(node_id, node_id)
+            if alias in alias_to_current and alias_to_current[alias] != node_id:
+                return None
+            alias_to_current[alias] = node_id
+        if not node_heads["solver_cache_node_alias"].isin(alias_to_current).all():
+            return None
+        node_heads["node_id"] = node_heads["solver_cache_node_alias"].map(
+            alias_to_current
+        )
+
+    summary["upstream_node"] = upstream_node
+    summary["downstream_node"] = downstream_node
+    summary["node_heads"] = node_heads
+    summary["edge_flows"] = edge_flows
+    summary["internal_heads"] = {
+        row.node_id: float(row.head_norm)
+        for row in node_heads.loc[~node_heads["is_boundary"].astype(bool)].itertuples(index=False)
+    }
+    summary["solver_cache_hit"] = True
+    summary["solver_cache_path"] = str(cache_path.resolve())
+    return summary
+
+
+def _write_cached_solver_result(
+    *,
+    cache_path: Path,
+    cache_key: str,
+    result: Mapping[str, Any],
+) -> None:
+    if not bool(result.get("solver_success", False)):
+        return
+    cache_path.mkdir(parents=True, exist_ok=True)
+    summary = {
+        key: _cache_scalar(value)
+        if isinstance(value, (np.integer, np.floating, np.bool_))
+        else value
+        for key, value in result.items()
+        if key not in {"node_heads", "edge_flows", "internal_heads"}
+    }
+    summary.update(
+        {
+            "cache_schema_version": SOLVER_CACHE_SCHEMA_VERSION,
+            "solver_cache_key": cache_key,
+            "solver_cache_hit": False,
+            "solver_cache_path": str(cache_path.resolve()),
+        }
+    )
+    result["node_heads"].to_csv(cache_path / "node_heads.csv", index=False)
+    result["edge_flows"].to_csv(cache_path / "edge_flows.csv", index=False)
+    (cache_path / "summary.json").write_text(
+        json.dumps(summary, indent=2, allow_nan=True), encoding="utf-8"
+    )
 
 
 def _to_numeric_array(value: object, *, field_name: str) -> np.ndarray:
@@ -260,6 +462,12 @@ def _canonicalize_nodes_and_edges(
     if canonical_edges["K"].isna().any():
         raise ValueError("All edges must provide finite resistance values in a K or K_e column.")
     _validate_positive(canonical_edges["K"].to_numpy(dtype=float), field_name="edge resistance")
+    if "solver_cache_edge_alias" not in canonical_edges.columns:
+        canonical_edges["solver_cache_edge_alias"] = canonical_edges["edge_id"]
+    if "solver_cache_u_alias" not in canonical_edges.columns:
+        canonical_edges["solver_cache_u_alias"] = canonical_edges["u"]
+    if "solver_cache_v_alias" not in canonical_edges.columns:
+        canonical_edges["solver_cache_v_alias"] = canonical_edges["v"]
 
     if node_frame.empty:
         endpoint_nodes = pd.Index(pd.unique(pd.concat([canonical_edges["u"], canonical_edges["v"]], ignore_index=True)))
@@ -373,6 +581,9 @@ def solve_bubble_equivalent_K(
     eps: float = 1e-10,
     continuity_abs_tolerance: float = 1e-8,
     continuity_rel_tolerance: float = 1e-3,
+    solver_backend: str = "dense_legacy",
+    sparse_min_internal_nodes: int = DEFAULT_SPARSE_MIN_INTERNAL_NODES,
+    solver_cache_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Solve a normalized unit-head equivalent resistance for a bubble subgraph.
 
@@ -381,6 +592,15 @@ def solve_bubble_equivalent_K(
     Model discharge Q, hydrograph outputs, and routed RAPID peaks must not be
     used inside this predictor calculation.
     """
+
+    requested_solver_backend = str(solver_backend or "dense_legacy").strip().lower()
+    if requested_solver_backend not in SOLVER_BACKENDS:
+        raise ValueError(
+            f"solver_backend must be one of {list(SOLVER_BACKENDS)}; "
+            f"received {solver_backend!r}."
+        )
+    if int(sparse_min_internal_nodes) < 1:
+        raise ValueError("sparse_min_internal_nodes must be at least 1.")
 
     node_frame, edge_frame = _canonicalize_nodes_and_edges(nodes, edges)
     edge_nodes = pd.Index(pd.unique(pd.concat([edge_frame["u"], edge_frame["v"]], ignore_index=True)))
@@ -451,12 +671,71 @@ def solve_bubble_equivalent_K(
         flow = np.asarray(edge_flow(heads[u_index], heads[v_index], resistance, smooth=smooth, eps=eps), dtype=float)
         return incidence_internal @ flow
 
+    def energy_and_gradient(
+        internal_head_values: np.ndarray,
+    ) -> tuple[float, np.ndarray]:
+        """Return convex hydraulic energy and its continuity-residual gradient."""
+        heads = assemble_heads(internal_head_values)
+        dh = heads[u_index] - heads[v_index]
+        if smooth:
+            dh_squared_eps = dh * dh + eps * eps
+            energy = np.sum(
+                (2.0 / (3.0 * np.sqrt(resistance)))
+                * (np.power(dh_squared_eps, 0.75) - eps**1.5)
+            )
+        else:
+            energy = np.sum(
+                (2.0 / (3.0 * np.sqrt(resistance)))
+                * np.power(np.abs(dh), 1.5)
+            )
+        flow = np.asarray(
+            edge_flow(
+                heads[u_index], heads[v_index], resistance,
+                smooth=smooth, eps=eps,
+            ),
+            dtype=float,
+        )
+        gradient = np.asarray(incidence_internal_sparse @ flow).ravel()
+        return float(energy), gradient
+
+    incidence_internal_sparse = csr_matrix(incidence_internal)
+
+    def sparse_jacobian(internal_head_values: np.ndarray) -> csr_matrix:
+        """Sparse derivative of internal-node continuity residuals."""
+        heads = assemble_heads(internal_head_values)
+        dh = heads[u_index] - heads[v_index]
+        if smooth:
+            dh_squared_eps = dh * dh + eps * eps
+            flow_derivative = (
+                (0.5 * dh * dh + eps * eps)
+                / (np.sqrt(resistance) * np.power(dh_squared_eps, 1.25))
+            )
+        else:
+            flow_derivative = 1.0 / (
+                2.0 * np.sqrt(resistance) * np.sqrt(np.maximum(np.abs(dh), eps))
+            )
+        return (
+            incidence_internal_sparse
+            @ incidence_internal_sparse.multiply(flow_derivative).transpose()
+        ).tocsr()
+
     if continuity_abs_tolerance < 0:
         raise ValueError("continuity_abs_tolerance cannot be negative.")
     if continuity_rel_tolerance < 0:
         raise ValueError("continuity_rel_tolerance cannot be negative.")
 
     if internal_nodes:
+        if requested_solver_backend in {"sparse", "sparse_least_squares"}:
+            resolved_solver_backend = "sparse_least_squares"
+        elif requested_solver_backend == "energy_sparse":
+            resolved_solver_backend = "energy_sparse"
+        elif (
+            requested_solver_backend == "auto"
+            and len(internal_nodes) >= int(sparse_min_internal_nodes)
+        ):
+            resolved_solver_backend = "energy_sparse"
+        else:
+            resolved_solver_backend = "dense_legacy"
         x0 = _build_initial_head_guess(
             graph,
             internal_nodes=internal_nodes,
@@ -464,35 +743,208 @@ def solve_bubble_equivalent_K(
             downstream_node=downstream_node,
             normalized_head_guess=normalized_head_guess,
         )
-        solve_result = least_squares(
-            residuals,
-            x0,
-            bounds=(0.0, 1.0),
-            xtol=1e-12,
-            ftol=1e-12,
-            gtol=1e-12,
-            max_nfev=4000,
+        solver_cache_key = _solver_cache_key(
+            edge_frame=edge_frame,
+            upstream_node=upstream_node,
+            downstream_node=downstream_node,
+            normalized_head_guess=normalized_head_guess,
+            smooth=smooth,
+            eps=eps,
+            continuity_abs_tolerance=continuity_abs_tolerance,
+            continuity_rel_tolerance=continuity_rel_tolerance,
+            requested_solver_backend=requested_solver_backend,
+            resolved_solver_backend=resolved_solver_backend,
+            sparse_min_internal_nodes=int(sparse_min_internal_nodes),
         )
-        solved_heads = assemble_heads(solve_result.x)
-        continuity_residual = residuals(solve_result.x)
-        solver_success = bool(solve_result.success)
-        solver_message = str(solve_result.message)
-        solver_method = "least_squares"
-        solver_nfev = int(solve_result.nfev)
+        solver_cache_path = (
+            Path(solver_cache_dir).expanduser() / solver_cache_key
+            if solver_cache_dir is not None
+            else None
+        )
+        if solver_cache_path is not None:
+            cached = _load_cached_solver_result(
+                solver_cache_path,
+                solver_cache_key,
+                edge_frame=edge_frame,
+                node_ids=node_ids,
+                upstream_node=upstream_node,
+                downstream_node=downstream_node,
+            )
+            if cached is not None:
+                return cached
+        energy_success: bool | None = None
+        energy_message = ""
+        energy_nit = 0
+        energy_nfev = 0
+        energy_residual_norm = float("nan")
+        energy_residual_relative = float("nan")
+        polish_attempted = False
+        polish_success: bool | None = None
+        polish_message = ""
+        polish_nfev = 0
+        polish_residual_norm = float("nan")
+        polish_residual_relative = float("nan")
+        solver_solution_stage = "least_squares"
+
+        if resolved_solver_backend == "energy_sparse":
+            energy_result = minimize(
+                energy_and_gradient,
+                x0,
+                method="L-BFGS-B",
+                jac=True,
+                bounds=[(0.0, 1.0)] * len(internal_nodes),
+                options={
+                    "ftol": 1e-15,
+                    "gtol": 1e-10,
+                    "maxiter": 20000,
+                    "maxfun": 50000,
+                    "maxls": 50,
+                },
+            )
+            energy_success = bool(energy_result.success)
+            energy_message = str(energy_result.message)
+            energy_nit = int(energy_result.nit)
+            energy_nfev = int(energy_result.nfev)
+            energy_x = np.asarray(energy_result.x, dtype=float)
+            energy_flow = np.asarray(
+                edge_flow(
+                    assemble_heads(energy_x)[u_index],
+                    assemble_heads(energy_x)[v_index],
+                    resistance,
+                    smooth=smooth,
+                    eps=eps,
+                ),
+                dtype=float,
+            )
+            energy_residual = residuals(energy_x)
+            energy_q_unit = float(incidence_upstream @ energy_flow)
+            energy_residual_norm = float(np.linalg.norm(energy_residual, ord=2))
+            energy_scale = float(
+                max(
+                    np.max(np.abs(energy_flow)) if energy_flow.size else 0.0,
+                    abs(energy_q_unit),
+                    1.0,
+                )
+            )
+            energy_residual_relative = float(energy_residual_norm / energy_scale)
+
+            polish_attempted = True
+            polish_result = least_squares(
+                residuals,
+                energy_x,
+                bounds=(0.0, 1.0),
+                xtol=1e-12,
+                ftol=1e-12,
+                gtol=1e-12,
+                max_nfev=4000,
+                jac=sparse_jacobian,
+                tr_solver="lsmr",
+            )
+            polish_success = bool(polish_result.success)
+            polish_message = str(polish_result.message)
+            polish_nfev = int(polish_result.nfev)
+            polish_residual = residuals(polish_result.x)
+            polish_flow = np.asarray(
+                edge_flow(
+                    assemble_heads(polish_result.x)[u_index],
+                    assemble_heads(polish_result.x)[v_index],
+                    resistance,
+                    smooth=smooth,
+                    eps=eps,
+                ),
+                dtype=float,
+            )
+            polish_q_unit = float(incidence_upstream @ polish_flow)
+            polish_residual_norm = float(np.linalg.norm(polish_residual, ord=2))
+            polish_scale = float(
+                max(
+                    np.max(np.abs(polish_flow)) if polish_flow.size else 0.0,
+                    abs(polish_q_unit),
+                    1.0,
+                )
+            )
+            polish_residual_relative = float(polish_residual_norm / polish_scale)
+
+            if (
+                np.isfinite(polish_residual_relative)
+                and (
+                    not np.isfinite(energy_residual_relative)
+                    or polish_residual_relative <= energy_residual_relative
+                )
+            ):
+                selected_x = np.asarray(polish_result.x, dtype=float)
+                solver_optimizer_success = polish_success
+                solver_solution_stage = "sparse_least_squares_polish"
+            else:
+                selected_x = energy_x
+                solver_optimizer_success = energy_success
+                solver_solution_stage = "energy_minimization"
+            solved_heads = assemble_heads(selected_x)
+            continuity_residual = residuals(selected_x)
+            solver_message = (
+                f"Energy stage: {energy_message} "
+                f"Sparse polish: {polish_message} "
+                f"Selected stage: {solver_solution_stage}."
+            )
+            solver_method = "energy_lbfgsb_then_sparse_lsmr"
+            solver_nfev = energy_nfev + polish_nfev
+        else:
+            solve_kwargs: dict[str, Any] = {}
+            if resolved_solver_backend == "sparse_least_squares":
+                solve_kwargs.update(jac=sparse_jacobian, tr_solver="lsmr")
+            solve_result = least_squares(
+                residuals,
+                x0,
+                bounds=(0.0, 1.0),
+                xtol=1e-12,
+                ftol=1e-12,
+                gtol=1e-12,
+                max_nfev=4000,
+                **solve_kwargs,
+            )
+            solved_heads = assemble_heads(solve_result.x)
+            continuity_residual = residuals(solve_result.x)
+            solver_optimizer_success = bool(solve_result.success)
+            solver_message = str(solve_result.message)
+            solver_method = (
+                "least_squares_sparse_lsmr"
+                if resolved_solver_backend == "sparse_least_squares"
+                else "least_squares"
+            )
+            solver_nfev = int(solve_result.nfev)
     else:
-        solve_result = None
+        resolved_solver_backend = "boundary_only"
+        solver_cache_key = ""
+        solver_cache_path = None
         solved_heads = assemble_heads(np.asarray([], dtype=float))
         continuity_residual = np.asarray([], dtype=float)
-        solver_success = True
+        solver_optimizer_success = True
         solver_message = "No internal nodes; equivalent resistance evaluated from boundary-connected edges only."
         solver_method = "boundary_only"
         solver_nfev = 0
+        energy_success = None
+        energy_message = ""
+        energy_nit = 0
+        energy_nfev = 0
+        energy_residual_norm = float("nan")
+        energy_residual_relative = float("nan")
+        polish_attempted = False
+        polish_success = None
+        polish_message = ""
+        polish_nfev = 0
+        polish_residual_norm = float("nan")
+        polish_residual_relative = float("nan")
+        solver_solution_stage = "boundary_only"
 
     flow = np.asarray(edge_flow(solved_heads[u_index], solved_heads[v_index], resistance, smooth=smooth, eps=eps), dtype=float)
     q_unit = float(incidence_upstream @ flow)
     residual_norm = float(np.linalg.norm(continuity_residual, ord=2)) if continuity_residual.size else 0.0
     continuity_scale = float(max(np.max(np.abs(flow)) if flow.size else 0.0, abs(q_unit), 1.0))
     residual_relative = float(residual_norm / continuity_scale)
+    residual_acceptable = bool(
+        residual_norm <= float(continuity_abs_tolerance)
+        or residual_relative <= float(continuity_rel_tolerance)
+    )
 
     if not np.isfinite(q_unit) or q_unit <= 0:
         k_eq = float("nan")
@@ -502,13 +954,15 @@ def solve_bubble_equivalent_K(
     else:
         k_eq = float(1.0 / (q_unit**2))
         g_eq = float(1.0 / k_eq)
-        if not solver_success and (
-            residual_norm <= float(continuity_abs_tolerance)
-            or residual_relative <= float(continuity_rel_tolerance)
-        ):
-            solver_success = True
+        solver_success = residual_acceptable
+        if residual_acceptable and not solver_optimizer_success:
             solver_message = (
                 f"{solver_message} Accepted by continuity residual tolerance "
+                f"(abs={residual_norm:.3e}, rel={residual_relative:.3e})."
+            )
+        elif not residual_acceptable:
+            solver_message = (
+                f"{solver_message} Rejected by continuity residual tolerance "
                 f"(abs={residual_norm:.3e}, rel={residual_relative:.3e})."
             )
 
@@ -529,6 +983,10 @@ def solve_bubble_equivalent_K(
             ],
         }
     )
+    node_aliases = _solver_cache_node_aliases(edge_frame)
+    node_results["solver_cache_node_alias"] = [
+        node_aliases.get(node_id, node_id) for node_id in node_ids
+    ]
 
     edge_results = edge_frame.copy()
     edge_results["K_e"] = resistance
@@ -538,13 +996,36 @@ def solve_bubble_equivalent_K(
     edge_results["flow_from_node"] = np.where(edge_results["q_unit"] >= 0.0, edge_results["u"], edge_results["v"])
     edge_results["flow_to_node"] = np.where(edge_results["q_unit"] >= 0.0, edge_results["v"], edge_results["u"])
 
-    return {
+    result = {
         "upstream_node": upstream_node,
         "downstream_node": downstream_node,
         "n_nodes": int(len(node_ids)),
         "n_edges": int(len(edge_frame)),
         "solver_success": bool(solver_success and np.isfinite(residual_norm)),
         "solver_method": solver_method,
+        "solver_algorithm_version": SOLVER_ALGORITHM_VERSION,
+        "solver_backend_requested": requested_solver_backend,
+        "solver_backend_resolved": resolved_solver_backend,
+        "solver_optimizer_success": bool(solver_optimizer_success),
+        "solver_solution_stage": solver_solution_stage,
+        "energy_stage_success": energy_success,
+        "energy_stage_message": energy_message,
+        "energy_stage_nit": energy_nit,
+        "energy_stage_nfev": energy_nfev,
+        "energy_stage_residual_norm": energy_residual_norm,
+        "energy_stage_residual_relative": energy_residual_relative,
+        "polish_attempted": polish_attempted,
+        "polish_success": polish_success,
+        "polish_message": polish_message,
+        "polish_nfev": polish_nfev,
+        "polish_residual_norm": polish_residual_norm,
+        "polish_residual_relative": polish_residual_relative,
+        "sparse_min_internal_nodes": int(sparse_min_internal_nodes),
+        "solver_cache_hit": False,
+        "solver_cache_key": solver_cache_key,
+        "solver_cache_path": (
+            str(solver_cache_path.resolve()) if solver_cache_path is not None else ""
+        ),
         "solver_message": solver_message,
         "solver_nfev": solver_nfev,
         "K_eq": k_eq,
@@ -559,6 +1040,13 @@ def solve_bubble_equivalent_K(
         },
         "edge_flows": edge_results.reset_index(drop=True),
     }
+    if solver_cache_path is not None:
+        _write_cached_solver_result(
+            cache_path=solver_cache_path,
+            cache_key=solver_cache_key,
+            result=result,
+        )
+    return result
 
 
 __all__ = [

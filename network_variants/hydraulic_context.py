@@ -574,6 +574,7 @@ def _apply_collapsed_unit_head_solver(
     link_context: pd.DataFrame,
     *,
     collapsed_unit_boundary_analysis: list[dict[str, object]],
+    min_slope: float = 1e-6,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     result = link_context.copy()
     for column, default in COLLAPSED_PARENT_PROFILE_COLUMNS.items():
@@ -592,6 +593,11 @@ def _apply_collapsed_unit_head_solver(
     candidate_link_ids: set[int] = set()
     applied_link_ids: set[int] = set()
     solved_component_ids: list[str] = []
+    topology_conflict_component_ids: list[str] = []
+    topology_conflict_link_ids: set[int] = set()
+    topology_context_link_ids: set[int] = set()
+    path_relative_component_ids: list[str] = []
+    path_relative_failed_components: list[dict[str, str]] = []
 
     for component in collapsed_unit_boundary_analysis:
         component_id = str(component.get("component_id", "") or "")
@@ -627,6 +633,257 @@ def _apply_collapsed_unit_head_solver(
         if local_links.empty:
             continue
 
+        # A collapse can move the effective split past a former base junction.
+        # In that case a child edge is correctly directed in the new graph while
+        # its matched parent endpoints occur in reverse order.  Hard-copying both
+        # parent heads then makes a positive child drop impossible.  Solve the
+        # changed component together with its immediate incident links, using
+        # exact parent slopes on the unchanged continuations as strong targets.
+        direction_match = local_links.get(
+            "slope_parent_direction_matches",
+            pd.Series(pd.NA, index=local_links.index, dtype="boolean"),
+        )
+        raw_local_slope = pd.to_numeric(local_links.get("raw_slope", np.nan), errors="coerce")
+        conflict_rows = local_links.loc[direction_match.eq(False) & raw_local_slope.lt(float(min_slope))].copy()
+        if not conflict_rows.empty:
+            local_node_set = set(local_links["id_us_node"].astype(int)) | set(local_links["id_ds_node"].astype(int))
+            all_us = pd.to_numeric(result["id_us_node"], errors="coerce")
+            all_ds = pd.to_numeric(result["id_ds_node"], errors="coerce")
+            neighborhood = result.loc[all_us.isin(local_node_set) | all_ds.isin(local_node_set)].copy()
+            for column in ("id_link", "id_us_node", "id_ds_node"):
+                neighborhood[column] = pd.to_numeric(neighborhood[column], errors="coerce").astype("Int64")
+            neighborhood["link_length_m"] = pd.to_numeric(neighborhood["link_length_m"], errors="coerce")
+            neighborhood = neighborhood.dropna(subset=["id_link", "id_us_node", "id_ds_node", "link_length_m"])
+            neighborhood = neighborhood.loc[neighborhood["link_length_m"].gt(0)].copy()
+
+            continuation_target_by_conflict: dict[int, tuple[int, float]] = {}
+            for conflict in conflict_rows.itertuples(index=False):
+                continuation = neighborhood.loc[
+                    neighborhood["id_us_node"].astype(int).eq(int(conflict.id_ds_node))
+                    & ~neighborhood["id_link"].astype(int).isin(variant_local_link_ids)
+                    & neighborhood.get(
+                        "slope_parent_inheritance_applied",
+                        pd.Series(False, index=neighborhood.index),
+                    ).fillna(False).astype(bool)
+                ].copy()
+                continuation["_target"] = pd.to_numeric(continuation.get("slope_parent_value"), errors="coerce")
+                continuation = continuation.loc[continuation["_target"].gt(0)].copy()
+                if "dominant_parent_overlap_fraction" in continuation.columns:
+                    continuation = continuation.sort_values(
+                        ["dominant_parent_overlap_fraction", "id_link"],
+                        ascending=[False, True],
+                        na_position="last",
+                    )
+                else:
+                    continuation = continuation.sort_values("id_link")
+                if not continuation.empty:
+                    selected = continuation.iloc[0]
+                    continuation_target_by_conflict[int(conflict.id_link)] = (
+                        int(selected["id_link"]),
+                        float(selected["_target"]),
+                    )
+
+            if continuation_target_by_conflict:
+                neighborhood_node_ids = sorted(
+                    set(neighborhood["id_us_node"].astype(int))
+                    | set(neighborhood["id_ds_node"].astype(int))
+                )
+                node_head_values: dict[int, list[float]] = {node_id: [] for node_id in neighborhood_node_ids}
+                for row in neighborhood.itertuples(index=False):
+                    us_head = _safe_float(getattr(row, "wse_us", None))
+                    ds_head = _safe_float(getattr(row, "wse_ds", None))
+                    if us_head is not None:
+                        node_head_values[int(row.id_us_node)].append(us_head)
+                    if ds_head is not None:
+                        node_head_values[int(row.id_ds_node)].append(ds_head)
+                node_head_prior = {
+                    node_id: float(np.mean(values))
+                    for node_id, values in node_head_values.items()
+                    if values
+                }
+                outer_nodes = [node_id for node_id in neighborhood_node_ids if node_id not in local_node_set]
+                anchor_candidates = [node_id for node_id in outer_nodes if node_id in node_head_prior]
+                if not anchor_candidates:
+                    anchor_candidates = [node_id for node_id in neighborhood_node_ids if node_id in node_head_prior]
+                anchor_node = min(anchor_candidates, key=lambda node_id: node_head_prior[node_id]) if anchor_candidates else None
+                variable_nodes = [node_id for node_id in neighborhood_node_ids if node_id != anchor_node]
+                variable_index = {node_id: index for index, node_id in enumerate(variable_nodes)}
+                fixed_heads = {anchor_node: node_head_prior[anchor_node]} if anchor_node is not None else {}
+
+                if anchor_node is not None and all(node_id in node_head_prior for node_id in variable_nodes):
+                    section_values = pd.to_numeric(neighborhood.get("slope_section_ref", np.nan), errors="coerce")
+                    positive_sections = section_values.loc[section_values.gt(0)]
+                    slope_scale_default = (
+                        float(positive_sections.median())
+                        if not positive_sections.empty
+                        else max(float(min_slope), 1e-4)
+                    )
+                    edge_specs: list[tuple[int, int, int, float, float, float, str]] = []
+                    for row in neighborhood.itertuples(index=False):
+                        link_id = int(row.id_link)
+                        target_source = "child_preinheritance"
+                        target = _safe_float(getattr(row, "slope_parent_value", None))
+                        inherited = bool(getattr(row, "slope_parent_inheritance_applied", False))
+                        if link_id in continuation_target_by_conflict:
+                            _, target = continuation_target_by_conflict[link_id]
+                            weight = 100.0
+                            target_source = "downstream_unchanged_parent_continuation"
+                        elif target is not None and target > 0:
+                            direction_matches = getattr(row, "slope_parent_direction_matches", pd.NA)
+                            if inherited:
+                                weight = 100.0
+                                target_source = "unchanged_parent"
+                            elif pd.notna(direction_matches) and bool(direction_matches):
+                                weight = 50.0 if link_id not in variant_local_link_ids else 25.0
+                                target_source = "high_overlap_parent_target"
+                            else:
+                                target = None
+                                weight = 10.0 if link_id in variant_local_link_ids else 25.0
+                        else:
+                            target = _safe_float(getattr(row, "slope_preinheritance_value", None))
+                            if target is None or target < float(min_slope):
+                                target = _safe_float(getattr(row, "slope_section_ref", None))
+                                target_source = "section_reference"
+                            weight = 10.0 if link_id in variant_local_link_ids else 25.0
+                        if target is None or target < float(min_slope):
+                            target = max(float(min_slope), slope_scale_default)
+                            target_source = "minimum_or_section_reference"
+                        edge_specs.append(
+                            (
+                                link_id,
+                                int(row.id_us_node),
+                                int(row.id_ds_node),
+                                float(row.link_length_m),
+                                float(target),
+                                float(weight),
+                                target_source,
+                            )
+                        )
+
+                    # Initialize from the target drops rather than the conflicting
+                    # child profile heads.  This keeps SLSQP well scaled and gives
+                    # an exact solution immediately when the one-hop graph is a
+                    # tree; loops are reconciled by least squares.
+                    all_node_index = {
+                        node_id: index for index, node_id in enumerate(neighborhood_node_ids)
+                    }
+                    equations: list[np.ndarray] = []
+                    rhs: list[float] = []
+                    for _, us_node, ds_node, length, target, _, _ in edge_specs:
+                        coeff = np.zeros(len(neighborhood_node_ids), dtype=float)
+                        coeff[all_node_index[us_node]] = 1.0
+                        coeff[all_node_index[ds_node]] = -1.0
+                        equations.append(coeff)
+                        rhs.append(float(target) * length)
+                    anchor_coeff = np.zeros(len(neighborhood_node_ids), dtype=float)
+                    anchor_coeff[all_node_index[int(anchor_node)]] = 1.0
+                    equations.append(anchor_coeff)
+                    rhs.append(float(fixed_heads[int(anchor_node)]))
+                    initial_solution, *_ = np.linalg.lstsq(
+                        np.vstack(equations),
+                        np.asarray(rhs, dtype=float),
+                        rcond=None,
+                    )
+                    x0 = np.asarray(
+                        [initial_solution[all_node_index[node_id]] for node_id in variable_nodes],
+                        dtype=float,
+                    )
+
+                    def local_head(node_id: int, x: np.ndarray) -> float:
+                        if node_id in variable_index:
+                            return float(x[variable_index[node_id]])
+                        return float(fixed_heads[node_id])
+
+                    conflict_upstream_nodes = {
+                        int(row.id_us_node) for row in conflict_rows.itertuples(index=False)
+                    }
+
+                    def local_objective(x: np.ndarray) -> float:
+                        slope_penalty = 0.0
+                        for _, us_node, ds_node, length, target, weight, _ in edge_specs:
+                            slope = (local_head(us_node, x) - local_head(ds_node, x)) / length
+                            scale = max(abs(target), slope_scale_default, float(min_slope))
+                            slope_penalty += weight * ((slope - target) / scale) ** 2
+                        head_penalty = 0.0
+                        for node_id in variable_nodes:
+                            # Profile heads stabilize the absolute placement but
+                            # remain deliberately weak; slope targets determine
+                            # the internally consistent local head differences.
+                            weight = 0.0001 if node_id in conflict_upstream_nodes else 0.001
+                            head_penalty += weight * ((local_head(node_id, x) - node_head_prior[node_id]) / 0.25) ** 2
+                        return float(slope_penalty + head_penalty)
+
+                    constraints = [
+                        {
+                            "type": "ineq",
+                            "fun": lambda x, us_node=us_node, ds_node=ds_node, length=length: float(
+                                local_head(us_node, x)
+                                - local_head(ds_node, x)
+                                - float(min_slope) * length
+                            ),
+                        }
+                        for _, us_node, ds_node, length, _, _, _ in edge_specs
+                    ]
+                    initial_feasible = all(
+                        local_head(us_node, x0) - local_head(ds_node, x0)
+                        >= float(min_slope) * length - 1e-9
+                        for _, us_node, ds_node, length, _, _, _ in edge_specs
+                    )
+                    if initial_feasible:
+                        solved_x = x0
+                        local_success = True
+                    else:
+                        try:
+                            local_solution = minimize(
+                                local_objective,
+                                x0,
+                                method="SLSQP",
+                                constraints=constraints,
+                                options={"ftol": 1e-12, "maxiter": 5000},
+                            )
+                        except Exception:
+                            local_solution = None
+                        local_success = bool(local_solution is not None and local_solution.success)
+                        solved_x = np.asarray(local_solution.x, dtype=float) if local_success else x0
+
+                    if local_success:
+                        solved_component_ids.append(component_id)
+                        topology_conflict_component_ids.append(component_id)
+                        x = np.asarray(solved_x, dtype=float)
+                        for link_id, us_node, ds_node, length, target, _, target_source in edge_specs:
+                            row_index = index_by_link_id.get(link_id)
+                            if row_index is None:
+                                continue
+                            solved_us_head = local_head(us_node, x)
+                            solved_ds_head = local_head(ds_node, x)
+                            solved_drop = solved_us_head - solved_ds_head
+                            solved_slope = max(solved_drop / length, float(min_slope))
+                            prior_slope = _safe_float(result.at[row_index, "slope_used"])
+                            result.at[row_index, "collapsed_profile_repair_candidate"] = True
+                            result.at[row_index, "collapsed_profile_repair_applied"] = True
+                            result.at[row_index, "collapsed_profile_repair_reason"] = "topology_conflict_local_solve"
+                            result.at[row_index, "collapsed_reference_drop_m"] = solved_drop
+                            result.at[row_index, "collapsed_reference_slope"] = solved_slope
+                            result.at[row_index, "slope_used"] = solved_slope
+                            result.at[row_index, "slope_source_method"] = "topology_conflict_local_head_solver"
+                            result.at[row_index, "slope_adjusted"] = True
+                            result.at[row_index, "slope_reason"] = f"target:{target_source}"
+                            result.at[row_index, "slope_minimum_applied"] = bool(
+                                np.isclose(solved_slope, float(min_slope))
+                            )
+                            result.at[row_index, "topology_conflict_target_slope"] = target
+                            result.at[row_index, "topology_conflict_target_source"] = target_source
+                            result.at[row_index, "topology_optimized_head_us"] = solved_us_head
+                            result.at[row_index, "topology_optimized_head_ds"] = solved_ds_head
+                            if np.isfinite(prior_slope or np.nan) and float(prior_slope) > 0:
+                                result.at[row_index, "collapsed_profile_change_factor"] = solved_slope / float(prior_slope)
+                            applied_link_ids.add(link_id)
+                            if link_id in variant_local_link_ids:
+                                topology_conflict_link_ids.add(link_id)
+                            else:
+                                topology_context_link_ids.add(link_id)
+                        continue
+
         local_node_ids = sorted(
             set(local_links["id_us_node"].astype(int).tolist())
             | set(local_links["id_ds_node"].astype(int).tolist())
@@ -647,19 +904,54 @@ def _apply_collapsed_unit_head_solver(
         if not edges:
             continue
 
-        initial_alpha = float(
-            np.nanmean(pd.to_numeric(local_links.get("slope_used", np.nan), errors="coerce"))
-        )
-        if not np.isfinite(initial_alpha):
-            initial_alpha = 0.0
-        initial_heads = np.array(
-            [
-                float(boundary_heads.get(node_id, np.mean(list(boundary_heads.values()))))
-                for node_id in internal_nodes
-            ],
-            dtype=float,
-        )
-        x0 = np.concatenate([initial_heads, np.asarray([initial_alpha], dtype=float)])
+        local_by_link = local_links.set_index("id_link", drop=False)
+        occurrence_records: list[dict[str, object]] = []
+        invalid_path_reason = ""
+        for path_number, path in enumerate(component.get("variant_paths", []) or [], start=1):
+            path_link_ids = [
+                int(link_id)
+                for link_id in path.get("link_path", []) or []
+                if int(link_id) in local_by_link.index
+            ]
+            if not path_link_ids:
+                continue
+            source_node = int(path["source_boundary_node"])
+            target_node = int(path["target_boundary_node"])
+            if source_node not in boundary_heads or target_node not in boundary_heads:
+                invalid_path_reason = "path_boundary_head_unavailable"
+                break
+            path_length = float(
+                pd.to_numeric(local_by_link.loc[path_link_ids, "link_length_m"], errors="coerce").sum()
+            )
+            target_drop = float(boundary_heads[source_node] - boundary_heads[target_node])
+            target_slope = target_drop / path_length if path_length > 0 else float("nan")
+            if not np.isfinite(target_slope) or target_slope < float(min_slope):
+                invalid_path_reason = (
+                    f"nonpositive_or_below_minimum_path_target:{source_node}->{target_node}"
+                )
+                break
+            path_id = f"P{path_number}:{source_node}->{target_node}"
+            for link_id in path_link_ids:
+                link_length = float(local_by_link.loc[link_id, "link_length_m"])
+                occurrence_records.append(
+                    {
+                        "path_id": path_id,
+                        "link_id": int(link_id),
+                        "path_length_m": path_length,
+                        "target_drop_m": target_drop,
+                        "target_slope": target_slope,
+                        "weight": link_length / path_length,
+                    }
+                )
+
+        if invalid_path_reason or not occurrence_records:
+            reason = invalid_path_reason or "missing_variant_path_targets"
+            for link_id in variant_local_link_ids:
+                result.at[index_by_link_id[link_id], "collapsed_profile_repair_reason"] = reason
+            path_relative_failed_components.append({"component_id": component_id, "reason": reason})
+            continue
+
+        occurrences = pd.DataFrame.from_records(occurrence_records)
 
         def head(node_id: int, x: np.ndarray) -> float:
             if node_id in boundary_heads:
@@ -667,51 +959,114 @@ def _apply_collapsed_unit_head_solver(
             return float(x[internal_index[node_id]])
 
         def objective(x: np.ndarray) -> float:
-            alpha = float(x[-1])
             return float(
                 sum(
-                    ((((head(us_node, x) - head(ds_node, x)) / link_length) - alpha) ** 2)
-                    for _, us_node, ds_node, link_length in edges
-                    if link_length > 0
+                    float(row.weight)
+                    * (
+                        (
+                            (
+                                head(int(local_by_link.loc[int(row.link_id), "id_us_node"]), x)
+                                - head(int(local_by_link.loc[int(row.link_id), "id_ds_node"]), x)
+                            )
+                            / float(local_by_link.loc[int(row.link_id), "link_length_m"])
+                            / float(row.target_slope)
+                        )
+                        - 1.0
+                    )
+                    ** 2
+                    for row in occurrences.itertuples(index=False)
                 )
             )
+
+        # Recover a topology-consistent starting point from the current positive
+        # link drops while retaining the hard base-derived boundary heads.
+        current_heads = dict(boundary_heads)
+        unresolved = set(internal_nodes)
+        for _ in range(len(local_node_ids) + 1):
+            changed = False
+            for link_id, us_node, ds_node, link_length in edges:
+                row_index = index_by_link_id[link_id]
+                current_slope = _safe_float(result.at[row_index, "slope_used"])
+                if current_slope is None or current_slope < float(min_slope):
+                    current_slope = float(min_slope)
+                drop = current_slope * link_length
+                if us_node in current_heads and ds_node not in current_heads:
+                    current_heads[ds_node] = current_heads[us_node] - drop
+                    unresolved.discard(ds_node)
+                    changed = True
+                elif ds_node in current_heads and us_node not in current_heads:
+                    current_heads[us_node] = current_heads[ds_node] + drop
+                    unresolved.discard(us_node)
+                    changed = True
+            if not changed:
+                break
+        if unresolved:
+            reason = "unresolved_internal_head_initialization"
+            for link_id in variant_local_link_ids:
+                result.at[index_by_link_id[link_id], "collapsed_profile_repair_reason"] = reason
+            path_relative_failed_components.append({"component_id": component_id, "reason": reason})
+            continue
+        x0 = np.asarray([current_heads[node_id] for node_id in internal_nodes], dtype=float)
+        objective_before = objective(x0)
 
         constraints = [
             {
                 "type": "ineq",
-                "fun": lambda x, us_node=us_node, ds_node=ds_node: float(head(us_node, x) - head(ds_node, x)),
+                "fun": lambda x, us_node=us_node, ds_node=ds_node, link_length=link_length: float(
+                    head(us_node, x)
+                    - head(ds_node, x)
+                    - float(min_slope) * link_length
+                ),
             }
-            for _, us_node, ds_node, _ in edges
+            for _, us_node, ds_node, link_length in edges
         ]
 
-        try:
-            solution = minimize(
-                objective,
-                x0,
-                method="SLSQP",
-                constraints=constraints,
-                options={"ftol": 1e-12, "maxiter": 5000},
-            )
-        except Exception:
+        if internal_nodes:
+            try:
+                solution = minimize(
+                    objective,
+                    x0,
+                    method="SLSQP",
+                    constraints=constraints,
+                    options={"ftol": 1e-12, "maxiter": 5000},
+                )
+            except Exception:
+                solution = None
+            solution_success = bool(solution is not None and solution.success)
+            solved_values = np.asarray(solution.x, dtype=float) if solution_success else x0
+        else:
             solution = None
+            solved_values = np.asarray([], dtype=float)
+            solution_success = all(
+                head(us_node, solved_values) - head(ds_node, solved_values)
+                >= float(min_slope) * link_length - 1e-9
+                for _, us_node, ds_node, link_length in edges
+            )
 
-        if solution is None or not solution.success:
+        if not solution_success:
             reason = "solver_failed"
             if solution is not None and solution.message:
                 reason = f"solver_failed:{solution.message}"
             for link_id in variant_local_link_ids:
                 result.at[index_by_link_id[link_id], "collapsed_profile_repair_reason"] = reason
+            path_relative_failed_components.append({"component_id": component_id, "reason": reason})
             continue
 
         solved_component_ids.append(component_id)
-        x = np.asarray(solution.x, dtype=float)
+        path_relative_component_ids.append(component_id)
+        x = solved_values
+        objective_after = objective(x)
         for link_id, us_node, ds_node, link_length in edges:
             row_index = index_by_link_id.get(int(link_id))
             if row_index is None:
                 continue
             candidate_link_ids.add(int(link_id))
             reference_drop = float(head(us_node, x) - head(ds_node, x))
-            repaired_slope = float(reference_drop / link_length) if link_length > 0 else float("nan")
+            repaired_slope = (
+                max(float(reference_drop / link_length), float(min_slope))
+                if link_length > 0
+                else float("nan")
+            )
             prior_slope = _safe_float(result.at[row_index, "slope_used"])
             result.at[row_index, "collapsed_profile_repair_candidate"] = True
             result.at[row_index, "collapsed_profile_repair_applied"] = True
@@ -719,10 +1074,23 @@ def _apply_collapsed_unit_head_solver(
             result.at[row_index, "collapsed_reference_drop_m"] = reference_drop
             result.at[row_index, "collapsed_reference_slope"] = repaired_slope
             result.at[row_index, "slope_used"] = repaired_slope
-            result.at[row_index, "slope_source_method"] = "collapsed_unit_head_solver"
+            result.at[row_index, "slope_source_method"] = "collapsed_unit_path_relative_solver"
             result.at[row_index, "slope_adjusted"] = True
-            result.at[row_index, "slope_reason"] = "filled_from_collapsed_unit_head_solver"
-            result.at[row_index, "slope_minimum_applied"] = False
+            result.at[row_index, "slope_reason"] = "filled_from_collapsed_unit_path_relative_solver"
+            result.at[row_index, "slope_minimum_applied"] = bool(
+                np.isclose(repaired_slope, float(min_slope))
+            )
+            targets = occurrences.loc[occurrences["link_id"].eq(int(link_id))]
+            result.at[row_index, "path_relative_target_paths"] = ",".join(
+                targets["path_id"].astype(str).tolist()
+            )
+            result.at[row_index, "path_relative_target_slopes"] = ",".join(
+                f"{float(value):.12g}" for value in targets["target_slope"].tolist()
+            )
+            result.at[row_index, "path_relative_objective_before"] = objective_before
+            result.at[row_index, "path_relative_objective_after"] = objective_after
+            result.at[row_index, "path_relative_optimized_head_us"] = head(us_node, x)
+            result.at[row_index, "path_relative_optimized_head_ds"] = head(ds_node, x)
             if np.isfinite(prior_slope) and prior_slope > 0:
                 result.at[row_index, "collapsed_profile_change_factor"] = float(repaired_slope / prior_slope)
             applied_link_ids.add(int(link_id))
@@ -736,6 +1104,15 @@ def _apply_collapsed_unit_head_solver(
         "candidate_link_ids": sorted(int(link_id) for link_id in candidate_link_ids),
         "applied_link_ids": sorted(int(link_id) for link_id in applied_link_ids),
         "solved_component_ids": sorted(component_id for component_id in solved_component_ids if component_id),
+        "topology_conflict_component_ids": sorted(
+            component_id for component_id in topology_conflict_component_ids if component_id
+        ),
+        "topology_conflict_link_ids": sorted(topology_conflict_link_ids),
+        "topology_context_link_ids": sorted(topology_context_link_ids),
+        "path_relative_component_ids": sorted(
+            component_id for component_id in path_relative_component_ids if component_id
+        ),
+        "path_relative_failed_components": path_relative_failed_components,
     }
 
 
@@ -980,6 +1357,198 @@ def _apply_family_representative_slope_inheritance(
     return result, {
         "applied_count": int(len(applied_link_ids)),
         "applied_link_ids": [int(link_id) for link_id in applied_link_ids],
+    }
+
+
+def _apply_parent_slope_inheritance(
+    link_context: pd.DataFrame,
+    links: gpd.GeoDataFrame,
+    *,
+    parent_link_context: pd.DataFrame | None,
+    excluded_link_ids: set[int] | None = None,
+    overlap_threshold: float = 0.999,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Reuse final parent slopes for strict, direction-consistent 1:1 links.
+
+    Child-state WSE profiles are still retained in the raw/profile columns.  The
+    inherited value replaces only the final routing slope and records both the
+    child pre-inheritance value and the parent provenance.  Links participating
+    in a collapsed local component are excluded because their heads/slopes must
+    be solved together even when geometry matching labels one segment 1:1.
+    """
+
+    result = link_context.copy()
+    result["slope_parent_inheritance_candidate"] = False
+    result["slope_parent_inheritance_applied"] = False
+    result["slope_inherited_from_parent_link"] = pd.Series(pd.NA, index=result.index, dtype="Int64")
+    result["slope_parent_inheritance_reason"] = ""
+    result["slope_parent_value"] = np.nan
+    result["slope_preinheritance_value"] = pd.to_numeric(result.get("slope_used"), errors="coerce")
+    result["slope_parent_source_method"] = ""
+    result["slope_parent_reason"] = ""
+    result["slope_parent_direction_matches"] = pd.Series(pd.NA, index=result.index, dtype="boolean")
+
+    required_link_columns = {
+        "id_link",
+        "lineage_type",
+        "dominant_parent_link_id",
+        "dominant_parent_overlap_fraction",
+        "matched_parent_us_node",
+        "matched_parent_ds_node",
+    }
+    required_parent_columns = {"id_link", "id_us_node", "id_ds_node", "slope_used"}
+    if parent_link_context is None or parent_link_context.empty:
+        result["slope_parent_inheritance_reason"] = "parent_context_unavailable"
+        return result, {
+            "applied_count": 0,
+            "applied_link_ids": [],
+            "excluded_local_link_ids": sorted(int(value) for value in (excluded_link_ids or set())),
+            "reason": "parent_context_unavailable",
+        }
+    if not required_link_columns.issubset(links.columns):
+        result["slope_parent_inheritance_reason"] = "child_lineage_columns_unavailable"
+        return result, {
+            "applied_count": 0,
+            "applied_link_ids": [],
+            "excluded_local_link_ids": sorted(int(value) for value in (excluded_link_ids or set())),
+            "reason": "child_lineage_columns_unavailable",
+        }
+    if not required_parent_columns.issubset(parent_link_context.columns):
+        result["slope_parent_inheritance_reason"] = "parent_slope_columns_unavailable"
+        return result, {
+            "applied_count": 0,
+            "applied_link_ids": [],
+            "excluded_local_link_ids": sorted(int(value) for value in (excluded_link_ids or set())),
+            "reason": "parent_slope_columns_unavailable",
+        }
+
+    child = links[list(required_link_columns)].copy()
+    for column in (
+        "id_link",
+        "dominant_parent_link_id",
+        "matched_parent_us_node",
+        "matched_parent_ds_node",
+    ):
+        child[column] = pd.to_numeric(child[column], errors="coerce").astype("Int64")
+    child["dominant_parent_overlap_fraction"] = pd.to_numeric(
+        child["dominant_parent_overlap_fraction"], errors="coerce"
+    )
+
+    parent_columns = ["id_link", "id_us_node", "id_ds_node", "slope_used"]
+    for optional_column in ("slope_source_method", "slope_reason", "slope_minimum_applied"):
+        if optional_column in parent_link_context.columns:
+            parent_columns.append(optional_column)
+    parent = parent_link_context[parent_columns].copy().rename(
+        columns={
+            "id_link": "parent_id_link",
+            "id_us_node": "parent_id_us_node",
+            "id_ds_node": "parent_id_ds_node",
+            "slope_used": "parent_slope_used",
+            "slope_source_method": "parent_slope_source_method",
+            "slope_reason": "parent_slope_reason",
+            "slope_minimum_applied": "parent_slope_minimum_applied",
+        }
+    )
+    for column in ("parent_id_link", "parent_id_us_node", "parent_id_ds_node"):
+        parent[column] = pd.to_numeric(parent[column], errors="coerce").astype("Int64")
+    parent["parent_slope_used"] = pd.to_numeric(parent["parent_slope_used"], errors="coerce")
+    parent = parent.dropna(subset=["parent_id_link"]).drop_duplicates(subset=["parent_id_link"])
+
+    inheritance = child.merge(
+        parent,
+        left_on="dominant_parent_link_id",
+        right_on="parent_id_link",
+        how="left",
+    ).set_index("id_link", drop=False)
+    excluded = {int(value) for value in (excluded_link_ids or set())}
+    result_index_by_link = {
+        int(link_id): row_index
+        for row_index, link_id in result["id_link"].items()
+        if pd.notna(link_id)
+    }
+    applied_link_ids: list[int] = []
+    candidate_link_ids: list[int] = []
+    direction_mismatch_link_ids: list[int] = []
+
+    for child_link_id, row in inheritance.iterrows():
+        if pd.isna(child_link_id) or int(child_link_id) not in result_index_by_link:
+            continue
+        link_id = int(child_link_id)
+        result_index = result_index_by_link[link_id]
+        if str(row.get("lineage_type", "")) != "unchanged_1to1":
+            result.at[result_index, "slope_parent_inheritance_reason"] = "not_unchanged_1to1"
+            continue
+        overlap = _safe_float(row.get("dominant_parent_overlap_fraction"))
+        if overlap is None or overlap < 0.95:
+            result.at[result_index, "slope_parent_inheritance_reason"] = "below_parent_target_overlap_threshold"
+            continue
+
+        direction_values = [
+            row.get("matched_parent_us_node"),
+            row.get("matched_parent_ds_node"),
+            row.get("parent_id_us_node"),
+            row.get("parent_id_ds_node"),
+        ]
+        if any(pd.isna(value) for value in direction_values):
+            result.at[result_index, "slope_parent_inheritance_reason"] = "missing_parent_direction"
+            continue
+        direction_matches = (
+            int(row["matched_parent_us_node"]) == int(row["parent_id_us_node"])
+            and int(row["matched_parent_ds_node"]) == int(row["parent_id_ds_node"])
+        )
+        result.at[result_index, "slope_parent_direction_matches"] = bool(direction_matches)
+        parent_slope = _safe_float(row.get("parent_slope_used"))
+        if parent_slope is not None and parent_slope > 0:
+            result.at[result_index, "slope_parent_value"] = parent_slope
+            result.at[result_index, "slope_parent_source_method"] = str(
+                row.get("parent_slope_source_method", "") or ""
+            )
+            result.at[result_index, "slope_parent_reason"] = str(row.get("parent_slope_reason", "") or "")
+        if not direction_matches:
+            result.at[result_index, "slope_parent_inheritance_reason"] = (
+                "collapsed_local_parent_direction_mismatch"
+                if link_id in excluded
+                else "parent_direction_mismatch"
+            )
+            direction_mismatch_link_ids.append(link_id)
+            continue
+        if overlap < float(overlap_threshold):
+            result.at[result_index, "slope_parent_inheritance_reason"] = "below_overlap_threshold_parent_target_available"
+            continue
+        result.at[result_index, "slope_parent_inheritance_candidate"] = True
+        candidate_link_ids.append(link_id)
+        if link_id in excluded:
+            result.at[result_index, "slope_parent_inheritance_reason"] = "collapsed_local_recalculation"
+            continue
+
+        if parent_slope is None or parent_slope <= 0:
+            result.at[result_index, "slope_parent_inheritance_reason"] = "invalid_parent_slope"
+            continue
+
+        parent_link_id = int(row["parent_id_link"])
+        result.at[result_index, "slope_used"] = parent_slope
+        result.at[result_index, "slope_source_method"] = "parent_unchanged_1to1"
+        result.at[result_index, "slope_reason"] = "inherited_from_parent_unchanged_1to1"
+        result.at[result_index, "slope_adjusted"] = True
+        if "slope_minimum_applied" in result.columns:
+            inherited_minimum = row.get("parent_slope_minimum_applied", False)
+            result.at[result_index, "slope_minimum_applied"] = bool(inherited_minimum) if pd.notna(inherited_minimum) else False
+        result.at[result_index, "slope_parent_inheritance_applied"] = True
+        result.at[result_index, "slope_inherited_from_parent_link"] = parent_link_id
+        result.at[result_index, "slope_parent_inheritance_reason"] = "inherited_from_parent_unchanged_1to1"
+        applied_link_ids.append(link_id)
+
+    untouched = result["slope_parent_inheritance_reason"].eq("")
+    result.loc[untouched, "slope_parent_inheritance_reason"] = "lineage_record_unavailable"
+    return result, {
+        "applied_count": int(len(applied_link_ids)),
+        "candidate_count": int(len(candidate_link_ids)),
+        "applied_link_ids": sorted(applied_link_ids),
+        "candidate_link_ids": sorted(candidate_link_ids),
+        "excluded_local_link_ids": sorted(excluded),
+        "direction_mismatch_link_ids": sorted(direction_mismatch_link_ids),
+        "overlap_threshold": float(overlap_threshold),
+        "reason": "ok",
     }
 
 
@@ -2591,6 +3160,7 @@ def generate_state_hydraulic_context(
     output_dir: str | Path,
     state_id: str | None = None,
     config: SlopeConfig | None = None,
+    parent_link_context_path: str | Path | None = None,
 ) -> StateHydraulicContextOutputs:
     """Write state-level node and link hydraulic context artifacts.
 
@@ -2621,17 +3191,39 @@ def generate_state_hydraulic_context(
         unit_summary=unit_summary,
         config=resolved_config,
     )
-    link_context, family_slope_inheritance_summary = _apply_family_representative_slope_inheritance(
+    collapsed_unit_boundary_analysis = _build_collapsed_unit_boundary_analysis(
+        result.link_context,
+        links_path=links_path,
+    )
+    collapsed_local_link_ids = {
+        int(link_id)
+        for component in collapsed_unit_boundary_analysis
+        for link_id in component.get("variant_local_link_ids", []) or []
+    }
+    resolved_parent_link_context_path = (
+        Path(parent_link_context_path).expanduser().resolve()
+        if parent_link_context_path is not None
+        else None
+    )
+    parent_link_context = (
+        pd.read_csv(resolved_parent_link_context_path)
+        if resolved_parent_link_context_path is not None and resolved_parent_link_context_path.exists()
+        else None
+    )
+    link_context, parent_slope_inheritance_summary = _apply_parent_slope_inheritance(
         result.link_context,
         links,
+        parent_link_context=parent_link_context,
+        excluded_link_ids=collapsed_local_link_ids,
     )
-    collapsed_unit_boundary_analysis = _build_collapsed_unit_boundary_analysis(
+    link_context, family_slope_inheritance_summary = _apply_family_representative_slope_inheritance(
         link_context,
-        links_path=links_path,
+        links,
     )
     link_context, collapsed_unit_head_solver_summary = _apply_collapsed_unit_head_solver(
         link_context,
         collapsed_unit_boundary_analysis=collapsed_unit_boundary_analysis,
+        min_slope=resolved_config.min_slope,
     )
 
     link_context_path = output_path / "link_hydraulic_context.csv"
@@ -2648,6 +3240,7 @@ def generate_state_hydraulic_context(
             "directed_links": str(links_path),
             "directed_nodes": str(nodes_path),
             "hierarchy_output_dir": str(Path(hierarchy_output_dir).expanduser().resolve()) if hierarchy_output_dir is not None else "",
+            "parent_link_hydraulic_context": str(resolved_parent_link_context_path) if resolved_parent_link_context_path is not None else "",
         },
         "output_paths": {
             "link_hydraulic_context": str(link_context_path),
@@ -2662,6 +3255,7 @@ def generate_state_hydraulic_context(
             "normalized_solver_heads": "not written here",
         },
         "family_slope_inheritance": family_slope_inheritance_summary,
+        "parent_slope_inheritance": parent_slope_inheritance_summary,
         "collapsed_unit_head_solver": collapsed_unit_head_solver_summary,
         "collapsed_unit_boundary_analysis": collapsed_unit_boundary_analysis,
         "slope_config": {

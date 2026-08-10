@@ -10,6 +10,7 @@ from shapely.geometry import LineString, Point
 
 from network_variants.hydraulic_context import (
     SlopeConfig,
+    _apply_collapsed_unit_head_solver,
     compute_hydraulic_context,
     generate_state_hydraulic_context,
 )
@@ -261,6 +262,287 @@ def test_generate_state_hydraulic_context_inherits_family_representative_slope(t
     assert outputs.manifest["family_slope_inheritance"]["applied_link_ids"] == [1]
 
 
+def test_generate_state_hydraulic_context_inherits_strict_parent_slope(tmp_path: Path) -> None:
+    links = _simple_links().copy()
+    links["lineage_type"] = "unchanged_1to1"
+    links["dominant_parent_link_id"] = 10
+    links["dominant_parent_overlap_fraction"] = 1.0
+    links["matched_parent_us_node"] = 101
+    links["matched_parent_ds_node"] = 102
+
+    links_path = tmp_path / "links.gpkg"
+    nodes_path = tmp_path / "nodes.gpkg"
+    parent_context_path = tmp_path / "parent_link_hydraulic_context.csv"
+    links.to_file(links_path, driver="GPKG")
+    _simple_nodes().to_file(nodes_path, driver="GPKG")
+    pd.DataFrame(
+        [
+            {
+                "id_link": 10,
+                "id_us_node": 101,
+                "id_ds_node": 102,
+                "slope_used": 0.0025,
+                "slope_source_method": "compound_bubble_profile",
+                "slope_reason": "filled_from_compound_bubble_profile",
+                "slope_minimum_applied": False,
+            }
+        ]
+    ).to_csv(parent_context_path, index=False)
+
+    outputs = generate_state_hydraulic_context(
+        directed_links_path=links_path,
+        directed_nodes_path=nodes_path,
+        hierarchy_output_dir=None,
+        output_dir=tmp_path / "hydraulic_context",
+        state_id="S001_unit_1",
+        parent_link_context_path=parent_context_path,
+    )
+
+    row = outputs.link_context.iloc[0]
+    assert float(row["raw_slope"]) == pytest.approx(0.01)
+    assert float(row["slope_preinheritance_value"]) == pytest.approx(0.01)
+    assert float(row["slope_used"]) == pytest.approx(0.0025)
+    assert str(row["slope_source_method"]) == "parent_unchanged_1to1"
+    assert bool(row["slope_parent_inheritance_applied"]) is True
+    assert int(row["slope_inherited_from_parent_link"]) == 10
+    assert str(row["slope_parent_source_method"]) == "compound_bubble_profile"
+    assert outputs.manifest["parent_slope_inheritance"]["applied_link_ids"] == [1]
+
+
+def test_parent_slope_inheritance_rejects_reversed_parent_direction(tmp_path: Path) -> None:
+    links = _simple_links().copy()
+    links["lineage_type"] = "unchanged_1to1"
+    links["dominant_parent_link_id"] = 10
+    links["dominant_parent_overlap_fraction"] = 1.0
+    links["matched_parent_us_node"] = 102
+    links["matched_parent_ds_node"] = 101
+
+    links_path = tmp_path / "links.gpkg"
+    nodes_path = tmp_path / "nodes.gpkg"
+    parent_context_path = tmp_path / "parent_link_hydraulic_context.csv"
+    links.to_file(links_path, driver="GPKG")
+    _simple_nodes().to_file(nodes_path, driver="GPKG")
+    pd.DataFrame(
+        [{"id_link": 10, "id_us_node": 101, "id_ds_node": 102, "slope_used": 0.0025}]
+    ).to_csv(parent_context_path, index=False)
+
+    outputs = generate_state_hydraulic_context(
+        directed_links_path=links_path,
+        directed_nodes_path=nodes_path,
+        hierarchy_output_dir=None,
+        output_dir=tmp_path / "hydraulic_context",
+        state_id="S001_unit_1",
+        parent_link_context_path=parent_context_path,
+    )
+
+    row = outputs.link_context.iloc[0]
+    assert float(row["slope_used"]) == pytest.approx(0.01)
+    assert bool(row["slope_parent_inheritance_applied"]) is False
+    assert str(row["slope_parent_inheritance_reason"]) == "parent_direction_mismatch"
+    assert outputs.manifest["parent_slope_inheritance"]["direction_mismatch_link_ids"] == [1]
+
+
+def test_topology_conflict_solver_uses_unchanged_downstream_parent_target() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "id_link": 1,
+                "id_us_node": 10,
+                "id_ds_node": 11,
+                "link_length_m": 20.0,
+                "wse_us": 9.0,
+                "wse_ds": 10.0,
+                "raw_slope": -0.05,
+                "slope_used": 1e-6,
+                "slope_preinheritance_value": 1e-6,
+                "slope_parent_value": 0.02,
+                "slope_parent_direction_matches": False,
+                "slope_parent_inheritance_applied": False,
+                "slope_section_ref": 0.001,
+            },
+            {
+                "id_link": 2,
+                "id_us_node": 11,
+                "id_ds_node": 12,
+                "link_length_m": 100.0,
+                "wse_us": 10.0,
+                "wse_ds": 9.5,
+                "raw_slope": 0.005,
+                "slope_used": 0.003,
+                "slope_preinheritance_value": 0.005,
+                "slope_parent_value": 0.003,
+                "slope_parent_direction_matches": True,
+                "slope_parent_inheritance_applied": True,
+                "slope_section_ref": 0.001,
+            },
+            {
+                "id_link": 3,
+                "id_us_node": 20,
+                "id_ds_node": 21,
+                "link_length_m": 50.0,
+                "wse_us": 8.0,
+                "wse_ds": 7.9,
+                "raw_slope": 0.002,
+                "slope_used": 0.002,
+                "slope_preinheritance_value": 0.002,
+                "slope_parent_value": 0.002,
+                "slope_parent_direction_matches": True,
+                "slope_parent_inheritance_applied": True,
+                "slope_section_ref": 0.001,
+            },
+        ]
+    )
+    solved, summary = _apply_collapsed_unit_head_solver(
+        frame,
+        collapsed_unit_boundary_analysis=[
+            {
+                "component_id": "C1",
+                "variant_local_link_ids": [1],
+                "variant_boundary_heads": [
+                    {"variant_node": 10, "head_m": 9.0},
+                    {"variant_node": 11, "head_m": 10.0},
+                ],
+            }
+        ],
+        min_slope=1e-6,
+    )
+
+    by_link = solved.set_index("id_link")
+    assert float(by_link.loc[1, "slope_used"]) == pytest.approx(0.003)
+    assert float(by_link.loc[2, "slope_used"]) == pytest.approx(0.003)
+    assert float(by_link.loc[3, "slope_used"]) == pytest.approx(0.002)
+    assert by_link.loc[1, "topology_conflict_target_source"] == "downstream_unchanged_parent_continuation"
+    assert summary["topology_conflict_link_ids"] == [1]
+    assert summary["topology_context_link_ids"] == [2]
+
+
+def test_collapsed_head_solver_never_replaces_positive_fallback_with_zero() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "id_link": 1,
+                "id_us_node": 10,
+                "id_ds_node": 11,
+                "link_length_m": 100.0,
+                "raw_slope": 0.0,
+                "slope_used": 1e-6,
+                "slope_source_method": "minimum_slope",
+                "slope_reason": "below_minimum_raw",
+                "slope_minimum_applied": True,
+            }
+        ]
+    )
+    solved, summary = _apply_collapsed_unit_head_solver(
+        frame,
+        collapsed_unit_boundary_analysis=[
+            {
+                "component_id": "C1",
+                "variant_local_link_ids": [1],
+                "variant_boundary_heads": [
+                    {"variant_node": 10, "head_m": 9.0},
+                    {"variant_node": 11, "head_m": 9.0},
+                ],
+            }
+        ],
+        min_slope=1e-6,
+    )
+
+    row = solved.iloc[0]
+    assert float(row["slope_used"]) == pytest.approx(1e-6)
+    assert float(row["slope_used"]) > 0
+    assert bool(row["collapsed_profile_repair_applied"]) is False
+    assert str(row["collapsed_profile_repair_reason"]) == "missing_variant_path_targets"
+    assert summary["applied_link_ids"] == []
+
+
+def test_path_relative_solver_combines_multiple_targets_for_shared_link() -> None:
+    frame = pd.DataFrame(
+        [
+            {
+                "id_link": 10,
+                "id_us_node": 1,
+                "id_ds_node": 2,
+                "link_length_m": 100.0,
+                "raw_slope": 0.001,
+                "slope_used": 0.001,
+                "slope_source_method": "raw_wse",
+                "slope_reason": "ok",
+                "slope_minimum_applied": False,
+            },
+            {
+                "id_link": 11,
+                "id_us_node": 2,
+                "id_ds_node": 3,
+                "link_length_m": 100.0,
+                "raw_slope": 0.009,
+                "slope_used": 0.009,
+                "slope_source_method": "raw_wse",
+                "slope_reason": "ok",
+                "slope_minimum_applied": False,
+            },
+            {
+                "id_link": 12,
+                "id_us_node": 2,
+                "id_ds_node": 4,
+                "link_length_m": 100.0,
+                "raw_slope": 0.019,
+                "slope_used": 0.019,
+                "slope_source_method": "raw_wse",
+                "slope_reason": "ok",
+                "slope_minimum_applied": False,
+            },
+        ]
+    )
+    solved, summary = _apply_collapsed_unit_head_solver(
+        frame,
+        collapsed_unit_boundary_analysis=[
+            {
+                "component_id": "C1",
+                "variant_local_link_ids": [10, 11, 12],
+                "variant_boundary_heads": [
+                    {"variant_node": 1, "head_m": 10.0},
+                    {"variant_node": 3, "head_m": 9.0},
+                    {"variant_node": 4, "head_m": 8.0},
+                ],
+                "variant_paths": [
+                    {
+                        "source_boundary_node": 1,
+                        "target_boundary_node": 3,
+                        "node_path": [1, 2, 3],
+                        "link_path": [10, 11],
+                    },
+                    {
+                        "source_boundary_node": 1,
+                        "target_boundary_node": 4,
+                        "node_path": [1, 2, 4],
+                        "link_path": [10, 12],
+                    },
+                ],
+            }
+        ],
+        min_slope=1e-6,
+    )
+
+    by_link = solved.set_index("id_link")
+    assert set(by_link["slope_source_method"]) == {"collapsed_unit_path_relative_solver"}
+    assert all(pd.to_numeric(by_link["slope_used"], errors="raise") >= 1e-6)
+    assert by_link.loc[10, "path_relative_target_paths"] == "P1:1->3,P2:1->4"
+    assert by_link.loc[10, "path_relative_target_slopes"] == "0.005,0.01"
+    assert float(by_link.loc[10, "path_relative_objective_after"]) < float(
+        by_link.loc[10, "path_relative_objective_before"]
+    )
+    assert (
+        float(by_link.loc[10, "collapsed_reference_drop_m"])
+        + float(by_link.loc[11, "collapsed_reference_drop_m"])
+    ) == pytest.approx(1.0)
+    assert (
+        float(by_link.loc[10, "collapsed_reference_drop_m"])
+        + float(by_link.loc[12, "collapsed_reference_drop_m"])
+    ) == pytest.approx(2.0)
+    assert summary["path_relative_component_ids"] == ["C1"]
+    assert summary["path_relative_failed_components"] == []
+
+
 def test_compute_hydraulic_context_can_use_reference_section_profile(tmp_path: Path) -> None:
     summary_path = _write_reference_section_summary(tmp_path)
     nodes = _simple_nodes().copy()
@@ -393,10 +675,11 @@ def test_generate_state_hydraulic_context_applies_collapsed_unit_head_solver(tmp
     expected_slope = (177.94389 - 177.245404) / 1447.522362
     assert float(written.loc[11, "raw_slope"]) == pytest.approx((177.94389 - 177.48722) / 1447.522362)
     assert float(written.loc[11, "slope_used"]) == pytest.approx(expected_slope)
-    assert str(written.loc[11, "slope_source_method"]) == "collapsed_unit_head_solver"
+    assert str(written.loc[11, "slope_source_method"]) == "collapsed_unit_path_relative_solver"
     assert bool(written.loc[11, "collapsed_profile_repair_applied"]) is True
     assert float(written.loc[11, "collapsed_reference_drop_m"]) == pytest.approx(177.94389 - 177.245404)
     assert outputs.manifest["collapsed_unit_head_solver"]["applied_link_ids"] == [11]
+    assert outputs.manifest["collapsed_unit_head_solver"]["path_relative_component_ids"] == ["C1"]
 
 
 def test_generate_state_hydraulic_context_reports_collapsed_unit_boundary_analysis_from_slope_used(

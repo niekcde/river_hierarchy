@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import hierarchy_level_definition.metrics.bubble_equivalent_metrics as bubble_metrics_module
 from hierarchy_level_definition.metrics import (
     BubbleEquivalentResistanceConfig,
     LENGTH_FIELD_CANDIDATES,
@@ -42,6 +43,105 @@ def _parallel_unit(*, unit_id: int, edge_ids: list[int], upstream: int, downstre
         children=[],
         parents=[],
     )
+
+
+def _fake_solve_result(*, success: bool, residual: float, k_eq: float) -> dict:
+    return {
+        "n_nodes": 3,
+        "n_edges": 2,
+        "solver_success": success,
+        "solver_method": "least_squares",
+        "solver_message": "ok" if success else "maximum evaluations reached",
+        "solver_nfev": 20 if success else 4000,
+        "K_eq": k_eq,
+        "G_eq": 1.0 / k_eq,
+        "Q_unit": 1.0 / k_eq**0.5,
+        "residual_norm": residual,
+        "residual_relative": residual,
+        "edge_flows": pd.DataFrame(
+            {"edge_id": [1, 2], "q_unit": [1.0, 1.0], "dh": [0.5, 0.5]}
+        ),
+        "node_heads": pd.DataFrame(
+            {
+                "node_id": [1, 2, 3],
+                "head_norm": [1.0, 0.5, 0.0],
+                "is_boundary": [True, False, True],
+                "is_upstream_boundary": [True, False, False],
+                "is_downstream_boundary": [False, False, True],
+                "head_source": ["boundary", "solved", "boundary"],
+                "continuity_residual": [pd.NA, residual, pd.NA],
+            }
+        ),
+    }
+
+
+def test_hierarchy_bubble_solver_retries_with_normalized_neutral_heads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guesses = []
+    results = [
+        _fake_solve_result(success=False, residual=0.3, k_eq=99.0),
+        _fake_solve_result(success=True, residual=1e-12, k_eq=4.0),
+    ]
+
+    def fake_solver(*args, optional_H_guess=None, **kwargs):
+        guesses.append(optional_H_guess)
+        return results.pop(0)
+
+    monkeypatch.setattr(bubble_metrics_module, "solve_bubble_equivalent_K", fake_solver)
+    nodes = pd.DataFrame(
+        {"node_id": [1, 2, 3], "sword_wse": [10.0, 9.8, 9.0]}
+    )
+    edges = pd.DataFrame(
+        {"edge_id": [1, 2], "u": [1, 2], "v": [2, 3], "K_e": [2.0, 2.0]}
+    )
+
+    solved = bubble_metrics_module._solve_with_neutral_head_fallback(
+        bubble_nodes=nodes,
+        bubble_edges=edges,
+        upstream_node=1,
+        downstream_node=3,
+        config=BubbleEquivalentResistanceConfig(),
+    )
+
+    assert guesses[0] is nodes
+    assert guesses[1] == {1: 1.0, 2: 0.5, 3: 0.0}
+    assert solved["solver_success"] is True
+    assert solved["K_eq"] == pytest.approx(4.0)
+    assert solved["solver_initialization"] == "neutral_internal_heads_fallback"
+    assert solved["primary_solver_success"] is False
+    assert solved["primary_residual_relative"] == pytest.approx(0.3)
+    assert solved["neutral_fallback_attempted"] is True
+
+
+def test_hierarchy_bubble_solver_masks_provisional_values_when_both_attempts_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results = [
+        _fake_solve_result(success=False, residual=0.3, k_eq=99.0),
+        _fake_solve_result(success=False, residual=0.2, k_eq=88.0),
+    ]
+    monkeypatch.setattr(
+        bubble_metrics_module,
+        "solve_bubble_equivalent_K",
+        lambda *args, **kwargs: results.pop(0),
+    )
+
+    solved = bubble_metrics_module._solve_with_neutral_head_fallback(
+        bubble_nodes=pd.DataFrame({"node_id": [1, 2, 3]}),
+        bubble_edges=pd.DataFrame(
+            {"edge_id": [1, 2], "u": [1, 2], "v": [2, 3], "K_e": [2.0, 2.0]}
+        ),
+        upstream_node=1,
+        downstream_node=3,
+        config=BubbleEquivalentResistanceConfig(),
+    )
+
+    assert solved["solver_success"] is False
+    assert pd.isna(solved["K_eq"])
+    assert pd.isna(solved["G_eq"])
+    assert pd.isna(solved["Q_unit"])
+    assert solved["edge_flows"][["q_unit", "dh"]].isna().all().all()
 
 
 def test_compute_bubble_equivalent_metrics_from_units_reduces_standalone_parallel_unit() -> None:
@@ -128,6 +228,7 @@ def test_compute_bubble_equivalent_metrics_from_units_groups_compound_bubbles() 
             {"id_link": 6, "id_us_node": 5, "id_ds_node": 3, "len_adj": 110.0, "wid_adj": 45.0},
             {"id_link": 7, "id_us_node": 9, "id_ds_node": 10, "len_adj": 100.0, "wid_adj": 55.0},
             {"id_link": 8, "id_us_node": 9, "id_ds_node": 10, "len_adj": 120.0, "wid_adj": 35.0},
+            {"id_link": 9, "id_us_node": 3, "id_ds_node": 4, "len_adj": 60.0, "wid_adj": 30.0},
         ]
     )
     nodes = pd.DataFrame(
@@ -147,7 +248,7 @@ def test_compute_bubble_equivalent_metrics_from_units_groups_compound_bubbles() 
             UnitPath(2, [1, 2, 4], [(1, 2, 2), (2, 4, 3)], [2, 3], 190.0),
         ],
         node_set={1, 2, 3, 4, 5},
-        edge_set={(1, 4, 1), (1, 2, 2), (2, 4, 3), (2, 3, 4), (2, 5, 5)},
+        edge_set={(1, 4, 1), (1, 2, 2), (2, 4, 3), (2, 3, 4), (2, 5, 5), (3, 4, 9)},
         internal_bifurcations=[2],
         internal_confluences=[],
         children=[20],
@@ -186,7 +287,7 @@ def test_compute_bubble_equivalent_metrics_from_units_groups_compound_bubbles() 
     assert compound_row["n_member_units"] == 2
     assert compound_row["upstream_boundary_node"] == 1
     assert compound_row["downstream_boundary_node"] == 4
-    assert compound_row["n_edges"] == 6
+    assert compound_row["n_edges"] == 7
     assert bool(compound_row["solver_success"]) is True
     assert compound_row["K_eq"] > 0.0
     assert compound_row["residual_relative"] < 1e-3
@@ -196,7 +297,7 @@ def test_compute_bubble_equivalent_metrics_from_units_groups_compound_bubbles() 
     assert bool(standalone_row["solver_success"]) is True
 
     compound_bubble_id = int(compound_row["compound_bubble_id"])
-    assert len(bubble_edges.loc[bubble_edges["compound_bubble_id"] == compound_bubble_id]) == 6
+    assert len(bubble_edges.loc[bubble_edges["compound_bubble_id"] == compound_bubble_id]) == 7
     assert set(bubble_nodes.loc[bubble_nodes["compound_bubble_id"] == compound_bubble_id, "node_id"]) >= {1, 2, 3, 4, 5}
 
 

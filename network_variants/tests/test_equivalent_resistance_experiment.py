@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import geopandas as gpd
@@ -9,7 +10,12 @@ from shapely.geometry import LineString, Point
 
 from hierarchy_level_definition.metrics import BubbleEquivalentResistanceConfig, compute_K_manning
 import network_variants.equivalent_resistance_experiment as equivalent_resistance_experiment_module
-from network_variants.equivalent_resistance_experiment import main, run_equivalent_resistance_experiment
+from network_variants.equivalent_resistance_experiment import (
+    load_manifest_equivalent_resistance_config,
+    main,
+    recompute_state_hierarchy_equivalent_resistance,
+    run_equivalent_resistance_experiment,
+)
 
 
 def _write_links(path: Path, rows: list[dict[str, object]]) -> None:
@@ -436,6 +442,150 @@ def test_main_passes_equivalent_length_field_into_equivalent_resistance_config(
     config = calls[0]["equivalent_resistance_config"]
     assert isinstance(config, BubbleEquivalentResistanceConfig)
     assert config.length_field_candidates == ("len", "len_adj", "link_length_m")
+
+
+def test_recompute_state_hierarchy_uses_manifest_config_and_updates_only_resistance_artifacts(
+    tmp_path: Path,
+) -> None:
+    experiment_dir = tmp_path / "experiment"
+    hierarchy_dir = experiment_dir / "states" / "S000_base" / "hierarchy"
+    hierarchy_dir.mkdir(parents=True)
+    links_path = experiment_dir / "links.gpkg"
+    nodes_path = experiment_dir / "nodes.gpkg"
+    links_path.touch()
+    nodes_path.touch()
+    config_payload = {
+        "resistance_law": "chezy",
+        "geometry_method": "wide",
+        "kb_mode": "based_reference_section",
+        "kb_value": 20.0,
+        "reference_kb_summary": {
+            "kb_value": 123.0,
+            "kb_source_method": "based_reference_section",
+        },
+        "length_field_candidates": ["len", "len_adj", "link_length_m"],
+        "default_chezy_cz": 22.0,
+    }
+    (experiment_dir / "experiment_manifest.json").write_text(
+        json.dumps(
+            {
+                "options": {
+                    "hierarchy": {
+                        "max_path_cutoff": 77,
+                        "max_paths": 888,
+                        "equivalent_resistance_config": config_payload,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    pd.DataFrame.from_records(
+        [
+            {
+                "state_id": "S000_base",
+                "status": "complete",
+                "hierarchy_status": "complete",
+                "analysis_links_path": str(links_path),
+                "directed_nodes_path": str(nodes_path),
+                "hierarchy_output_dir": str(hierarchy_dir),
+                "n_equivalent_bubbles": 1,
+                "n_equivalent_bubbles_solver_success": 0,
+            }
+        ]
+    ).to_csv(experiment_dir / "state_registry.csv", index=False)
+    pd.DataFrame.from_records(
+        [
+            {
+                "compound_bubble_id": 1,
+                "upstream_boundary_node": 10,
+                "downstream_boundary_node": 11,
+                "solver_success": False,
+                "K_eq": float("nan"),
+            }
+        ]
+    ).to_csv(hierarchy_dir / "bubble_equivalent_metrics.csv", index=False)
+    (hierarchy_dir / "unit_workflow_manifest.json").write_text(
+        json.dumps({"unrelated_metric": "preserved"}),
+        encoding="utf-8",
+    )
+
+    calls: list[dict[str, object]] = []
+
+    def fake_metrics_runner(*args: object, **kwargs: object):
+        calls.append({"args": args, **kwargs})
+        metrics = pd.DataFrame.from_records(
+            [
+                {
+                    "compound_bubble_id": 1,
+                    "upstream_boundary_node": 10,
+                    "downstream_boundary_node": 12,
+                    "solver_success": True,
+                    "solver_initialization": "neutral_internal_heads",
+                    "neutral_fallback_attempted": True,
+                    "neutral_fallback_solver_success": True,
+                    "K_eq": 2.5,
+                    "G_eq": 0.4,
+                    "Q_unit": 0.4,
+                    "residual_relative": 0.0,
+                }
+            ]
+        )
+        metrics.attrs["resolved_kb_context"] = {
+            "kb_value": 123.0,
+            "kb_mode": "based_reference_section",
+        }
+        edges = pd.DataFrame.from_records([{"compound_bubble_id": 1, "edge_id": 5}])
+        heads = pd.DataFrame.from_records([{"compound_bubble_id": 1, "node_id": 10}])
+        return metrics, edges, heads
+
+    results = recompute_state_hierarchy_equivalent_resistance(
+        experiment_dir,
+        metrics_runner=fake_metrics_runner,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["max_path_cutoff"] == 77
+    assert calls[0]["max_paths"] == 888
+    config = calls[0]["config"]
+    assert isinstance(config, BubbleEquivalentResistanceConfig)
+    assert config.resistance_law == "chezy"
+    assert config.reference_kb_summary["kb_value"] == pytest.approx(123.0)
+    assert config.length_field_candidates == ("len", "len_adj", "link_length_m")
+
+    refreshed = pd.read_csv(hierarchy_dir / "bubble_equivalent_metrics.csv")
+    assert bool(refreshed.loc[0, "solver_success"]) is True
+    assert refreshed.loc[0, "downstream_boundary_node"] == 12
+    assert bool(results.audit.loc[0, "boundary_changed"]) is True
+    assert bool(results.audit.loc[0, "K_changed"]) is True
+    registry = pd.read_csv(experiment_dir / "state_registry.csv")
+    assert registry.loc[0, "n_equivalent_bubbles_solver_success"] == 1
+    workflow_manifest = json.loads(
+        (hierarchy_dir / "unit_workflow_manifest.json").read_text(encoding="utf-8")
+    )
+    assert workflow_manifest["unrelated_metric"] == "preserved"
+    assert workflow_manifest["equivalent_resistance_recompute_scope"] == "state_hierarchy_only"
+    assert results.audit_csv_path.exists()
+    assert results.summary_json_path.exists()
+
+
+def test_load_manifest_equivalent_resistance_config_requires_stored_config(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "experiment_manifest.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="equivalent_resistance_config"):
+        load_manifest_equivalent_resistance_config(tmp_path)
+
+
+def test_state_hierarchy_recompute_audit_accepts_states_without_bubbles() -> None:
+    audit = equivalent_resistance_experiment_module._audit_state_recompute(
+        state_id="S999_empty",
+        old_metrics=pd.DataFrame(),
+        new_metrics=pd.DataFrame(),
+    )
+    assert audit.empty
+    assert "boundary_changed" in audit.columns
+    assert "K_changed" in audit.columns
 
 
 def test_equivalent_resistance_prefers_width_family_link_source(tmp_path: Path) -> None:

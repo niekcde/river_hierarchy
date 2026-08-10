@@ -54,9 +54,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--x-value", type=float, default=0.1, help="Muskingum X parameter.")
     parser.add_argument("--kb-value", type=float, default=20.0, help="K-value helper parameter kb.")
     parser.add_argument("--kb-mode", choices=["fixed", "based_reference_section"], default="fixed", help="How to select kb for RAPID K preparation.")
-    parser.add_argument("--kb-model-path", help="Optional local path to the BASED model .ubj file when kb-mode=based_reference_section.")
-    parser.add_argument("--kb-width-sample-field", default="wid_adj_wet", help="Reference-section width field used when kb-mode=based_reference_section. Summary width fields on the reference link are preferred over raw sample percentiles when available.")
-    parser.add_argument("--kb-width-percentile", type=float, default=90.0, help="Reference-section width percentile used only when the selected kb width field is read from raw sample widths.")
+    parser.add_argument("--kb-model-path", help="Legacy provenance option. RAPID reuses the stored upstream BASED result and does not run the model.")
+    parser.add_argument("--kb-width-sample-field", default="wid_adj_routing", help="Legacy provenance option. The stored upstream reference_kb_summary.json is authoritative when kb-mode=based_reference_section.")
+    parser.add_argument(
+        "--kb-width-percentile",
+        type=float,
+        default=None,
+        help=(
+            "Legacy provenance option. RAPID does not recalculate the stored reference-section kb."
+        ),
+    )
     parser.add_argument("--n-manning", type=float, default=0.35, help="Manning roughness used in K preparation.")
     parser.add_argument("--min-width", type=float, default=1.0, help="Minimum positive width used when width is missing or invalid.")
     parser.add_argument("--min-effective-length-for-k-m", type=float, help="Optional K-only lower bound for effective reach length in meters. Geometry and exported link lengths are unchanged.")
@@ -66,8 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-stability-effective-length-cap", action="store_true", help="In unstable or near-unstable states, shorten K-only effective lengths on minimum-celerity reaches to the maximum value allowed by the current dt_max and the requested safety margin.")
     parser.add_argument("--stability-effective-length-cap-margin-seconds", type=float, default=10.0, help="Requested safety margin below dt_max when deriving the statewise K-only effective-length cap.")
     parser.add_argument("--stability-effective-length-cap-celerity-rel-buffer", type=float, default=0.03, help="Relative buffer above min-celerity that is still treated as near-floor for the stability effective-length cap.")
-    parser.add_argument("--preferred-routing-dt-seconds", type=int, help="Preferred universal routing timestep. When multiple admissible divisors exist, choose the one closest to this value instead of the midpoint of the stability interval.")
-    parser.add_argument("--forcing-dt-search-max-offset-seconds", type=int, default=120, help="If the current forcing timestep has no admissible routing divisor, search nearby forcing timesteps within this offset to find a compatible routing timestep.")
+    parser.add_argument("--preferred-routing-dt-seconds", type=int, help="Enable experiment-level automatic timestep coordination. Use one stable multiple-of-five for all states when possible; otherwise select the closest stable state-specific values. Each selected forcing interval equals its routing interval.")
+    parser.add_argument("--forcing-dt-search-max-offset-seconds", type=int, default=120, help="Legacy statewise fallback used only when experiment-level coordination is not enabled.")
     parser.add_argument("--target-subreach-length-m", type=float, help="Target RAPID-only subreach length in meters. Long links are split using max(1, round(L / target)).")
     parser.add_argument("--min-slope", type=float, default=1e-6, help="Legacy metadata only. Effective slope limits should be applied during variant hydraulic-context generation, not RAPID prep.")
     parser.add_argument("--max-slope-for-k", type=float, help="Legacy metadata only. Effective slope limits should be applied during variant hydraulic-context generation, not RAPID prep.")

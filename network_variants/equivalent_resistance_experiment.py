@@ -7,6 +7,7 @@ import sys
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
 import geopandas as gpd
@@ -27,6 +28,7 @@ from hierarchy_level_definition.metrics import (
     BubbleEquivalentResistanceConfig,
     LENGTH_FIELD_CANDIDATES,
     compare_states,
+    compute_bubble_equivalent_metrics,
     prepare_bubble_resistance_edges,
     resolve_length_field_candidates,
     solve_bubble_equivalent_K,
@@ -48,6 +50,55 @@ class EquivalentResistanceExperimentOutputs:
     comparison: pd.DataFrame
     output_dir: Path
     manifest: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class StateHierarchyRecomputeOutputs:
+    """Outputs from an equivalent-resistance-only state hierarchy refresh."""
+
+    audit: pd.DataFrame
+    state_registry: pd.DataFrame
+    n_states_recomputed: int
+    audit_csv_path: Path
+    summary_json_path: Path
+
+
+def _atomic_write_csv(frame: pd.DataFrame, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+        mode="w",
+        encoding="utf-8",
+        newline="",
+    ) as handle:
+        temporary = Path(handle.name)
+        frame.to_csv(handle, index=False)
+    try:
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_json(payload: Mapping[str, Any], destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+        mode="w",
+        encoding="utf-8",
+    ) as handle:
+        temporary = Path(handle.name)
+        json.dump(dict(payload), handle, indent=2)
+        handle.write("\n")
+    try:
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _parse_int_list(value: Any) -> list[int]:
@@ -313,7 +364,7 @@ def _resolve_equivalent_reference_kb_summary(
     forcing_config: ForcingConfig | None,
     kb_model_path: str | Path | None,
     kb_width_sample_field: str,
-    kb_width_percentile: float,
+    kb_width_percentile: float | None,
     forcing_table_runner: Callable[..., tuple[pd.DataFrame, dict[str, object]]],
     reference_kb_summary_runner: Callable[..., dict[str, Any]],
 ) -> tuple[BubbleEquivalentResistanceConfig, dict[str, Any] | None, dict[str, object] | None]:
@@ -342,6 +393,276 @@ def _resolve_equivalent_reference_kb_summary(
     return config, dict(reference_kb_summary), dict(forcing_metadata)
 
 
+def load_manifest_equivalent_resistance_config(
+    experiment_dir: str | Path,
+) -> tuple[BubbleEquivalentResistanceConfig, dict[str, Any]]:
+    """Recover the exact state-hierarchy resistance configuration from a collapse manifest."""
+
+    experiment_path = Path(experiment_dir).expanduser().resolve()
+    manifest_path = experiment_path / "experiment_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Experiment manifest was not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    hierarchy_options = manifest.get("options", {}).get("hierarchy", {})
+    payload = hierarchy_options.get("equivalent_resistance_config")
+    if not isinstance(payload, Mapping) or not payload:
+        raise ValueError(
+            "The experiment manifest does not contain options.hierarchy."
+            "equivalent_resistance_config; state hierarchy resistance cannot be "
+            "recomputed safely without its original configuration."
+        )
+
+    normalized = dict(payload)
+    tuple_fields = (
+        "width_field_candidates",
+        "length_field_candidates",
+        "kb_field_candidates",
+        "manning_n_field_candidates",
+        "chezy_cz_field_candidates",
+    )
+    for field_name in tuple_fields:
+        if field_name in normalized and normalized[field_name] is not None:
+            normalized[field_name] = tuple(normalized[field_name])
+    config = BubbleEquivalentResistanceConfig(**normalized)
+    return config, hierarchy_options
+
+
+def _read_optional_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+
+def _audit_state_recompute(
+    *,
+    state_id: str,
+    old_metrics: pd.DataFrame,
+    new_metrics: pd.DataFrame,
+) -> pd.DataFrame:
+    audit_columns = (
+        "compound_bubble_id",
+        "bubble_root_unit_id",
+        "upstream_boundary_node",
+        "downstream_boundary_node",
+        "declared_root_upstream_boundary_node",
+        "declared_root_downstream_boundary_node",
+        "assembled_boundaries_differ_from_root",
+        "solver_success",
+        "solver_initialization",
+        "neutral_fallback_attempted",
+        "neutral_fallback_solver_success",
+        "K_eq",
+        "G_eq",
+        "Q_unit",
+        "residual_relative",
+    )
+
+    def selected(frame: pd.DataFrame, prefix: str) -> pd.DataFrame:
+        available = [column for column in audit_columns if column in frame.columns]
+        result = frame[available].copy()
+        if "compound_bubble_id" not in result.columns:
+            result["compound_bubble_id"] = pd.Series(dtype="Int64")
+        return result.rename(
+            columns={
+                column: f"{prefix}_{column}"
+                for column in result.columns
+                if column != "compound_bubble_id"
+            }
+        )
+
+    old_selected = selected(old_metrics, "old")
+    new_selected = selected(new_metrics, "new")
+    audit = old_selected.merge(
+        new_selected,
+        on="compound_bubble_id",
+        how="outer",
+        validate="1:1",
+        indicator=True,
+    )
+    audit.insert(0, "state_id", state_id)
+
+    def numeric_column(column: str) -> pd.Series:
+        if column not in audit.columns:
+            return pd.Series(np.nan, index=audit.index, dtype=float)
+        return pd.to_numeric(audit[column], errors="coerce")
+
+    old_up = numeric_column("old_upstream_boundary_node")
+    old_down = numeric_column("old_downstream_boundary_node")
+    new_up = numeric_column("new_upstream_boundary_node")
+    new_down = numeric_column("new_downstream_boundary_node")
+    audit["boundary_changed"] = ~(
+        old_up.eq(new_up) & old_down.eq(new_down)
+    )
+    old_k = numeric_column("old_K_eq")
+    new_k = numeric_column("new_K_eq")
+    audit["K_changed"] = ~np.isclose(
+        old_k.to_numpy(dtype=float),
+        new_k.to_numpy(dtype=float),
+        rtol=1e-10,
+        atol=0.0,
+        equal_nan=True,
+    )
+    return audit
+
+
+def recompute_state_hierarchy_equivalent_resistance(
+    experiment_dir: str | Path,
+    *,
+    equivalent_resistance_config: BubbleEquivalentResistanceConfig | None = None,
+    max_path_cutoff: int | None = None,
+    max_paths: int | None = None,
+    debug: bool = False,
+    metrics_runner: Callable[..., tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]] = compute_bubble_equivalent_metrics,
+) -> StateHierarchyRecomputeOutputs:
+    """Recompute only per-state hierarchy equivalent resistance artifacts.
+
+    Masks, RivGraph products, widths, slopes, unit metrics, and collapse states
+    are read-only. The three equivalent-resistance CSVs and their manifest/count
+    metadata are replaced atomically.
+    """
+
+    experiment_path = Path(experiment_dir).expanduser().resolve()
+    registry_path = experiment_path / "state_registry.csv"
+    if not registry_path.exists():
+        raise FileNotFoundError(f"State registry was not found: {registry_path}")
+    registry = pd.read_csv(registry_path)
+    manifest_config, hierarchy_options = load_manifest_equivalent_resistance_config(
+        experiment_path
+    )
+    config = equivalent_resistance_config or manifest_config
+    resolved_max_path_cutoff = int(
+        max_path_cutoff
+        if max_path_cutoff is not None
+        else hierarchy_options.get("max_path_cutoff", 100)
+    )
+    resolved_max_paths = int(
+        max_paths
+        if max_paths is not None
+        else hierarchy_options.get("max_paths", 5000)
+    )
+
+    audit_frames: list[pd.DataFrame] = []
+    state_summaries: list[dict[str, Any]] = []
+    completed = registry["status"].fillna("complete").astype(str).eq("complete")
+    if "hierarchy_status" in registry.columns:
+        completed &= registry["hierarchy_status"].fillna("complete").astype(str).eq("complete")
+
+    for index, row in registry.loc[completed].iterrows():
+        state_id = str(row["state_id"])
+        links_path = _optional_path(row.get("analysis_links_path"))
+        nodes_path = _optional_path(row.get("directed_nodes_path"))
+        hierarchy_dir = _optional_path(row.get("hierarchy_output_dir"))
+        if links_path is None or nodes_path is None or hierarchy_dir is None:
+            raise ValueError(
+                f"State {state_id} is missing analysis_links_path, directed_nodes_path, "
+                "or hierarchy_output_dir."
+            )
+        if not links_path.exists() or not nodes_path.exists():
+            raise FileNotFoundError(
+                f"State {state_id} inputs were not found: links={links_path}, nodes={nodes_path}"
+            )
+
+        metrics_path = hierarchy_dir / "bubble_equivalent_metrics.csv"
+        edges_path = hierarchy_dir / "bubble_edge_resistance.csv"
+        heads_path = hierarchy_dir / "bubble_node_heads.csv"
+        old_metrics = _read_optional_csv(metrics_path)
+        new_metrics, new_edges, new_heads = metrics_runner(
+            links_path,
+            nodes_path,
+            max_path_cutoff=resolved_max_path_cutoff,
+            max_paths=resolved_max_paths,
+            debug=debug,
+            config=config,
+        )
+        state_audit = _audit_state_recompute(
+            state_id=state_id,
+            old_metrics=old_metrics,
+            new_metrics=new_metrics,
+        )
+        audit_frames.append(state_audit)
+
+        _atomic_write_csv(new_metrics, metrics_path)
+        _atomic_write_csv(new_edges, edges_path)
+        _atomic_write_csv(new_heads, heads_path)
+
+        workflow_manifest_path = hierarchy_dir / "unit_workflow_manifest.json"
+        workflow_manifest: dict[str, Any] = {}
+        if workflow_manifest_path.exists():
+            workflow_manifest = json.loads(
+                workflow_manifest_path.read_text(encoding="utf-8")
+            )
+        recomputed_at = datetime.now(timezone.utc).isoformat()
+        workflow_manifest.update(
+            {
+                "n_equivalent_bubbles": int(len(new_metrics)),
+                "n_equivalent_edges": int(len(new_edges)),
+                "n_equivalent_nodes": int(len(new_heads)),
+                "equivalent_resistance_config": asdict(config),
+                "resolved_kb_context": dict(
+                    new_metrics.attrs.get("resolved_kb_context", {})
+                ),
+                "equivalent_resistance_recomputed_at": recomputed_at,
+                "equivalent_resistance_recompute_scope": "state_hierarchy_only",
+            }
+        )
+        _atomic_write_json(workflow_manifest, workflow_manifest_path)
+
+        solver_success = (
+            int(new_metrics["solver_success"].fillna(False).astype(bool).sum())
+            if "solver_success" in new_metrics.columns
+            else 0
+        )
+        registry.loc[index, "n_equivalent_bubbles"] = int(len(new_metrics))
+        registry.loc[index, "n_equivalent_bubbles_solver_success"] = solver_success
+        state_summaries.append(
+            {
+                "state_id": state_id,
+                "n_old_rows": int(len(old_metrics)),
+                "n_new_rows": int(len(new_metrics)),
+                "n_solver_success": solver_success,
+                "n_solver_failed": int(len(new_metrics) - solver_success),
+                "n_boundary_changed": int(state_audit["boundary_changed"].sum()),
+                "n_K_changed": int(state_audit["K_changed"].sum()),
+            }
+        )
+
+    audit = (
+        pd.concat(audit_frames, ignore_index=True)
+        if audit_frames
+        else pd.DataFrame()
+    )
+    report_dir = experiment_path / "equivalent_resistance"
+    audit_csv_path = report_dir / "state_hierarchy_recompute_audit.csv"
+    summary_json_path = report_dir / "state_hierarchy_recompute_summary.json"
+    _atomic_write_csv(audit, audit_csv_path)
+    _atomic_write_csv(registry, registry_path)
+    summary = {
+        "experiment_dir": str(experiment_path),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "scope": "state_hierarchy_equivalent_resistance_only",
+        "max_path_cutoff": resolved_max_path_cutoff,
+        "max_paths": resolved_max_paths,
+        "equivalent_resistance_config": asdict(config),
+        "n_states_recomputed": int(len(state_summaries)),
+        "n_rows_recomputed": int(len(audit)),
+        "n_boundaries_changed": int(audit["boundary_changed"].sum()) if not audit.empty else 0,
+        "n_K_values_changed": int(audit["K_changed"].sum()) if not audit.empty else 0,
+        "n_solver_failed_after": int(
+            sum(item["n_solver_failed"] for item in state_summaries)
+        ),
+        "state_summaries": state_summaries,
+        "audit_csv": str(audit_csv_path),
+    }
+    _atomic_write_json(summary, summary_json_path)
+    return StateHierarchyRecomputeOutputs(
+        audit=audit,
+        state_registry=registry,
+        n_states_recomputed=len(state_summaries),
+        audit_csv_path=audit_csv_path,
+        summary_json_path=summary_json_path,
+    )
+
+
 def _incident_node_ids(links: pd.DataFrame) -> list[int]:
     nodes = pd.unique(pd.concat([links["id_us_node"], links["id_ds_node"]], ignore_index=True))
     return [int(node_id) for node_id in nodes.tolist()]
@@ -359,6 +680,8 @@ def _compute_equivalent_resistance(
         return {
             "solver_success": False,
             "solver_method": "",
+            "solver_backend_requested": config.solver_backend,
+            "solver_backend_resolved": "",
             "solver_message": "Could not resolve boundary nodes for equivalent-resistance solve.",
             "solver_nfev": np.nan,
             "K_eq": np.nan,
@@ -383,12 +706,17 @@ def _compute_equivalent_resistance(
             optional_H_guess=optional_head_guess,
             smooth=config.smooth,
             eps=config.smooth_eps,
+            solver_backend=config.solver_backend,
+            sparse_min_internal_nodes=config.sparse_min_internal_nodes,
+            solver_cache_dir=config.solver_cache_dir,
         )
         return result, resolved_kb.to_dict()
     except Exception as exc:
         return {
             "solver_success": False,
             "solver_method": "",
+            "solver_backend_requested": config.solver_backend,
+            "solver_backend_resolved": "",
             "solver_message": str(exc),
             "solver_nfev": np.nan,
             "K_eq": np.nan,
@@ -1377,8 +1705,8 @@ def run_equivalent_resistance_experiment(
     forcing_path: str | Path | None = None,
     forcing_config: ForcingConfig | None = None,
     kb_model_path: str | Path | None = None,
-    kb_width_sample_field: str = "wid_adj_wet",
-    kb_width_percentile: float = 90.0,
+    kb_width_sample_field: str = "wid_adj_routing",
+    kb_width_percentile: float | None = None,
     forcing_table_runner: Callable[..., tuple[pd.DataFrame, dict[str, object]]] = prepare_forcing_table,
     reference_kb_summary_runner: Callable[..., dict[str, Any]] = compute_reference_section_kb,
 ) -> EquivalentResistanceExperimentOutputs:
@@ -1482,10 +1810,31 @@ def run_equivalent_resistance_experiment(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Compute experiment-level equivalent-resistance comparisons between nominal base targets and realized collapsed variants."
+        description=(
+            "Recompute optional per-state hierarchy equivalent resistance and "
+            "compute experiment-level comparisons between nominal base targets "
+            "and realized collapsed variants."
+        )
     )
     parser.add_argument("experiment_dir", help="Path to a network_variants experiment directory.")
     parser.add_argument("--output-dir", default=None, help="Optional output directory. Defaults to <experiment>/equivalent_resistance.")
+    parser.add_argument(
+        "--recompute-state-hierarchy",
+        action="store_true",
+        help=(
+            "Recompute only the three equivalent-resistance hierarchy CSVs for "
+            "every completed state before refreshing experiment comparisons. "
+            "Masks, RivGraph, widths, slopes, and other hierarchy metrics are not rerun."
+        ),
+    )
+    parser.add_argument(
+        "--reuse-manifest-config",
+        action="store_true",
+        help=(
+            "Use the exact equivalent-resistance configuration stored in the "
+            "collapse experiment manifest. Recommended for regenerating an existing experiment."
+        ),
+    )
     parser.add_argument(
         "--equivalent-resistance-law",
         choices=("manning", "chezy"),
@@ -1512,17 +1861,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--equivalent-kb-width-sample-field",
-        default="wid_adj_wet",
+        default="wid_adj_routing",
         help="Reference-section width field used for based_reference_section kb. Summary width fields on the reference link are preferred over raw sample percentiles when available.",
     )
     parser.add_argument(
         "--equivalent-kb-width-percentile",
         type=float,
-        default=90.0,
-        help="Reference-section width percentile used only when the selected equivalent kb width field is read from raw sample widths.",
+        default=None,
+        help=(
+            "Reference-section width percentile used only when the selected equivalent kb width "
+            "field is read from raw sample widths. Omit it for summary fields such as wid_adj_routing."
+        ),
     )
     parser.add_argument("--equivalent-manning-n", type=float, default=0.035, help="Default Manning n used when links do not provide one.")
     parser.add_argument("--equivalent-chezy-cz", type=float, default=22.0, help="Default Chezy Cz used when links do not provide one.")
+    parser.add_argument(
+        "--equivalent-solver-backend",
+        choices=(
+            "dense_legacy", "sparse", "sparse_least_squares",
+            "energy_sparse", "auto",
+        ),
+        default=None,
+        help=(
+            "Override the manifest solver backend. Omit to retain the manifest "
+            "backend; new non-manifest runs default to dense_legacy."
+        ),
+    )
+    parser.add_argument(
+        "--equivalent-sparse-min-internal-nodes",
+        type=int,
+        default=None,
+        help="Override the internal-node threshold used by auto.",
+    )
     parser.add_argument("--equivalent-forcing-path", default=None, help="Forcing CSV/parquet used when equivalent-kb-mode=based_reference_section.")
     parser.add_argument("--equivalent-forcing-station-key", default=None, help="Station key used when equivalent-kb-mode=based_reference_section.")
     parser.add_argument("--equivalent-station-key-column", default="station_key", help="Station-key column in the forcing file.")
@@ -1555,8 +1925,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    manifest_config = None
+    if args.reuse_manifest_config or args.recompute_state_hierarchy:
+        manifest_config, _ = load_manifest_equivalent_resistance_config(
+            args.experiment_dir
+        )
     forcing_config = None
-    if args.equivalent_kb_mode == "based_reference_section":
+    if manifest_config is None and args.equivalent_kb_mode == "based_reference_section":
         forcing_config = ForcingConfig(
             time_column=args.equivalent_time_column,
             discharge_column=args.equivalent_discharge_column,
@@ -1568,24 +1943,63 @@ def main(argv: Sequence[str] | None = None) -> int:
             resample_seconds=args.equivalent_forcing_resample_seconds,
             output_cache_dir=args.equivalent_forcing_output_cache_dir,
         )
+    equivalent_resistance_config = manifest_config or BubbleEquivalentResistanceConfig(
+        resistance_law=args.equivalent_resistance_law,
+        geometry_method=args.equivalent_geometry_method,
+        kb_mode=args.equivalent_kb_mode,
+        kb_value=args.equivalent_kb_value,
+        length_field_candidates=resolve_length_field_candidates(args.equivalent_length_field),
+        default_manning_n=args.equivalent_manning_n,
+        default_chezy_cz=args.equivalent_chezy_cz,
+        solver_backend=args.equivalent_solver_backend or "dense_legacy",
+        sparse_min_internal_nodes=(
+            args.equivalent_sparse_min_internal_nodes
+            if args.equivalent_sparse_min_internal_nodes is not None
+            else 64
+        ),
+    )
+    if args.equivalent_solver_backend is not None:
+        equivalent_resistance_config = replace(
+            equivalent_resistance_config,
+            solver_backend=args.equivalent_solver_backend,
+        )
+    if args.equivalent_sparse_min_internal_nodes is not None:
+        equivalent_resistance_config = replace(
+            equivalent_resistance_config,
+            sparse_min_internal_nodes=args.equivalent_sparse_min_internal_nodes,
+        )
+    if equivalent_resistance_config.solver_cache_dir is None:
+        equivalent_resistance_config = replace(
+            equivalent_resistance_config,
+            solver_cache_dir=str(
+                (
+                    Path(args.experiment_dir).expanduser().resolve()
+                    / "equivalent_resistance"
+                    / "solve_cache"
+                ).resolve()
+            ),
+        )
+    state_results = None
+    if args.recompute_state_hierarchy:
+        state_results = recompute_state_hierarchy_equivalent_resistance(
+            args.experiment_dir,
+            equivalent_resistance_config=equivalent_resistance_config,
+        )
     results = run_equivalent_resistance_experiment(
         args.experiment_dir,
         output_dir=args.output_dir,
-        equivalent_resistance_config=BubbleEquivalentResistanceConfig(
-            resistance_law=args.equivalent_resistance_law,
-            geometry_method=args.equivalent_geometry_method,
-            kb_mode=args.equivalent_kb_mode,
-            kb_value=args.equivalent_kb_value,
-            length_field_candidates=resolve_length_field_candidates(args.equivalent_length_field),
-            default_manning_n=args.equivalent_manning_n,
-            default_chezy_cz=args.equivalent_chezy_cz,
-        ),
+        equivalent_resistance_config=equivalent_resistance_config,
         forcing_path=args.equivalent_forcing_path,
         forcing_config=forcing_config,
         kb_model_path=args.equivalent_kb_model_path,
         kb_width_sample_field=args.equivalent_kb_width_sample_field,
         kb_width_percentile=args.equivalent_kb_width_percentile,
     )
+    if state_results is not None:
+        print(f"Recomputed state hierarchy resistance for {state_results.n_states_recomputed} states")
+        print(f"State hierarchy rows: {len(state_results.audit)}")
+        print(f"State hierarchy audit: {state_results.audit_csv_path}")
+        print(f"State hierarchy summary: {state_results.summary_json_path}")
     print(f"Wrote equivalent-resistance outputs to {results.output_dir}")
     print(f"Nominal targets: {len(results.base_nominal_targets)}")
     print(f"Child realized objects: {len(results.child_realized_objects)}")

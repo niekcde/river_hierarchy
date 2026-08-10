@@ -27,12 +27,15 @@ from rapid_tools.k_values import (
     compute_k_values,
     compute_routing_dt_seconds,
     find_nearby_compatible_forcing_and_routing_dt,
+    select_coordinated_routing_timesteps,
 )
 from rapid_tools.prep import RapidPrepConfig, build_rapid_graph, compute_reach_ratios, create_conn_file, prepare_experiment
 from rapid_tools.reference_section import (
     _build_reference_section_variant,
     _load_width_summary,
     _reference_section_paths,
+    compute_reference_section_kb,
+    ensure_reference_section_geometry,
 )
 from rapid_tools.slope import SlopeConfig, compute_link_slopes
 
@@ -254,12 +257,126 @@ def test_reference_section_width_summary_prefers_link_family_field(tmp_path: Pat
         samples_path,
         families_path,
         width_sample_field="wid_adj_wet",
-        width_percentile=90.0,
+        width_percentile=None,
     )
 
     assert summary["width_reference_m"] == 275.0
     assert summary["source"] == "link_width_families"
     assert summary["statistic"] == "direct_single_link"
+    assert summary["percentile"] is None
+
+
+def test_reference_section_raw_width_samples_require_explicit_percentile(tmp_path: Path) -> None:
+    samples_path = tmp_path / "link_width_samples.csv"
+    pd.DataFrame({"width_wet": [100.0, 200.0, 400.0]}).to_csv(samples_path, index=False)
+
+    with pytest.raises(ValueError, match="percentile must be provided"):
+        _load_width_summary(
+            samples_path,
+            tmp_path / "missing_link_width_families.csv",
+            width_sample_field="width_wet",
+            width_percentile=None,
+        )
+
+
+def test_reference_section_cache_refreshes_width_summary_without_rebuilding_variant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment_dir = tmp_path / "experiment"
+    reference_dir = experiment_dir / "reference_section"
+    variant_dir = reference_dir / "variant"
+    widths_dir = variant_dir / "widths"
+    directed_dir = variant_dir / "directed"
+    widths_dir.mkdir(parents=True)
+    directed_dir.mkdir(parents=True)
+
+    pd.DataFrame([{"state_role": "base"}]).to_csv(experiment_dir / "state_registry.csv", index=False)
+    (experiment_dir / "experiment_manifest.json").write_text(json.dumps({"example_id": "02"}))
+    samples_path = widths_dir / "link_width_samples.csv"
+    pd.DataFrame({"width_wet": [100.0, 200.0, 400.0]}).to_csv(samples_path, index=False)
+    pd.DataFrame({"wid_adj_routing": [225.0]}).to_csv(
+        widths_dir / "link_width_families.csv", index=False
+    )
+    directed_links_path = directed_dir / "links.gpkg"
+    directed_nodes_path = directed_dir / "nodes.gpkg"
+    directed_links_path.touch()
+    directed_nodes_path.touch()
+
+    summary_path = reference_dir / "reference_section_summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "width_summary": {
+                    "sample_field": "width_wet",
+                    "percentile": 90.0,
+                    "width_reference_m": 400.0,
+                },
+                "slope_summary": {"slope": 0.001},
+                "paths": {
+                    "variant_output_dir": str(variant_dir.resolve()),
+                    "directed_links_path": str(directed_links_path.resolve()),
+                    "directed_nodes_path": str(directed_nodes_path.resolve()),
+                    "link_width_samples_path": str(samples_path.resolve()),
+                },
+            }
+        )
+    )
+
+    monkeypatch.setattr(
+        "rapid_tools.reference_section._build_reference_section_variant",
+        lambda **_: pytest.fail("cached reference geometry should not be rebuilt"),
+    )
+    summary = ensure_reference_section_geometry(
+        experiment_dir,
+        width_sample_field="wid_adj_routing",
+        width_percentile=90.0,
+    )
+
+    assert summary["width_summary"]["width_reference_m"] == 225.0
+    assert summary["width_summary"]["sample_field"] == "wid_adj_routing"
+    assert summary["width_summary"]["percentile"] is None
+    assert json.loads(summary_path.read_text())["width_summary"] == summary["width_summary"]
+
+
+def test_reference_section_kb_accepts_direct_summary_without_percentile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment_dir = tmp_path / "experiment"
+    monkeypatch.setattr(
+        "rapid_tools.reference_section.ensure_reference_section_geometry",
+        lambda *args, **kwargs: {
+            "example_id": "02",
+            "width_summary": {
+                "sample_field": "wid_adj_routing",
+                "percentile": None,
+                "width_reference_m": 200.0,
+            },
+            "slope_summary": {
+                "slope": 0.001,
+                "source_method": "test",
+                "anchor_count": 2,
+            },
+        },
+    )
+    monkeypatch.setattr("rapid_tools.reference_section.predict_based_depth", lambda **kwargs: 4.0)
+    monkeypatch.setattr(
+        "rapid_tools.reference_section.resolve_based_model_path",
+        lambda model_path=None: Path("model.ubj"),
+    )
+    forcing = pd.DataFrame({"discharge_cms": [10.0, 20.0]})
+
+    summary = compute_reference_section_kb(
+        experiment_dir,
+        forcing=forcing,
+        width_sample_field="wid_adj_routing",
+        width_percentile=None,
+    )
+
+    assert summary["kb_value"] == 50.0
+    assert summary["width_sample_field"] == "wid_adj_routing"
+    assert summary["width_percentile"] is None
 
 
 def test_reference_section_variant_reuses_base_boundary_component_labels(
@@ -664,35 +781,24 @@ def test_prepare_experiment_reuses_station_key_forcing_cache(tmp_path: Path) -> 
     assert bool(registry.loc[0, "forcing_loaded_from_cache"])
 
 
-def test_prepare_experiment_uses_reference_section_kb(tmp_path: Path, monkeypatch) -> None:
+def test_prepare_experiment_reuses_stored_reference_section_kb(tmp_path: Path) -> None:
     experiment_dir = _write_state(tmp_path)
-    captured: dict[str, object] = {}
-
-    def fake_compute_reference_section_kb(
-        experiment_dir_arg,
-        *,
-        forcing,
-        width_sample_field,
-        width_percentile,
-        model_path,
-    ):
-        captured["experiment_dir"] = str(experiment_dir_arg)
-        captured["forcing_peak"] = float(pd.to_numeric(forcing["discharge_cms"], errors="coerce").max())
-        captured["width_sample_field"] = width_sample_field
-        captured["width_percentile"] = width_percentile
-        captured["model_path"] = model_path
-        return {
-            "kb_source_method": "based_reference_section",
-            "kb_value": 12.5,
-            "reference_discharge_cms": 120.0,
-            "reference_width_m": 320.0,
-            "reference_slope": 1.2e-4,
-            "reference_depth_m": 25.6,
-            "reference_section_summary_path": str(experiment_dir / "reference_section" / "reference_section_summary.json"),
-            "based_model_path": "/tmp/based_model_v2.ubj",
-        }
-
-    monkeypatch.setattr("rapid_tools.prep.compute_reference_section_kb", fake_compute_reference_section_kb)
+    reference_dir = experiment_dir / "reference_section"
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    stored_summary = {
+        "kb_source_method": "based_reference_section",
+        "kb_value": 12.5,
+        "reference_discharge_cms": 120.0,
+        "reference_width_m": 320.0,
+        "reference_slope": 1.2e-4,
+        "reference_depth_m": 25.6,
+        "reference_section_summary_path": str(reference_dir / "reference_section_summary.json"),
+        "based_model_path": "/tmp/based_model_v2.ubj",
+    }
+    (reference_dir / "reference_kb_summary.json").write_text(
+        json.dumps(stored_summary),
+        encoding="utf-8",
+    )
 
     registry = prepare_experiment(
         experiment_dir,
@@ -707,9 +813,6 @@ def test_prepare_experiment_uses_reference_section_kb(tmp_path: Path, monkeypatc
     assert registry.loc[0, "status"] == "prepared"
     assert registry.loc[0, "rapid_kb_value"] == 12.5
     assert registry.loc[0, "rapid_kb_source_method"] == "based_reference_section"
-    assert captured["forcing_peak"] == 120.0
-    assert captured["width_sample_field"] == "width_wet"
-    assert captured["width_percentile"] == 90.0
 
     prep_dir = experiment_dir / "states" / "S001_unit_1" / "rapid" / "prep"
     rapid_links = pd.read_csv(prep_dir / "rapid_link_attributes.csv")
@@ -729,6 +832,23 @@ def test_prepare_experiment_uses_reference_section_kb(tmp_path: Path, monkeypatc
     assert experiment_manifest["reference_kb_summary"]["kb_source_method"] == "based_reference_section"
     assert experiment_manifest["resolved_kb_summary"]["kb_mode"] == "based_reference_section"
     assert experiment_manifest["resolved_kb_summary"]["kb_value"] == 12.5
+    assert experiment_manifest["reference_kb_recomputed"] is False
+    assert experiment_manifest["reference_kb_summary_source"].endswith(
+        "reference_section/reference_kb_summary.json"
+    )
+
+
+def test_prepare_experiment_does_not_recalculate_missing_reference_kb(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path)
+
+    registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=experiment_dir / "forcing.csv",
+        prep_config=RapidPrepConfig(kb_mode="based_reference_section"),
+    )
+
+    assert registry.loc[0, "status"] == "failed"
+    assert "RAPID no longer recalculates BASED" in str(registry.loc[0, "error"])
 
 
 def test_run_prepared_experiment_writes_qout(tmp_path: Path) -> None:
@@ -1102,6 +1222,39 @@ def test_find_nearby_compatible_forcing_and_routing_dt_prefers_multiple_of_five(
     )
     assert forcing_dt_seconds == 630
     assert routing_dt_seconds == 630
+
+
+def test_select_coordinated_routing_timesteps_uses_common_midpoint() -> None:
+    plan = select_coordinated_routing_timesteps(
+        {
+            "S000_base": (731.083, 741.083),
+            "S001_unit_1": (733.0, 744.0),
+        },
+        preferred_routing_dt_seconds=980,
+        multiple_seconds=5,
+    )
+
+    assert plan["selection_mode"] == "common_intersection"
+    assert plan["selected_unique_routing_dt_seconds"] == [735]
+    assert plan["states"]["S000_base"]["routing_dt_seconds"] == 735
+    assert plan["states"]["S001_unit_1"]["forcing_dt_seconds"] == 735
+
+
+def test_select_coordinated_routing_timesteps_keeps_disjoint_states_close() -> None:
+    plan = select_coordinated_routing_timesteps(
+        {
+            "S000_base": (731.083, 741.083),
+            "S021_unit_15": (795.111, 805.111),
+            "CB001_bubble_5": (703.770, 713.770),
+        },
+        preferred_routing_dt_seconds=980,
+        multiple_seconds=5,
+    )
+
+    assert plan["selection_mode"] == "coordinated_state_specific"
+    assert plan["states"]["S000_base"]["routing_dt_seconds"] == 740
+    assert plan["states"]["S021_unit_15"]["routing_dt_seconds"] == 800
+    assert plan["states"]["CB001_bubble_5"]["routing_dt_seconds"] == 710
 
 
 def test_integrate_trapezoid_falls_back_to_trapz(monkeypatch) -> None:

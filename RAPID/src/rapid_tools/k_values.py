@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
 
 import numpy as np
 import pandas as pd
@@ -341,3 +342,147 @@ def find_nearby_compatible_forcing_and_routing_dt(
         "Could not find a nearby forcing timestep with any routing timestep that satisfies the Muskingum "
         f"stability bounds [{dt_min:.3f}, {dt_max:.3f}] and evenly divides the forcing timestep."
     )
+
+
+def _stable_integer_candidates(
+    dt_min: float,
+    dt_max: float,
+    *,
+    multiple_seconds: int,
+) -> list[int]:
+    """Return stable integer timesteps, preferring a requested regular grid."""
+    if not np.isfinite(dt_min) or not np.isfinite(dt_max) or dt_min > dt_max:
+        return []
+    multiple = max(1, int(multiple_seconds))
+    first = int(np.ceil(float(dt_min) / multiple)) * multiple
+    last = int(np.floor(float(dt_max) / multiple)) * multiple
+    if first <= last:
+        return list(range(first, last + 1, multiple))
+
+    # Very narrow valid intervals may contain no multiple of the requested grid.
+    # Preserve stability with an integer-second fallback rather than rounding out
+    # of bounds.
+    first_integer = int(np.ceil(float(dt_min)))
+    last_integer = int(np.floor(float(dt_max)))
+    if first_integer <= last_integer:
+        return list(range(first_integer, last_integer + 1))
+    return []
+
+
+def select_coordinated_routing_timesteps(
+    state_bounds: Mapping[str, tuple[float, float]],
+    *,
+    preferred_routing_dt_seconds: int | None = None,
+    multiple_seconds: int = 5,
+) -> dict[str, object]:
+    """Select stable routing timesteps jointly for every experiment state.
+
+    A single multiple-of-five timestep is used when the state stability
+    intervals overlap. When they do not, a common central target is projected
+    into each interval so that the selected stable values remain as close as
+    the intervals permit.
+    """
+    if not state_bounds:
+        raise ValueError("Cannot coordinate routing timesteps without state stability bounds.")
+
+    normalized: dict[str, tuple[float, float]] = {}
+    state_candidates: dict[str, list[int]] = {}
+    for state_id, raw_bounds in state_bounds.items():
+        dt_min, dt_max = (float(raw_bounds[0]), float(raw_bounds[1]))
+        if not np.isfinite(dt_min) or not np.isfinite(dt_max):
+            raise ValueError(f"State {state_id} has non-finite routing timestep bounds.")
+        if dt_min > dt_max:
+            raise ValueError(
+                f"State {state_id} has no stable routing timestep: "
+                f"dt_min={dt_min:.3f} > dt_max={dt_max:.3f}."
+            )
+        candidates = _stable_integer_candidates(
+            dt_min,
+            dt_max,
+            multiple_seconds=multiple_seconds,
+        )
+        if not candidates:
+            raise ValueError(
+                f"State {state_id} has no stable integer-second routing timestep "
+                f"inside [{dt_min:.3f}, {dt_max:.3f}]."
+            )
+        normalized[str(state_id)] = (dt_min, dt_max)
+        state_candidates[str(state_id)] = candidates
+
+    common_min = max(bounds[0] for bounds in normalized.values())
+    common_max = min(bounds[1] for bounds in normalized.values())
+    common_candidates = _stable_integer_candidates(
+        common_min,
+        common_max,
+        multiple_seconds=multiple_seconds,
+    )
+    preferred = (
+        float(preferred_routing_dt_seconds)
+        if preferred_routing_dt_seconds is not None
+        else None
+    )
+
+    if common_candidates:
+        if preferred is not None and preferred in common_candidates:
+            target = preferred
+        else:
+            target = 0.5 * (common_min + common_max)
+        selected_common = min(
+            common_candidates,
+            key=lambda value: (abs(float(value) - target), -value),
+        )
+        selections = {state_id: int(selected_common) for state_id in normalized}
+        mode = "common_intersection"
+        central_target = float(selected_common)
+    else:
+        # The midpoint between the highest lower bound and lowest upper bound is
+        # the minimax centre of a disjoint set of one-dimensional intervals.
+        # Projecting it into every interval yields the smallest possible spread
+        # before regular-grid rounding.
+        central_target = 0.5 * (common_min + common_max)
+        selections = {
+            state_id: int(
+                min(
+                    candidates,
+                    key=lambda value: (
+                        abs(float(value) - central_target),
+                        abs(float(value) - preferred) if preferred is not None else 0.0,
+                        -value,
+                    ),
+                )
+            )
+            for state_id, candidates in state_candidates.items()
+        }
+        mode = "coordinated_state_specific"
+
+    state_rows = {
+        state_id: {
+            "dt_min_seconds": float(normalized[state_id][0]),
+            "dt_max_seconds": float(normalized[state_id][1]),
+            "routing_dt_seconds": int(selections[state_id]),
+            # A one-to-one forcing/routing interval is the smallest exact
+            # alignment and avoids independently changing the two clocks.
+            "forcing_dt_seconds": int(selections[state_id]),
+            "selection_source": mode,
+            "used_multiple_seconds": int(multiple_seconds),
+            "multiple_fallback_used": bool(
+                int(selections[state_id]) % max(1, int(multiple_seconds)) != 0
+            ),
+        }
+        for state_id in normalized
+    }
+    return {
+        "selection_mode": mode,
+        "preferred_routing_dt_seconds": (
+            int(preferred_routing_dt_seconds)
+            if preferred_routing_dt_seconds is not None
+            else None
+        ),
+        "multiple_seconds": int(multiple_seconds),
+        "common_dt_min_seconds": float(common_min),
+        "common_dt_max_seconds": float(common_max),
+        "common_intersection_exists": bool(common_candidates),
+        "central_target_seconds": float(central_target),
+        "selected_unique_routing_dt_seconds": sorted(set(selections.values())),
+        "states": state_rows,
+    }

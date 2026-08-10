@@ -6,6 +6,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+import networkx as nx
 
 from network_variants.reference_context import ResolvedKbContext, resolve_kb_context
 
@@ -66,6 +67,9 @@ class BubbleEquivalentResistanceConfig:
     use_node_head_field_as_initial_guess: bool = True
     smooth: bool = True
     smooth_eps: float = 1e-10
+    solver_backend: str = "dense_legacy"
+    sparse_min_internal_nodes: int = 64
+    solver_cache_dir: str | None = None
 
 
 def _resolve_first_present(columns: Sequence[str], candidates: Sequence[str]) -> str | None:
@@ -244,6 +248,47 @@ def prepare_bubble_resistance_edges(
 
     prepared["G_e"] = 1.0 / prepared["K_e"].astype(float)
     prepared["resistance_law"] = normalized_law
+    prepared["solver_cache_edge_alias"] = prepared["edge_id"].map(int).astype(object)
+    prepared["solver_cache_u_alias"] = prepared["u"].map(int).astype(object)
+    prepared["solver_cache_v_alias"] = prepared["v"].map(int).astype(object)
+    lineage_columns = {
+        "lineage_type",
+        "dominant_parent_link_id",
+        "matched_parent_us_node",
+        "matched_parent_ds_node",
+    }
+    if lineage_columns.issubset(prepared.columns):
+        exact = prepared["lineage_type"].astype(str).eq("unchanged_1to1")
+        parent_edge = pd.to_numeric(
+            prepared["dominant_parent_link_id"], errors="coerce"
+        )
+        parent_u = pd.to_numeric(prepared["matched_parent_us_node"], errors="coerce")
+        parent_v = pd.to_numeric(prepared["matched_parent_ds_node"], errors="coerce")
+        exact &= parent_edge.notna() & parent_u.notna() & parent_v.notna()
+        prepared.loc[exact, "solver_cache_edge_alias"] = parent_edge.loc[exact].astype(int)
+
+        node_alias_candidates: dict[int, set[int]] = {}
+        for row in prepared.loc[exact].itertuples(index=False):
+            node_alias_candidates.setdefault(int(row.u), set()).add(
+                int(row.matched_parent_us_node)
+            )
+            node_alias_candidates.setdefault(int(row.v), set()).add(
+                int(row.matched_parent_ds_node)
+            )
+        stable_node_alias = {
+            child_node: next(iter(parent_nodes))
+            for child_node, parent_nodes in node_alias_candidates.items()
+            if len(parent_nodes) == 1
+        }
+        prepared["solver_cache_u_alias"] = prepared["u"].map(
+            lambda node: stable_node_alias.get(int(node), f"local:{int(node)}")
+        )
+        prepared["solver_cache_v_alias"] = prepared["v"].map(
+            lambda node: stable_node_alias.get(int(node), f"local:{int(node)}")
+        )
+        prepared.loc[~exact, "solver_cache_edge_alias"] = prepared.loc[
+            ~exact, "edge_id"
+        ].map(lambda edge_id: f"local:{int(edge_id)}")
     return prepared, resolved_kb
 
 
@@ -254,14 +299,46 @@ def _empty_bubble_summary_frame() -> pd.DataFrame:
             "bubble_root_unit_id",
             "upstream_boundary_node",
             "downstream_boundary_node",
+            "declared_root_upstream_boundary_node",
+            "declared_root_downstream_boundary_node",
+            "assembled_boundaries_differ_from_root",
             "n_member_units",
             "member_unit_ids",
             "n_nodes",
             "n_edges",
             "solver_success",
             "solver_method",
+            "solver_algorithm_version",
+            "solver_backend_requested",
+            "solver_backend_resolved",
+            "solver_optimizer_success",
+            "solver_solution_stage",
+            "energy_stage_success",
+            "energy_stage_message",
+            "energy_stage_nit",
+            "energy_stage_nfev",
+            "energy_stage_residual_norm",
+            "energy_stage_residual_relative",
+            "polish_attempted",
+            "polish_success",
+            "polish_message",
+            "polish_nfev",
+            "polish_residual_norm",
+            "polish_residual_relative",
+            "sparse_min_internal_nodes",
+            "solver_cache_hit",
+            "solver_cache_key",
+            "solver_cache_path",
             "solver_message",
             "solver_nfev",
+            "solver_initialization",
+            "primary_solver_success",
+            "primary_solver_nfev",
+            "primary_residual_relative",
+            "neutral_fallback_attempted",
+            "neutral_fallback_solver_success",
+            "neutral_fallback_solver_nfev",
+            "neutral_fallback_residual_relative",
             "K_eq",
             "G_eq",
             "Q_unit",
@@ -334,6 +411,144 @@ def _bubble_groups(units: Sequence[StructuralUnit]) -> list[tuple[int, list[Stru
     return sorted(bubble_specs, key=lambda item: item[0])
 
 
+def _validated_assembled_bubble_terminals(
+    bubble_edges: pd.DataFrame,
+    *,
+    bubble_id: int,
+) -> tuple[int, int]:
+    graph = nx.DiGraph()
+    graph.add_edges_from(
+        (int(row.u), int(row.v)) for row in bubble_edges.itertuples(index=False)
+    )
+    sources = [int(node) for node in graph if graph.in_degree(node) == 0]
+    sinks = [int(node) for node in graph if graph.out_degree(node) == 0]
+    if len(sources) != 1 or len(sinks) != 1:
+        raise ValueError(
+            f"Assembled bubble {bubble_id} requires one directed source and sink; "
+            f"found sources={sources}, sinks={sinks}."
+        )
+    source_node = sources[0]
+    sink_node = sinks[0]
+    if not nx.is_directed_acyclic_graph(graph):
+        raise ValueError(f"Assembled bubble {bubble_id} is not a directed acyclic graph.")
+    between_nodes = (
+        (set(nx.descendants(graph, source_node)) | {source_node})
+        & (set(nx.ancestors(graph, sink_node)) | {sink_node})
+    )
+    excluded = sorted(set(graph.nodes) - between_nodes)
+    if excluded:
+        raise ValueError(
+            f"Assembled bubble {bubble_id} contains nodes outside its complete "
+            f"source-to-sink domain: {excluded[:10]}."
+        )
+    return source_node, sink_node
+
+
+def _solve_with_neutral_head_fallback(
+    *,
+    bubble_nodes: pd.DataFrame,
+    bubble_edges: pd.DataFrame,
+    upstream_node: int,
+    downstream_node: int,
+    config: BubbleEquivalentResistanceConfig,
+) -> dict[str, Any]:
+    optional_guess = bubble_nodes if config.use_node_head_field_as_initial_guess else None
+    primary_initialization = (
+        "available_node_heads"
+        if optional_guess is not None
+        else "solver_default_initialization"
+    )
+    primary = solve_bubble_equivalent_K(
+        bubble_nodes,
+        bubble_edges,
+        upstream_node=int(upstream_node),
+        downstream_node=int(downstream_node),
+        optional_H_guess=optional_guess,
+        smooth=config.smooth,
+        eps=config.smooth_eps,
+        solver_backend=config.solver_backend,
+        sparse_min_internal_nodes=config.sparse_min_internal_nodes,
+        solver_cache_dir=config.solver_cache_dir,
+    )
+    primary = dict(primary)
+    primary_success = bool(primary["solver_success"])
+    primary_residual = float(primary["residual_relative"])
+    primary_nfev = int(primary["solver_nfev"])
+    if primary_success:
+        primary.update(
+            {
+                "solver_initialization": primary_initialization,
+                "primary_solver_success": True,
+                "primary_solver_nfev": primary_nfev,
+                "primary_residual_relative": primary_residual,
+                "neutral_fallback_attempted": False,
+                "neutral_fallback_solver_success": pd.NA,
+                "neutral_fallback_solver_nfev": pd.NA,
+                "neutral_fallback_residual_relative": np.nan,
+            }
+        )
+        return primary
+
+    node_ids = pd.to_numeric(bubble_nodes["node_id"], errors="coerce").dropna().astype(int)
+    neutral_guess = {int(node_id): 0.5 for node_id in node_ids}
+    neutral_guess[int(upstream_node)] = 1.0
+    neutral_guess[int(downstream_node)] = 0.0
+    fallback = solve_bubble_equivalent_K(
+        bubble_nodes,
+        bubble_edges,
+        upstream_node=int(upstream_node),
+        downstream_node=int(downstream_node),
+        optional_H_guess=neutral_guess,
+        smooth=config.smooth,
+        eps=config.smooth_eps,
+        solver_backend=config.solver_backend,
+        sparse_min_internal_nodes=config.sparse_min_internal_nodes,
+        solver_cache_dir=config.solver_cache_dir,
+    )
+    fallback = dict(fallback)
+    fallback_success = bool(fallback["solver_success"])
+    fallback_residual = float(fallback["residual_relative"])
+    fallback_nfev = int(fallback["solver_nfev"])
+    if fallback_success or (
+        np.isfinite(fallback_residual)
+        and (not np.isfinite(primary_residual) or fallback_residual <= primary_residual)
+    ):
+        selected = fallback
+        selected_initialization = "neutral_internal_heads_fallback"
+    else:
+        selected = primary
+        selected_initialization = primary_initialization
+    selected.update(
+        {
+            "solver_initialization": selected_initialization,
+            "primary_solver_success": False,
+            "primary_solver_nfev": primary_nfev,
+            "primary_residual_relative": primary_residual,
+            "neutral_fallback_attempted": True,
+            "neutral_fallback_solver_success": fallback_success,
+            "neutral_fallback_solver_nfev": fallback_nfev,
+            "neutral_fallback_residual_relative": fallback_residual,
+        }
+    )
+    if not bool(selected["solver_success"]):
+        selected["K_eq"] = np.nan
+        selected["G_eq"] = np.nan
+        selected["Q_unit"] = np.nan
+        edge_flows = selected["edge_flows"].copy()
+        edge_flows[["q_unit", "dh"]] = np.nan
+        selected["edge_flows"] = edge_flows
+        node_heads = selected["node_heads"].copy()
+        for column in ("head_norm", "continuity_residual"):
+            if column in node_heads.columns:
+                node_heads[column] = np.nan
+        selected["node_heads"] = node_heads
+        selected["solver_message"] = (
+            f"Primary solve failed ({primary.get('solver_message', '')}); "
+            f"neutral fallback failed ({fallback.get('solver_message', '')})."
+        )
+    return selected
+
+
 def compute_bubble_equivalent_metrics_from_units(
     links: pd.DataFrame,
     nodes: pd.DataFrame,
@@ -386,31 +601,107 @@ def compute_bubble_equivalent_metrics_from_units(
                 ignore_index=True,
             )
 
-        optional_guess = bubble_nodes if config.use_node_head_field_as_initial_guess else None
-        solve_result = solve_bubble_equivalent_K(
-            bubble_nodes,
-            bubble_edges[["edge_id", "u", "v", "K_e"]],
-            upstream_node=int(root_unit.bifurcation),
-            downstream_node=int(root_unit.confluence),
-            optional_H_guess=optional_guess,
-            smooth=config.smooth,
-            eps=config.smooth_eps,
+        assembled_upstream_node, assembled_downstream_node = (
+            _validated_assembled_bubble_terminals(
+                bubble_edges,
+                bubble_id=bubble_id,
+            )
+        )
+        declared_upstream_node = int(root_unit.bifurcation)
+        declared_downstream_node = int(root_unit.confluence)
+        solve_result = _solve_with_neutral_head_fallback(
+            bubble_nodes=bubble_nodes,
+            bubble_edges=bubble_edges[
+                [
+                    "edge_id",
+                    "u",
+                    "v",
+                    "K_e",
+                    "solver_cache_edge_alias",
+                    "solver_cache_u_alias",
+                    "solver_cache_v_alias",
+                ]
+            ],
+            upstream_node=assembled_upstream_node,
+            downstream_node=assembled_downstream_node,
+            config=config,
         )
 
         bubble_rows.append(
             {
                 "compound_bubble_id": bubble_id,
                 "bubble_root_unit_id": int(root_unit.unit_id),
-                "upstream_boundary_node": int(root_unit.bifurcation),
-                "downstream_boundary_node": int(root_unit.confluence),
+                "upstream_boundary_node": assembled_upstream_node,
+                "downstream_boundary_node": assembled_downstream_node,
+                "declared_root_upstream_boundary_node": declared_upstream_node,
+                "declared_root_downstream_boundary_node": declared_downstream_node,
+                "assembled_boundaries_differ_from_root": bool(
+                    assembled_upstream_node != declared_upstream_node
+                    or assembled_downstream_node != declared_downstream_node
+                ),
                 "n_member_units": int(len(members)),
                 "member_unit_ids": ",".join(str(unit.unit_id) for unit in members),
                 "n_nodes": int(solve_result["n_nodes"]),
                 "n_edges": int(solve_result["n_edges"]),
                 "solver_success": bool(solve_result["solver_success"]),
                 "solver_method": solve_result["solver_method"],
+                "solver_algorithm_version": solve_result.get(
+                    "solver_algorithm_version", ""
+                ),
+                "solver_backend_requested": solve_result.get(
+                    "solver_backend_requested", config.solver_backend
+                ),
+                "solver_backend_resolved": solve_result.get(
+                    "solver_backend_resolved", ""
+                ),
+                "solver_optimizer_success": bool(
+                    solve_result.get("solver_optimizer_success", False)
+                ),
+                "solver_solution_stage": solve_result.get(
+                    "solver_solution_stage", ""
+                ),
+                "energy_stage_success": solve_result.get("energy_stage_success"),
+                "energy_stage_message": solve_result.get("energy_stage_message", ""),
+                "energy_stage_nit": solve_result.get("energy_stage_nit", 0),
+                "energy_stage_nfev": solve_result.get("energy_stage_nfev", 0),
+                "energy_stage_residual_norm": solve_result.get(
+                    "energy_stage_residual_norm", np.nan
+                ),
+                "energy_stage_residual_relative": solve_result.get(
+                    "energy_stage_residual_relative", np.nan
+                ),
+                "polish_attempted": bool(solve_result.get("polish_attempted", False)),
+                "polish_success": solve_result.get("polish_success"),
+                "polish_message": solve_result.get("polish_message", ""),
+                "polish_nfev": solve_result.get("polish_nfev", 0),
+                "polish_residual_norm": solve_result.get(
+                    "polish_residual_norm", np.nan
+                ),
+                "polish_residual_relative": solve_result.get(
+                    "polish_residual_relative", np.nan
+                ),
+                "sparse_min_internal_nodes": solve_result.get(
+                    "sparse_min_internal_nodes", config.sparse_min_internal_nodes
+                ),
+                "solver_cache_hit": bool(solve_result.get("solver_cache_hit", False)),
+                "solver_cache_key": solve_result.get("solver_cache_key", ""),
+                "solver_cache_path": solve_result.get("solver_cache_path", ""),
                 "solver_message": solve_result["solver_message"],
                 "solver_nfev": int(solve_result["solver_nfev"]),
+                "solver_initialization": solve_result["solver_initialization"],
+                "primary_solver_success": solve_result["primary_solver_success"],
+                "primary_solver_nfev": solve_result["primary_solver_nfev"],
+                "primary_residual_relative": solve_result["primary_residual_relative"],
+                "neutral_fallback_attempted": solve_result["neutral_fallback_attempted"],
+                "neutral_fallback_solver_success": solve_result[
+                    "neutral_fallback_solver_success"
+                ],
+                "neutral_fallback_solver_nfev": solve_result[
+                    "neutral_fallback_solver_nfev"
+                ],
+                "neutral_fallback_residual_relative": solve_result[
+                    "neutral_fallback_residual_relative"
+                ],
                 "K_eq": float(solve_result["K_eq"]),
                 "G_eq": float(solve_result["G_eq"]),
                 "Q_unit": float(solve_result["Q_unit"]),

@@ -21,6 +21,7 @@ from network_variants.variant_generation import (
     _build_oriented_child_graph,
     _componentize_units,
     _compute_family_stats,
+    _compute_changed_link_width_products,
     _infer_parent_node_order,
     _match_child_links_to_parent_links,
     _match_child_nodes_to_parent_nodes,
@@ -93,6 +94,78 @@ def test_normalize_width_boolean_fields_preserves_text_identifiers() -> None:
     assert normalized["width_correction_applied"].tolist() == [True, False]
     assert normalized["dry_corridor_meaningful"].tolist() == [False, True]
     assert normalized["collapsed_unit_ids"].tolist() == ["1", "1"]
+
+
+def test_changed_link_width_products_measure_only_non_inherited_links() -> None:
+    parent_links = gpd.GeoDataFrame(
+        {
+            "id_link": [10, 20],
+            "wid_adj_wet": [100.0, 200.0],
+            "wid_adj_routing": [110.0, 210.0],
+            "geometry": [
+                LineString([(0, 0), (1, 0)]),
+                LineString([(0, 1), (1, 1)]),
+            ],
+        },
+        crs="EPSG:3857",
+    )
+    child_links = gpd.GeoDataFrame(
+        {
+            "id_link": [110, 220],
+            "geometry": [
+                LineString([(1, 0), (0, 0)]),
+                LineString([(0, 1), (2, 1)]),
+            ],
+        },
+        crs=parent_links.crs,
+    )
+    lineage = pd.DataFrame(
+        {
+            "id_link": [110, 220],
+            "lineage_type": ["unchanged_1to1", "changed_merged"],
+            "dominant_parent_link_id": [10, 20],
+        }
+    )
+    parent_samples = pd.DataFrame(
+        {
+            "id_link": [10, 10, 20],
+            "sample_index": [0, 1, 0],
+            "width_wet": [95.0, 105.0, 200.0],
+        }
+    )
+    measured_ids: list[int] = []
+
+    def fake_width_runner(links: gpd.GeoDataFrame, **_: object):
+        measured_ids.extend(links["id_link"].astype(int).tolist())
+        enriched = links.copy()
+        enriched["wid_adj_wet"] = 250.0
+        enriched["wid_adj_routing"] = np.nan
+        samples = pd.DataFrame(
+            {"id_link": [220], "sample_index": [0], "width_wet": [250.0]}
+        )
+        return enriched, samples
+
+    links, samples, changed_ids, summary = _compute_changed_link_width_products(
+        child_links,
+        parent_links=parent_links,
+        parent_width_samples=parent_samples,
+        link_lineage=lineage,
+        width_runner=fake_width_runner,
+    )
+
+    assert measured_ids == [220]
+    assert changed_ids == [220]
+    by_id = links.set_index("id_link")
+    assert by_id.loc[110, "wid_adj_wet"] == 100.0
+    assert by_id.loc[110, "wid_adj_routing"] == 110.0
+    assert by_id.loc[110, "width_inheritance_status"] == "inherited_unchanged_1to1"
+    assert by_id.loc[220, "wid_adj_wet"] == 250.0
+    assert by_id.loc[220, "width_inheritance_status"] == "changed_requires_evaluation"
+    assert samples.loc[samples["id_link"].eq(110), "width_wet"].tolist() == [95.0, 105.0]
+    assert samples.loc[samples["id_link"].eq(220), "width_wet"].tolist() == [250.0]
+    assert summary["measurement_scope"] == "changed_links_only_full_raster_context"
+    assert summary["measured_link_count"] == 1
+    assert summary["skipped_measurement_link_count"] == 1
 
 
 def test_trim_slice_matches_rivgraph_style_end_trimming() -> None:

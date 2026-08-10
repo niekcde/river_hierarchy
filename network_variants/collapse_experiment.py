@@ -46,6 +46,13 @@ from network_variants.hydraulic_context import (
     StateHydraulicContextOutputs,
     generate_state_hydraulic_context,
 )
+from network_variants.equivalent_transition_domain import (
+    build_matched_child_domain,
+    load_parent_to_child_anchor_map,
+    read_network,
+    select_smallest_closed_parent_domain,
+    solve_hydraulic_domain,
+)
 from network_variants.sword_matching import match_variant_nodes_to_sword
 from network_variants.variant_generation import (
     COLLAPSE_CORRIDOR_MODES,
@@ -127,7 +134,7 @@ class ExperimentStateContext:
     cleaned_mask_path: Path
     reviewed_links_path: Path
     reviewed_nodes_path: Path
-    workflow: UnitWorkflowOutputs
+    workflow: UnitWorkflowOutputs | None
     analysis_links_path: Path | None = None
     variant_output_dir: Path | None = None
     hydraulic_context_output_dir: Path | None = None
@@ -136,6 +143,7 @@ class ExperimentStateContext:
     equivalent_transition_summary_path: Path | None = None
     equivalent_transition_summary: dict[str, Any] | None = None
     selection: ExperimentSelection | None = None
+    hierarchy_deferred: bool = False
 
 
 @dataclass
@@ -810,6 +818,8 @@ def _optional_float(value: Any) -> float | None:
 
 
 def _workflow_output_path(context: ExperimentStateContext, filename: str) -> str:
+    if context.hierarchy_deferred or context.workflow is None:
+        return ""
     return str((context.hierarchy_output_dir / filename).resolve())
 
 
@@ -845,7 +855,7 @@ def _resolve_equivalent_reference_kb_summary(
     equivalent_forcing_config: ForcingConfig | None,
     equivalent_kb_model_path: str | Path | None,
     equivalent_kb_width_sample_field: str,
-    equivalent_kb_width_percentile: float,
+    equivalent_kb_width_percentile: float | None,
     equivalent_forcing_table_runner: Callable[..., tuple[pd.DataFrame, dict[str, object]]],
     equivalent_reference_kb_summary_runner: Callable[..., dict[str, Any]],
 ) -> tuple[BubbleEquivalentResistanceConfig, dict[str, Any] | None, dict[str, object] | None]:
@@ -1000,6 +1010,13 @@ def _empty_equivalent_transition_frame() -> pd.DataFrame:
             "parent_state_id",
             "child_state_id",
             "match_method",
+            "comparison_scope",
+            "selected_domain_status",
+            "selected_domain_error",
+            "hydraulic_domain_type",
+            "selected_unit_ids",
+            "selected_unit_is_closed",
+            "selected_unit_violating_link_ids",
             "parent_compound_bubble_id",
             "child_compound_bubble_id",
             "parent_bubble_root_unit_id",
@@ -1008,10 +1025,40 @@ def _empty_equivalent_transition_frame() -> pd.DataFrame:
             "parent_downstream_boundary_node",
             "child_upstream_boundary_node",
             "child_downstream_boundary_node",
+            "child_upstream_anchor_match_method",
+            "child_downstream_anchor_match_method",
             "parent_n_member_units",
             "child_n_member_units",
+            "parent_domain_n_links",
+            "child_domain_n_links",
             "parent_solver_success",
             "child_solver_success",
+            "parent_solver_method",
+            "child_solver_method",
+            "parent_solver_backend_requested",
+            "child_solver_backend_requested",
+            "parent_solver_backend_resolved",
+            "child_solver_backend_resolved",
+            "parent_solver_nfev",
+            "child_solver_nfev",
+            "parent_solver_solution_stage",
+            "child_solver_solution_stage",
+            "parent_energy_stage_residual_relative",
+            "child_energy_stage_residual_relative",
+            "parent_polish_residual_relative",
+            "child_polish_residual_relative",
+            "parent_solver_cache_hit",
+            "child_solver_cache_hit",
+            "parent_solver_cache_key",
+            "child_solver_cache_key",
+            "parent_solver_cache_path",
+            "child_solver_cache_path",
+            "parent_solver_initialization",
+            "child_solver_initialization",
+            "parent_primary_solver_success",
+            "child_primary_solver_success",
+            "parent_primary_residual_relative",
+            "child_primary_residual_relative",
             "K_before",
             "K_after",
             "G_before",
@@ -1036,11 +1083,254 @@ def _equivalent_transition_frame(records: Sequence[Mapping[str, Any]]) -> pd.Dat
     return pd.DataFrame.from_records(records)
 
 
+def _finite_comparison_statistic(
+    frame: pd.DataFrame,
+    column: str,
+    statistic: str,
+) -> float:
+    if frame.empty or column not in frame.columns:
+        return float("nan")
+    values = pd.to_numeric(frame[column], errors="coerce").dropna()
+    if values.empty:
+        return float("nan")
+    if statistic == "mean":
+        return float(values.mean())
+    if statistic == "median":
+        return float(values.median())
+    raise ValueError(f"Unsupported comparison statistic: {statistic}.")
+
+
+def _selected_hydraulic_domain_comparison(
+    *,
+    transition_id: str,
+    parent_context: ExperimentStateContext,
+    child_context: ExperimentStateContext,
+    equivalent_resistance_config: BubbleEquivalentResistanceConfig | None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Evaluate the selected collapse in its smallest closed hydraulic domain."""
+    selection = child_context.selection
+    if (
+        selection is None
+        or parent_context.workflow is None
+        or equivalent_resistance_config is None
+        or parent_context.analysis_links_path is None
+        or child_context.analysis_links_path is None
+        or parent_context.variant_output_dir is None
+        or child_context.variant_output_dir is None
+    ):
+        return pd.DataFrame(), pd.DataFrame()
+
+    membership_path = (
+        Path(parent_context.variant_output_dir)
+        / "summary"
+        / "unit_link_membership.csv"
+    )
+    node_match_path = (
+        Path(child_context.variant_output_dir) / "matching" / "node_match.csv"
+    )
+    if not membership_path.exists() or not node_match_path.exists():
+        return pd.DataFrame(), pd.DataFrame()
+
+    parent_links = read_network(parent_context.analysis_links_path)
+    child_links = read_network(child_context.analysis_links_path)
+    parent_nodes = read_network(parent_context.reviewed_nodes_path)
+    child_nodes = read_network(child_context.reviewed_nodes_path)
+    membership = pd.read_csv(membership_path)
+
+    parent_domain = select_smallest_closed_parent_domain(
+        full_links=parent_links,
+        unit_summary=parent_context.workflow.unit_summary,
+        unit_link_membership=membership,
+        bubble_edge_resistance=parent_context.workflow.bubble_edge_resistance,
+        selected_unit_ids=selection.selected_unit_ids,
+        selected_compound_bubble_id=selection.compound_bubble_id,
+    )
+    parent_to_child, anchor_match_methods = load_parent_to_child_anchor_map(
+        node_match_path=node_match_path,
+        child_links=child_links,
+        link_lineage_path=(
+            Path(child_context.variant_output_dir)
+            / "matching"
+            / "link_lineage.csv"
+        ),
+    )
+    child_domain = build_matched_child_domain(
+        parent_domain=parent_domain,
+        child_links=child_links,
+        parent_to_child_node=parent_to_child,
+    )
+    parent_solve, _ = solve_hydraulic_domain(
+        domain=parent_domain,
+        nodes=parent_nodes,
+        config=equivalent_resistance_config,
+    )
+    child_solve, _ = solve_hydraulic_domain(
+        domain=child_domain,
+        nodes=child_nodes,
+        config=equivalent_resistance_config,
+    )
+
+    parent_k = float(parent_solve.get("K_eq", np.nan))
+    child_k = float(child_solve.get("K_eq", np.nan))
+    comparison_metrics = {
+        "Lambda_K": np.nan,
+        "Lambda_G": np.nan,
+        "percent_change_K": np.nan,
+        "percent_change_G": np.nan,
+    }
+    if np.isfinite(parent_k) and parent_k > 0 and np.isfinite(child_k) and child_k > 0:
+        resolved = compare_states(parent_k, child_k)
+        comparison_metrics = {
+            key: float(resolved[key])
+            for key in comparison_metrics
+        }
+
+    compound_bubble_id = parent_domain.compound_bubble_id
+    if compound_bubble_id is None:
+        member_count = len(parent_domain.selected_unit_ids)
+    else:
+        compound_ids = pd.to_numeric(
+            parent_context.workflow.unit_summary.get(
+                "compound_bubble_id", pd.Series(dtype=float)
+            ),
+            errors="coerce",
+        )
+        member_count = int(compound_ids.eq(compound_bubble_id).sum())
+    selected_unit_ids_text = ",".join(map(str, parent_domain.selected_unit_ids))
+    violating_link_ids_text = ",".join(
+        map(str, parent_domain.selected_unit_violating_link_ids)
+    )
+    record = {
+        "transition_id": transition_id,
+        "parent_state_id": parent_context.state_id,
+        "child_state_id": child_context.state_id,
+        "match_method": "smallest_closed_hydraulic_domain__matched_parent_anchors",
+        "comparison_scope": "selected_hydraulic_domain",
+        "selected_domain_status": "complete",
+        "selected_domain_error": "",
+        "hydraulic_domain_type": parent_domain.domain_type,
+        "selected_unit_ids": selected_unit_ids_text,
+        "selected_unit_is_closed": parent_domain.selected_unit_is_closed,
+        "selected_unit_violating_link_ids": violating_link_ids_text,
+        "parent_compound_bubble_id": compound_bubble_id,
+        "child_compound_bubble_id": compound_bubble_id,
+        "parent_bubble_root_unit_id": selection.bubble_root_unit_id,
+        "child_bubble_root_unit_id": selection.bubble_root_unit_id,
+        "parent_upstream_boundary_node": parent_domain.source_node,
+        "parent_downstream_boundary_node": parent_domain.sink_node,
+        "child_upstream_boundary_node": child_domain.source_node,
+        "child_downstream_boundary_node": child_domain.sink_node,
+        "child_upstream_anchor_match_method": anchor_match_methods.get(
+            parent_domain.source_node, ""
+        ),
+        "child_downstream_anchor_match_method": anchor_match_methods.get(
+            parent_domain.sink_node, ""
+        ),
+        "parent_n_member_units": member_count,
+        "child_n_member_units": member_count,
+        "parent_domain_n_links": len(parent_domain.links),
+        "child_domain_n_links": len(child_domain.links),
+        "parent_solver_success": bool(parent_solve.get("solver_success", False)),
+        "child_solver_success": bool(child_solve.get("solver_success", False)),
+        "parent_solver_method": parent_solve.get("solver_method", ""),
+        "child_solver_method": child_solve.get("solver_method", ""),
+        "parent_solver_backend_requested": parent_solve.get(
+            "solver_backend_requested", equivalent_resistance_config.solver_backend
+        ),
+        "child_solver_backend_requested": child_solve.get(
+            "solver_backend_requested", equivalent_resistance_config.solver_backend
+        ),
+        "parent_solver_backend_resolved": parent_solve.get(
+            "solver_backend_resolved", ""
+        ),
+        "child_solver_backend_resolved": child_solve.get(
+            "solver_backend_resolved", ""
+        ),
+        "parent_solver_nfev": parent_solve.get("solver_nfev", np.nan),
+        "child_solver_nfev": child_solve.get("solver_nfev", np.nan),
+        "parent_solver_solution_stage": parent_solve.get(
+            "solver_solution_stage", ""
+        ),
+        "child_solver_solution_stage": child_solve.get(
+            "solver_solution_stage", ""
+        ),
+        "parent_energy_stage_residual_relative": parent_solve.get(
+            "energy_stage_residual_relative", np.nan
+        ),
+        "child_energy_stage_residual_relative": child_solve.get(
+            "energy_stage_residual_relative", np.nan
+        ),
+        "parent_polish_residual_relative": parent_solve.get(
+            "polish_residual_relative", np.nan
+        ),
+        "child_polish_residual_relative": child_solve.get(
+            "polish_residual_relative", np.nan
+        ),
+        "parent_solver_cache_hit": bool(parent_solve.get("solver_cache_hit", False)),
+        "child_solver_cache_hit": bool(child_solve.get("solver_cache_hit", False)),
+        "parent_solver_cache_key": parent_solve.get("solver_cache_key", ""),
+        "child_solver_cache_key": child_solve.get("solver_cache_key", ""),
+        "parent_solver_cache_path": parent_solve.get("solver_cache_path", ""),
+        "child_solver_cache_path": child_solve.get("solver_cache_path", ""),
+        "parent_solver_initialization": parent_solve.get("initialization_used", ""),
+        "child_solver_initialization": child_solve.get("initialization_used", ""),
+        "parent_primary_solver_success": bool(
+            parent_solve.get("primary_solver_success", False)
+        ),
+        "child_primary_solver_success": bool(
+            child_solve.get("primary_solver_success", False)
+        ),
+        "parent_primary_residual_relative": parent_solve.get(
+            "primary_residual_relative", np.nan
+        ),
+        "child_primary_residual_relative": child_solve.get(
+            "primary_residual_relative", np.nan
+        ),
+        "K_before": parent_solve.get("K_eq", np.nan),
+        "K_after": child_solve.get("K_eq", np.nan),
+        "G_before": parent_solve.get("G_eq", np.nan),
+        "G_after": child_solve.get("G_eq", np.nan),
+        "Q_unit_before": parent_solve.get("Q_unit", np.nan),
+        "Q_unit_after": child_solve.get("Q_unit", np.nan),
+        "residual_norm_before": parent_solve.get("residual_norm", np.nan),
+        "residual_norm_after": child_solve.get("residual_norm", np.nan),
+        "residual_relative_before": parent_solve.get("residual_relative", np.nan),
+        "residual_relative_after": child_solve.get("residual_relative", np.nan),
+        **comparison_metrics,
+    }
+
+    link_audits: list[pd.DataFrame] = []
+    for role, state_id, domain in (
+        ("parent", parent_context.state_id, parent_domain),
+        ("child", child_context.state_id, child_domain),
+    ):
+        available = [
+            column
+            for column in (
+                "id_link",
+                "id_us_node",
+                "id_ds_node",
+                "len",
+                "wid_adj_routing",
+                "wid_adj_wet",
+                "wid_adj_total",
+            )
+            if column in domain.links.columns
+        ]
+        audit = domain.links[available].copy()
+        audit.insert(0, "state_id", state_id)
+        audit.insert(0, "domain_role", role)
+        audit.insert(0, "transition_id", transition_id)
+        link_audits.append(audit)
+    return pd.DataFrame.from_records([record]), pd.concat(link_audits, ignore_index=True)
+
+
 def _write_equivalent_transition_outputs(
     *,
     transition_id: str,
     parent_context: ExperimentStateContext,
     child_context: ExperimentStateContext,
+    equivalent_resistance_config: BubbleEquivalentResistanceConfig | None = None,
 ) -> pd.DataFrame:
     parent_frame = parent_context.workflow.bubble_equivalent_metrics.copy()
     child_frame = _augment_child_equivalent_frame_for_parent_matching(
@@ -1154,23 +1444,99 @@ def _write_equivalent_transition_outputs(
             ]
         ].copy()
 
+    redetected_comparison = comparison.copy()
+    redetected_comparison_path = output_dir / "redetected_bubble_matches.csv"
+    redetected_comparison.to_csv(redetected_comparison_path, index=False)
+    selected_domain_error = ""
+    try:
+        selected_comparison, selected_link_audit = _selected_hydraulic_domain_comparison(
+            transition_id=transition_id,
+            parent_context=parent_context,
+            child_context=child_context,
+            equivalent_resistance_config=equivalent_resistance_config,
+        )
+    except Exception as exc:
+        selected_domain_error = f"{type(exc).__name__}: {exc}"
+        selected_comparison = pd.DataFrame.from_records(
+            [
+                {
+                    "transition_id": transition_id,
+                    "parent_state_id": parent_context.state_id,
+                    "child_state_id": child_context.state_id,
+                    "match_method": "smallest_closed_hydraulic_domain_failed",
+                    "comparison_scope": "selected_hydraulic_domain",
+                    "selected_domain_status": "failed",
+                    "selected_domain_error": selected_domain_error,
+                    "selected_unit_ids": (
+                        ",".join(map(str, child_context.selection.selected_unit_ids))
+                        if child_context.selection is not None
+                        else ""
+                    ),
+                    "parent_solver_success": False,
+                    "child_solver_success": False,
+                    "K_before": np.nan,
+                    "K_after": np.nan,
+                    "G_before": np.nan,
+                    "G_after": np.nan,
+                    "Q_unit_before": np.nan,
+                    "Q_unit_after": np.nan,
+                    "residual_norm_before": np.nan,
+                    "residual_norm_after": np.nan,
+                    "residual_relative_before": np.nan,
+                    "residual_relative_after": np.nan,
+                    "Lambda_K": np.nan,
+                    "Lambda_G": np.nan,
+                    "percent_change_K": np.nan,
+                    "percent_change_G": np.nan,
+                }
+            ]
+        )
+        selected_link_audit = pd.DataFrame()
+    selected_link_audit_path: Path | None = None
+    if not selected_comparison.empty:
+        comparison = selected_comparison
+        selected_link_audit_path = output_dir / "selected_hydraulic_domain_links.csv"
+        selected_link_audit.to_csv(selected_link_audit_path, index=False)
+
     comparison.to_csv(comparison_path, index=False)
     summary = {
         "transition_id": transition_id,
         "parent_state_id": parent_context.state_id,
         "child_state_id": child_context.state_id,
         "comparison_csv": str(comparison_path.resolve()),
+        "comparison_method": (
+            "smallest_closed_hydraulic_domain"
+            if not selected_comparison.empty
+            else "redetected_bubble_matching_compatibility_fallback"
+        ),
+        "redetected_bubble_matches_csv": str(redetected_comparison_path.resolve()),
+        "selected_hydraulic_domain_links_csv": (
+            str(selected_link_audit_path.resolve())
+            if selected_link_audit_path is not None
+            else None
+        ),
         "n_equivalent_bubbles_before": int(len(parent_frame)),
         "n_equivalent_bubbles_after": int(len(child_frame)),
-        "n_equivalent_bubbles_matched": int(len(comparison)),
-        "n_equivalent_bubbles_unmatched_before": int(max(len(parent_frame) - len(comparison), 0)),
-        "n_equivalent_bubbles_unmatched_after": int(max(len(child_frame) - len(comparison), 0)),
+        "n_equivalent_bubbles_matched": int(len(redetected_comparison)),
+        "n_equivalent_bubbles_unmatched_before": int(max(len(parent_frame) - len(redetected_comparison), 0)),
+        "n_equivalent_bubbles_unmatched_after": int(max(len(child_frame) - len(redetected_comparison), 0)),
+        "n_selected_hydraulic_domain_comparisons": int(len(selected_comparison)),
+        "selected_hydraulic_domain_status": (
+            str(selected_comparison.iloc[0].get("selected_domain_status", "complete"))
+            if not selected_comparison.empty
+            else "not_available"
+        ),
+        "selected_hydraulic_domain_error": selected_domain_error or None,
         "n_equivalent_solver_success_before": _count_equivalent_solver_success(parent_frame),
         "n_equivalent_solver_success_after": _count_equivalent_solver_success(child_frame),
-        "mean_lambda_k": float(comparison["Lambda_K"].mean()) if not comparison.empty else float("nan"),
-        "median_lambda_k": float(comparison["Lambda_K"].median()) if not comparison.empty else float("nan"),
-        "mean_percent_change_k": float(comparison["percent_change_K"].mean()) if not comparison.empty else float("nan"),
-        "median_percent_change_k": float(comparison["percent_change_K"].median()) if not comparison.empty else float("nan"),
+        "mean_lambda_k": _finite_comparison_statistic(comparison, "Lambda_K", "mean"),
+        "median_lambda_k": _finite_comparison_statistic(comparison, "Lambda_K", "median"),
+        "mean_percent_change_k": _finite_comparison_statistic(
+            comparison, "percent_change_K", "mean"
+        ),
+        "median_percent_change_k": _finite_comparison_statistic(
+            comparison, "percent_change_K", "median"
+        ),
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     child_context.equivalent_transition_summary = summary
@@ -1367,6 +1733,7 @@ def _select_group_from_selected_groups(selected_groups: pd.DataFrame) -> Experim
 def _state_record(context: ExperimentStateContext, mode: str) -> dict[str, Any]:
     selection = context.selection
     equivalent_transition_summary = context.equivalent_transition_summary or {}
+    workflow = context.workflow
     return {
         "state_id": context.state_id,
         "parent_state_id": context.parent_state_id or "",
@@ -1394,6 +1761,7 @@ def _state_record(context: ExperimentStateContext, mode: str) -> dict[str, Any]:
             else ""
         ),
         "hierarchy_output_dir": str(context.hierarchy_output_dir.resolve()),
+        "hierarchy_status": "deferred" if context.hierarchy_deferred else "complete",
         "bubble_equivalent_metrics_path": _workflow_output_path(context, "bubble_equivalent_metrics.csv"),
         "bubble_edge_resistance_path": _workflow_output_path(context, "bubble_edge_resistance.csv"),
         "bubble_node_heads_path": _workflow_output_path(context, "bubble_node_heads.csv"),
@@ -1418,14 +1786,23 @@ def _state_record(context: ExperimentStateContext, mode: str) -> dict[str, Any]:
             (context.analysis_links_path or context.reviewed_links_path).resolve()
         ),
         "directed_nodes_path": str(context.reviewed_nodes_path.resolve()),
-        "n_units_detected": int(len(context.workflow.unit_metrics)),
-        "n_paths_detected": int(len(context.workflow.path_metrics)),
-        "n_equivalent_bubbles": int(len(context.workflow.bubble_equivalent_metrics)),
-        "n_equivalent_bubbles_solver_success": _count_equivalent_solver_success(context.workflow.bubble_equivalent_metrics),
+        "n_units_detected": int(len(workflow.unit_metrics)) if workflow is not None else pd.NA,
+        "n_paths_detected": int(len(workflow.path_metrics)) if workflow is not None else pd.NA,
+        "n_equivalent_bubbles": int(len(workflow.bubble_equivalent_metrics)) if workflow is not None else pd.NA,
+        "n_equivalent_bubbles_solver_success": _count_equivalent_solver_success(workflow.bubble_equivalent_metrics) if workflow is not None else pd.NA,
+        "n_equivalent_bubbles_solver_cache_hits": (
+            int(
+                workflow.bubble_equivalent_metrics.get(
+                    "solver_cache_hit", pd.Series(dtype=bool)
+                ).fillna(False).astype(bool).sum()
+            )
+            if workflow is not None
+            else pd.NA
+        ),
         "n_equivalent_bubbles_matched_to_parent": equivalent_transition_summary.get("n_equivalent_bubbles_matched", pd.NA),
-        "n_selected_groups": int(len(context.workflow.selected_groups)),
-        "optimal_n_groups": _optimal_n_groups(context.workflow.group_count_summary),
-        "status": "complete",
+        "n_selected_groups": int(len(workflow.selected_groups)) if workflow is not None else pd.NA,
+        "optimal_n_groups": _optimal_n_groups(workflow.group_count_summary) if workflow is not None else pd.NA,
+        "status": "hydraulic_complete_hierarchy_deferred" if context.hierarchy_deferred else "complete",
         "error_stage": "",
         "error": "",
     }
@@ -1441,6 +1818,8 @@ def _transition_record(
     selection = child_context.selection
     assert selection is not None
     equivalent_transition_summary = child_context.equivalent_transition_summary or {}
+    parent_workflow = parent_context.workflow
+    child_workflow = child_context.workflow
     return {
         "transition_id": transition_id,
         "step_index": int(step_index),
@@ -1461,10 +1840,10 @@ def _transition_record(
         "compound_bubble_id": selection.compound_bubble_id if selection is not None else pd.NA,
         "bubble_root_unit_id": selection.bubble_root_unit_id if selection is not None else pd.NA,
         "total_unit_nodes_selected": selection.total_unit_nodes_selected if selection is not None else pd.NA,
-        "n_units_before": int(len(parent_context.workflow.unit_metrics)),
-        "n_units_after": int(len(child_context.workflow.unit_metrics)),
-        "n_equivalent_bubbles_before": int(len(parent_context.workflow.bubble_equivalent_metrics)),
-        "n_equivalent_bubbles_after": int(len(child_context.workflow.bubble_equivalent_metrics)),
+        "n_units_before": int(len(parent_workflow.unit_metrics)) if parent_workflow is not None else pd.NA,
+        "n_units_after": int(len(child_workflow.unit_metrics)) if child_workflow is not None else pd.NA,
+        "n_equivalent_bubbles_before": int(len(parent_workflow.bubble_equivalent_metrics)) if parent_workflow is not None else pd.NA,
+        "n_equivalent_bubbles_after": int(len(child_workflow.bubble_equivalent_metrics)) if child_workflow is not None else pd.NA,
         "n_equivalent_bubbles_matched": equivalent_transition_summary.get("n_equivalent_bubbles_matched", 0),
         "n_equivalent_bubbles_unmatched_before": equivalent_transition_summary.get("n_equivalent_bubbles_unmatched_before", 0),
         "n_equivalent_bubbles_unmatched_after": equivalent_transition_summary.get("n_equivalent_bubbles_unmatched_after", 0),
@@ -1474,6 +1853,7 @@ def _transition_record(
         "median_percent_change_k": equivalent_transition_summary.get("median_percent_change_k", float("nan")),
         "parent_hierarchy_output_dir": str(parent_context.hierarchy_output_dir.resolve()),
         "child_hierarchy_output_dir": str(child_context.hierarchy_output_dir.resolve()),
+        "child_hierarchy_status": "deferred" if child_context.hierarchy_deferred else "complete",
         "parent_bubble_equivalent_metrics_csv": _workflow_output_path(parent_context, "bubble_equivalent_metrics.csv"),
         "child_bubble_equivalent_metrics_csv": _workflow_output_path(child_context, "bubble_equivalent_metrics.csv"),
         "equivalent_transition_comparison_csv": (
@@ -1487,7 +1867,7 @@ def _transition_record(
             else ""
         ),
         "child_variant_output_dir": str(child_context.variant_output_dir.resolve()) if child_context.variant_output_dir is not None else "",
-        "status": "complete",
+        "status": "hydraulic_complete_hierarchy_deferred" if child_context.hierarchy_deferred else "complete",
         "error_stage": "",
         "error": "",
     }
@@ -1764,14 +2144,21 @@ def _run_state_hydraulic_context(
     context: ExperimentStateContext,
     hydraulic_context_runner: Callable[..., StateHydraulicContextOutputs],
     hydraulic_context_kwargs: Mapping[str, Any] | None = None,
+    parent_context: ExperimentStateContext | None = None,
 ) -> ExperimentStateContext:
+    runner_kwargs = dict(hydraulic_context_kwargs or {})
+    if parent_context is not None and parent_context.hydraulic_context_output_dir is not None:
+        runner_kwargs.setdefault(
+            "parent_link_context_path",
+            parent_context.hydraulic_context_output_dir / "link_hydraulic_context.csv",
+        )
     outputs = hydraulic_context_runner(
         directed_links_path=context.analysis_links_path or context.reviewed_links_path,
         directed_nodes_path=context.reviewed_nodes_path,
-        hierarchy_output_dir=context.hierarchy_output_dir,
+        hierarchy_output_dir=None if context.hierarchy_deferred else context.hierarchy_output_dir,
         output_dir=context.state_dir / "hydraulic_context",
         state_id=context.state_id,
-        **dict(hydraulic_context_kwargs or {}),
+        **runner_kwargs,
     )
     context.hydraulic_context_output_dir = outputs.output_dir
     return context
@@ -2946,6 +3333,7 @@ def _build_child_state(
     unit_workflow_kwargs: Mapping[str, Any],
     hydraulic_context_runner: Callable[..., StateHydraulicContextOutputs],
     hydraulic_context_kwargs: Mapping[str, Any] | None = None,
+    defer_hierarchy: bool = False,
 ) -> ExperimentStateContext:
     state_started = time.perf_counter()
     stage_timings: dict[str, float | str] = {
@@ -2988,28 +3376,48 @@ def _build_child_state(
         variant_output_dir=variant_outputs.output_dir,
         directed_links_path=variant_outputs.directed_links_path,
     )
-    hierarchy_started = time.perf_counter()
-    child_context = _run_state_hierarchy(
-        state_id=state_id,
-        parent_state_id=parent_context.state_id,
-        depth=parent_context.depth + 1,
-        state_dir=state_dir,
-        cleaned_mask_path=variant_outputs.collapsed_mask_path,
-        reviewed_links_path=analysis_links_path,
-        reviewed_nodes_path=variant_outputs.directed_nodes_path,
-        directed_links_path=variant_outputs.directed_links_path,
-        selection=selection,
-        unit_workflow_runner=unit_workflow_runner,
-        unit_workflow_writer=unit_workflow_writer,
-        unit_workflow_kwargs=unit_workflow_kwargs,
-    )
-    stage_timings["hierarchy_seconds"] = time.perf_counter() - hierarchy_started
+    if defer_hierarchy:
+        child_context = ExperimentStateContext(
+            state_id=state_id,
+            parent_state_id=parent_context.state_id,
+            depth=parent_context.depth + 1,
+            state_dir=state_dir,
+            hierarchy_output_dir=state_dir / "hierarchy",
+            cleaned_mask_path=Path(variant_outputs.collapsed_mask_path),
+            reviewed_links_path=Path(variant_outputs.directed_links_path),
+            reviewed_nodes_path=Path(variant_outputs.directed_nodes_path),
+            workflow=None,
+            analysis_links_path=analysis_links_path,
+            selection=selection,
+            hierarchy_deferred=True,
+        )
+        stage_timings["hierarchy_seconds"] = 0.0
+        stage_timings["hierarchy_status"] = "deferred"
+    else:
+        hierarchy_started = time.perf_counter()
+        child_context = _run_state_hierarchy(
+            state_id=state_id,
+            parent_state_id=parent_context.state_id,
+            depth=parent_context.depth + 1,
+            state_dir=state_dir,
+            cleaned_mask_path=variant_outputs.collapsed_mask_path,
+            reviewed_links_path=analysis_links_path,
+            reviewed_nodes_path=variant_outputs.directed_nodes_path,
+            directed_links_path=variant_outputs.directed_links_path,
+            selection=selection,
+            unit_workflow_runner=unit_workflow_runner,
+            unit_workflow_writer=unit_workflow_writer,
+            unit_workflow_kwargs=unit_workflow_kwargs,
+        )
+        stage_timings["hierarchy_seconds"] = time.perf_counter() - hierarchy_started
+        stage_timings["hierarchy_status"] = "complete"
     child_context.variant_output_dir = variant_outputs.output_dir
     hydraulic_started = time.perf_counter()
     child_context = _run_state_hydraulic_context(
         context=child_context,
         hydraulic_context_runner=hydraulic_context_runner,
         hydraulic_context_kwargs=hydraulic_context_kwargs,
+        parent_context=parent_context,
     )
     stage_timings["hydraulic_context_seconds"] = time.perf_counter() - hydraulic_started
     stage_timings["state_total_seconds"] = time.perf_counter() - state_started
@@ -3066,12 +3474,13 @@ def run_collapse_experiment(
     sword_reach_buffer_steps: int = 2,
     verbose_rivgraph: bool = False,
     state_hydraulic_context_kwargs: Mapping[str, Any] | None = None,
+    defer_child_hierarchy: bool = False,
     equivalent_resistance_config: BubbleEquivalentResistanceConfig | None = None,
     equivalent_forcing_path: str | Path | None = None,
     equivalent_forcing_config: ForcingConfig | None = None,
     equivalent_kb_model_path: str | Path | None = None,
-    equivalent_kb_width_sample_field: str = "wid_adj_wet",
-    equivalent_kb_width_percentile: float = 90.0,
+    equivalent_kb_width_sample_field: str = "wid_adj_routing",
+    equivalent_kb_width_percentile: float | None = None,
     base_only: bool = False,
     requested_unit_ids: Sequence[int] | None = None,
     requested_compound_bubble_ids: Sequence[int] | None = None,
@@ -3091,6 +3500,12 @@ def run_collapse_experiment(
         raise ValueError(f"Unsupported mode {mode!r}. Expected one of {EXPERIMENT_MODES}.")
     if requested_compound_bubble_ids is not None and mode != "compound-bubbles":
         raise ValueError("--compound-bubble-id is supported only with compound-bubbles.")
+    if defer_child_hierarchy and mode not in {"independent-units", "compound-bubbles"}:
+        raise ValueError(
+            "Deferred child hierarchy is currently supported only for independent-units "
+            "and compound-bubbles; sequential modes require each child hierarchy to select "
+            "the next collapse."
+        )
     if collapse_corridor_mode not in COLLAPSE_CORRIDOR_MODES:
         raise ValueError(
             f"Unsupported collapse_corridor_mode {collapse_corridor_mode!r}. "
@@ -3153,6 +3568,16 @@ def run_collapse_experiment(
         )
 
     active_equivalent_resistance_config = equivalent_resistance_config
+    if (
+        active_equivalent_resistance_config is not None
+        and active_equivalent_resistance_config.solver_cache_dir is None
+    ):
+        active_equivalent_resistance_config = replace(
+            active_equivalent_resistance_config,
+            solver_cache_dir=str(
+                (output_path / "equivalent_resistance" / "solve_cache").resolve()
+            ),
+        )
     base_equivalent_resistance_config = active_equivalent_resistance_config
     if _needs_equivalent_reference_kb_prepass(active_equivalent_resistance_config):
         base_equivalent_resistance_config = None
@@ -3300,6 +3725,11 @@ def run_collapse_experiment(
 
     def write_metadata() -> None:
         n_complete_states = sum(1 for record in state_records if record.get("status") == "complete")
+        n_hierarchy_deferred_states = sum(
+            1
+            for record in state_records
+            if record.get("status") == "hydraulic_complete_hierarchy_deferred"
+        )
         n_failed_states = sum(1 for record in state_records if record.get("status") == "failed")
         n_compound_states = sum(1 for record in state_records if bool(record.get("is_compound_state", False)))
         n_equivalent_transition_rows = len(equivalent_transition_records)
@@ -3329,6 +3759,7 @@ def run_collapse_experiment(
             "max_steps": max_steps,
             "n_states": len(state_records),
             "n_complete_states": n_complete_states,
+            "n_hierarchy_deferred_states": n_hierarchy_deferred_states,
             "n_failed_states": n_failed_states,
             "n_compound_states": n_compound_states,
             "n_transitions": len(transition_records),
@@ -3338,6 +3769,7 @@ def run_collapse_experiment(
             "stop_reason": stop_reason,
             "options": {
                 "hierarchy": {
+                    "defer_child_hierarchy": bool(defer_child_hierarchy),
                     "max_path_cutoff": max_path_cutoff,
                     "max_paths": max_paths,
                     "pixel_width_fields": list(pixel_width_fields) if pixel_width_fields is not None else None,
@@ -3366,7 +3798,11 @@ def run_collapse_experiment(
                         else None
                     ),
                     "equivalent_kb_width_sample_field": equivalent_kb_width_sample_field,
-                    "equivalent_kb_width_percentile": float(equivalent_kb_width_percentile),
+                    "equivalent_kb_width_percentile": (
+                        float(equivalent_kb_width_percentile)
+                        if equivalent_kb_width_percentile is not None
+                        else None
+                    ),
                     "debug_hierarchy": bool(debug_hierarchy),
                 },
             "variant": {
@@ -3536,6 +3972,7 @@ def run_collapse_experiment(
                     unit_workflow_kwargs=unit_workflow_kwargs,
                     hydraulic_context_runner=state_hydraulic_context_runner,
                     hydraulic_context_kwargs=state_hydraulic_context_kwargs,
+                    defer_hierarchy=defer_child_hierarchy,
                 )
             except VariantDirectionValidationError as exc:
                 error_text = _format_exception(exc)
@@ -3603,13 +4040,18 @@ def run_collapse_experiment(
                 continue
 
             transition_id = f"T{index:03d}"
-            equivalent_transition = _write_equivalent_transition_outputs(
-                transition_id=transition_id,
-                parent_context=base_context,
-                child_context=child_context,
-            )
-            if not equivalent_transition.empty:
-                equivalent_transition_records.extend(equivalent_transition.to_dict("records"))
+            if not child_context.hierarchy_deferred:
+                equivalent_transition = _write_equivalent_transition_outputs(
+                    transition_id=transition_id,
+                    parent_context=base_context,
+                    child_context=child_context,
+                    equivalent_resistance_config=(
+                        active_equivalent_resistance_config
+                        or BubbleEquivalentResistanceConfig()
+                    ),
+                )
+                if not equivalent_transition.empty:
+                    equivalent_transition_records.extend(equivalent_transition.to_dict("records"))
             state_records.append(_state_record(child_context, mode))
             transition = _transition_record(
                 transition_id=transition_id,
@@ -3670,6 +4112,7 @@ def run_collapse_experiment(
                 unit_workflow_kwargs=unit_workflow_kwargs,
                 hydraulic_context_runner=state_hydraulic_context_runner,
                 hydraulic_context_kwargs=state_hydraulic_context_kwargs,
+                defer_hierarchy=False,
             )
         except VariantDirectionValidationError as exc:
             error_text = _format_exception(exc)
@@ -3743,6 +4186,10 @@ def run_collapse_experiment(
             transition_id=transition_id,
             parent_context=current_context,
             child_context=child_context,
+            equivalent_resistance_config=(
+                active_equivalent_resistance_config
+                or BubbleEquivalentResistanceConfig()
+            ),
         )
         if not equivalent_transition.empty:
             equivalent_transition_records.extend(equivalent_transition.to_dict("records"))
@@ -3875,8 +4322,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--equivalent-kb-width-percentile",
         type=float,
-        default=90.0,
-        help="Reference-section width percentile used only when the selected equivalent kb width field is read from raw sample widths.",
+        default=None,
+        help=(
+            "Reference-section width percentile used only when the selected equivalent kb width "
+            "field is read from raw sample widths. Omit it for summary fields such as wid_adj_routing."
+        ),
     )
     parser.add_argument(
         "--equivalent-length-field",
@@ -3895,6 +4345,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=22.0,
         help="Default Chezy Cz used when the links do not provide one.",
+    )
+    parser.add_argument(
+        "--equivalent-solver-backend",
+        choices=(
+            "dense_legacy", "sparse", "sparse_least_squares",
+            "energy_sparse", "auto",
+        ),
+        default="dense_legacy",
+        help=(
+            "Equivalent-resistance solver backend. dense_legacy preserves the "
+            "previous dense-SVD path; sparse/sparse_least_squares use LSMR; "
+            "energy_sparse uses convex energy minimization plus LSMR polishing; "
+            "auto uses energy_sparse for larger domains."
+        ),
+    )
+    parser.add_argument(
+        "--equivalent-sparse-min-internal-nodes",
+        type=int,
+        default=64,
+        help="Internal-node threshold at which auto selects energy_sparse.",
     )
     parser.add_argument(
         "--equivalent-forcing-path",
@@ -3921,11 +4391,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional inclusive UTC truncation end for equivalent-resistance forcing normalization.",
     )
-    parser.add_argument(
+    equivalent_forcing_resample_group = parser.add_mutually_exclusive_group()
+    equivalent_forcing_resample_group.add_argument(
         "--equivalent-forcing-resample-minutes",
         type=int,
         default=None,
         help="Optional normalized forcing interval in minutes for equivalent-resistance kb preparation.",
+    )
+    equivalent_forcing_resample_group.add_argument(
+        "--equivalent-forcing-resample-seconds",
+        type=int,
+        default=None,
+        help="Optional normalized forcing interval in seconds for equivalent-resistance kb preparation.",
     )
     parser.add_argument(
         "--equivalent-forcing-output-cache-dir",
@@ -3995,6 +4472,15 @@ def build_parser() -> argparse.ArgumentParser:
             "then stop before building derived unit/group states."
         ),
     )
+    parser.add_argument(
+        "--defer-child-hierarchy",
+        action="store_true",
+        help=(
+            "For independent-unit or compound-bubble runs, finish child variant and hydraulic "
+            "artifacts without rebuilding each complete child hierarchy. Hierarchy-dependent "
+            "comparison/equivalent outputs are marked deferred and can be finalized later."
+        ),
+    )
     parser.add_argument("--execution-mode", choices=EXECUTION_MODES, default="full_raster", help="Use full-raster processing or the panelized base-state materializer.")
     parser.add_argument(
         "--base-state-source",
@@ -4002,6 +4488,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional completed experiment directory (or S000_base/variant directory) whose "
             "base variant should be copied instead of recomputing base widths."
+        ),
+    )
+    parser.add_argument(
+        "--anchored-source-experiment",
+        default=None,
+        help=(
+            "Optional completed realized experiment directory used to build only the matching "
+            "anchored experiment. This skips realized-state regeneration, reuses its boundary "
+            "components and base state, and requires --collapse-corridor-mode anchored."
         ),
     )
     parser.add_argument("--panelized-width-samples", default=None, help="Optional merged panelized width-samples CSV; defaults beside --reviewed-links.")
@@ -4023,6 +4518,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             length_field_candidates=resolve_length_field_candidates(args.equivalent_length_field),
             default_manning_n=args.equivalent_manning_n,
             default_chezy_cz=args.equivalent_chezy_cz,
+            solver_backend=args.equivalent_solver_backend,
+            sparse_min_internal_nodes=args.equivalent_sparse_min_internal_nodes,
         )
         if args.equivalent_kb_mode == "based_reference_section":
             equivalent_forcing_config = ForcingConfig(
@@ -4033,6 +4530,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 start_time=args.equivalent_forcing_start_time,
                 end_time=args.equivalent_forcing_end_time,
                 resample_minutes=args.equivalent_forcing_resample_minutes,
+                resample_seconds=args.equivalent_forcing_resample_seconds,
                 output_cache_dir=args.equivalent_forcing_output_cache_dir,
             )
 
@@ -4085,6 +4583,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "equivalent_kb_width_sample_field": args.equivalent_kb_width_sample_field,
         "equivalent_kb_width_percentile": args.equivalent_kb_width_percentile,
         "base_only": args.base_only,
+        "defer_child_hierarchy": args.defer_child_hierarchy,
         "requested_unit_ids": args.requested_unit_ids,
         "requested_compound_bubble_ids": args.requested_compound_bubble_ids,
         "execution_mode": args.execution_mode,
@@ -4101,14 +4600,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             Path(args.panelized_boundary_component_labels).resolve().parent
         )
 
-    persist_realized_and_anchored = args.collapse_corridor_mode in {"both", "anchored"}
-    requested_modes = COLLAPSE_CORRIDOR_MODES if persist_realized_and_anchored else (args.collapse_corridor_mode,)
-    realized_output_dir_for_reuse: Path | None = None
+    anchored_source_experiment: Path | None = None
+    if args.anchored_source_experiment is not None:
+        if args.collapse_corridor_mode != "anchored":
+            parser.error("--anchored-source-experiment requires --collapse-corridor-mode anchored.")
+        if not _supports_realized_reuse_speedup(args.mode):
+            parser.error(
+                "--anchored-source-experiment is supported only for independent-units and compound-bubbles."
+            )
+        anchored_source_experiment = Path(args.anchored_source_experiment).resolve()
+        required_source_paths = (
+            anchored_source_experiment / "states" / "S000_base" / "variant",
+            anchored_source_experiment / "boundary_components",
+        )
+        missing_source_paths = [path for path in required_source_paths if not path.exists()]
+        if missing_source_paths:
+            parser.error(
+                "--anchored-source-experiment is missing required realized artifacts: "
+                + ", ".join(str(path) for path in missing_source_paths)
+            )
+
+    persist_realized_and_anchored = (
+        args.collapse_corridor_mode in {"both", "anchored"}
+        and anchored_source_experiment is None
+    )
+    requested_modes = (
+        ("anchored",)
+        if anchored_source_experiment is not None
+        else (COLLAPSE_CORRIDOR_MODES if persist_realized_and_anchored else (args.collapse_corridor_mode,))
+    )
+    suffix_mode_outputs = persist_realized_and_anchored or anchored_source_experiment is not None
+    realized_output_dir_for_reuse: Path | None = anchored_source_experiment
     for collapse_corridor_mode in requested_modes:
         experiment_id = args.experiment_id
         output_dir = args.output_dir
         current_run_kwargs = dict(run_kwargs)
-        if persist_realized_and_anchored:
+        if suffix_mode_outputs:
             experiment_id = _suffix_experiment_id_for_collapse_mode(
                 experiment_id or _default_experiment_id(args.cleaned_mask, args.mode),
                 collapse_corridor_mode,
