@@ -468,6 +468,15 @@ def apply_routing_width_model(
                 )
             else:
                 assigned_values = inherited_values.to_numpy()
+                # Columns containing serialized lists/labels can initially be
+                # inferred as float when the evaluated rows are all missing.
+                # Promote before restoring inherited object values; assigning
+                # objects directly into float64 is deprecated by pandas.
+                if (
+                    pd.api.types.is_object_dtype(inherited_values.dtype)
+                    and not pd.api.types.is_object_dtype(audit[column].dtype)
+                ):
+                    audit[column] = audit[column].astype(object)
             audit.loc[fixed_audit_mask, column] = assigned_values
         audit["width_evaluation_status"] = np.where(
             audit["width_model_evaluation_scope"],
