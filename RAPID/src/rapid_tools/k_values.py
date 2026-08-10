@@ -187,6 +187,11 @@ def apply_stability_effective_length_cap(
     frame["rapid_effective_length_m_pre_stability_cap"] = current_effective_length
     frame["rapid_stability_length_cap_candidate"] = False
     frame["rapid_stability_length_cap_applied"] = False
+    frame["rapid_stability_length_cap_near_floor_candidate"] = False
+    frame["rapid_stability_length_cap_adaptive_candidate"] = False
+    frame["rapid_stability_length_cap_adaptive_applied"] = False
+    frame["rapid_stability_length_cap_method"] = "not_applied"
+    frame["rapid_stability_length_cap_unresolved"] = False
     frame["rapid_stability_length_cap_triggered"] = False
     frame["rapid_stability_length_cap_target_m"] = np.nan
     frame["rapid_stability_length_cap_active_m"] = np.nan
@@ -210,7 +215,7 @@ def apply_stability_effective_length_cap(
         return frame
 
     active_cap = np.maximum(target_cap, floor_length)
-    candidate_mask = (
+    near_floor_candidate = (
         celerity.le(near_floor_threshold)
         & current_effective_length.gt(active_cap)
         & np.isfinite(active_cap)
@@ -219,20 +224,58 @@ def apply_stability_effective_length_cap(
     frame["rapid_stability_length_cap_triggered"] = True
     frame["rapid_stability_length_cap_target_m"] = target_cap.astype(float)
     frame["rapid_stability_length_cap_active_m"] = active_cap.astype(float)
-    frame["rapid_stability_length_cap_candidate"] = candidate_mask
+    frame["rapid_stability_length_cap_near_floor_candidate"] = near_floor_candidate
 
-    if candidate_mask.any():
-        updated_effective_length = current_effective_length.where(~candidate_mask, active_cap)
-        frame["rapid_effective_length_m"] = updated_effective_length.astype(float)
-        frame["rapid_stability_length_cap_applied"] = candidate_mask
-        frame["rapid_k"] = (frame["rapid_effective_length_m"].astype(float) / frame["rapid_celerity_mps"]).astype(float)
-        frame["rapid_k_source_method"] = np.where(
-            frame["rapid_stability_length_cap_applied"],
-            frame["rapid_k_source_method"].astype(str) + "+stability_length_cap",
-            frame["rapid_k_source_method"],
+    updated_effective_length = current_effective_length.where(
+        ~near_floor_candidate,
+        active_cap,
+    )
+    updated_k = (updated_effective_length / celerity).astype(float)
+    dt_min_after_near_floor, dt_max_after_near_floor = compute_dt_bounds(
+        updated_k,
+        x_value=x_value,
+    )
+
+    # A changed topology can introduce a short, fast reach that lowers dt_max
+    # while an unchanged slow reach just outside the near-floor celerity window
+    # still controls dt_min. In that case, extend the same cap to the actual
+    # high-K tail. This is not a second physical calibration: it only applies
+    # the already-derived target cap when the first numerical safeguard did not
+    # open a valid Muskingum interval.
+    adaptive_candidate = pd.Series(False, index=frame.index, dtype=bool)
+    if dt_min_after_near_floor > dt_max_after_near_floor + 1e-9:
+        adaptive_candidate = (
+            updated_effective_length.gt(active_cap)
+            & np.isfinite(active_cap)
         )
+        updated_effective_length = updated_effective_length.where(
+            ~adaptive_candidate,
+            active_cap,
+        )
+        updated_k = (updated_effective_length / celerity).astype(float)
+
+    applied_mask = near_floor_candidate | adaptive_candidate
+    frame["rapid_stability_length_cap_adaptive_candidate"] = adaptive_candidate
+    frame["rapid_stability_length_cap_adaptive_applied"] = adaptive_candidate
+    frame["rapid_stability_length_cap_candidate"] = applied_mask
+    frame["rapid_stability_length_cap_applied"] = applied_mask
+    frame["rapid_effective_length_m"] = updated_effective_length.astype(float)
+    frame["rapid_k"] = updated_k
+    frame["rapid_stability_length_cap_method"] = np.select(
+        [adaptive_candidate, near_floor_candidate],
+        ["adaptive_high_k_tail", "near_minimum_celerity"],
+        default="not_applied",
+    )
+    frame["rapid_k_source_method"] = np.where(
+        applied_mask,
+        frame["rapid_k_source_method"].astype(str) + "+stability_length_cap",
+        frame["rapid_k_source_method"],
+    )
 
     dt_min_after, dt_max_after = compute_dt_bounds(frame["rapid_k"], x_value=x_value)
+    frame["rapid_stability_length_cap_unresolved"] = bool(
+        dt_min_after > dt_max_after + 1e-9
+    )
     frame["rapid_stability_length_cap_dt_min_after_seconds"] = float(dt_min_after)
     frame["rapid_stability_length_cap_dt_max_after_seconds"] = float(dt_max_after)
     return frame

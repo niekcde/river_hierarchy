@@ -1200,6 +1200,42 @@ def test_apply_stability_effective_length_cap_targets_near_floor_reaches() -> No
     assert abs(float(adjusted.loc[1, "rapid_effective_length_m"]) - expected_cap) < 1e-9
 
 
+def test_apply_stability_effective_length_cap_adapts_to_high_k_tail() -> None:
+    """A slow reach outside the near-floor buffer must not collapse state dt."""
+    frame = pd.DataFrame(
+        {
+            "rapid_effective_length_m": [293.918117, 224.807529],
+            "rapid_effective_length_floor_m": [200.0, 200.0],
+            "rapid_celerity_mps": [0.054203, 0.389380],
+            "rapid_celerity_capped": [False, False],
+            "rapid_k_source_method": [
+                "hydraulic_celerity_uncapped",
+                "hydraulic_celerity_uncapped",
+            ],
+        }
+    )
+    frame["rapid_k"] = (
+        frame["rapid_effective_length_m"] / frame["rapid_celerity_mps"]
+    )
+
+    adjusted = apply_stability_effective_length_cap(
+        frame,
+        x_value=0.1,
+        min_celerity_mps=0.05,
+        safety_margin_seconds=10.0,
+        celerity_rel_buffer=0.03,
+    )
+
+    assert bool(adjusted.loc[0, "rapid_stability_length_cap_near_floor_candidate"]) is False
+    assert bool(adjusted.loc[0, "rapid_stability_length_cap_adaptive_applied"]) is True
+    assert adjusted.loc[0, "rapid_stability_length_cap_method"] == "adaptive_high_k_tail"
+    assert bool(adjusted.loc[1, "rapid_stability_length_cap_applied"]) is False
+    assert bool(adjusted["rapid_stability_length_cap_unresolved"].any()) is False
+    assert float(adjusted.loc[0, "rapid_stability_length_cap_dt_min_after_seconds"]) < float(
+        adjusted.loc[0, "rapid_stability_length_cap_dt_max_after_seconds"]
+    )
+
+
 def test_compute_routing_dt_seconds_prefers_requested_timestep() -> None:
     k_values = pd.Series([1000.0, 277.77777777777777], dtype=float)
     selected = compute_routing_dt_seconds(

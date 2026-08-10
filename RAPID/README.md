@@ -223,6 +223,17 @@ parameterization:
   links first try to borrow the nearest valid neighboring slope; if that fails,
   prep can fall back to the section reference slope.
 
+- `--use-stability-effective-length-cap`
+  First limits excessive `K` values on reaches at or near the configured
+  minimum celerity. If that pass still leaves `dt_min > dt_max`, prep applies
+  the same mathematically derived cap to the remaining high-`K` tail, only as
+  far as needed to open the Muskingum stability interval and never below the
+  configured effective-length floor. This adaptive fallback is recorded per
+  subreach with `rapid_stability_length_cap_method=adaptive_high_k_tail` and
+  summarized separately in the prep manifest. Geometry, exported physical
+  length, width, slope, and celerity are not changed; only the effective length
+  used to calculate routing `K` is regularized.
+
 These controls are intended as numerical and hydraulic safeguards, not as a
 replacement for the underlying network geometry.
 
