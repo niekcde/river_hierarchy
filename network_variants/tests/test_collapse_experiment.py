@@ -1309,6 +1309,89 @@ def test_infer_boundary_artifacts_from_reused_base_variant(tmp_path: Path) -> No
     assert inferred == boundary_components.resolve()
 
 
+def test_full_raster_base_source_reuses_complete_base_products_and_boundaries(
+    tmp_path: Path,
+) -> None:
+    source_experiment = tmp_path / "source_experiment"
+    source_state = source_experiment / "states" / "S000_base"
+    source_variant = source_state / "variant"
+    for directory in (
+        source_variant / "directed",
+        source_variant / "mask",
+        source_variant / "widths",
+        source_state / "hydraulic_context",
+        source_experiment / "boundary_components",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    (source_variant / "directed" / "22__S000_base_directed_links.gpkg").write_bytes(b"links")
+    (source_variant / "directed" / "22__S000_base_directed_nodes.gpkg").write_bytes(b"nodes")
+    (source_variant / "mask" / "22__S000_base_collapsed.tif").write_bytes(b"mask")
+    (source_variant / "widths" / "links_with_width_families.gpkg").write_bytes(b"widths")
+    labels = (
+        source_experiment
+        / "boundary_components"
+        / "22_full_extent_land_water_labels_with_snapped_buffered_border_cut.tif"
+    )
+    labels.write_bytes(b"labels")
+
+    write_unit_workflow_outputs(
+        source_state / "hierarchy",
+        _workflow_outputs(unit_ids=[1]),
+    )
+    (source_state / "hydraulic_context" / "link_hydraulic_context.csv").write_text(
+        "id_link,slope_used\n1,0.001\n", encoding="utf-8"
+    )
+    (source_state / "hydraulic_context" / "node_hydraulic_context.csv").write_text(
+        "id_node,rapid_wse_for_slope\n1,10\n2,9\n", encoding="utf-8"
+    )
+    (source_state / "hydraulic_context" / "hydraulic_context_manifest.json").write_text(
+        json.dumps({"state_id": "S000_base"}), encoding="utf-8"
+    )
+
+    def fail_workflow_runner(*args: Any, **kwargs: Any) -> UnitWorkflowOutputs:
+        raise AssertionError("Complete base hierarchy should have been reused.")
+
+    def fail_hydraulic_runner(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("Complete base hydraulic context should have been reused.")
+
+    output_dir = tmp_path / "reused_output"
+    results = run_collapse_experiment(
+        "independent-units",
+        cleaned_mask_path=tmp_path / "22_cleaned.tif",
+        reviewed_links_path=tmp_path / "22_links.gpkg",
+        reviewed_nodes_path=tmp_path / "22_nodes.gpkg",
+        exit_sides="NS",
+        output_dir=output_dir,
+        collapse_corridor_mode="realized",
+        base_only=True,
+        base_state_variant_source_dir=source_variant,
+        unit_workflow_runner=fail_workflow_runner,
+        state_hydraulic_context_runner=fail_hydraulic_runner,
+    )
+
+    copied_labels = (
+        output_dir
+        / "boundary_components"
+        / "22_full_extent_land_water_labels_with_snapped_buffered_border_cut.tif"
+    )
+    assert copied_labels.read_bytes() == b"labels"
+    assert (output_dir / "states" / "S000_base" / "hierarchy" / "unit_summary.csv").exists()
+    assert (
+        output_dir
+        / "states"
+        / "S000_base"
+        / "hydraulic_context"
+        / "link_hydraulic_context.csv"
+    ).exists()
+    assert len(results.state_registry) == 1
+    reuse = results.manifest["base_state_reuse"]
+    assert reuse["variant_reused"] is True
+    assert reuse["hierarchy_reused"] is True
+    assert reuse["hydraulic_context_reused"] is True
+    assert reuse["boundary_components_reused"] is True
+
+
 def test_run_copies_boundary_artifacts_before_base_materialization(tmp_path: Path) -> None:
     source = tmp_path / "realized" / "boundary_components"
     source.mkdir(parents=True)

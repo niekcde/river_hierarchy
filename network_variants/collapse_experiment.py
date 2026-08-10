@@ -2139,6 +2139,97 @@ def _run_state_hierarchy(
     )
 
 
+_UNIT_WORKFLOW_FRAME_FILES: dict[str, str] = {
+    "unit_summary": "unit_summary.csv",
+    "unit_metrics": "unit_metrics.csv",
+    "path_metrics": "path_metrics.csv",
+    "hierarchy_level_metrics": "hierarchy_level_metrics.csv",
+    "collapse_ranking": "collapse_ranking.csv",
+    "merge_tree": "merge_tree.csv",
+    "bubble_summary": "bubble_summary.csv",
+    "bubble_equivalent_metrics": "bubble_equivalent_metrics.csv",
+    "bubble_edge_resistance": "bubble_edge_resistance.csv",
+    "bubble_node_heads": "bubble_node_heads.csv",
+    "group_count_summary": "group_count_summary.csv",
+    "selected_groups": "selected_groups.csv",
+}
+
+
+def _load_unit_workflow_outputs(output_dir: str | Path) -> UnitWorkflowOutputs:
+    """Load a previously completed hierarchy bundle without recomputation."""
+    hierarchy_dir = Path(output_dir).resolve()
+    missing = [
+        hierarchy_dir / filename
+        for filename in _UNIT_WORKFLOW_FRAME_FILES.values()
+        if not (hierarchy_dir / filename).exists()
+    ]
+    manifest_path = hierarchy_dir / "unit_workflow_manifest.json"
+    if not manifest_path.exists():
+        missing.append(manifest_path)
+    if missing:
+        raise FileNotFoundError(
+            "Completed base hierarchy reuse is missing required artifacts: "
+            + ", ".join(str(path) for path in missing)
+        )
+    frames: dict[str, pd.DataFrame] = {}
+    for field, filename in _UNIT_WORKFLOW_FRAME_FILES.items():
+        try:
+            frames[field] = pd.read_csv(hierarchy_dir / filename)
+        except pd.errors.EmptyDataError:
+            # A few optional workflow products are legitimately empty and
+            # older writers represented those as a zero-byte CSV. Preserve
+            # that completed state instead of forcing an expensive rebuild.
+            frames[field] = pd.DataFrame()
+    return UnitWorkflowOutputs(**frames)
+
+
+def _copy_completed_base_state_products(
+    *,
+    source_variant_dir: str | Path,
+    destination_state_dir: Path,
+) -> UnitWorkflowOutputs | None:
+    """Copy hierarchy/hydraulic products when the source base is complete.
+
+    Older or deliberately minimal base sources remain supported: returning
+    ``None`` instructs the caller to rebuild those products as before.
+    """
+    source_state_dir = Path(source_variant_dir).resolve().parent
+    source_hierarchy = source_state_dir / "hierarchy"
+    source_hydraulic = source_state_dir / "hydraulic_context"
+    required = (
+        source_hierarchy / "unit_workflow_manifest.json",
+        *(source_hierarchy / filename for filename in _UNIT_WORKFLOW_FRAME_FILES.values()),
+        source_hydraulic / "link_hydraulic_context.csv",
+        source_hydraulic / "node_hydraulic_context.csv",
+        source_hydraulic / "hydraulic_context_manifest.json",
+    )
+    if not all(path.exists() for path in required):
+        return None
+
+    workflow = _load_unit_workflow_outputs(source_hierarchy)
+    shutil.copytree(
+        source_hierarchy,
+        destination_state_dir / "hierarchy",
+        dirs_exist_ok=True,
+    )
+    shutil.copytree(
+        source_hydraulic,
+        destination_state_dir / "hydraulic_context",
+        dirs_exist_ok=True,
+    )
+    return workflow
+
+
+def _source_experiment_dir_from_base_variant(source_variant_dir: str | Path) -> Path:
+    source = Path(source_variant_dir).resolve()
+    if source.name != "variant" or source.parent.name != "S000_base" or source.parent.parent.name != "states":
+        raise ValueError(
+            "Base-state reuse expects a canonical <experiment>/states/S000_base/variant directory: "
+            f"{source}"
+        )
+    return source.parent.parent.parent
+
+
 def _run_state_hydraulic_context(
     *,
     context: ExperimentStateContext,
@@ -3517,8 +3608,7 @@ def run_collapse_experiment(
     output_path = Path(output_dir) if output_dir is not None else _default_output_dir(cleaned_mask_path, experiment_id)
     boundary_component_output_dir = output_path / "boundary_components"
     if (
-        execution_mode == "panelized"
-        and base_state_variant_source_dir is not None
+        base_state_variant_source_dir is not None
         and boundary_component_artifact_source_dir is None
         and panelized_boundary_component_labels_path is None
     ):
@@ -3527,7 +3617,7 @@ def run_collapse_experiment(
         )
         if inferred_boundary_source is None:
             raise FileNotFoundError(
-                "Panelized base-state reuse could not find the source experiment's "
+                "Base-state reuse could not find the source experiment's "
                 "boundary_components directory. Pass "
                 "--panelized-boundary-component-labels explicitly or reuse a canonical "
                 "<experiment>/states/S000_base/variant directory."
@@ -3567,7 +3657,100 @@ def run_collapse_experiment(
             else None
         )
 
+    reused_base_experiment_dir: Path | None = None
+    reused_base_manifest: dict[str, Any] | None = None
+    if base_state_variant_source_dir is not None:
+        reused_base_experiment_dir = _source_experiment_dir_from_base_variant(
+            base_state_variant_source_dir
+        )
+        source_manifest_path = reused_base_experiment_dir / "experiment_manifest.json"
+        if source_manifest_path.exists():
+            reused_base_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+            source_roots = reused_base_manifest.get("root_paths", {})
+            requested_roots = {
+                "cleaned_mask": Path(cleaned_mask_path).resolve(),
+                "reviewed_links": Path(reviewed_links_path).resolve(),
+                "reviewed_nodes": Path(reviewed_nodes_path).resolve(),
+            }
+            mismatches: list[str] = []
+            for key, requested_path in requested_roots.items():
+                source_value = source_roots.get(key)
+                if source_value and Path(str(source_value)).resolve() != requested_path:
+                    mismatches.append(
+                        f"{key}: source={Path(str(source_value)).resolve()} requested={requested_path}"
+                    )
+            if mismatches:
+                raise ValueError(
+                    "Base-state source inputs do not match the requested experiment: "
+                    + "; ".join(mismatches)
+                )
+
+        source_reference = reused_base_experiment_dir / "reference_section"
+        if source_reference.is_dir():
+            shutil.copytree(
+                source_reference,
+                output_path / "reference_section",
+                dirs_exist_ok=True,
+            )
+        source_solver_cache = reused_base_experiment_dir / "equivalent_resistance" / "solve_cache"
+        if source_solver_cache.is_dir():
+            shutil.copytree(
+                source_solver_cache,
+                output_path / "equivalent_resistance" / "solve_cache",
+                dirs_exist_ok=True,
+            )
+
     active_equivalent_resistance_config = equivalent_resistance_config
+    if (
+        active_equivalent_resistance_config is not None
+        and active_equivalent_resistance_config.reference_kb_summary is None
+        and reused_base_manifest is not None
+    ):
+        source_hierarchy_options = reused_base_manifest.get("options", {}).get("hierarchy", {})
+        source_equivalent_config = source_hierarchy_options.get("equivalent_resistance_config")
+        source_reference_summary = source_hierarchy_options.get("equivalent_reference_kb_summary")
+        if source_equivalent_config is not None and source_reference_summary is not None:
+            comparison_fields = (
+                "resistance_law",
+                "geometry_method",
+                "kb_mode",
+                "default_chezy_cz",
+                "solver_backend",
+                "sparse_min_internal_nodes",
+            )
+            current_config = asdict(active_equivalent_resistance_config)
+            incompatible = [
+                field
+                for field in comparison_fields
+                if source_equivalent_config.get(field) != current_config.get(field)
+            ]
+            source_width_field = source_hierarchy_options.get(
+                "equivalent_kb_width_sample_field"
+            )
+            source_width_percentile = source_hierarchy_options.get(
+                "equivalent_kb_width_percentile"
+            )
+            if source_width_field != equivalent_kb_width_sample_field:
+                incompatible.append("equivalent_kb_width_sample_field")
+            if source_width_percentile != equivalent_kb_width_percentile:
+                incompatible.append("equivalent_kb_width_percentile")
+            if incompatible:
+                raise ValueError(
+                    "Base-state source equivalent-resistance configuration is incompatible "
+                    "with the requested run: " + ", ".join(sorted(set(incompatible)))
+                )
+            localized_reference_summary = dict(source_reference_summary)
+            local_reference_summary_path = (
+                output_path / "reference_section" / "reference_section_summary.json"
+            )
+            if local_reference_summary_path.exists():
+                localized_reference_summary["reference_section_summary_path"] = str(
+                    local_reference_summary_path.resolve()
+                )
+            active_equivalent_resistance_config = replace(
+                active_equivalent_resistance_config,
+                reference_kb_summary=localized_reference_summary,
+            )
     if (
         active_equivalent_resistance_config is not None
         and active_equivalent_resistance_config.solver_cache_dir is None
@@ -3619,19 +3802,43 @@ def run_collapse_experiment(
 
     base_state_id = "S000_base"
     _reset_state_dir(states_dir / base_state_id)
-    base_context = _run_state_hierarchy(
-        state_id=base_state_id,
-        parent_state_id=None,
-        depth=0,
-        state_dir=states_dir / base_state_id,
-        cleaned_mask_path=cleaned_mask_path,
-        reviewed_links_path=reviewed_links_path,
-        reviewed_nodes_path=reviewed_nodes_path,
-        selection=None,
-        unit_workflow_runner=unit_workflow_runner,
-        unit_workflow_writer=unit_workflow_writer,
-        unit_workflow_kwargs=unit_workflow_kwargs,
+    reused_base_workflow = (
+        _copy_completed_base_state_products(
+            source_variant_dir=base_state_variant_source_dir,
+            destination_state_dir=states_dir / base_state_id,
+        )
+        if base_state_variant_source_dir is not None
+        else None
     )
+    if reused_base_workflow is not None:
+        base_context = ExperimentStateContext(
+            state_id=base_state_id,
+            parent_state_id=None,
+            depth=0,
+            state_dir=states_dir / base_state_id,
+            hierarchy_output_dir=states_dir / base_state_id / "hierarchy",
+            cleaned_mask_path=Path(cleaned_mask_path),
+            reviewed_links_path=Path(reviewed_links_path),
+            reviewed_nodes_path=Path(reviewed_nodes_path),
+            workflow=reused_base_workflow,
+            analysis_links_path=Path(reviewed_links_path),
+            hydraulic_context_output_dir=states_dir / base_state_id / "hydraulic_context",
+            selection=None,
+        )
+    else:
+        base_context = _run_state_hierarchy(
+            state_id=base_state_id,
+            parent_state_id=None,
+            depth=0,
+            state_dir=states_dir / base_state_id,
+            cleaned_mask_path=cleaned_mask_path,
+            reviewed_links_path=reviewed_links_path,
+            reviewed_nodes_path=reviewed_nodes_path,
+            selection=None,
+            unit_workflow_runner=unit_workflow_runner,
+            unit_workflow_writer=unit_workflow_writer,
+            unit_workflow_kwargs=unit_workflow_kwargs,
+        )
     if base_state_variant_source_dir is not None:
         base_variant_outputs = _materialize_copied_base_state_variant(
             context=base_context,
@@ -3667,7 +3874,12 @@ def run_collapse_experiment(
         variant_output_dir=base_variant_outputs.output_dir,
         directed_links_path=base_variant_outputs.directed_links_path,
     )
-    if base_analysis_links_path != Path(base_variant_outputs.directed_links_path):
+    if reused_base_workflow is not None:
+        base_context.cleaned_mask_path = base_variant_outputs.collapsed_mask_path
+        base_context.reviewed_links_path = base_variant_outputs.directed_links_path
+        base_context.reviewed_nodes_path = base_variant_outputs.directed_nodes_path
+        base_context.analysis_links_path = base_analysis_links_path
+    elif base_analysis_links_path != Path(base_variant_outputs.directed_links_path):
         base_context = _run_state_hierarchy(
             state_id=base_state_id,
             parent_state_id=None,
@@ -3688,11 +3900,12 @@ def run_collapse_experiment(
         base_context.reviewed_nodes_path = base_variant_outputs.directed_nodes_path
         base_context.analysis_links_path = base_analysis_links_path
     base_context.variant_output_dir = base_variant_outputs.output_dir
-    base_context = _run_state_hydraulic_context(
-        context=base_context,
-        hydraulic_context_runner=state_hydraulic_context_runner,
-        hydraulic_context_kwargs=state_hydraulic_context_kwargs,
-    )
+    if reused_base_workflow is None:
+        base_context = _run_state_hydraulic_context(
+            context=base_context,
+            hydraulic_context_runner=state_hydraulic_context_runner,
+            hydraulic_context_kwargs=state_hydraulic_context_kwargs,
+        )
     if execution_mode == "panelized" and not base_only and variant_runner is generate_network_variant:
         child_boundary_labels = Path(panelized_boundary_component_labels_path) if panelized_boundary_component_labels_path else boundary_component_labels_path
         if child_boundary_labels is None:
@@ -3767,6 +3980,26 @@ def run_collapse_experiment(
             "n_equivalent_transitions_with_matches": n_equivalent_transitions_with_matches,
             "terminal_state_id": terminal_state_id,
             "stop_reason": stop_reason,
+            "base_state_reuse": {
+                "requested": base_state_variant_source_dir is not None,
+                "source_experiment_dir": (
+                    str(reused_base_experiment_dir)
+                    if reused_base_experiment_dir is not None
+                    else None
+                ),
+                "variant_reused": base_state_variant_source_dir is not None,
+                "hierarchy_reused": reused_base_workflow is not None,
+                "hydraulic_context_reused": reused_base_workflow is not None,
+                "boundary_components_reused": boundary_component_artifact_source_dir is not None,
+                "solver_cache_seeded": bool(
+                    reused_base_experiment_dir is not None
+                    and (
+                        reused_base_experiment_dir
+                        / "equivalent_resistance"
+                        / "solve_cache"
+                    ).is_dir()
+                ),
+            },
             "options": {
                 "hierarchy": {
                     "defer_child_hierarchy": bool(defer_child_hierarchy),
@@ -4487,7 +4720,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional completed experiment directory (or S000_base/variant directory) whose "
-            "base variant should be copied instead of recomputing base widths."
+            "base variant should be copied instead of recomputing base widths. When the source "
+            "also contains complete hierarchy and hydraulic-context bundles, those products, "
+            "boundary components, reference section, and solver cache are reused as well."
         ),
     )
     parser.add_argument(
