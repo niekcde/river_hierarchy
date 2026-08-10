@@ -234,6 +234,81 @@ def _solve_base_component_heads(
     return {node_id: float(solution[node_index[node_id]]) for node_id in node_ids}, anchor_node
 
 
+def _summarize_dag_path_drops(
+    graph: nx.DiGraph,
+    source: int,
+    target: int,
+) -> dict[str, float | int | bool | str] | None:
+    """Summarize every source-target path without materializing the paths.
+
+    For a directed acyclic graph, path count, total path-drop sum, and extrema
+    obey simple downstream recurrences.  The resulting count/min/max/mean are
+    exactly the statistics produced by explicit simple-path enumeration, but
+    runtime is bounded by the relevant subgraph rather than by its potentially
+    exponential number of paths.
+    """
+
+    source = int(source)
+    target = int(target)
+    if source == target or source not in graph or target not in graph:
+        return None
+    if not nx.has_path(graph, source, target):
+        return None
+
+    relevant_nodes = (
+        (nx.descendants(graph, source) | {source})
+        & (nx.ancestors(graph, target) | {target})
+    )
+    relevant = graph.subgraph(relevant_nodes)
+    if not nx.is_directed_acyclic_graph(relevant):
+        raise ValueError(
+            f"Cannot aggregate path-drop diagnostics for cyclic subgraph {source}->{target}."
+        )
+
+    path_count: dict[int, int] = {target: 1}
+    drop_sum: dict[int, float] = {target: 0.0}
+    drop_min: dict[int, float] = {target: 0.0}
+    drop_max: dict[int, float] = {target: 0.0}
+    for node_id in reversed(list(nx.topological_sort(relevant))):
+        node_id = int(node_id)
+        if node_id == target:
+            continue
+        count = 0
+        total = 0.0
+        minimum = float("inf")
+        maximum = float("-inf")
+        for successor in relevant.successors(node_id):
+            successor = int(successor)
+            successor_count = int(path_count.get(successor, 0))
+            if successor_count == 0:
+                continue
+            edge_drop = float(relevant[node_id][successor]["drop_m"])
+            count += successor_count
+            total += float(drop_sum[successor]) + edge_drop * successor_count
+            minimum = min(minimum, edge_drop + float(drop_min[successor]))
+            maximum = max(maximum, edge_drop + float(drop_max[successor]))
+        if count:
+            path_count[node_id] = count
+            drop_sum[node_id] = total
+            drop_min[node_id] = minimum
+            drop_max[node_id] = maximum
+
+    count = int(path_count.get(source, 0))
+    if count == 0:
+        return None
+    minimum = float(drop_min[source])
+    maximum = float(drop_max[source])
+    return {
+        "n_paths": count,
+        "drop_min_m": minimum,
+        "drop_max_m": maximum,
+        "drop_mean_m": float(drop_sum[source] / count),
+        "drop_spread_m": float(maximum - minimum),
+        "is_consistent": bool(np.isclose(minimum, maximum, rtol=1e-6, atol=1e-9)),
+        "summary_method": "dag_dynamic_programming",
+    }
+
+
 def _build_collapsed_unit_boundary_analysis(
     link_context: pd.DataFrame,
     *,
@@ -373,45 +448,20 @@ def _build_collapsed_unit_boundary_analysis(
                 drop_m=drop,
             )
 
-        base_path_drop_records: list[dict[str, object]] = []
-        base_drop_consistency: dict[str, dict[str, float | int | bool | None]] = {}
-        for source in base_unit_nodes:
-            for target in base_unit_nodes:
-                if source == target or source not in base_graph or target not in base_graph:
-                    continue
-                if not nx.has_path(base_graph, source, target):
-                    continue
-                pair_key = f"{source}->{target}"
-                pair_drops: list[float] = []
-                for node_path in nx.all_simple_paths(base_graph, source, target, cutoff=max(2, len(base_unit_nodes))):
-                    link_ids = [
-                        int(base_graph[us_node][ds_node]["id_link"])
-                        for us_node, ds_node in zip(node_path[:-1], node_path[1:], strict=False)
-                    ]
-                    drop_m = float(
-                        sum(base_graph[us_node][ds_node]["drop_m"] for us_node, ds_node in zip(node_path[:-1], node_path[1:], strict=False))
-                    )
-                    pair_drops.append(drop_m)
-                    base_path_drop_records.append(
-                        {
-                            "source_base_node": int(source),
-                            "target_base_node": int(target),
-                            "node_path": [int(node_id) for node_id in node_path],
-                            "link_path": link_ids,
-                            "drop_m": drop_m,
-                        }
-                    )
-                if pair_drops:
-                    drop_min = float(min(pair_drops))
-                    drop_max = float(max(pair_drops))
-                    base_drop_consistency[pair_key] = {
-                        "n_paths": int(len(pair_drops)),
-                        "drop_min_m": drop_min,
-                        "drop_max_m": drop_max,
-                        "drop_mean_m": float(np.mean(pair_drops)),
-                        "drop_spread_m": float(drop_max - drop_min),
-                        "is_consistent": bool(np.isclose(drop_min, drop_max, rtol=1e-6, atol=1e-9)),
-                    }
+        base_drop_consistency: dict[str, dict[str, float | int | bool | str]] = {}
+        # Only matched component boundaries constrain the child solve.  The old
+        # diagnostic considered every ordered pair of internal base nodes and
+        # explicitly listed every simple path, which becomes exponential for a
+        # large compound bubble.  Retain the exact path-drop statistics for the
+        # relevant boundary pairs using bounded DAG dynamic programming.
+        matched_base_boundary_nodes = sorted(
+            {int(parent_id) for _, parent_id in variant_boundary_pairs}
+        )
+        for source in matched_base_boundary_nodes:
+            for target in matched_base_boundary_nodes:
+                summary = _summarize_dag_path_drops(base_graph, source, target)
+                if summary is not None:
+                    base_drop_consistency[f"{source}->{target}"] = summary
 
         solved_base_heads, anchor_node = _solve_base_component_heads(
             base_component_links,

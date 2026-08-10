@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import geopandas as gpd
+import networkx as nx
 import pandas as pd
 import pytest
 from shapely.geometry import LineString, Point
@@ -11,9 +12,38 @@ from shapely.geometry import LineString, Point
 from network_variants.hydraulic_context import (
     SlopeConfig,
     _apply_collapsed_unit_head_solver,
+    _summarize_dag_path_drops,
     compute_hydraulic_context,
     generate_state_hydraulic_context,
 )
+
+
+def test_dag_path_drop_summary_matches_explicit_path_enumeration() -> None:
+    graph = nx.DiGraph()
+    graph.add_edge(0, 1, drop_m=1.0)
+    graph.add_edge(1, 3, drop_m=2.0)
+    graph.add_edge(0, 2, drop_m=4.0)
+    graph.add_edge(2, 3, drop_m=1.0)
+    graph.add_edge(0, 4, drop_m=2.0)
+    graph.add_edge(4, 2, drop_m=1.0)
+
+    explicit_drops = [
+        sum(
+            float(graph[upstream][downstream]["drop_m"])
+            for upstream, downstream in zip(path[:-1], path[1:], strict=False)
+        )
+        for path in nx.all_simple_paths(graph, 0, 3)
+    ]
+    summary = _summarize_dag_path_drops(graph, 0, 3)
+
+    assert summary is not None
+    assert summary["n_paths"] == len(explicit_drops) == 3
+    assert summary["drop_min_m"] == pytest.approx(min(explicit_drops))
+    assert summary["drop_max_m"] == pytest.approx(max(explicit_drops))
+    assert summary["drop_mean_m"] == pytest.approx(sum(explicit_drops) / len(explicit_drops))
+    assert summary["drop_spread_m"] == pytest.approx(max(explicit_drops) - min(explicit_drops))
+    assert summary["is_consistent"] is False
+    assert summary["summary_method"] == "dag_dynamic_programming"
 
 
 def _simple_nodes() -> gpd.GeoDataFrame:
