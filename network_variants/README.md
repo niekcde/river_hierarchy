@@ -331,6 +331,16 @@ the configured positive minimum slope. The link context records target paths,
 target slopes, optimized endpoint heads, and objective values before and after
 the solve.
 
+Base-component path-drop consistency is diagnostic and does not determine the
+node-head solution. It is evaluated only between base nodes that match the
+child component boundaries. For a directed acyclic component, path count and
+the minimum, maximum, mean, and spread of path drops are calculated exactly by
+DAG dynamic programming. Individual base paths are never materialized: their
+number can grow exponentially in a nested compound bubble. This bounded
+aggregation leaves the least-squares base heads, transferred child boundary
+heads, and path-relative child slope optimizer unchanged. The manifest records
+`summary_method=dag_dynamic_programming` with the aggregated diagnostics.
+
 The hydraulic context can also inherit slope from a family representative when
 width inheritance was applied to an anchored segmented stub. This is recorded
 with:
@@ -570,6 +580,30 @@ Example: materialize only the base directed state for review
 
 This writes `states/S000_base/` including the base directed links/nodes and
 hydraulic context, then stops before generating any unit or group child states.
+
+### Reusing a completed base state
+
+Full-raster and panelized child experiments can start from a completed base
+experiment with `--base-state-source`. Reuse is a complete base-state contract,
+not just a copy of the directed vectors. When available, the new experiment
+copies and reuses:
+
+- the `S000_base` variant, hierarchy tables, and hydraulic context
+- the experiment-level boundary-component artifacts
+- the reference-section products and equivalent-resistance solve cache
+
+The input mask, reviewed links, and reviewed nodes recorded by the source
+manifest must match the requested inputs. Equivalent-resistance solver, width,
+and geometry settings must also match before the reference section or cache is
+accepted. If an older source lacks a complete hierarchy or hydraulic bundle,
+the workflow falls back to rebuilding those products; it never silently treats
+a partial bundle as complete. Reuse decisions are recorded under
+`base_state_reuse` in `experiment_manifest.json`.
+
+This avoids repeating the expensive base hierarchy and resistance solve for an
+anchored run derived from an already completed realized base. Child states are
+still generated and solved normally; only their unchanged base context is
+reused.
 
 ### Recommended Parent Review Workflow
 
