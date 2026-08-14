@@ -341,6 +341,19 @@ aggregation leaves the least-squares base heads, transferred child boundary
 heads, and path-relative child slope optimizer unchanged. The manifest records
 `summary_method=dag_dynamic_programming` with the aggregated diagnostics.
 
+Compound-bubble slope QC is also bounded for derived states. A capped DAG path
+count is evaluated before any explicit path sequence is created; bubbles above
+`compound_bubble_max_paths_for_qc` therefore receive the same
+`path_limit_exceeded` result without first searching for 501 complete paths.
+When a parent hydraulic context is available, bubbles that do not touch a
+changed link or changed endpoint are not recalculated. Their QC fields and
+final slopes are inherited through the same strict, direction-consistent
+`unchanged_1to1` contract. A bubble that touches changed topology is still
+evaluated in full; unchanged links retain their parent final values afterward,
+matching the pre-optimization result contract. The per-state manifest records
+this under `compound_bubble_qc_scope`, and link-level provenance uses
+`bubble_slope_qc_recalculated` and `bubble_slope_qc_inherited`.
+
 The hydraulic context can also inherit slope from a family representative when
 width inheritance was applied to an anchored segmented stub. This is recorded
 with:
@@ -580,6 +593,44 @@ Example: materialize only the base directed state for review
 
 This writes `states/S000_base/` including the base directed links/nodes and
 hydraulic context, then stops before generating any unit or group child states.
+
+### Bounded local-patch child execution
+
+Completed anchored base states can generate independent-unit or
+compound-bubble children with the bounded local raster workflow:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  network_variants/run_collapse_experiment.py \
+  independent-units \
+  --cleaned-mask rivgraph_centerline/outputs/runs/56/masks_cleaned/56_cleaned.tif \
+  --reviewed-links rivgraph_centerline/outputs/runs/56/rivgraph/56_links.gpkg \
+  --reviewed-nodes rivgraph_centerline/outputs/runs/56/rivgraph/56_nodes.gpkg \
+  --exit-sides WN \
+  --experiment-id 56_indep_local_patch \
+  --output-dir network_variants/output/56_indep_local_patch \
+  --collapse-corridor-mode anchored \
+  --execution-mode local_patch
+```
+
+This mode is deliberately separate from `full_raster` and `panelized`. It
+recalculates RivGraph and raster-derived widths only inside a validated crop,
+merges that result into the complete parent graph, and then uses the normal
+hierarchy/hydraulic pipeline. Strict unchanged one-to-one links inherit their
+parent products. The published collapsed mask remains a genuine full-extent
+mask, written blockwise from the parent plus the local collapse edit.
+
+Safety is per child. If topology planning, crop validation, or conservative
+interface merging is unsafe or ambiguous, that child automatically uses the
+normal full-raster generator. The audit is written under
+`states/<state>/variant/local_patch_attempt/fallback_to_full_raster.json` and
+the fallback is recorded in `variant/summary/variant_manifest.json`.
+
+At present this execution mode supports only `independent-units` and
+`compound-bubbles`, and requires `--collapse-corridor-mode anchored`. Unlike
+the historical anchored CLI behavior, it does not first generate all realized
+children; only the requested anchored experiment is written (with the normal
+`__anchored` output suffix).
 
 ### Reusing a completed base state
 

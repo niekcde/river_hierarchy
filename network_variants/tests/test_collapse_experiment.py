@@ -2212,3 +2212,58 @@ def test_normalize_numeric_id_columns_coerces_base_link_ids_from_object() -> Non
     assert str(normalized["id_ds_node"].dtype) == "int64"
     assert normalized.loc[0, "id_us_node"] == 31
     assert normalized.loc[1, "id_ds_node"] == 36
+
+
+def test_local_patch_child_runner_returns_local_result_without_full_fallback(tmp_path: Path) -> None:
+    sentinel = object()
+    calls = {"local": 0, "full": 0}
+
+    def local_runner(**kwargs: Any):
+        calls["local"] += 1
+        return sentinel
+
+    def full_runner(**kwargs: Any):
+        calls["full"] += 1
+        raise AssertionError("full-raster fallback must not run for a successful local patch")
+
+    runner = collapse_experiment_module._make_local_patch_child_runner(
+        fallback_variant_runner=full_runner,
+        local_variant_runner=local_runner,
+    )
+
+    assert runner(output_dir=tmp_path / "variant") is sentinel
+    assert calls == {"local": 1, "full": 0}
+
+
+def test_local_patch_child_runner_audits_ambiguous_merge_and_falls_back(tmp_path: Path) -> None:
+    output_dir = tmp_path / "variant"
+    source_audit = output_dir / "local_patch_attempt" / "merge" / "merge_audit.json"
+    source_audit.parent.mkdir(parents=True)
+    source_audit.write_text("{}\n", encoding="utf-8")
+
+    def local_runner(**kwargs: Any):
+        raise collapse_experiment_module.LocalPatchFallbackRequested(
+            stage="merge",
+            code="ambiguous_interface",
+            reason="Two local terminals match the upstream cut.",
+            audit_path=source_audit,
+        )
+
+    def full_runner(**kwargs: Any):
+        summary_dir = output_dir / "summary"
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(output_dir=output_dir, manifest={"variant_id": "S001_unit_7"})
+
+    runner = collapse_experiment_module._make_local_patch_child_runner(
+        fallback_variant_runner=full_runner,
+        local_variant_runner=local_runner,
+    )
+    outputs = runner(output_dir=output_dir)
+
+    audit_path = output_dir / "local_patch_attempt" / "fallback_to_full_raster.json"
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert audit["execution_mode_used"] == "full_raster"
+    assert audit["fallback_stage"] == "merge"
+    assert audit["fallback_code"] == "ambiguous_interface"
+    assert outputs.manifest["execution_mode_requested"] == "local_patch"
+    assert outputs.manifest["local_patch_fallback_audit"] == str(audit_path.resolve())

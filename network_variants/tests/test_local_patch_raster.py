@@ -1,0 +1,209 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+from shapely.geometry import LineString, Point
+
+from network_variants.local_patch import (
+    LocalPatchCollar,
+    LocalPatchContract,
+    LocalPatchRasterPolicy,
+)
+from network_variants.local_patch_raster import _cut_center_points
+from network_variants.local_patch_raster import _resolve_main_bank_component_ids
+from network_variants.local_patch_raster import build_local_patch_base_raster
+
+
+def _write_raster(path: Path, values: np.ndarray, *, dtype: str) -> Path:
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=values.shape[0],
+        width=values.shape[1],
+        count=1,
+        dtype=dtype,
+        crs="EPSG:3857",
+        transform=from_origin(0, 100, 1, 1),
+        nodata=0,
+    ) as destination:
+        destination.write(values.astype(dtype), 1)
+    return path
+
+
+def _contract() -> LocalPatchContract:
+    return LocalPatchContract(
+        example_id="synthetic",
+        selection_type="unit",
+        selected_unit_ids=(1,),
+        domain_type="closed_unit",
+        core_link_ids=(2,),
+        upstream_collar=LocalPatchCollar(
+            role="upstream",
+            base_link_id=1,
+            base_upstream_node_id=10,
+            base_downstream_node_id=11,
+            domain_boundary_node_id=11,
+            outer_splice_anchor_node_id=10,
+        ),
+        downstream_collar=LocalPatchCollar(
+            role="downstream",
+            base_link_id=3,
+            base_upstream_node_id=12,
+            base_downstream_node_id=13,
+            domain_boundary_node_id=12,
+            outer_splice_anchor_node_id=13,
+        ),
+        raster_policy=LocalPatchRasterPolicy(
+            minimum_halo_m=10,
+            halo_expansion_step_m=10,
+            maximum_halo_m=10,
+            minimum_collar_context_m=10,
+        ),
+    )
+
+
+def _network() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    links = gpd.GeoDataFrame(
+        [
+            {"id_link": 1, "id_us_node": 10, "id_ds_node": 11, "geometry": LineString([(50, 80), (50, 65)])},
+            {"id_link": 2, "id_us_node": 11, "id_ds_node": 12, "geometry": LineString([(50, 65), (50, 35)])},
+            {"id_link": 3, "id_us_node": 12, "id_ds_node": 13, "geometry": LineString([(50, 35), (50, 20)])},
+        ],
+        crs="EPSG:3857",
+    )
+    nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 10, "geometry": Point(50, 80)},
+            {"id_node": 11, "geometry": Point(50, 65)},
+            {"id_node": 12, "geometry": Point(50, 35)},
+            {"id_node": 13, "geometry": Point(50, 20)},
+        ],
+        crs="EPSG:3857",
+    )
+    return links, nodes
+
+
+def test_short_collars_extend_to_minimum_reference_centerline_context() -> None:
+    links, nodes = _network()
+    contract = _contract()
+    contract = LocalPatchContract(
+        example_id=contract.example_id,
+        selection_type=contract.selection_type,
+        selected_unit_ids=contract.selected_unit_ids,
+        domain_type=contract.domain_type,
+        core_link_ids=contract.core_link_ids,
+        upstream_collar=contract.upstream_collar,
+        downstream_collar=contract.downstream_collar,
+        raster_policy=LocalPatchRasterPolicy(
+            minimum_halo_m=10,
+            halo_expansion_step_m=10,
+            maximum_halo_m=10,
+            minimum_collar_context_m=20,
+        ),
+    )
+    source, sink = _cut_center_points(
+        nodes=nodes,
+        links=links,
+        contract=contract,
+        reference_centerline=LineString([(50, 0), (50, 100)]),
+    )
+    assert source[1:] == (20.0, True)
+    assert sink[1:] == (20.0, True)
+    assert source[0].equals_exact(Point(50, 85), 1e-9)
+    assert sink[0].equals_exact(Point(50, 15), 1e-9)
+
+
+def test_main_bank_summary_ignores_macos_sidecar(tmp_path) -> None:
+    water, land = _base_arrays()
+    mask_path = _write_raster(tmp_path / "mask.tif", water, dtype="uint8")
+    labels_path = _write_raster(tmp_path / "labels.tif", land, dtype="int32")
+    (tmp_path / "._land_component_summary.csv").write_bytes(b"\x00\x05\xb0invalid metadata")
+    (tmp_path / "land_component_summary.csv").write_text(
+        "raster_value,n_pixels\n3,4000\n2,3900\n4,20\n",
+        encoding="utf-8",
+    )
+
+    with rasterio.open(labels_path) as labels_source, rasterio.open(mask_path) as mask_source:
+        assert _resolve_main_bank_component_ids(labels_source, mask_source) == (2, 3)
+
+
+def _base_arrays(*, lateral_branch: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    water = np.zeros((100, 100), dtype=np.uint8)
+    water[:, 48:52] = 1
+    if lateral_branch:
+        water[48:52, 50:] = 1
+    land = np.zeros((100, 100), dtype=np.int32)
+    land[:, :48] = 1
+    land[:, 52:] = 2
+    if lateral_branch:
+        land[48:52, 52:] = 0
+    return water, land
+
+
+def test_build_local_patch_base_raster_accepts_two_crossings_and_stable_banks(
+    tmp_path,
+) -> None:
+    water, land = _base_arrays()
+    mask_path = _write_raster(tmp_path / "mask.tif", water, dtype="uint8")
+    labels_path = _write_raster(tmp_path / "labels.tif", land, dtype="int32")
+    links, nodes = _network()
+
+    result = build_local_patch_base_raster(
+        contract=_contract(),
+        full_links=links,
+        full_nodes=nodes,
+        cleaned_mask_path=mask_path,
+        boundary_component_labels_path=labels_path,
+        output_dir=tmp_path / "output",
+    )
+
+    assert result.is_safe
+    selected = result.selected_attempt
+    assert selected is not None
+    assert len(selected.crossings) == 2
+    assert {crossing.assigned_role for crossing in selected.crossings} == {
+        "upstream",
+        "downstream",
+    }
+    assert {crossing.bank_component_ids for crossing in selected.crossings} == {(1, 2)}
+    assert selected.unauthorized_boundary_section_count == 0
+    assert selected.cuts_contained_in_crop == (True, True)
+    assert len(selected.bank_cuts) == 2
+    assert all(
+        cut.geometry.distance(Point(cut.anchor_x, cut.anchor_y)) <= 1e-9
+        for cut in selected.bank_cuts
+    )
+    assert selected.full_raster_fraction < 0.3
+    for output_path in result.output_paths.values():
+        assert Path(output_path).exists()
+
+
+def test_build_local_patch_base_raster_rejects_an_extra_connected_water_crossing(
+    tmp_path,
+) -> None:
+    water, land = _base_arrays(lateral_branch=True)
+    mask_path = _write_raster(tmp_path / "mask.tif", water, dtype="uint8")
+    labels_path = _write_raster(tmp_path / "labels.tif", land, dtype="int32")
+    links, nodes = _network()
+
+    result = build_local_patch_base_raster(
+        contract=_contract(),
+        full_links=links,
+        full_nodes=nodes,
+        cleaned_mask_path=mask_path,
+        boundary_component_labels_path=labels_path,
+        output_dir=tmp_path / "output",
+    )
+
+    assert not result.is_safe
+    assert result.status == "fallback_full_raster"
+    assert result.selected_attempt_index is None
+    assert result.attempts[-1].reason_codes == (
+        "unauthorized_main_water_crop_edge_contact",
+    )
+    assert (tmp_path / "output/local_patch_raster_plan.json").exists()
