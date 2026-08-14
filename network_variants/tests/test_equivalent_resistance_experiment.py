@@ -369,6 +369,47 @@ def test_run_equivalent_resistance_experiment_detects_expanded_boundaries(tmp_pa
     assert (output_dir / "equivalent_resistance_manifest.json").exists()
 
 
+def test_nominal_boundaries_win_when_only_internal_target_nodes_disappear(tmp_path: Path) -> None:
+    experiment_dir = _build_synthetic_experiment(tmp_path)
+    base_state = experiment_dir / "states" / "S000_base"
+
+    unit_summary_path = base_state / "hierarchy" / "unit_summary.csv"
+    unit_summary = pd.read_csv(unit_summary_path)
+    unit_summary.loc[unit_summary["unit_id"].eq(99), "bifurcation"] = 1
+    unit_summary.loc[unit_summary["unit_id"].eq(99), "confluence"] = 4
+    unit_summary.to_csv(unit_summary_path, index=False)
+
+    pd.DataFrame(
+        [
+            {"unit_id": 99, "id_link": link_id, "path_ids": "1", "n_paths_through_link": 1}
+            for link_id in (10, 11, 12, 13)
+        ]
+    ).to_csv(
+        base_state / "variant" / "summary" / "unit_link_membership.csv",
+        index=False,
+    )
+
+    results = run_equivalent_resistance_experiment(
+        experiment_dir,
+        equivalent_resistance_config=BubbleEquivalentResistanceConfig(
+            resistance_law="manning",
+            geometry_method="wide",
+            kb_mode="fixed",
+            kb_value=20.0,
+            default_manning_n=0.035,
+        ),
+    )
+
+    child = results.child_realized_objects.iloc[0]
+    assert int(child["child_boundary_match_upstream_parent_node"]) == 1
+    assert int(child["child_boundary_match_downstream_parent_node"]) == 4
+    assert int(child["child_upstream_node"]) == 100
+    assert int(child["child_downstream_node"]) == 101
+    assert child["matched_parent_node_path"] == "1,2,3,4"
+    assert bool(child["boundaries_match_nominal_target"]) is True
+    assert child["boundary_relation"] == "exact_match"
+
+
 def test_run_equivalent_resistance_experiment_recovers_component_from_unstable_node_match(tmp_path: Path) -> None:
     experiment_dir = _build_synthetic_unstable_node_experiment(tmp_path)
 

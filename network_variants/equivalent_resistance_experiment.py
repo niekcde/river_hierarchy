@@ -1311,7 +1311,23 @@ def _resolve_child_objects(
         stable_parent_to_child = _build_parent_to_child_stable_matches(node_match)
         stable_parent_node_ids = set(stable_parent_to_child)
         missing_target_parent_nodes = target_parent_node_ids.difference(stable_parent_node_ids)
-        if missing_target_parent_nodes:
+        nominal_upstream_node = _optional_int(target.nominal_upstream_node)
+        nominal_downstream_node = _optional_int(target.nominal_downstream_node)
+
+        # Prefer the target's own boundaries whenever both survived matching.
+        # A collapse of a compound/nested unit commonly removes its internal
+        # nodes while retaining its inlet and outlet. Treating those internal
+        # removals as a reason to replace nominal endpoints yields a small,
+        # non-comparable residual corridor rather than the full target.
+        if (
+            nominal_upstream_node is not None
+            and nominal_downstream_node is not None
+            and nominal_upstream_node in stable_parent_node_ids
+            and nominal_downstream_node in stable_parent_node_ids
+        ):
+            parent_upstream_anchor = nominal_upstream_node
+            parent_downstream_anchor = nominal_downstream_node
+        elif missing_target_parent_nodes:
             parent_upstream_anchor = _find_nearest_parent_anchor_from_missing(
                 base_digraph,
                 missing_parent_nodes=missing_target_parent_nodes,
@@ -1324,6 +1340,12 @@ def _resolve_child_objects(
                 stable_parent_nodes=stable_parent_node_ids,
                 direction="downstream",
             )
+
+        else:
+            parent_upstream_anchor = None
+            parent_downstream_anchor = None
+
+        if parent_upstream_anchor is not None and parent_downstream_anchor is not None:
             child_upstream_node, child_downstream_node, corridor_links = _select_child_anchor_pair(
                 child_links=child_links,
                 parent_to_child_matches=stable_parent_to_child,
