@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import OptimizeResult
 
+from network_variants import adaptive_routing_solver
 from network_variants.width_solver_comparison import (
     AdaptiveSolverConfig,
     _evaluate_method,
@@ -55,6 +57,87 @@ def test_adaptive_solver_uses_positive_soft_compromise_when_fixed_sibling_consum
     assert np.isfinite(scale)
     assert 0.05 <= scale < 1.0
     assert float(solved.loc[solved["id_link"].eq(3), "comparison_scale_factor"].iloc[0]) == 1.0
+
+
+def test_adaptive_solver_accepts_only_converged_improving_line_search_stall(monkeypatch) -> None:
+    links = pd.DataFrame(
+        {
+            "id_link": [1, 2],
+            "id_us_node": [0, 1],
+            "id_ds_node": [1, 2],
+            "wid_adj_wet": [100.0, 200.0],
+            "routing_context_width_us": [100.0, 200.0],
+            "routing_context_width_ds": [100.0, 200.0],
+            "width_model_prediction": [0, 1],
+            "width_model_probability": [0.0, 0.99],
+            "width_model_threshold": [0.45, 0.45],
+            "upstream_continuity_abs_deviation": [0.0, 1.0],
+            "opposition_cos_trimmed_mean": [-1.0, 0.8],
+        }
+    )
+
+    def stalled_minimize(objective, initial, **kwargs):
+        solution = np.asarray([-0.5])
+        return OptimizeResult(
+            success=False,
+            message="ABNORMAL_TERMINATION_IN_LNSRCH",
+            x=solution,
+            fun=objective(solution),
+            jac=np.asarray([2e-8]),
+            nit=6,
+        )
+
+    monkeypatch.setattr(adaptive_routing_solver, "minimize", stalled_minimize)
+    solved, diagnostics = adaptive_routing_solver.solve_adaptive_two_ended(
+        links, config=AdaptiveSolverConfig()
+    )
+
+    assert diagnostics["success"] is True
+    assert diagnostics["optimizer_success"] is False
+    assert diagnostics["numerical_stagnation_accepted"] is True
+    candidate = solved.loc[solved["id_link"].eq(2)].iloc[0]
+    assert candidate["comparison_status"] == "accepted_numerical_stagnation"
+    assert candidate["comparison_scale_factor"] == np.exp(-0.5)
+
+
+def test_adaptive_solver_rejects_line_search_stall_with_large_gradient(monkeypatch) -> None:
+    links = pd.DataFrame(
+        {
+            "id_link": [1, 2],
+            "id_us_node": [0, 1],
+            "id_ds_node": [1, 2],
+            "wid_adj_wet": [100.0, 200.0],
+            "routing_context_width_us": [100.0, 200.0],
+            "routing_context_width_ds": [100.0, 200.0],
+            "width_model_prediction": [0, 1],
+            "width_model_probability": [0.0, 0.99],
+            "width_model_threshold": [0.45, 0.45],
+            "upstream_continuity_abs_deviation": [0.0, 1.0],
+            "opposition_cos_trimmed_mean": [-1.0, 0.8],
+        }
+    )
+
+    def stalled_minimize(objective, initial, **kwargs):
+        solution = np.asarray([-0.5])
+        return OptimizeResult(
+            success=False,
+            message="ABNORMAL_TERMINATION_IN_LNSRCH",
+            x=solution,
+            fun=objective(solution),
+            jac=np.asarray([1e-2]),
+            nit=6,
+        )
+
+    monkeypatch.setattr(adaptive_routing_solver, "minimize", stalled_minimize)
+    solved, diagnostics = adaptive_routing_solver.solve_adaptive_two_ended(
+        links, config=AdaptiveSolverConfig()
+    )
+
+    assert diagnostics["success"] is False
+    assert diagnostics["numerical_stagnation_accepted"] is False
+    candidate = solved.loc[solved["id_link"].eq(2)].iloc[0]
+    assert candidate["comparison_status"] == "unresolved_retain_raw_flag"
+    assert candidate["comparison_scale_factor"] == 1.0
 
 
 def test_evaluation_keeps_equal_node_ids_in_different_examples_independent() -> None:

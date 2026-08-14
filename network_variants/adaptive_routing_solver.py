@@ -8,7 +8,7 @@ import pandas as pd
 from scipy.optimize import minimize
 
 
-ADAPTIVE_ROUTING_SOLVER_VERSION = "adaptive-two-ended-routing-v1"
+ADAPTIVE_ROUTING_SOLVER_VERSION = "adaptive-two-ended-routing-v2"
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,74 @@ class AdaptiveSolverConfig:
     hard_min_scale: float = 0.05
     hard_max_scale: float = 8.0
     max_iterations: int = 2000
+    numerical_stagnation_gradient_tolerance: float = 1e-6
+
+
+_ACCEPTABLE_NUMERICAL_STAGNATION_MESSAGES = (
+    "ABNORMAL_TERMINATION_IN_LNSRCH",
+    "ABNORMAL: TERMINATION IN LNSRCH",
+)
+
+
+def _accept_numerically_stalled_solution(
+    result: Any,
+    *,
+    initial_objective: float,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    config: AdaptiveSolverConfig,
+) -> tuple[bool, dict[str, Any]]:
+    """Accept only a finite, improving, converged L-BFGS line-search stall.
+
+    SciPy can report ``ABNORMAL_TERMINATION_IN_LNSRCH`` after L-BFGS-B has
+    already reached a numerical optimum.  This postcondition deliberately
+    does not convert arbitrary optimizer failures into successful solves.
+    """
+    values = np.asarray(getattr(result, "x", ()), dtype=float)
+    gradient = np.asarray(getattr(result, "jac", ()), dtype=float)
+    objective_value = float(getattr(result, "fun", np.nan))
+    message = str(getattr(result, "message", ""))
+    recognized_stall = any(
+        token in message.upper()
+        for token in _ACCEPTABLE_NUMERICAL_STAGNATION_MESSAGES
+    )
+    finite_solution = (
+        values.shape == lower.shape
+        and np.isfinite(values).all()
+        and np.isfinite(objective_value)
+    )
+    within_bounds = bool(
+        finite_solution
+        and np.all(values >= lower - 1e-10)
+        and np.all(values <= upper + 1e-10)
+    )
+    gradient_inf_norm = (
+        float(np.max(np.abs(gradient)))
+        if gradient.shape == values.shape and gradient.size and np.isfinite(gradient).all()
+        else np.inf
+    )
+    improvement_tolerance = max(1e-12, abs(float(initial_objective)) * 1e-10)
+    objective_improvement = float(initial_objective) - objective_value
+    accepted = bool(
+        not bool(getattr(result, "success", False))
+        and recognized_stall
+        and within_bounds
+        and gradient_inf_norm <= float(config.numerical_stagnation_gradient_tolerance)
+        and objective_improvement > improvement_tolerance
+    )
+    return accepted, {
+        "recognized_numerical_stagnation": bool(recognized_stall),
+        "finite_solution": bool(finite_solution),
+        "within_bounds": bool(within_bounds),
+        "gradient_inf_norm": (
+            gradient_inf_norm if np.isfinite(gradient_inf_norm) else None
+        ),
+        "initial_objective": float(initial_objective),
+        "objective_improvement": (
+            objective_improvement if np.isfinite(objective_improvement) else None
+        ),
+        "numerical_stagnation_accepted": accepted,
+    }
 
 
 def _clip01(values: pd.Series | np.ndarray) -> np.ndarray:
@@ -183,6 +251,7 @@ def solve_adaptive_two_ended(
 
     lower = np.log(evidence["adaptive_min_scale"].to_numpy(float))
     upper = np.log(evidence["adaptive_max_scale"].to_numpy(float))
+    initial_objective = float(objective(np.zeros(len(candidate_positions), dtype=float)))
     result = minimize(
         objective,
         np.zeros(len(candidate_positions), dtype=float),
@@ -190,10 +259,24 @@ def solve_adaptive_two_ended(
         bounds=list(zip(lower, upper)),
         options={"maxiter": int(config.max_iterations), "ftol": 1e-12, "gtol": 1e-8},
     )
+    stalled_solution_accepted, convergence_diagnostics = _accept_numerically_stalled_solution(
+        result,
+        initial_objective=initial_objective,
+        lower=lower,
+        upper=upper,
+        config=config,
+    )
     scales = np.ones(len(frame), dtype=float)
-    if result.success and np.isfinite(result.fun):
+    solution_accepted = bool(
+        (result.success and np.isfinite(result.fun)) or stalled_solution_accepted
+    )
+    if solution_accepted:
         scales[candidate_positions] = np.exp(result.x)
-        status = "optimized"
+        status = (
+            "accepted_numerical_stagnation"
+            if stalled_solution_accepted
+            else "optimized"
+        )
     else:
         status = "unresolved_retain_raw_flag"
 
@@ -210,10 +293,13 @@ def solve_adaptive_two_ended(
     frame.loc[adaptive_flag, "comparison_status"] = "adaptive_partial_correction_flag"
     frame["comparison_objective"] = float(result.fun) if np.isfinite(result.fun) else np.nan
     return frame, {
-        "success": bool(result.success),
+        "success": solution_accepted,
+        "optimizer_success": bool(result.success),
+        "acceptance_status": status,
         "message": str(result.message),
         "iterations": int(getattr(result, "nit", 0)),
         "objective": float(result.fun) if np.isfinite(result.fun) else None,
         "candidate_count": int(len(candidate_positions)),
         "adaptive_flag_count": int(adaptive_flag.sum()),
+        **convergence_diagnostics,
     }
