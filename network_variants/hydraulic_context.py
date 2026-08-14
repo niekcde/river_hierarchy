@@ -93,7 +93,22 @@ COMPOUND_BUBBLE_QC_COLUMNS: dict[str, object] = {
     "bubble_path_drop_max_abs_error_m": np.nan,
     "bubble_path_drop_max_rel_error": np.nan,
     "bubble_path_drop_qc_failed": False,
+    "bubble_slope_qc_recalculated": False,
+    "bubble_slope_qc_inherited": False,
 }
+
+COMPOUND_BUBBLE_QC_INHERIT_COLUMNS = tuple(
+    column
+    for column in COMPOUND_BUBBLE_QC_COLUMNS
+    if column
+    not in {
+        "compound_bubble_id_link",
+        "bubble_entry_node_id",
+        "bubble_exit_node_id",
+        "bubble_slope_qc_recalculated",
+        "bubble_slope_qc_inherited",
+    }
+)
 
 COLLAPSED_PARENT_PROFILE_COLUMNS: dict[str, object] = {
     "collapsed_profile_repair_candidate": False,
@@ -112,6 +127,13 @@ def _safe_float(value: object) -> float | None:
     if pd.isna(numeric):
         return None
     return float(numeric)
+
+
+def _safe_int(value: object) -> int | None:
+    numeric = _safe_float(value)
+    if numeric is None or not float(numeric).is_integer():
+        return None
+    return int(numeric)
 
 
 def _load_unit_summary_if_exists(hierarchy_output_dir: str | Path | None) -> pd.DataFrame | None:
@@ -309,21 +331,93 @@ def _summarize_dag_path_drops(
     }
 
 
+def _count_dag_edge_paths_capped(
+    graph: nx.MultiDiGraph,
+    source: int,
+    target: int,
+    *,
+    cap: int,
+) -> int:
+    """Count source-target edge paths in a DAG, stopping at ``cap + 1``.
+
+    Parallel links count as distinct edge paths, matching
+    :func:`networkx.all_simple_edge_paths`.  Returning ``cap + 1`` means only
+    that the true count exceeds the configured diagnostic limit.
+    """
+
+    if cap <= 0:
+        raise ValueError("Path-count cap must be positive.")
+    source = int(source)
+    target = int(target)
+    if source == target or source not in graph or target not in graph:
+        return 0
+    relevant_nodes = (
+        (nx.descendants(graph, source) | {source})
+        & (nx.ancestors(graph, target) | {target})
+    )
+    relevant = graph.subgraph(relevant_nodes)
+    if not nx.is_directed_acyclic_graph(relevant):
+        raise ValueError(
+            f"Cannot count source-target paths for cyclic subgraph {source}->{target}."
+        )
+
+    limit = int(cap) + 1
+    counts: dict[int, int] = {target: 1}
+    for node_id in reversed(list(nx.topological_sort(relevant))):
+        node_id = int(node_id)
+        if node_id == target:
+            continue
+        count = 0
+        for successor in relevant.successors(node_id):
+            successor = int(successor)
+            successor_count = int(counts.get(successor, 0))
+            if successor_count == 0:
+                continue
+            count += int(relevant.number_of_edges(node_id, successor)) * successor_count
+            if count >= limit:
+                count = limit
+                break
+        if count:
+            counts[node_id] = count
+    return int(counts.get(source, 0))
+
+
 def _build_collapsed_unit_boundary_analysis(
     link_context: pd.DataFrame,
     *,
     links_path: Path,
+    collapse_components_path: str | Path | None = None,
+    node_match_path: str | Path | None = None,
+    base_link_context_path: str | Path | None = None,
+    base_node_context_path: str | Path | None = None,
 ) -> list[dict[str, object]]:
-    state_dir = _infer_state_dir_from_links_path(links_path)
-    if state_dir is None or state_dir.name == "S000_base":
-        return []
-
-    collapse_components_path = state_dir / "variant" / "summary" / "collapse_components.csv"
-    node_match_path = state_dir / "variant" / "matching" / "node_match.csv"
-    experiment_dir = state_dir.parent.parent
-    base_state_dir = experiment_dir / "states" / "S000_base"
-    base_link_context_path = base_state_dir / "hydraulic_context" / "link_hydraulic_context.csv"
-    base_node_context_path = base_state_dir / "hydraulic_context" / "node_hydraulic_context.csv"
+    supplied_context_paths = (
+        collapse_components_path,
+        node_match_path,
+        base_link_context_path,
+        base_node_context_path,
+    )
+    explicit_paths = all(value is not None for value in supplied_context_paths)
+    if any(value is not None for value in supplied_context_paths) and not explicit_paths:
+        raise ValueError(
+            "Explicit collapsed-unit analysis requires collapse components, node match, "
+            "base link context, and base node context together."
+        )
+    if explicit_paths:
+        collapse_components_path = Path(collapse_components_path).expanduser().resolve()
+        node_match_path = Path(node_match_path).expanduser().resolve()
+        base_link_context_path = Path(base_link_context_path).expanduser().resolve()
+        base_node_context_path = Path(base_node_context_path).expanduser().resolve()
+    else:
+        state_dir = _infer_state_dir_from_links_path(links_path)
+        if state_dir is None or state_dir.name == "S000_base":
+            return []
+        collapse_components_path = state_dir / "variant" / "summary" / "collapse_components.csv"
+        node_match_path = state_dir / "variant" / "matching" / "node_match.csv"
+        experiment_dir = state_dir.parent.parent
+        base_state_dir = experiment_dir / "states" / "S000_base"
+        base_link_context_path = base_state_dir / "hydraulic_context" / "link_hydraulic_context.csv"
+        base_node_context_path = base_state_dir / "hydraulic_context" / "node_hydraulic_context.csv"
     if not (
         collapse_components_path.exists()
         and node_match_path.exists()
@@ -1483,21 +1577,49 @@ def _apply_parent_slope_inheritance(
     child["dominant_parent_overlap_fraction"] = pd.to_numeric(
         child["dominant_parent_overlap_fraction"], errors="coerce"
     )
+    parent_to_child_node: dict[int, int] = {}
+    for child_row in links.itertuples(index=False):
+        child_us = _safe_int(getattr(child_row, "id_us_node", None))
+        child_ds = _safe_int(getattr(child_row, "id_ds_node", None))
+        parent_us = _safe_int(getattr(child_row, "matched_parent_us_node", None))
+        parent_ds = _safe_int(getattr(child_row, "matched_parent_ds_node", None))
+        if child_us is not None and parent_us is not None:
+            parent_to_child_node.setdefault(parent_us, child_us)
+        if child_ds is not None and parent_ds is not None:
+            parent_to_child_node.setdefault(parent_ds, child_ds)
 
     parent_columns = ["id_link", "id_us_node", "id_ds_node", "slope_used"]
     for optional_column in ("slope_source_method", "slope_reason", "slope_minimum_applied"):
         if optional_column in parent_link_context.columns:
             parent_columns.append(optional_column)
-    parent = parent_link_context[parent_columns].copy().rename(
-        columns={
-            "id_link": "parent_id_link",
-            "id_us_node": "parent_id_us_node",
-            "id_ds_node": "parent_id_ds_node",
-            "slope_used": "parent_slope_used",
-            "slope_source_method": "parent_slope_source_method",
-            "slope_reason": "parent_slope_reason",
-            "slope_minimum_applied": "parent_slope_minimum_applied",
+    inherited_qc_columns = [
+        column
+        for column in COMPOUND_BUBBLE_QC_INHERIT_COLUMNS
+        if column in parent_link_context.columns
+    ]
+    inherited_node_qc_columns = [
+        column
+        for column in ("bubble_entry_node_id", "bubble_exit_node_id")
+        if column in parent_link_context.columns
+    ]
+    parent_columns.extend(inherited_qc_columns + inherited_node_qc_columns)
+    rename_columns = {
+        "id_link": "parent_id_link",
+        "id_us_node": "parent_id_us_node",
+        "id_ds_node": "parent_id_ds_node",
+        "slope_used": "parent_slope_used",
+        "slope_source_method": "parent_slope_source_method",
+        "slope_reason": "parent_slope_reason",
+        "slope_minimum_applied": "parent_slope_minimum_applied",
+    }
+    rename_columns.update(
+        {
+            column: f"parent_qc__{column}"
+            for column in inherited_qc_columns + inherited_node_qc_columns
         }
+    )
+    parent = parent_link_context[parent_columns].copy().rename(
+        columns=rename_columns
     )
     for column in ("parent_id_link", "parent_id_us_node", "parent_id_ds_node"):
         parent[column] = pd.to_numeric(parent[column], errors="coerce").astype("Int64")
@@ -1586,6 +1708,19 @@ def _apply_parent_slope_inheritance(
         result.at[result_index, "slope_parent_inheritance_applied"] = True
         result.at[result_index, "slope_inherited_from_parent_link"] = parent_link_id
         result.at[result_index, "slope_parent_inheritance_reason"] = "inherited_from_parent_unchanged_1to1"
+        for column in inherited_qc_columns:
+            parent_column = f"parent_qc__{column}"
+            if parent_column in row.index:
+                result.at[result_index, column] = row[parent_column]
+        for node_column in ("bubble_entry_node_id", "bubble_exit_node_id"):
+            parent_column = f"parent_qc__{node_column}"
+            parent_node = _safe_int(row.get(parent_column))
+            child_node = parent_to_child_node.get(parent_node) if parent_node is not None else None
+            if child_node is not None:
+                result.at[result_index, node_column] = int(child_node)
+        if inherited_qc_columns:
+            result.at[result_index, "bubble_slope_qc_inherited"] = True
+            result.at[result_index, "bubble_slope_qc_recalculated"] = False
         applied_link_ids.append(link_id)
 
     untouched = result["slope_parent_inheritance_reason"].eq("")
@@ -2668,6 +2803,8 @@ def _apply_compound_bubble_qc(
     node_attrs: pd.DataFrame,
     unit_summary: pd.DataFrame | None,
     config: SlopeConfig,
+    recalculation_link_ids: set[int] | None = None,
+    recalculation_node_ids: set[int] | None = None,
 ) -> pd.DataFrame:
     if not bool(config.use_compound_bubble_slope_qc):
         return _initialize_compound_bubble_qc_columns(frame, default_reason="disabled")
@@ -2735,6 +2872,23 @@ def _apply_compound_bubble_qc(
             result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "ambiguous_link_assignment"
             continue
 
+        if recalculation_link_ids is not None or recalculation_node_ids is not None:
+            candidate_link_ids = {
+                int(value)
+                for value in result.loc[unique_candidate_indices, "id_link"].tolist()
+            }
+            touches_changed_link = bool(
+                candidate_link_ids.intersection(recalculation_link_ids or set())
+            )
+            touches_changed_node = bool(node_ids.intersection(recalculation_node_ids or set()))
+            if not touches_changed_link and not touches_changed_node:
+                result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = (
+                    "deferred_parent_inheritance"
+                )
+                continue
+
+        result.loc[unique_candidate_indices, "bubble_slope_qc_recalculated"] = True
+
         bubble_links = result.loc[unique_candidate_indices].copy()
         internal_node_ids = set(bubble_links["id_us_node"].tolist()) | set(bubble_links["id_ds_node"].tolist())
         incoming_boundary_nodes = sorted(
@@ -2797,18 +2951,21 @@ def _apply_compound_bubble_qc(
             result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "nonpositive_reference_dist_span"
             continue
 
-        path_link_sequences: list[list[int]] = []
         max_paths = int(config.compound_bubble_max_paths_for_qc)
-        path_limit_exceeded = False
-        for path_index, edge_path in enumerate(nx.all_simple_edge_paths(internal_graph, entry_node, exit_node), start=1):
-            if path_index > max_paths:
-                path_limit_exceeded = True
-                break
-            path_link_sequences.append([int(link_key) for _, _, link_key in edge_path])
-        if path_limit_exceeded:
+        path_count = _count_dag_edge_paths_capped(
+            internal_graph,
+            entry_node,
+            exit_node,
+            cap=max_paths,
+        )
+        if path_count > max_paths:
             result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "path_limit_exceeded"
             result.loc[unique_candidate_indices, "bubble_n_paths_checked"] = int(max_paths)
             continue
+        path_link_sequences = [
+            [int(link_key) for _, _, link_key in edge_path]
+            for edge_path in nx.all_simple_edge_paths(internal_graph, entry_node, exit_node)
+        ]
         if not path_link_sequences:
             result.loc[unique_candidate_indices, "bubble_slope_qc_reason"] = "no_entry_exit_path"
             continue
@@ -2948,6 +3105,8 @@ def compute_hydraulic_context(
     *,
     unit_summary: pd.DataFrame | None = None,
     config: SlopeConfig | None = None,
+    compound_bubble_recalculation_link_ids: set[int] | None = None,
+    compound_bubble_recalculation_node_ids: set[int] | None = None,
 ) -> HydraulicContextResult:
     """Compute node profile context and link slope context for a realized network state."""
     config = config or SlopeConfig()
@@ -3146,6 +3305,8 @@ def compute_hydraulic_context(
         node_attrs=node_attrs,
         unit_summary=unit_summary,
         config=config,
+        recalculation_link_ids=compound_bubble_recalculation_link_ids,
+        recalculation_node_ids=compound_bubble_recalculation_node_ids,
     )
 
     section_slope_summary = {
@@ -3202,6 +3363,83 @@ def compute_section_slope_reference(
     }
 
 
+def _changed_child_topology_scope(
+    links: gpd.GeoDataFrame,
+    parent_link_context: pd.DataFrame | None,
+    *,
+    overlap_threshold: float = 0.999,
+) -> tuple[set[int], set[int]] | None:
+    """Return child links/nodes that cannot safely inherit parent hydraulics."""
+
+    required_child = {
+        "id_link",
+        "id_us_node",
+        "id_ds_node",
+        "lineage_type",
+        "dominant_parent_link_id",
+        "dominant_parent_overlap_fraction",
+        "matched_parent_us_node",
+        "matched_parent_ds_node",
+    }
+    required_parent = {
+        "id_link",
+        "id_us_node",
+        "id_ds_node",
+        "slope_used",
+        *COMPOUND_BUBBLE_QC_INHERIT_COLUMNS,
+    }
+    if (
+        parent_link_context is None
+        or parent_link_context.empty
+        or not required_child.issubset(links.columns)
+        or not required_parent.issubset(parent_link_context.columns)
+    ):
+        return None
+
+    parent = parent_link_context[["id_link", "id_us_node", "id_ds_node", "slope_used"]].copy()
+    for column in ("id_link", "id_us_node", "id_ds_node"):
+        parent[column] = pd.to_numeric(parent[column], errors="coerce").astype("Int64")
+    parent["slope_used"] = pd.to_numeric(parent["slope_used"], errors="coerce")
+    parent = parent.dropna(subset=["id_link"]).drop_duplicates(subset=["id_link"]).set_index("id_link")
+
+    inheritable: set[int] = set()
+    changed_nodes: set[int] = set()
+    for row in links.itertuples(index=False):
+        link_id = _safe_int(getattr(row, "id_link", None))
+        us_node = _safe_int(getattr(row, "id_us_node", None))
+        ds_node = _safe_int(getattr(row, "id_ds_node", None))
+        parent_id = _safe_int(getattr(row, "dominant_parent_link_id", None))
+        overlap = _safe_float(getattr(row, "dominant_parent_overlap_fraction", None))
+        parent_us_match = _safe_int(getattr(row, "matched_parent_us_node", None))
+        parent_ds_match = _safe_int(getattr(row, "matched_parent_ds_node", None))
+        safe = (
+            link_id is not None
+            and str(getattr(row, "lineage_type", "")) == "unchanged_1to1"
+            and parent_id is not None
+            and parent_id in parent.index
+            and overlap is not None
+            and overlap >= float(overlap_threshold)
+            and parent_us_match is not None
+            and parent_ds_match is not None
+            and parent_us_match == _safe_int(parent.at[parent_id, "id_us_node"])
+            and parent_ds_match == _safe_int(parent.at[parent_id, "id_ds_node"])
+            and (_safe_float(parent.at[parent_id, "slope_used"]) or 0.0) > 0
+        )
+        if safe:
+            inheritable.add(int(link_id))
+        else:
+            if us_node is not None:
+                changed_nodes.add(int(us_node))
+            if ds_node is not None:
+                changed_nodes.add(int(ds_node))
+
+    all_link_ids = {
+        int(value)
+        for value in pd.to_numeric(links["id_link"], errors="coerce").dropna().astype(int)
+    }
+    return all_link_ids.difference(inheritable), changed_nodes
+
+
 def generate_state_hydraulic_context(
     *,
     directed_links_path: str | Path,
@@ -3211,6 +3449,10 @@ def generate_state_hydraulic_context(
     state_id: str | None = None,
     config: SlopeConfig | None = None,
     parent_link_context_path: str | Path | None = None,
+    collapse_components_path: str | Path | None = None,
+    node_match_path: str | Path | None = None,
+    base_link_context_path: str | Path | None = None,
+    base_node_context_path: str | Path | None = None,
 ) -> StateHydraulicContextOutputs:
     """Write state-level node and link hydraulic context artifacts.
 
@@ -3235,21 +3477,6 @@ def generate_state_hydraulic_context(
     links = gpd.read_file(links_path)
     nodes = gpd.read_file(nodes_path)
     unit_summary = _load_unit_summary_if_exists(hierarchy_output_dir)
-    result = compute_hydraulic_context(
-        links,
-        nodes,
-        unit_summary=unit_summary,
-        config=resolved_config,
-    )
-    collapsed_unit_boundary_analysis = _build_collapsed_unit_boundary_analysis(
-        result.link_context,
-        links_path=links_path,
-    )
-    collapsed_local_link_ids = {
-        int(link_id)
-        for component in collapsed_unit_boundary_analysis
-        for link_id in component.get("variant_local_link_ids", []) or []
-    }
     resolved_parent_link_context_path = (
         Path(parent_link_context_path).expanduser().resolve()
         if parent_link_context_path is not None
@@ -3260,6 +3487,29 @@ def generate_state_hydraulic_context(
         if resolved_parent_link_context_path is not None and resolved_parent_link_context_path.exists()
         else None
     )
+    changed_scope = _changed_child_topology_scope(links, parent_link_context)
+    changed_link_ids, changed_node_ids = changed_scope if changed_scope is not None else (None, None)
+    result = compute_hydraulic_context(
+        links,
+        nodes,
+        unit_summary=unit_summary,
+        config=resolved_config,
+        compound_bubble_recalculation_link_ids=changed_link_ids,
+        compound_bubble_recalculation_node_ids=changed_node_ids,
+    )
+    collapsed_unit_boundary_analysis = _build_collapsed_unit_boundary_analysis(
+        result.link_context,
+        links_path=links_path,
+        collapse_components_path=collapse_components_path,
+        node_match_path=node_match_path,
+        base_link_context_path=base_link_context_path,
+        base_node_context_path=base_node_context_path,
+    )
+    collapsed_local_link_ids = {
+        int(link_id)
+        for component in collapsed_unit_boundary_analysis
+        for link_id in component.get("variant_local_link_ids", []) or []
+    }
     link_context, parent_slope_inheritance_summary = _apply_parent_slope_inheritance(
         result.link_context,
         links,
@@ -3291,6 +3541,10 @@ def generate_state_hydraulic_context(
             "directed_nodes": str(nodes_path),
             "hierarchy_output_dir": str(Path(hierarchy_output_dir).expanduser().resolve()) if hierarchy_output_dir is not None else "",
             "parent_link_hydraulic_context": str(resolved_parent_link_context_path) if resolved_parent_link_context_path is not None else "",
+            "collapse_components": str(Path(collapse_components_path).expanduser().resolve()) if collapse_components_path is not None else "",
+            "node_match": str(Path(node_match_path).expanduser().resolve()) if node_match_path is not None else "",
+            "base_link_hydraulic_context": str(Path(base_link_context_path).expanduser().resolve()) if base_link_context_path is not None else "",
+            "base_node_hydraulic_context": str(Path(base_node_context_path).expanduser().resolve()) if base_node_context_path is not None else "",
         },
         "output_paths": {
             "link_hydraulic_context": str(link_context_path),
@@ -3306,6 +3560,17 @@ def generate_state_hydraulic_context(
         },
         "family_slope_inheritance": family_slope_inheritance_summary,
         "parent_slope_inheritance": parent_slope_inheritance_summary,
+        "compound_bubble_qc_scope": {
+            "scoped_to_changed_topology": bool(changed_scope is not None),
+            "changed_link_count": int(len(changed_link_ids or set())),
+            "changed_node_count": int(len(changed_node_ids or set())),
+            "recalculated_final_link_count": int(
+                link_context["bubble_slope_qc_recalculated"].fillna(False).astype(bool).sum()
+            ),
+            "inherited_final_link_count": int(
+                link_context["bubble_slope_qc_inherited"].fillna(False).astype(bool).sum()
+            ),
+        },
         "collapsed_unit_head_solver": collapsed_unit_head_solver_summary,
         "collapsed_unit_boundary_analysis": collapsed_unit_boundary_analysis,
         "slope_config": {

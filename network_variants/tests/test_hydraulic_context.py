@@ -12,10 +12,36 @@ from shapely.geometry import LineString, Point
 from network_variants.hydraulic_context import (
     SlopeConfig,
     _apply_collapsed_unit_head_solver,
+    _count_dag_edge_paths_capped,
     _summarize_dag_path_drops,
     compute_hydraulic_context,
     generate_state_hydraulic_context,
 )
+import network_variants.hydraulic_context as hydraulic_context_module
+
+
+def test_capped_dag_edge_path_count_matches_multigraph_enumeration() -> None:
+    graph = nx.MultiDiGraph()
+    graph.add_edge(0, 1, key=10)
+    graph.add_edge(0, 1, key=11)
+    graph.add_edge(1, 3, key=12)
+    graph.add_edge(0, 2, key=13)
+    graph.add_edge(2, 3, key=14)
+
+    explicit = list(nx.all_simple_edge_paths(graph, 0, 3))
+
+    assert len(explicit) == 3
+    assert _count_dag_edge_paths_capped(graph, 0, 3, cap=10) == 3
+    assert _count_dag_edge_paths_capped(graph, 0, 3, cap=2) == 3
+
+
+def test_capped_dag_edge_path_count_avoids_exponential_enumeration() -> None:
+    graph = nx.MultiDiGraph()
+    for layer in range(12):
+        graph.add_edge(layer, layer + 1, key=layer * 2)
+        graph.add_edge(layer, layer + 1, key=layer * 2 + 1)
+
+    assert _count_dag_edge_paths_capped(graph, 0, 12, cap=500) == 501
 
 
 def test_dag_path_drop_summary_matches_explicit_path_enumeration() -> None:
@@ -370,6 +396,129 @@ def test_parent_slope_inheritance_rejects_reversed_parent_direction(tmp_path: Pa
     assert bool(row["slope_parent_inheritance_applied"]) is False
     assert str(row["slope_parent_inheritance_reason"]) == "parent_direction_mismatch"
     assert outputs.manifest["parent_slope_inheritance"]["direction_mismatch_link_ids"] == [1]
+
+
+def test_unaffected_compound_bubble_qc_is_inherited_without_path_enumeration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node_rows = [
+        {
+            "id_node": node_id,
+            "is_inlet": node_id == 0,
+            "is_outlet": node_id == 5,
+            "sword_wse": 12.0 - node_id * 0.5,
+            "sword_wse_field": "wse",
+            "sword_wse_fill_method": "requested_field",
+            "geometry": Point(float(node_id), 0.0),
+        }
+        for node_id in range(6)
+    ]
+    nodes = gpd.GeoDataFrame(node_rows, geometry="geometry", crs="EPSG:3857")
+    edge_nodes = [(0, 1), (1, 2), (2, 4), (1, 3), (3, 4), (4, 5)]
+    base_links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": link_id,
+                "id_us_node": us_node,
+                "id_ds_node": ds_node,
+                "len": 100.0,
+                "geometry": LineString([(float(us_node), 0.0), (float(ds_node), 0.0)]),
+            }
+            for link_id, (us_node, ds_node) in enumerate(edge_nodes, start=10)
+        ],
+        geometry="geometry",
+        crs="EPSG:3857",
+    )
+    hierarchy_dir = tmp_path / "hierarchy"
+    hierarchy_dir.mkdir()
+    pd.DataFrame(
+        [
+            {
+                "unit_id": 1,
+                "compound_bubble_id": 7,
+                "in_compound_bubble": True,
+                "unit_node_ids": "1,2,3,4",
+            }
+        ]
+    ).to_csv(hierarchy_dir / "unit_summary.csv", index=False)
+    nodes_path = tmp_path / "nodes.gpkg"
+    base_links_path = tmp_path / "base_links.gpkg"
+    nodes.to_file(nodes_path, driver="GPKG")
+    base_links.to_file(base_links_path, driver="GPKG")
+    base_outputs = generate_state_hydraulic_context(
+        directed_links_path=base_links_path,
+        directed_nodes_path=nodes_path,
+        hierarchy_output_dir=hierarchy_dir,
+        output_dir=tmp_path / "base_context",
+        state_id="S000_base",
+    )
+
+    child_links = base_links.copy()
+    child_links["id_link"] = child_links["id_link"] + 100
+    child_links["lineage_type"] = "unchanged_1to1"
+    child_links["dominant_parent_link_id"] = base_links["id_link"].to_numpy()
+    child_links["dominant_parent_overlap_fraction"] = 1.0
+    child_links["matched_parent_us_node"] = child_links["id_us_node"]
+    child_links["matched_parent_ds_node"] = child_links["id_ds_node"]
+    child_links_path = tmp_path / "child_links.gpkg"
+    child_links.to_file(child_links_path, driver="GPKG")
+
+    original_path_count = hydraulic_context_module._count_dag_edge_paths_capped
+
+    def unexpected_path_count(*_args, **_kwargs):
+        raise AssertionError("Unaffected inherited bubble should not be traversed.")
+
+    monkeypatch.setattr(
+        hydraulic_context_module,
+        "_count_dag_edge_paths_capped",
+        unexpected_path_count,
+    )
+    child_outputs = generate_state_hydraulic_context(
+        directed_links_path=child_links_path,
+        directed_nodes_path=nodes_path,
+        hierarchy_output_dir=hierarchy_dir,
+        output_dir=tmp_path / "child_context",
+        state_id="S001_unit_1",
+        parent_link_context_path=base_outputs.link_context_path,
+    )
+
+    bubble = child_outputs.link_context.loc[
+        child_outputs.link_context["compound_bubble_id_link"].eq(7)
+    ]
+    assert len(bubble) == 4
+    assert bubble["bubble_slope_qc_inherited"].all()
+    assert not bubble["bubble_slope_qc_recalculated"].any()
+    assert set(bubble["bubble_slope_qc_reason"]) == {"ok"}
+
+    affected_links = child_links.copy()
+    affected_links.loc[affected_links["id_link"].eq(111), "lineage_type"] = "collapsed_many_to_one"
+    affected_links.loc[
+        affected_links["id_link"].eq(111), "dominant_parent_overlap_fraction"
+    ] = 0.5
+    affected_links_path = tmp_path / "affected_links.gpkg"
+    affected_links.to_file(affected_links_path, driver="GPKG")
+    monkeypatch.setattr(
+        hydraulic_context_module,
+        "_count_dag_edge_paths_capped",
+        original_path_count,
+    )
+    affected_outputs = generate_state_hydraulic_context(
+        directed_links_path=affected_links_path,
+        directed_nodes_path=nodes_path,
+        hierarchy_output_dir=hierarchy_dir,
+        output_dir=tmp_path / "affected_context",
+        state_id="S002_unit_2",
+        parent_link_context_path=base_outputs.link_context_path,
+    )
+    affected_bubble = affected_outputs.link_context.loc[
+        affected_outputs.link_context["compound_bubble_id_link"].eq(7)
+    ]
+    changed = affected_bubble.loc[affected_bubble["id_link"].eq(111)].iloc[0]
+    unchanged = affected_bubble.loc[~affected_bubble["id_link"].eq(111)]
+    assert bool(changed["bubble_slope_qc_recalculated"]) is True
+    assert bool(changed["bubble_slope_qc_inherited"]) is False
+    assert unchanged["bubble_slope_qc_inherited"].all()
 
 
 def test_topology_conflict_solver_uses_unchanged_downstream_parent_target() -> None:
