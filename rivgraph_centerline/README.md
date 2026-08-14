@@ -275,6 +275,24 @@ Then compare the two runs:
 The comparison report focuses on the parts most likely to move for river masks:
 summary counts, link counts, node counts, and centerline/link lengths.
 
+## Deterministic-ID centerline compatibility
+
+The project adds deterministic network-ID metadata to RivGraph link and node
+dictionaries. Older RivGraph centerline code assumes that every link value
+except `n_networks` is a per-link sequence and can otherwise try to index
+scalar metadata such as `_ids_finalized`.
+
+Both the standard RivGraph workflow and the network-variant/reference-section
+workflow call centerline generation through the shared
+`rivgraph_compat.rivgraph_centerline_compat` guard. The guard sanitizes only
+the temporary holes-filled graph built internally for centerline extraction;
+it does not modify exported network IDs, topology, widths, or lineage.
+
+The compatibility correction does not change the centerline algorithm or its
+selected pixels. Runs that already completed successfully do not require
+regeneration. Only runs that failed at RivGraph's temporary centerline-link
+assembly need to be rerun.
+
 ## Status
 
 Framework plus first manual smoke-test tooling:

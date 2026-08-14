@@ -31,6 +31,7 @@ from network_variants.variant_generation import (
     _resolve_link_by_progression,
     _resolve_link_lineage,
     _resolve_single_remaining_link,
+    _run_rivgraph,
     _segment_collapsed_links_to_anchor_nodes,
     _trim_slice,
     compute_width_families,
@@ -59,6 +60,61 @@ def _unit(unit_id: int, node_ids: set[int], edge_keys: set[tuple[int, int, int]]
         node_set=node_ids,
         edge_set=edge_keys,
     )
+
+
+def test_variant_rivgraph_centerline_uses_metadata_compatibility(tmp_path, monkeypatch) -> None:
+    import rivgraph.ln_utils as lnu
+    import rivgraph.rivers.river_utils as ru
+    import network_variants.variant_generation as variant_generation
+
+    original_width_runner = lnu.link_widths_and_lengths
+    observed = {"compat_active": False}
+
+    class FakeRiver:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.links = {"id": [0], "idx": [[1]], "conn": [[0, 1]]}
+            self.nodes = {"id": [0, 1], "idx": [1, 2], "conn": [[0], [0]]}
+            self.exit_sides = "we"
+            self.Iskel = np.ones((2, 2), dtype=bool)
+            self.paths = {}
+
+        def compute_network(self) -> None:
+            pass
+
+        def finalize_ids(self) -> None:
+            pass
+
+        def compute_distance_transform(self) -> None:
+            pass
+
+        def compute_link_width_and_length(self) -> None:
+            pass
+
+        def compute_centerline(self) -> None:
+            observed["compat_active"] = lnu.link_widths_and_lengths is not original_width_runner
+
+        def to_geotiff(self, *_args, **_kwargs) -> None:
+            pass
+
+        def to_geovectors(self, *_args, **_kwargs) -> None:
+            pass
+
+        def save_network(self) -> None:
+            pass
+
+    monkeypatch.setattr(variant_generation, "river", FakeRiver)
+    monkeypatch.setattr(ru, "prune_river", lambda links, nodes, *_args: (links, nodes))
+
+    _run_rivgraph(
+        run_name="test",
+        collapsed_mask_path=tmp_path / "mask.tif",
+        rivgraph_output_dir=tmp_path / "rivgraph",
+        exit_sides="WE",
+        export_sword=False,
+    )
+
+    assert observed["compat_active"] is True
+    assert lnu.link_widths_and_lengths is original_width_runner
 
 
 def test_componentize_units_groups_by_shared_nodes() -> None:

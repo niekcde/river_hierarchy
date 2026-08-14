@@ -21,10 +21,10 @@ from rivgraph_centerline.workflow import (
     _clear_rivgraph_outputs,
     _patched_rivgraph_dir_centerline,
     _representative_project_point,
-    _sanitize_rivgraph_centerline_link_fields,
     prepare_binary_projected_mask,
     run_rivgraph_for_run,
 )
+from rivgraph_compat import sanitize_centerline_link_fields
 
 
 def test_crop_binary_mask_reduces_empty_margins_and_updates_transform() -> None:
@@ -119,7 +119,7 @@ def test_sanitize_rivgraph_centerline_link_fields_drops_scalar_metadata() -> Non
         "bad_short": [1, 2],
     }
 
-    _sanitize_rivgraph_centerline_link_fields(links)
+    sanitize_centerline_link_fields(links)
 
     assert set(links) == {"id", "idx", "conn", "len", "n_networks"}
 

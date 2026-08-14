@@ -35,6 +35,7 @@ if __package__ is None or __package__ == "":
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
 from rivgraph.classes import river
+from rivgraph_compat import rivgraph_centerline_compat
 
 from hierarchy_level_definition.metrics.unit_metrics import (
     edge_width_from_attrs,
@@ -3970,7 +3971,8 @@ def _run_rivgraph(
     network.finalize_ids()
     network.compute_distance_transform()
     network.compute_link_width_and_length()
-    network.compute_centerline()
+    with rivgraph_centerline_compat():
+        network.compute_centerline()
     network.to_geotiff("skeleton")
     network.to_geovectors(export="network", ftype="gpkg", metadata=metadata)
     network.to_geovectors(export="centerline", ftype="gpkg", metadata=metadata)
