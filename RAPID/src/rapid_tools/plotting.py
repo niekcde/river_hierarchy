@@ -32,6 +32,7 @@ TIMING_Y_METRIC_LABELS = {
     "plateau995_center_shift_hours": "99.5% peak-plateau center shift [hours]",
     "peak_window_center95_shift_hours": "95% peak-window center shift [hours]",
     "peak_window_centroid95_shift_hours": "95% peak-window centroid shift [hours]",
+    "peak_window_width95_shift_hours": "95% peak-window width change [hours]",
     "xcorr_lag_hours": "Cross-correlation lag [hours]",
     "delta_peak_time_hours": "Peak-time delta vs base [hours]",
     "delta_lag_to_inflow_peak_hours": "Lag-to-inflow-peak delta vs base [hours]",
@@ -40,6 +41,10 @@ TIMING_Y_METRIC_LABELS = {
     "lag_to_inflow_peak_pct_shift_vs_base": "Lag-to-inflow-peak percent shift vs base [%]",
     "lag_to_inflow_peak_hour_shift_vs_base": "Lag-to-inflow-peak hour shift vs base [hours]",
     "lag_to_inflow_peak_hour_shift_vs_observed_peak": "Lag-to-inflow-peak hour shift vs observed gauge peak lag [hours]",
+    "delta_rise_time_hours": "Event-start-to-peak duration change [hours]",
+    "delta_fall_time_50_hours": "Peak-to-50% recession-duration change [hours]",
+    "delta_fall_time_10_hours": "Peak-to-10% recession-duration change [hours]",
+    "delta_e_folding_time_hours": "Peak e-folding recession-duration change [hours]",
     "unit_to_bubble_lag_to_inflow_peak_relative": "Lag-to-inflow-peak relative change vs matching compound",
     "unit_to_bubble_lag_to_inflow_peak_pct_shift": "Lag-to-inflow-peak percent shift vs matching compound [%]",
 }
@@ -54,17 +59,18 @@ GEOMETRY_X_METRIC_LABELS = {
     "child_length_fraction": "Child length / matched parent length",
     "width_fraction_of_total": "Upstream width-share routed into target object",
     "width_fraction": "Upstream width-share routed into target object",
-    "Lambda_matched": "Lambda_matched",
-    "lambda_matched": "Lambda_matched",
-    "neg_log10_lambda": "-log10(Lambda_matched)",
-    "log_lambda": "-log10(Lambda_matched)",
-    "length_weighted_log_lambda": "Selected length fraction * (-log10(Lambda_matched))",
-    "len_fraction_weighted_log_lambda": "Selected length fraction * (-log10(Lambda_matched))",
-    "width_weighted_log_lambda": "Selected length fraction * (-log10(Lambda_matched)) * width_fraction",
-    "len_fraction_width_weighted_log_lambda": "Selected length fraction * (-log10(Lambda_matched)) * width_fraction",
+    "Lambda_matched": "Lambda_K (selected hydraulic domain)",
+    "lambda_matched": "Lambda_K (selected hydraulic domain)",
+    "neg_log10_lambda": "-log10(Lambda_K, selected hydraulic domain)",
+    "log_lambda": "-log10(Lambda_K, selected hydraulic domain)",
+    "length_weighted_log_lambda": "Selected-domain length fraction * (-log10(Lambda_K))",
+    "len_fraction_weighted_log_lambda": "Selected-domain length fraction * (-log10(Lambda_K))",
+    "width_weighted_log_lambda": "Selected-domain length fraction * (-log10(Lambda_K)) * width_fraction",
+    "len_fraction_width_weighted_log_lambda": "Selected-domain length fraction * (-log10(Lambda_K)) * width_fraction",
     "child_parent_weighted_log_lambda": "(child_len / matched_parent_len) * (-log10(Lambda_matched))",
     "child_parent_width_weighted_log_lambda": "(child_len / matched_parent_len) * (-log10(Lambda_matched)) * width_fraction",
-    "k_ratio_to_matched_base": "K_variant_realized / K_eq_matched_base",
+    "Lambda_matched_diagnostic": "Lambda_matched (deprecated residual-corridor diagnostic)",
+    "k_ratio_to_matched_base": "K_after / K_before (selected hydraulic domain)",
 }
 
 PLOT_DIMENSION_LABELS = {
@@ -260,6 +266,20 @@ def _peak_window_centroid_time(t: np.ndarray, q: np.ndarray, frac: float = 0.95)
     return float(np.sum(t[mask] * weights) / np.sum(weights))
 
 
+def _peak_window_width(t: np.ndarray, q: np.ndarray, frac: float = 0.95) -> float:
+    """Return the duration of the contiguous-envelope peak window.
+
+    Unlike a peak-time metric, this is invariant to a rigid time translation
+    and therefore isolates flattening or narrowing around the peak.
+    """
+    peak = float(np.max(q))
+    mask = q >= peak * frac
+    if not np.any(mask):
+        return float("nan")
+    selected = t[mask]
+    return float(selected[-1] - selected[0])
+
+
 def _xcorr_lag_hours(q_base: np.ndarray, q_other: np.ndarray, dt_seconds: float) -> float:
     qb = np.asarray(q_base, dtype=float) - np.mean(q_base)
     qo = np.asarray(q_other, dtype=float) - np.mean(q_other)
@@ -329,6 +349,45 @@ def _load_unit_summary(exp_dir: Path) -> pd.DataFrame:
     ].copy()
 
 
+def _load_selected_hydraulic_domain_frame(exp_dir: Path, state_ids: Sequence[str]) -> pd.DataFrame:
+    """Load the authoritative state-transition resistance comparison.
+
+    The transition domain is the selected unit when hydraulically closed, or
+    its complete enclosing compound otherwise.  It is therefore the only
+    resistance comparison suitable as a predictor of the state-level RAPID
+    response.  The older re-detected matched-corridor comparison is retained
+    solely as a diagnostic elsewhere in the frame.
+    """
+    registry_path = exp_dir / "equivalent_transition_registry.csv"
+    if not registry_path.exists():
+        return pd.DataFrame()
+    transition = _read_csv_nonempty(registry_path)
+    if transition is None or transition.empty:
+        return pd.DataFrame()
+    transition = transition.rename(columns={"child_state_id": "state_id"}).copy()
+    transition = transition.loc[transition["state_id"].astype(str).isin([str(x) for x in state_ids])].copy()
+    required = {"Lambda_K", "parent_solver_success", "child_solver_success", "selected_domain_status"}
+    if not required.issubset(transition.columns):
+        return pd.DataFrame()
+    transition = transition.loc[
+        transition["parent_solver_success"].fillna(False)
+        & transition["child_solver_success"].fillna(False)
+        & transition["selected_domain_status"].astype(str).eq("complete")
+    ].copy()
+
+    parent_link_ids: list[str] = []
+    for state_id in transition["state_id"].astype(str):
+        domain_path = exp_dir / "states" / state_id / "equivalent_resistance" / "selected_hydraulic_domain_links.csv"
+        domain = _read_csv_nonempty(domain_path)
+        if domain is None or domain.empty or "domain_role" not in domain or "id_link" not in domain:
+            parent_link_ids.append("")
+            continue
+        ids = pd.to_numeric(domain.loc[domain["domain_role"].astype(str).eq("parent"), "id_link"], errors="coerce")
+        parent_link_ids.append(",".join(str(link_id) for link_id in sorted(ids.dropna().astype(int).unique().tolist())))
+    transition["selected_domain_base_link_ids"] = parent_link_ids
+    return transition
+
+
 def _classify_plot_category(row: pd.Series) -> str:
     if row.get("target_type") == "compound_bubble":
         return "compound unit"
@@ -376,6 +435,7 @@ def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.Dat
         "centroid75_seconds": _weighted_centroid_time(t_base, q_base, frac=0.75),
         "peak_window_center95_seconds": _peak_window_center_time(t_base, q_base, frac=0.95),
         "peak_window_centroid95_seconds": _peak_window_centroid_time(t_base, q_base, frac=0.95),
+        "peak_window_width95_seconds": _peak_window_width(t_base, q_base, frac=0.95),
     }
 
     rows: list[dict[str, Any]] = []
@@ -392,6 +452,7 @@ def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.Dat
             "centroid75_seconds": _weighted_centroid_time(t, q, frac=0.75),
             "peak_window_center95_seconds": _peak_window_center_time(t, q, frac=0.95),
             "peak_window_centroid95_seconds": _peak_window_centroid_time(t, q, frac=0.95),
+            "peak_window_width95_seconds": _peak_window_width(t, q, frac=0.95),
             "xcorr_lag_hours": _xcorr_lag_hours(q_base, q, dt_seconds),
         }
         for key, base_value in base_metrics.items():
@@ -403,6 +464,11 @@ def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.Dat
             f"Skipping {exp_dir.name}: no derived outlet hydrographs could be loaded.",
             stacklevel=2,
         )
+        return pd.DataFrame()
+
+    transition = _load_selected_hydraulic_domain_frame(exp_dir, state_ids)
+    if transition.empty:
+        warnings.warn(f"Skipping {exp_dir.name}: selected hydraulic-domain transition results are unavailable.", stacklevel=2)
         return pd.DataFrame()
 
     summary = pd.DataFrame(rows).merge(
@@ -422,7 +488,17 @@ def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.Dat
         on="state_id",
         how="left",
     )
-    summary = summary.loc[summary["comparison_valid_for_matched"].fillna(False)].copy()
+    summary = summary.rename(columns={"Lambda_matched": "Lambda_matched_diagnostic"})
+    transition_columns = [
+        "state_id", "Lambda_K", "K_before", "K_after", "percent_change_K",
+        "hydraulic_domain_type", "parent_domain_n_links", "child_domain_n_links",
+        "selected_domain_base_link_ids",
+    ]
+    transition_columns = [column for column in transition_columns if column in transition]
+    summary = summary.merge(transition[transition_columns], on="state_id", how="inner")
+    # Keep the established column name for notebook compatibility, but its
+    # value is now the selected hydraulic-domain Lambda_K.
+    summary["Lambda_matched"] = pd.to_numeric(summary["Lambda_K"], errors="coerce")
     summary["target_id"] = pd.to_numeric(summary["target_id"], errors="coerce").astype("Int64")
 
     summary = (
@@ -459,6 +535,8 @@ def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.Dat
     )
 
     base_len_lookup, total_base_len, length_field = _build_length_lookup(exp_dir)
+    # Geometry weighting must use the same parent domain as Lambda_K.
+    summary["matched_base_link_ids"] = summary["selected_domain_base_link_ids"]
     summary["matched_base_len"] = summary["matched_base_link_ids"].map(
         lambda value: _matched_length_from_ids(value, base_len_lookup)
     )
@@ -479,7 +557,10 @@ def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.Dat
 
     summary["plot_category"] = summary.apply(_classify_plot_category, axis=1)
     summary["mode"] = mode
-    summary["experiment_dir"] = str(exp_dir)
+    # Use a canonical local path here.  RAPID run registries can retain the
+    # absolute path of the machine that generated them, so a raw string path
+    # is not a stable merge key across workspaces.
+    summary["experiment_dir"] = str(exp_dir.resolve())
     summary["base_length_field"] = length_field
     summary["example_id"] = example_id
     summary["plot_unit_id"] = summary["target_id"]
@@ -518,6 +599,10 @@ def _build_analysis_metric_frame(
         "lag_to_inflow_peak_hour_shift_vs_base",
         "observed_gauge_peak_shift_hours",
         "lag_to_inflow_peak_hour_shift_vs_observed_peak",
+        "delta_rise_time_hours",
+        "delta_fall_time_50_hours",
+        "delta_fall_time_10_hours",
+        "delta_e_folding_time_hours",
         "unit_to_bubble_lag_to_inflow_peak_relative",
         "unit_to_bubble_lag_to_inflow_peak_pct_shift",
     ]
@@ -525,7 +610,17 @@ def _build_analysis_metric_frame(
     if "experiment_dir" not in present_columns or "state_id" not in present_columns:
         return pd.DataFrame()
     analysis = analysis[present_columns].copy()
-    analysis["experiment_dir"] = analysis["experiment_dir"].astype(str)
+    # Registry rows may contain a stale absolute path (for example an old
+    # external-volume mount).  These analysis results were built from the two
+    # experiment directories above, so map by their unambiguous directory
+    # names onto the active output root before merging with timing rows.
+    local_experiment_dirs = {
+        indep_dir.name: indep_dir.resolve(),
+        compound_dir.name: compound_dir.resolve(),
+    }
+    analysis["experiment_dir"] = analysis["experiment_dir"].map(
+        lambda value: str(local_experiment_dirs.get(Path(str(value)).name, Path(str(value)).resolve()))
+    )
     return analysis.drop_duplicates(subset=["experiment_dir", "state_id"])
 
 
@@ -611,7 +706,14 @@ def _build_base_context(exp_dir: Path) -> dict[str, Any]:
     ds_lookup = base_variant.set_index("id_link")["id_ds_node"]
 
     base_directed_dir = exp_dir / "states" / "S000_base" / "variant" / "directed"
-    directed_paths = sorted(base_directed_dir.glob("*_directed_links.gpkg"))
+    # External drives mounted on macOS can contain AppleDouble metadata files
+    # such as ``._02__S000_base_directed_links.gpkg``. They match the glob but
+    # are not GeoPackages, so never allow them to become the selected source.
+    directed_paths = sorted(
+        path
+        for path in base_directed_dir.glob("*_directed_links.gpkg")
+        if not path.name.startswith("._")
+    )
     if not directed_paths:
         raise FileNotFoundError(f"Could not resolve base directed links for {exp_dir}.")
     base_directed = gpd.read_file(directed_paths[0])
@@ -641,9 +743,22 @@ def _build_base_context(exp_dir: Path) -> dict[str, Any]:
         base_in_edges[int(row.id_ds_node)].append(edge_record)
         base_out_edges[int(row.id_us_node)].append(edge_record)
 
-    base_rapid = pd.read_csv(exp_dir / "states" / "S000_base" / "rapid" / "prep" / "rapid_link_attributes.csv")
-    dist_cols = [column for column in ["parent_link_id", "network_us_dist_out_m", "network_ds_dist_out_m"] if column in base_rapid.columns]
-    dist_df = base_rapid[dist_cols].copy()
+    distance_columns = {
+        "parent_link_id",
+        "network_us_dist_out_m",
+        "network_ds_dist_out_m",
+    }
+    base_rapid = pd.read_csv(
+        exp_dir / "states" / "S000_base" / "rapid" / "prep" / "rapid_link_attributes.csv",
+        usecols=lambda column: column in distance_columns,
+    )
+    missing_distance_columns = distance_columns.difference(base_rapid.columns)
+    if missing_distance_columns:
+        raise ValueError(
+            "Base RAPID link attributes are missing distance columns: "
+            f"{sorted(missing_distance_columns)}"
+        )
+    dist_df = base_rapid[list(distance_columns)].copy()
     dist_df["parent_link_id"] = pd.to_numeric(dist_df["parent_link_id"], errors="coerce").astype("Int64")
     dist_df["network_us_dist_out_m"] = pd.to_numeric(dist_df["network_us_dist_out_m"], errors="coerce")
     dist_df["network_ds_dist_out_m"] = pd.to_numeric(dist_df["network_ds_dist_out_m"], errors="coerce")

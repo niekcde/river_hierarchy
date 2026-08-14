@@ -23,6 +23,9 @@ BASE_COMPARISON_COLUMNS = {
     "peak_discharge_cms": "delta_peak_discharge_cms",
     "time_to_peak_seconds": "delta_rise_time_hours",
     "fall_time_seconds": "delta_fall_time_hours",
+    "fall_time_50_seconds": "delta_fall_time_50_hours",
+    "fall_time_10_seconds": "delta_fall_time_10_hours",
+    "e_folding_time_seconds": "delta_e_folding_time_hours",
     "peak_attenuation_ratio": "delta_peak_attenuation_ratio",
     "lag_to_inflow_peak_seconds": "delta_lag_to_inflow_peak_hours",
 }
