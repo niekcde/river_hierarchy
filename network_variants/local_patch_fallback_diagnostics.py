@@ -173,14 +173,27 @@ def plot_terminal_case(case: dict[str, Any], *, pad_fraction: float = 0.05):
         raise FileNotFoundError("Terminal plots require saved local links and cut geometries.")
     terminals = _terminal_nodes(case)
     fig, ax = plt.subplots(figsize=(10, 8))
+    local_extent = box(*links.total_bounds)
+    base_context = case["base_links"].loc[
+        case["base_links"].geometry.intersects(local_extent)
+    ]
+    base_context.plot(
+        ax=ax,
+        color="0.35",
+        linewidth=2.2,
+        linestyle="--",
+        alpha=0.85,
+        zorder=1,
+        label="base/reference network",
+    )
     crop = case.get("crop")
     if crop is not None:
-        crop.boundary.plot(ax=ax, color="black", linewidth=1.4, label="crop boundary")
-    links.plot(ax=ax, color="#2ca02c", linewidth=2.2, label="raw local RivGraph")
+        crop.boundary.plot(ax=ax, color="black", linewidth=1.4, zorder=2, label="crop boundary")
+    links.plot(ax=ax, color="#2ca02c", linewidth=2.2, zorder=3, label="raw local RivGraph")
     colors = {"upstream": "#1f77b4", "downstream": "#ff7f0e"}
     for cut in cuts.itertuples(index=False):
         gpd.GeoSeries([cut.geometry], crs=cuts.crs).plot(
-            ax=ax, color=colors[str(cut.role)], linewidth=3, label=f"{cut.role} cut"
+            ax=ax, color=colors[str(cut.role)], linewidth=3, zorder=4, label=f"{cut.role} cut"
         )
     for row in terminals.itertuples(index=False):
         marker = "^" if bool(getattr(row, "is_inlet", False)) else "s"
