@@ -1,0 +1,59 @@
+\section{Water-surface profiles and slope assignment}
+\label{app:slope_estimation}
+
+Reach slopes were derived to provide a consistent hydraulic context for equivalent-resistance calculations and routing. The procedure distinguished the observed or matched SWORD water-surface elevation (WSE) associated with a network node from the profile elevation used to calculate slope. The latter was constructed to represent a physically consistent downstream-decreasing water surface across each study corridor, rather than reproducing local variation in individual WSE observations.
+
+\subsection{Longitudinal-profile construction}
+
+Each reference-network node was matched to SWORD node information, and the requested WSE field, \texttt{wse\_obs\_p50}, was used as the elevation input. When an individual requested value was unavailable, a value from the nearest valid node on the same SWORD reach was used where possible. SWORD nodes associated with the analysed corridor, including a two-reach connected buffer, supplied the profile anchors. Anchor elevations were ordered by downstream distance and fitted using isotonic regression, producing a non-decreasing profile in the upstream direction and therefore a non-increasing profile in the downstream direction. The fitted profile was evaluated at each node of the reference network using linear interpolation.
+
+Profile elevations used for slope calculation were retained separately from the matched SWORD WSE values. This distinction allowed the effects of profile regularisation to be inspected without altering the source-elevation information.
+
+\subsection{Initial reach-slope estimation and screening}
+
+For each directed reach $i$, the initial slope was calculated from the fitted profile elevations at its upstream and downstream nodes:
+\begin{equation}
+S_{\mathrm{raw},i}=\frac{H_{\mathrm{up},i}-H_{\mathrm{down},i}}{L_i},
+\end{equation}
+where $H_{\mathrm{up},i}$ and $H_{\mathrm{down},i}$ are the profile elevations and $L_i$ is the mapped reach length. A section-reference slope was calculated independently from the elevation difference between the upstreammost and downstreammost valid profile anchors divided by their longitudinal distance. This reference slope provided a section-scale check on local values.
+
+Raw slopes were flagged when either node lacked profile elevation, when the slope was below the minimum permitted value, when it exceeded the maximum raw-slope threshold, or when it exceeded the permitted ratio relative to the section-reference slope (Table~\ref{tab:slope_parameters}). Flagged reaches were assigned a replacement value using a hierarchical procedure: the slope of the nearest valid connected reach was used first; where this was unavailable, the section-reference slope was used; and where neither was available, the minimum slope was assigned. The resulting value, $S_{\mathrm{used},i}$, was stored with its source and reason for adjustment.
+
+\begin{table}[ht]
+\centering
+\caption{Parameters used for water-surface-profile construction, reach-slope estimation, and slope quality control.}
+\label{tab:slope_parameters}
+\begin{tabular}{p{0.38\linewidth}p{0.20\linewidth}p{0.32\linewidth}}
+\hline
+Parameter & Value & Purpose \\
+\hline
+SWORD WSE field & \texttt{wse\_obs\_p50} & Elevation input for longitudinal-profile construction. \\
+SWORD reach buffer & 2 reaches & Connected SWORD reaches included when constructing the corridor profile. \\
+Minimum profile anchors & 2 & Minimum number of valid elevations required for profile fitting. \\
+Minimum slope & $1\times10^{-6}$ & Lower validity limit and final slope fallback. \\
+Maximum raw slope & $0.009$ & Upper validity limit for raw reach slopes. \\
+Maximum local-to-section slope ratio & 5 & Flags local slopes disproportionately steep relative to the section-reference slope. \\
+Nearest-valid-reach fallback & Enabled & First replacement for an invalid raw slope. \\
+Section-slope fallback & Enabled & Second replacement when no valid connected-reach slope is available. \\
+Compound-unit path-drop QC & Enabled & Checks agreement of path-integrated drops with the reference entry--exit drop. \\
+Maximum paths assessed & 500 & Computational limit for compound-unit path checks. \\
+Absolute path-drop tolerance & $0.05$ m & Maximum allowable absolute mismatch from the reference drop. \\
+Relative path-drop tolerance & $0.10$ & Maximum allowable relative mismatch from the reference drop. \\
+Large-repair flag & Factor 3 & Flags compound-unit slope changes exceeding a factor of three. \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Slope assignment in regenerated variants}
+
+For geometrically unchanged one-to-one reaches, the slope assigned in a simplified variant was inherited from the corresponding reference-network reach. Newly generated or modified reaches initially received slopes from the common reference longitudinal profile. Within collapsed corridors, these initial values were subsequently adjusted where necessary by the internal head optimiser to preserve the reference elevation drop between matched corridor-boundary nodes. When direct transfer of parent heads was incompatible with the regenerated topology, local node heads and reach slopes were solved jointly, while slopes of unchanged parent reaches were retained as strong targets. This drop-constrained adjustment ensured positive downstream slopes and avoided assigning incompatible local drops solely because the position of a bifurcation or confluence changed after regeneration.
+
+\subsection{Compound-unit path-drop quality control}
+
+Additional quality control was applied to compound units with a single entry and exit. All directed paths between these boundary nodes were identified, up to the maximum number specified in Table~\ref{tab:slope_parameters}. The cumulative drop along each path was calculated as
+\begin{equation}
+\Delta H_p=\sum_{i\in p}S_{\mathrm{used},i}L_i,
+\end{equation}
+and compared with the reference entry--exit drop, $\Delta H_{\mathrm{ref}}$. A compound unit was flagged when the maximum absolute difference exceeded $0.05$~m or the maximum relative difference exceeded $10\%$.
+
+Where the fitted internal profile produced non-positive or inconsistent local slopes, reach drops were projected onto the set of path-drop constraints while remaining close to their prior values and respecting the minimum slope. If this projection was not feasible, a locally linear profile between the entry and exit boundary heads was used as a fallback. All slope source methods, repairs, path-drop diagnostics, and large-change flags were retained in the state-level hydraulic-context outputs.

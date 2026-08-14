@@ -1,0 +1,30 @@
+\subsection{RAPID routing parameters}
+\label{app:routing_parameters}
+
+RAPID routing parameters and parameter-selection rules were shared by the reference network and all simplified variants within each study case. State-specific differences were limited to network geometry, effective routing widths, slopes, and the resulting travel-time parameters. The width-to-depth ratio was estimated once for each case from its reference section and retained across its variants. The routing timestep and spin-up duration were selected separately for each state because both depend on the state-specific distribution of travel-time parameters; they were not independently calibrated.
+
+At bifurcations, discharge was partitioned among downstream routing reaches in proportion to their effective routing widths, with partitioning ratios normalised to sum to one. Mapped reaches were subdivided into RAPID-only subreaches using a target length of 200~m. This subdivision, together with the effective-length floor and stability cap used for $K$ calculation, affected routing resolution and travel-time calculation only; it did not alter the mapped network geometry or geometric analyses.
+
+\begin{table}[t]
+\centering
+\caption{RAPID routing parameters and parameter-selection rules. Values labelled as ranges summarise the currently completed anchored runs and should be verified after all final runs have been completed.}
+\label{tab:routing_parameters}
+\begin{tabular}{p{0.31\linewidth}p{0.13\linewidth}p{0.20\linewidth}p{0.26\linewidth}}
+\hline
+Parameter & Symbol & Value & Description \\
+\hline
+Muskingum weighting factor & $X$ & 0.1 & Applied to all cases and states. \\
+Manning roughness & $n$ & 0.35 & Applied to all cases and states. \\
+Width-to-depth ratio & $k_b$ & 120.1--314.5 & Case-specific value estimated from the reference section using BASED; held constant across variants within a case. \\
+Minimum celerity & $c_{\min}$ & 0.05--0.07~m~s$^{-1}$ & Case-specific lower celerity cap selected for numerical stability. \\
+Maximum celerity & $c_{\max}$ & 2.524~m~s$^{-1}$ & Upper celerity cap applied to all cases and states. \\
+Target subreach length & $T_l$ & 200~m & Target length used to create RAPID-only subreaches. \\
+Effective-length floor & $L_{\mathrm{eff,min}}$ & 200~m & Minimum length used in travel-time parameter calculation. \\
+Stability effective-length cap & --- & Enabled & Applied near the lower celerity bound; 10~s margin and 0.03 relative celerity buffer. \\
+Routing timestep & $\Delta t$ & 620--4,200~s & Selected per state from the allowable Muskingum stability interval. \\
+Spin-up multiplier & $m_{\mathrm{spinup}}$ & 1.1 & Spin-up duration equals 1.1 times the longest downstream $K$ path for that state; an equally long terminal period was added. \\
+\hline
+\end{tabular}
+\end{table}
+
+% FINAL-RUN CHECK: Recalculate the reported ranges for k_b, c_min, and Delta t from all completed final anchored experiments, then remove the qualification in the table caption.

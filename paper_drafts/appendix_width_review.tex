@@ -1,0 +1,69 @@
+\section{Width review and effective routing-width estimation}
+\label{app:width_review}
+
+This appendix documents the quality-control procedure used to distinguish the measured geometric width of a reach from the effective width used for routing. The procedure was designed to retain measured width families as geometric attributes while identifying the limited set of reaches for which the automatically measured wet width was unsuitable for use in the routing network.
+
+\subsection{Reference-network review and model training}
+
+Reference networks were reviewed manually before the generation of simplified variants. Candidate reaches were defined by a measured length-to-wet-width ratio below 1.5. Each candidate was classified as accepted or requiring correction (Table~\ref{tab:width_review_criteria}). The review considered whether the selected bank pair represented the local channel cross-section and whether the resulting width was plausible in relation to adjacent reaches. Reaches whose bank pairing was affected by a junction, an inappropriate boundary component, or an implausible discontinuity in width were marked as requiring correction. The reviewed decisions were retained as permanent reference-network provenance and were used to train the automated screening model.
+
+\begin{table}[ht]
+\centering
+\caption{Summary of manual reference-network width review.}
+\label{tab:width_review_summary}
+\begin{tabular}{lrrrr}
+\hline
+Reference networks & Source reaches & Reviewed candidates & Accepted & Requiring correction \\
+\hline
+16 & 5,315 & 1,269 & 721 & 548 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table}[ht]
+\centering
+\caption{Manual review criteria for candidate width measurements.}
+\label{tab:width_review_criteria}
+\begin{tabular}{p{0.20\linewidth}p{0.70\linewidth}}
+\hline
+Classification & Criterion \\
+\hline
+Accepted & The two selected banks represented a plausible local channel cross-section and the resulting wet width was consistent with the surrounding network geometry. \\
+Requiring correction & The selected banks did not represent the intended local channel width, for example because of a junction-dominated cross-section, an inappropriate boundary component, or an implausible discontinuity relative to connected reaches. \\
+\hline
+\end{tabular}
+\end{table}
+
+For regenerated variants, a frozen logistic-regression classifier identified reaches requiring further consideration. Eleven ambiguous review records were excluded, leaving 1,258 records for model fitting. The model was applied only to candidate reaches and used the features listed in Table~\ref{tab:width_qc_features}. A predicted correction probability of at least 0.4 initiated the effective-width optimisation. In child networks, only reaches whose geometry changed during regeneration were evaluated anew; inherited reaches retained their previously assigned routing width.
+
+\begin{table}[ht]
+\centering
+\caption{Features used by the frozen width-quality-control classifier.}
+\label{tab:width_qc_features}
+\begin{tabular}{p{0.35\linewidth}p{0.55\linewidth}}
+\hline
+Feature & Description \\
+\hline
+Length-to-width ratio & Reach length divided by measured wet width. \\
+Split sensitivity & Indicator of whether the reach occurs in a locally split-flow setting. \\
+Mean and median bank opposition & Trimmed mean and median alignment of the two selected banks on opposite sides of the centreline. \\
+Invalid-sample fraction & Proportion of centreline samples for which a valid two-bank measurement was unavailable. \\
+Upstream continuity ratio & Ratio between the summed downstream width and upstream width at the upstream node. \\
+Upstream continuity deviation & Absolute and hybrid deviations from upstream width continuity. \\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Two-ended effective-width optimisation}
+
+The measured wet width, $W_{\mathrm{wet},e}$, was retained as a geometric attribute for every reach $e$. For reaches predicted to require correction, an effective routing width was estimated as $W_{\mathrm{routing},e}=s_eW_{\mathrm{wet},e}$, where $s_e$ is a reach-specific scale factor. Scale factors for all predicted reaches in a network were estimated jointly. Reaches not predicted to require correction were fixed at $s_e=1$.
+
+The optimisation balanced fidelity to the measured width against continuity of the total effective width at both ends of a candidate reach:
+\begin{equation}
+\min_{s_e} \left[ \sum_{e\in C}\lambda_e\left(\ln s_e\right)^2 + \sum_{j\in J}\omega_j\rho_{\delta}\left(\ln\frac{W_{\mathrm{out},j}}{W_{\mathrm{in},j}}\right) \right],
+\end{equation}
+where $C$ is the set of predicted reaches, $J$ is the set of their adjacent nodes, $W_{\mathrm{in},j}$ and $W_{\mathrm{out},j}$ are the summed effective widths entering and leaving node $j$, respectively, and $\rho_{\delta}$ is a robust Huber loss with $\delta=0.5$. The parameter $\delta$ defines the magnitude of the log-width-continuity residual at which the loss changes from quadratic to linear. The first term discourages unnecessary departure from the measured wet width; the second encourages width continuity while permitting genuine changes in total channel width.
+
+Continuity at a candidate reach's upstream node received a base weight of 2.0 and continuity at its downstream node a base weight of 1.0. The upstream contribution increased with the measured upstream continuity deviation. The penalty $\lambda_e$ and admissible range of $s_e$ were also adapted to the available evidence: classifier confidence, upstream continuity deviation, and poor bank opposition permitted a larger departure from the measured width. Nominal scale-factor bounds of 0.25--4 were therefore relaxed, where justified by the evidence, toward hard bounds of 0.05--8. Optimisation used the bounded L-BFGS-B algorithm. For sufficiently long reaches with non-overlapping endpoint windows, continuity was evaluated using separately measured upstream and downstream width contexts; otherwise, the whole-reach width was used at both ends.
+
+The resulting effective routing width was used only to parameterise routing. The measured wet, dry, and total width families were preserved separately for geometric analysis. Optimisation diagnostics, scale factors, model decisions, and any corrections extending beyond the nominal scale-factor range were written to the width-correction audit for each network state.
