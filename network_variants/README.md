@@ -634,7 +634,8 @@ children; only the requested anchored experiment is written (with the normal
 
 ### Reusing a completed base state
 
-Full-raster and panelized child experiments can start from a completed base
+Independent-unit and compound-bubble experiments can either build their base
+independently or start from a completed base
 experiment with `--base-state-source`. Reuse is a complete base-state contract,
 not just a copy of the directed vectors. When available, the new experiment
 copies and reuses:
@@ -643,18 +644,32 @@ copies and reuses:
 - the experiment-level boundary-component artifacts
 - the reference-section products and equivalent-resistance solve cache
 
-The input mask, reviewed links, and reviewed nodes recorded by the source
-manifest must match the requested inputs. Equivalent-resistance solver, width,
-and geometry settings must also match before the reference section or cache is
-accepted. If an older source lacks a complete hierarchy or hydraulic bundle,
-the workflow falls back to rebuilding those products; it never silently treats
-a partial bundle as complete. Reuse decisions are recorded under
-`base_state_reuse` in `experiment_manifest.json`.
+The input mask, reviewed links, reviewed nodes, example ID, exit sides,
+hierarchy settings, width settings, and equivalent-resistance configuration
+recorded by the source manifest must match the requested run. A missing or
+partial source is rejected before the destination experiment is reset; the
+workflow never mixes copied and recalculated base products.
 
-This avoids repeating the expensive base hierarchy and resistance solve for an
-anchored run derived from an already completed realized base. Child states are
-still generated and solved normally; only their unchanged base context is
-reused.
+Copying is transactional. Internal paths in the copied variant, hierarchy,
+hydraulic-context, boundary-component, reference-section, and solver-cache
+JSON manifests are rewritten from the source experiment root to the
+destination experiment root. External provenance paths (the original mask,
+reviewed vectors, permanent width-review archive, and model bundle) remain
+external references. The destination writes
+`states/S000_base/base_state_reuse_manifest.json`, while the experiment-level
+summary is recorded under `base_state_reuse` in `experiment_manifest.json`.
+
+For example, a compound run can reuse an already completed independent base:
+
+```bash
+--base-state-source network_variants/output/15_indep__anchored
+```
+
+Omitting this option keeps the fully independent behavior and recalculates the
+compound experiment's base. Supplying it avoids repeating width measurement,
+hierarchy detection, SWORD matching, slopes, hydraulic context, reference
+geometry, and the base resistance solve. Child states are still generated and
+solved normally.
 
 ### Recommended Parent Review Workflow
 

@@ -244,7 +244,7 @@ def test_variant_analysis_links_prefer_width_family_product(tmp_path: Path) -> N
 
 
 def test_copied_base_localizes_nested_routing_audit_reference(tmp_path: Path) -> None:
-    source = tmp_path / "source" / "variant"
+    source = tmp_path / "source" / "states" / "S000_base" / "variant"
     for directory in ("summary", "widths", "directed", "mask"):
         (source / directory).mkdir(parents=True, exist_ok=True)
     (source / "summary" / "variant_manifest.json").write_text(
@@ -269,7 +269,7 @@ def test_copied_base_localizes_nested_routing_audit_reference(tmp_path: Path) ->
     (source / "directed" / "99__S000_base_directed_links.gpkg").touch()
     (source / "directed" / "99__S000_base_directed_nodes.gpkg").touch()
     (source / "mask" / "99__S000_base_collapsed.tif").touch()
-    state_dir = tmp_path / "destination" / "S000_base"
+    state_dir = tmp_path / "destination" / "states" / "S000_base"
     context = SimpleNamespace(state_dir=state_dir)
 
     collapse_experiment_module._materialize_copied_base_state_variant(
@@ -1319,6 +1319,7 @@ def test_full_raster_base_source_reuses_complete_base_products_and_boundaries(
         source_variant / "directed",
         source_variant / "mask",
         source_variant / "widths",
+        source_variant / "summary",
         source_state / "hydraulic_context",
         source_experiment / "boundary_components",
     ):
@@ -1328,6 +1329,23 @@ def test_full_raster_base_source_reuses_complete_base_products_and_boundaries(
     (source_variant / "directed" / "22__S000_base_directed_nodes.gpkg").write_bytes(b"nodes")
     (source_variant / "mask" / "22__S000_base_collapsed.tif").write_bytes(b"mask")
     (source_variant / "widths" / "links_with_width_families.gpkg").write_bytes(b"widths")
+    (source_variant / "summary" / "variant_manifest.json").write_text(
+        json.dumps(
+            {
+                "output_paths": {
+                    "output_dir": str(source_variant.resolve()),
+                    "directed_links": str(
+                        (
+                            source_variant
+                            / "directed"
+                            / "22__S000_base_directed_links.gpkg"
+                        ).resolve()
+                    ),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     labels = (
         source_experiment
         / "boundary_components"
@@ -1346,7 +1364,47 @@ def test_full_raster_base_source_reuses_complete_base_products_and_boundaries(
         "id_node,rapid_wse_for_slope\n1,10\n2,9\n", encoding="utf-8"
     )
     (source_state / "hydraulic_context" / "hydraulic_context_manifest.json").write_text(
-        json.dumps({"state_id": "S000_base"}), encoding="utf-8"
+        json.dumps(
+            {
+                "state_id": "S000_base",
+                "output_paths": {
+                    "link_hydraulic_context": str(
+                        (
+                            source_state
+                            / "hydraulic_context"
+                            / "link_hydraulic_context.csv"
+                        ).resolve()
+                    )
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cleaned_mask = tmp_path / "22_cleaned.tif"
+    reviewed_links = tmp_path / "22_links.gpkg"
+    reviewed_nodes = tmp_path / "22_nodes.gpkg"
+    for path in (cleaned_mask, reviewed_links, reviewed_nodes):
+        path.write_bytes(b"input")
+    (source_experiment / "experiment_manifest.json").write_text(
+        json.dumps(
+            {
+                "mode": "independent-units",
+                "example_id": "22",
+                "exit_sides": "NS",
+                "code_version": "source-test-revision",
+                "n_complete_states": 1,
+                "n_failed_states": 0,
+                "stop_reason": "base_state_only",
+                "root_paths": {
+                    "cleaned_mask": str(cleaned_mask.resolve()),
+                    "reviewed_links": str(reviewed_links.resolve()),
+                    "reviewed_nodes": str(reviewed_nodes.resolve()),
+                },
+                "options": {"hierarchy": {}, "variant": {}},
+            }
+        ),
+        encoding="utf-8",
     )
 
     def fail_workflow_runner(*args: Any, **kwargs: Any) -> UnitWorkflowOutputs:
@@ -1358,9 +1416,9 @@ def test_full_raster_base_source_reuses_complete_base_products_and_boundaries(
     output_dir = tmp_path / "reused_output"
     results = run_collapse_experiment(
         "independent-units",
-        cleaned_mask_path=tmp_path / "22_cleaned.tif",
-        reviewed_links_path=tmp_path / "22_links.gpkg",
-        reviewed_nodes_path=tmp_path / "22_nodes.gpkg",
+        cleaned_mask_path=cleaned_mask,
+        reviewed_links_path=reviewed_links,
+        reviewed_nodes_path=reviewed_nodes,
         exit_sides="NS",
         output_dir=output_dir,
         collapse_corridor_mode="realized",
@@ -1390,6 +1448,81 @@ def test_full_raster_base_source_reuses_complete_base_products_and_boundaries(
     assert reuse["hierarchy_reused"] is True
     assert reuse["hydraulic_context_reused"] is True
     assert reuse["boundary_components_reused"] is True
+    assert reuse["compatibility_validated"] is True
+    reuse_audit = json.loads(Path(reuse["audit_manifest"]).read_text(encoding="utf-8"))
+    assert reuse_audit["validation_passed"] is True
+    assert reuse_audit["non_json_content_verified"] is True
+    assert reuse_audit["non_json_content_mismatches"] == []
+    assert reuse_audit["source_code_version"] == "source-test-revision"
+
+    copied_state = output_dir / "states" / "S000_base"
+    copied_variant_manifest = json.loads(
+        (copied_state / "variant" / "summary" / "variant_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert copied_variant_manifest["output_paths"]["output_dir"] == str(
+        (copied_state / "variant").resolve()
+    )
+    copied_hydraulic_manifest = json.loads(
+        (copied_state / "hydraulic_context" / "hydraulic_context_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert copied_hydraulic_manifest["output_paths"]["link_hydraulic_context"] == str(
+        (copied_state / "hydraulic_context" / "link_hydraulic_context.csv").resolve()
+    )
+
+
+def test_incomplete_base_source_is_rejected_before_destination_reset(
+    tmp_path: Path,
+) -> None:
+    source_experiment = tmp_path / "source"
+    source_variant = source_experiment / "states" / "S000_base" / "variant"
+    source_variant.mkdir(parents=True)
+    (source_experiment / "boundary_components").mkdir()
+    output_dir = tmp_path / "destination"
+    output_dir.mkdir()
+    marker = output_dir / "existing-output-must-survive.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    cleaned_mask = tmp_path / "22_cleaned.tif"
+    reviewed_links = tmp_path / "22_links.gpkg"
+    reviewed_nodes = tmp_path / "22_nodes.gpkg"
+    for path in (cleaned_mask, reviewed_links, reviewed_nodes):
+        path.write_bytes(b"input")
+    (source_experiment / "experiment_manifest.json").write_text(
+        json.dumps(
+            {
+                "mode": "independent-units",
+                "example_id": "22",
+                "exit_sides": "NS",
+                "n_complete_states": 1,
+                "n_failed_states": 0,
+                "root_paths": {
+                    "cleaned_mask": str(cleaned_mask.resolve()),
+                    "reviewed_links": str(reviewed_links.resolve()),
+                    "reviewed_nodes": str(reviewed_nodes.resolve()),
+                },
+                "options": {"hierarchy": {}, "variant": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(FileNotFoundError, match="source is incomplete"):
+        run_collapse_experiment(
+            "compound-bubbles",
+            cleaned_mask_path=cleaned_mask,
+            reviewed_links_path=reviewed_links,
+            reviewed_nodes_path=reviewed_nodes,
+            exit_sides="NS",
+            output_dir=output_dir,
+            collapse_corridor_mode="anchored",
+            base_only=True,
+            base_state_variant_source_dir=source_variant,
+        )
+
+    assert marker.read_text(encoding="utf-8") == "preserve"
 
 
 def test_run_copies_boundary_artifacts_before_base_materialization(tmp_path: Path) -> None:

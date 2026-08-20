@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import subprocess
@@ -654,23 +655,16 @@ def _copy_boundary_component_artifacts(
     if not source.is_dir():
         raise FileNotFoundError(f"Boundary-component artifact directory does not exist: {source}")
 
-    destination.mkdir(parents=True, exist_ok=True)
-    for source_path in source.iterdir():
-        destination_path = destination / source_path.name
-        if source_path.is_dir():
-            shutil.copytree(source_path, destination_path, dirs_exist_ok=True)
-        else:
-            shutil.copy2(source_path, destination_path)
-
-    labels_path = (
-        destination
-        / f"{example_id}_full_extent_land_water_labels_with_snapped_buffered_border_cut.tif"
+    labels_name = (
+        f"{example_id}_full_extent_land_water_labels_with_snapped_buffered_border_cut.tif"
     )
-    if not labels_path.exists():
+    if not (source / labels_name).exists():
         raise FileNotFoundError(
-            "Copied boundary-component artifacts do not contain the expected labels: "
-            f"{labels_path}"
+            "Boundary-component reuse source does not contain the expected labels: "
+            f"{source / labels_name}"
         )
+    _copytree_transactional(source, destination)
+    labels_path = destination / labels_name
 
     for manifest_path in destination.glob("*boundary_component_manifest.json"):
         with manifest_path.open("r", encoding="utf-8") as handle:
@@ -2191,37 +2185,210 @@ def _copy_completed_base_state_products(
     *,
     source_variant_dir: str | Path,
     destination_state_dir: Path,
-) -> UnitWorkflowOutputs | None:
-    """Copy hierarchy/hydraulic products when the source base is complete.
+) -> UnitWorkflowOutputs:
+    """Copy the complete hierarchy/hydraulic base-state contract."""
+    source_state_dir = Path(source_variant_dir).resolve().parent
+    source_hierarchy = source_state_dir / "hierarchy"
+    source_hydraulic = source_state_dir / "hydraulic_context"
+    missing = _missing_completed_base_state_artifacts(source_variant_dir)
+    if missing:
+        raise FileNotFoundError(
+            "Base-state reuse source is incomplete; refusing partial reuse: "
+            + ", ".join(str(path) for path in missing)
+        )
 
-    Older or deliberately minimal base sources remain supported: returning
-    ``None`` instructs the caller to rebuild those products as before.
-    """
+    workflow = _load_unit_workflow_outputs(source_hierarchy)
+    _copytree_transactional(source_hierarchy, destination_state_dir / "hierarchy")
+    _copytree_transactional(
+        source_hydraulic,
+        destination_state_dir / "hydraulic_context",
+    )
+    return workflow
+
+
+def _missing_completed_base_state_artifacts(
+    source_variant_dir: str | Path,
+) -> list[Path]:
     source_state_dir = Path(source_variant_dir).resolve().parent
     source_hierarchy = source_state_dir / "hierarchy"
     source_hydraulic = source_state_dir / "hydraulic_context"
     required = (
+        source_state_dir / "variant",
         source_hierarchy / "unit_workflow_manifest.json",
         *(source_hierarchy / filename for filename in _UNIT_WORKFLOW_FRAME_FILES.values()),
         source_hydraulic / "link_hydraulic_context.csv",
         source_hydraulic / "node_hydraulic_context.csv",
         source_hydraulic / "hydraulic_context_manifest.json",
     )
-    if not all(path.exists() for path in required):
-        return None
+    return [path for path in required if not path.exists()]
 
-    workflow = _load_unit_workflow_outputs(source_hierarchy)
-    shutil.copytree(
-        source_hierarchy,
-        destination_state_dir / "hierarchy",
-        dirs_exist_ok=True,
+
+def _copytree_transactional(source: Path, destination: Path) -> None:
+    """Copy one artifact tree without exposing a partially copied product."""
+    source = Path(source).resolve()
+    destination = Path(destination).resolve()
+    staging = destination.parent / f".{destination.name}.base-reuse-staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    try:
+        shutil.copytree(
+            source,
+            staging,
+            ignore=shutil.ignore_patterns("._*"),
+        )
+        if destination.exists():
+            shutil.rmtree(destination)
+        staging.replace(destination)
+    except Exception:
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+
+
+def _localize_json_value(
+    value: Any,
+    *,
+    source_experiment_dir: Path,
+    destination_experiment_dir: Path,
+) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _localize_json_value(
+                item,
+                source_experiment_dir=source_experiment_dir,
+                destination_experiment_dir=destination_experiment_dir,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _localize_json_value(
+                item,
+                source_experiment_dir=source_experiment_dir,
+                destination_experiment_dir=destination_experiment_dir,
+            )
+            for item in value
+        ]
+    if not isinstance(value, str):
+        return value
+    try:
+        relative = Path(value).resolve().relative_to(source_experiment_dir)
+    except (OSError, ValueError):
+        return value
+    return str((destination_experiment_dir / relative).resolve())
+
+
+def _localize_copied_base_manifests(
+    *,
+    source_experiment_dir: Path,
+    destination_experiment_dir: Path,
+    destination_state_dir: Path,
+) -> list[str]:
+    """Rewrite copied internal paths while retaining external provenance paths."""
+    localized: list[str] = []
+    roots = [
+        destination_state_dir,
+        destination_experiment_dir / "reference_section",
+        destination_experiment_dir / "equivalent_resistance" / "solve_cache",
+        destination_experiment_dir / "boundary_components",
+    ]
+    seen: set[Path] = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*.json")):
+            resolved = path.resolve()
+            if resolved in seen or path.name.startswith("._"):
+                continue
+            seen.add(resolved)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            rewritten = _localize_json_value(
+                payload,
+                source_experiment_dir=source_experiment_dir,
+                destination_experiment_dir=destination_experiment_dir,
+            )
+            if rewritten != payload:
+                path.write_text(json.dumps(rewritten, indent=2) + "\n", encoding="utf-8")
+                localized.append(str(path.resolve()))
+    return localized
+
+
+def _artifact_inventory(root: Path) -> dict[str, int]:
+    return {
+        str(path.relative_to(root)): int(path.stat().st_size)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+        and not path.name.startswith("._")
+        and path.relative_to(root).parts[0]
+        in {"variant", "hierarchy", "hydraulic_context"}
+    }
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_base_reuse_audit(
+    *,
+    source_experiment_dir: Path,
+    destination_experiment_dir: Path,
+    destination_state_dir: Path,
+    localized_manifests: Sequence[str],
+    source_manifest: Mapping[str, Any] | None,
+) -> Path:
+    source_state = source_experiment_dir / "states" / "S000_base"
+    source_inventory = _artifact_inventory(source_state)
+    destination_inventory = _artifact_inventory(destination_state_dir)
+    missing = sorted(set(source_inventory).difference(destination_inventory))
+    size_mismatches = sorted(
+        path
+        for path in set(source_inventory).intersection(destination_inventory)
+        if not path.endswith(".json")
+        and source_inventory[path] != destination_inventory[path]
     )
-    shutil.copytree(
-        source_hydraulic,
-        destination_state_dir / "hydraulic_context",
-        dirs_exist_ok=True,
+    content_mismatches = sorted(
+        relative
+        for relative in set(source_inventory).intersection(destination_inventory)
+        if not relative.endswith(".json")
+        and relative not in size_mismatches
+        and _sha256(source_state / relative)
+        != _sha256(destination_state_dir / relative)
     )
-    return workflow
+    if missing or size_mismatches or content_mismatches:
+        raise ValueError(
+            "Copied base-state inventory validation failed: "
+            f"missing={missing}, size_mismatches={size_mismatches}, "
+            f"content_mismatches={content_mismatches}."
+        )
+    audit_path = destination_state_dir / "base_state_reuse_manifest.json"
+    audit = {
+        "schema_version": "base-state-reuse-v1",
+        "status": "complete",
+        "source_experiment_dir": str(source_experiment_dir.resolve()),
+        "destination_experiment_dir": str(destination_experiment_dir.resolve()),
+        "source_code_version": (
+            source_manifest.get("code_version") if source_manifest is not None else None
+        ),
+        "source_mode": source_manifest.get("mode") if source_manifest is not None else None,
+        "source_stop_reason": (
+            source_manifest.get("stop_reason") if source_manifest is not None else None
+        ),
+        "source_file_count": int(len(source_inventory)),
+        "destination_file_count_before_audit": int(len(destination_inventory)),
+        "localized_manifest_count": int(len(localized_manifests)),
+        "localized_manifests": list(localized_manifests),
+        "missing_relative_paths": missing,
+        "non_json_size_mismatches": size_mismatches,
+        "non_json_content_mismatches": content_mismatches,
+        "non_json_content_verified": True,
+        "validation_passed": True,
+    }
+    audit_path.write_text(json.dumps(audit, indent=2) + "\n", encoding="utf-8")
+    return audit_path
 
 
 def _source_experiment_dir_from_base_variant(source_variant_dir: str | Path) -> Path:
@@ -2593,30 +2760,24 @@ def _materialize_copied_base_state_variant(
     destination = (context.state_dir / "variant").resolve()
     if source == destination:
         raise ValueError("Base-state variant source and destination must differ.")
-    shutil.copytree(source, destination, dirs_exist_ok=True)
+    _copytree_transactional(source, destination)
+
+    source_experiment = _source_experiment_dir_from_base_variant(source)
+    destination_experiment = context.state_dir.parent.parent.resolve()
+    localized_manifests = _localize_copied_base_manifests(
+        source_experiment_dir=source_experiment,
+        destination_experiment_dir=destination_experiment,
+        destination_state_dir=context.state_dir.resolve(),
+    )
 
     manifest_path = destination / "summary" / "variant_manifest.json"
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-
-        def localize(value: Any) -> Any:
-            if isinstance(value, dict):
-                return {key: localize(item) for key, item in value.items()}
-            if isinstance(value, list):
-                return [localize(item) for item in value]
-            if isinstance(value, str):
-                try:
-                    relative = Path(value).resolve().relative_to(source)
-                except (OSError, ValueError):
-                    return value
-                return str((destination / relative).resolve())
-            return value
-
-        manifest = localize(manifest)
         manifest["collapse_corridor_mode"] = collapse_corridor_mode
         manifest["base_state_copy"] = {
             "copied": True,
             "source_variant_dir": str(source),
+            "source_experiment_dir": str(source_experiment),
         }
         if boundary_component_labels_path is not None:
             local_boundary = str(Path(boundary_component_labels_path).resolve())
@@ -2640,6 +2801,19 @@ def _materialize_copied_base_state_variant(
             f"Copied base variant is missing required S000_base artifacts in {destination}."
         )
     bank_labels = destination / "mask" / "bank_labels.tif"
+    source_manifest_path = source_experiment / "experiment_manifest.json"
+    source_manifest = (
+        json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        if source_manifest_path.exists()
+        else None
+    )
+    _write_base_reuse_audit(
+        source_experiment_dir=source_experiment,
+        destination_experiment_dir=destination_experiment,
+        destination_state_dir=context.state_dir.resolve(),
+        localized_manifests=localized_manifests,
+        source_manifest=source_manifest,
+    )
     return BaseStateVariantOutputs(
         output_dir=destination,
         collapsed_mask_path=collapsed_mask,
@@ -3717,6 +3891,153 @@ def run_collapse_experiment(
             "Base-state reuse source must be outside the experiment output directory "
             f"that will be reset: {Path(base_state_variant_source_dir).resolve()}"
         )
+    reused_base_experiment_dir: Path | None = None
+    reused_base_manifest: dict[str, Any] | None = None
+    base_reuse_compatibility_validated = False
+    if base_state_variant_source_dir is not None:
+        reused_base_experiment_dir = _source_experiment_dir_from_base_variant(
+            base_state_variant_source_dir
+        )
+        source_manifest_path = reused_base_experiment_dir / "experiment_manifest.json"
+        if not source_manifest_path.exists():
+            raise FileNotFoundError(
+                "Base-state reuse requires the source experiment manifest: "
+                f"{source_manifest_path}"
+            )
+        reused_base_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        missing_base_artifacts = _missing_completed_base_state_artifacts(
+            base_state_variant_source_dir
+        )
+        if missing_base_artifacts:
+            raise FileNotFoundError(
+                "Base-state reuse source is incomplete; refusing partial reuse: "
+                + ", ".join(str(path) for path in missing_base_artifacts)
+            )
+        source_roots = reused_base_manifest.get("root_paths", {})
+        requested_roots = {
+            "cleaned_mask": Path(cleaned_mask_path).resolve(),
+            "reviewed_links": Path(reviewed_links_path).resolve(),
+            "reviewed_nodes": Path(reviewed_nodes_path).resolve(),
+        }
+        mismatches: list[str] = []
+        for key, requested_path in requested_roots.items():
+            source_value = source_roots.get(key)
+            if not source_value:
+                mismatches.append(f"{key}: source manifest value is missing")
+            elif Path(str(source_value)).resolve() != requested_path:
+                mismatches.append(
+                    f"{key}: source={Path(str(source_value)).resolve()} requested={requested_path}"
+                )
+        if str(reused_base_manifest.get("example_id")) != str(root_example_id):
+            mismatches.append(
+                "example_id: "
+                f"source={reused_base_manifest.get('example_id')!r} requested={root_example_id!r}"
+            )
+        if str(reused_base_manifest.get("exit_sides")) != str(exit_sides):
+            mismatches.append(
+                "exit_sides: "
+                f"source={reused_base_manifest.get('exit_sides')!r} requested={exit_sides!r}"
+            )
+        if int(reused_base_manifest.get("n_failed_states", 0) or 0) != 0:
+            mismatches.append(
+                f"n_failed_states: source={reused_base_manifest.get('n_failed_states')!r} requested=0"
+            )
+        if int(reused_base_manifest.get("n_complete_states", 0) or 0) < 1:
+            mismatches.append("source experiment has no completed base state")
+
+        source_options = reused_base_manifest.get("options", {})
+        source_hierarchy = source_options.get("hierarchy", {})
+        requested_hierarchy = {
+            "max_path_cutoff": max_path_cutoff,
+            "max_paths": max_paths,
+            "pixel_width_fields": (
+                list(pixel_width_fields) if pixel_width_fields is not None else None
+            ),
+            "pixel_width_percentiles": (
+                list(pixel_width_percentiles)
+                if pixel_width_percentiles is not None
+                else None
+            ),
+            "use_pixel_widths_for_extremes": bool(use_pixel_widths_for_extremes),
+        }
+        for key, requested_value in requested_hierarchy.items():
+            if key in source_hierarchy and source_hierarchy.get(key) != requested_value:
+                mismatches.append(
+                    f"hierarchy.{key}: source={source_hierarchy.get(key)!r} "
+                    f"requested={requested_value!r}"
+                )
+
+        source_variant = source_options.get("variant", {})
+        requested_variant = {
+            "exit_sides": exit_sides,
+            "preferred_width_field": preferred_width_field,
+            "transect_scale": transect_scale,
+            "min_transect_pixels": min_transect_pixels,
+            "bank_candidate_neighbors_max": bank_candidate_neighbors_max,
+            "sword_wse_field": sword_wse_field,
+            "sword_match_tolerance": sword_match_tolerance,
+            "sword_reach_buffer_steps": sword_reach_buffer_steps,
+        }
+        for key, requested_value in requested_variant.items():
+            if key in source_variant and source_variant.get(key) != requested_value:
+                mismatches.append(
+                    f"variant.{key}: source={source_variant.get(key)!r} "
+                    f"requested={requested_value!r}"
+                )
+
+        if equivalent_resistance_config is not None:
+            source_equivalent_config = source_hierarchy.get(
+                "equivalent_resistance_config"
+            )
+            source_reference_summary = source_hierarchy.get(
+                "equivalent_reference_kb_summary"
+            )
+            if source_equivalent_config is None or source_reference_summary is None:
+                mismatches.append(
+                    "equivalent resistance: source base has no reusable reference-Kb configuration"
+                )
+            else:
+                comparison_fields = (
+                    "resistance_law",
+                    "geometry_method",
+                    "kb_mode",
+                    "default_chezy_cz",
+                    "solver_backend",
+                    "sparse_min_internal_nodes",
+                )
+                current_config = asdict(equivalent_resistance_config)
+                for field in comparison_fields:
+                    if source_equivalent_config.get(field) != current_config.get(field):
+                        mismatches.append(
+                            f"equivalent_resistance_config.{field}: "
+                            f"source={source_equivalent_config.get(field)!r} "
+                            f"requested={current_config.get(field)!r}"
+                        )
+                source_width_field = source_hierarchy.get(
+                    "equivalent_kb_width_sample_field"
+                )
+                source_width_percentile = source_hierarchy.get(
+                    "equivalent_kb_width_percentile"
+                )
+                if source_width_field != equivalent_kb_width_sample_field:
+                    mismatches.append(
+                        "equivalent_kb_width_sample_field: "
+                        f"source={source_width_field!r} requested={equivalent_kb_width_sample_field!r}"
+                    )
+                if source_width_percentile != equivalent_kb_width_percentile:
+                    mismatches.append(
+                        "equivalent_kb_width_percentile: "
+                        f"source={source_width_percentile!r} requested={equivalent_kb_width_percentile!r}"
+                    )
+        if mismatches:
+            raise ValueError(
+                "Base-state source is incompatible with the requested experiment: "
+                + "; ".join(mismatches)
+            )
+        base_reuse_compatibility_validated = True
+
+    # Do not reset an existing destination until every source compatibility
+    # check above has passed.
     _reset_experiment_output_dir(output_path)
     states_dir = output_path / "states"
     states_dir.mkdir(parents=True, exist_ok=True)
@@ -3732,48 +4053,17 @@ def run_collapse_experiment(
             if execution_mode == "panelized" and panelized_boundary_component_labels_path is not None
             else None
         )
-
-    reused_base_experiment_dir: Path | None = None
-    reused_base_manifest: dict[str, Any] | None = None
-    if base_state_variant_source_dir is not None:
-        reused_base_experiment_dir = _source_experiment_dir_from_base_variant(
-            base_state_variant_source_dir
-        )
-        source_manifest_path = reused_base_experiment_dir / "experiment_manifest.json"
-        if source_manifest_path.exists():
-            reused_base_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
-            source_roots = reused_base_manifest.get("root_paths", {})
-            requested_roots = {
-                "cleaned_mask": Path(cleaned_mask_path).resolve(),
-                "reviewed_links": Path(reviewed_links_path).resolve(),
-                "reviewed_nodes": Path(reviewed_nodes_path).resolve(),
-            }
-            mismatches: list[str] = []
-            for key, requested_path in requested_roots.items():
-                source_value = source_roots.get(key)
-                if source_value and Path(str(source_value)).resolve() != requested_path:
-                    mismatches.append(
-                        f"{key}: source={Path(str(source_value)).resolve()} requested={requested_path}"
-                    )
-            if mismatches:
-                raise ValueError(
-                    "Base-state source inputs do not match the requested experiment: "
-                    + "; ".join(mismatches)
-                )
-
+    if reused_base_experiment_dir is not None:
         source_reference = reused_base_experiment_dir / "reference_section"
         if source_reference.is_dir():
-            shutil.copytree(
-                source_reference,
-                output_path / "reference_section",
-                dirs_exist_ok=True,
-            )
-        source_solver_cache = reused_base_experiment_dir / "equivalent_resistance" / "solve_cache"
+            _copytree_transactional(source_reference, output_path / "reference_section")
+        source_solver_cache = (
+            reused_base_experiment_dir / "equivalent_resistance" / "solve_cache"
+        )
         if source_solver_cache.is_dir():
-            shutil.copytree(
+            _copytree_transactional(
                 source_solver_cache,
                 output_path / "equivalent_resistance" / "solve_cache",
-                dirs_exist_ok=True,
             )
 
     active_equivalent_resistance_config = equivalent_resistance_config
@@ -3783,38 +4073,8 @@ def run_collapse_experiment(
         and reused_base_manifest is not None
     ):
         source_hierarchy_options = reused_base_manifest.get("options", {}).get("hierarchy", {})
-        source_equivalent_config = source_hierarchy_options.get("equivalent_resistance_config")
         source_reference_summary = source_hierarchy_options.get("equivalent_reference_kb_summary")
-        if source_equivalent_config is not None and source_reference_summary is not None:
-            comparison_fields = (
-                "resistance_law",
-                "geometry_method",
-                "kb_mode",
-                "default_chezy_cz",
-                "solver_backend",
-                "sparse_min_internal_nodes",
-            )
-            current_config = asdict(active_equivalent_resistance_config)
-            incompatible = [
-                field
-                for field in comparison_fields
-                if source_equivalent_config.get(field) != current_config.get(field)
-            ]
-            source_width_field = source_hierarchy_options.get(
-                "equivalent_kb_width_sample_field"
-            )
-            source_width_percentile = source_hierarchy_options.get(
-                "equivalent_kb_width_percentile"
-            )
-            if source_width_field != equivalent_kb_width_sample_field:
-                incompatible.append("equivalent_kb_width_sample_field")
-            if source_width_percentile != equivalent_kb_width_percentile:
-                incompatible.append("equivalent_kb_width_percentile")
-            if incompatible:
-                raise ValueError(
-                    "Base-state source equivalent-resistance configuration is incompatible "
-                    "with the requested run: " + ", ".join(sorted(set(incompatible)))
-                )
+        if source_reference_summary is not None:
             localized_reference_summary = dict(source_reference_summary)
             local_reference_summary_path = (
                 output_path / "reference_section" / "reference_section_summary.json"
@@ -4074,6 +4334,7 @@ def run_collapse_experiment(
                     if reused_base_experiment_dir is not None
                     else None
                 ),
+                "compatibility_validated": bool(base_reuse_compatibility_validated),
                 "variant_reused": base_state_variant_source_dir is not None,
                 "hierarchy_reused": reused_base_workflow is not None,
                 "hydraulic_context_reused": reused_base_workflow is not None,
@@ -4085,6 +4346,18 @@ def run_collapse_experiment(
                         / "equivalent_resistance"
                         / "solve_cache"
                     ).is_dir()
+                ),
+                "audit_manifest": (
+                    str(
+                        (
+                            output_path
+                            / "states"
+                            / "S000_base"
+                            / "base_state_reuse_manifest.json"
+                        ).resolve()
+                    )
+                    if base_state_variant_source_dir is not None
+                    else None
                 ),
             },
             "options": {
