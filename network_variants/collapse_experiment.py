@@ -109,6 +109,82 @@ EXECUTION_MODES = ("full_raster", "panelized", "local_patch")
 COLLAPSE_CORRIDOR_MODE_CHOICES = COLLAPSE_CORRIDOR_MODES + ("both",)
 
 
+@dataclass(frozen=True)
+class ExecutionBackendPlan:
+    """Resolved base, primary-child, and fallback execution backends."""
+
+    requested_modes: tuple[str, ...]
+    base_backend: str
+    child_backend: str
+    fallback_backend: str | None
+
+    @property
+    def is_hybrid_panelized_local_patch(self) -> bool:
+        return self.base_backend == "panelized" and self.child_backend == "local_patch"
+
+    def as_manifest(self) -> dict[str, object]:
+        return {
+            "requested_modes": list(self.requested_modes),
+            "base_backend": self.base_backend,
+            "child_backend": self.child_backend,
+            "fallback_backend": self.fallback_backend,
+            "hybrid_panelized_local_patch": self.is_hybrid_panelized_local_patch,
+        }
+
+
+def resolve_execution_backend_plan(
+    execution_mode: str | Sequence[str],
+) -> ExecutionBackendPlan:
+    """Resolve backward-compatible CLI modes into explicit execution roles."""
+    raw_modes = (
+        [execution_mode]
+        if isinstance(execution_mode, str)
+        else [str(mode) for mode in execution_mode]
+    )
+    modes: list[str] = []
+    for mode in raw_modes:
+        normalized = str(mode).strip()
+        if not normalized or normalized in modes:
+            continue
+        if normalized not in EXECUTION_MODES:
+            raise ValueError(
+                f"Unsupported execution mode {normalized!r}. Expected values from "
+                f"{EXECUTION_MODES}."
+            )
+        modes.append(normalized)
+    if not modes:
+        raise ValueError("At least one execution mode is required.")
+
+    mode_set = set(modes)
+    if mode_set == {"panelized", "local_patch"}:
+        return ExecutionBackendPlan(
+            requested_modes=("panelized", "local_patch"),
+            base_backend="panelized",
+            child_backend="local_patch",
+            fallback_backend="panelized",
+        )
+    if len(mode_set) != 1:
+        raise ValueError(
+            "Unsupported execution-mode combination. The only combined mode is "
+            "'panelized local_patch'."
+        )
+
+    mode = modes[0]
+    if mode == "local_patch":
+        return ExecutionBackendPlan(
+            requested_modes=(mode,),
+            base_backend="full_raster",
+            child_backend="local_patch",
+            fallback_backend="full_raster",
+        )
+    return ExecutionBackendPlan(
+        requested_modes=(mode,),
+        base_backend=mode,
+        child_backend=mode,
+        fallback_backend=None,
+    )
+
+
 @dataclass
 class ExperimentSelection:
     selection_type: str
@@ -3613,8 +3689,14 @@ def _make_local_patch_child_runner(
     *,
     fallback_variant_runner: Callable[..., NetworkVariantOutputs] = generate_network_variant,
     local_variant_runner: Callable[..., NetworkVariantOutputs] = materialize_local_patch_network_variant,
+    fallback_execution_mode: str = "full_raster",
 ) -> Callable[..., NetworkVariantOutputs]:
-    """Use a bounded local patch, with an explicit per-child full-raster fallback."""
+    """Use a bounded local patch with an explicit per-child fallback backend."""
+    if fallback_execution_mode not in {"full_raster", "panelized"}:
+        raise ValueError(
+            "Local-patch fallback execution must be 'full_raster' or 'panelized', "
+            f"not {fallback_execution_mode!r}."
+        )
 
     def run(**kwargs: Any) -> NetworkVariantOutputs:
         output_dir = Path(kwargs["output_dir"])
@@ -3636,16 +3718,16 @@ def _make_local_patch_child_runner(
                 source_audit = None
             attempt_dir.mkdir(parents=True, exist_ok=True)
             fallback_audit = {
-                "schema_version": "local-patch-fallback-v1",
+                "schema_version": "local-patch-fallback-v2",
                 "execution_mode_requested": "local_patch",
-                "execution_mode_used": "full_raster",
+                "execution_mode_used": fallback_execution_mode,
                 "fallback_stage": stage,
                 "fallback_code": code,
                 "fallback_reason": reason,
                 "source_audit": source_audit,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             }
-            fallback_path = attempt_dir / "fallback_to_full_raster.json"
+            fallback_path = attempt_dir / f"fallback_to_{fallback_execution_mode}.json"
             fallback_path.write_text(
                 json.dumps(fallback_audit, indent=2, sort_keys=True) + "\n",
                 encoding="utf-8",
@@ -3836,7 +3918,7 @@ def run_collapse_experiment(
     base_only: bool = False,
     requested_unit_ids: Sequence[int] | None = None,
     requested_compound_bubble_ids: Sequence[int] | None = None,
-    execution_mode: str = "full_raster",
+    execution_mode: str | Sequence[str] = "full_raster",
     panelized_width_samples_path: str | Path | None = None,
     panelized_boundary_component_labels_path: str | Path | None = None,
     boundary_component_artifact_source_dir: str | Path | None = None,
@@ -3844,15 +3926,14 @@ def run_collapse_experiment(
     equivalent_forcing_table_runner: Callable[..., tuple[pd.DataFrame, dict[str, object]]] = prepare_forcing_table,
     equivalent_reference_kb_summary_runner: Callable[..., dict[str, Any]] = compute_reference_section_kb,
 ) -> CollapseExperimentOutputs:
-    if execution_mode not in EXECUTION_MODES:
-        raise ValueError(f"Unsupported execution mode {execution_mode!r}. Expected one of {EXECUTION_MODES}.")
-    if execution_mode == "panelized":
+    execution_plan = resolve_execution_backend_plan(execution_mode)
+    if execution_plan.base_backend == "panelized":
         base_state_variant_materializer = _materialize_panelized_base_state_variant
     if mode not in EXPERIMENT_MODES:
         raise ValueError(f"Unsupported mode {mode!r}. Expected one of {EXPERIMENT_MODES}.")
     if requested_compound_bubble_ids is not None and mode != "compound-bubbles":
         raise ValueError("--compound-bubble-id is supported only with compound-bubbles.")
-    if execution_mode == "local_patch":
+    if execution_plan.child_backend == "local_patch":
         if mode not in {"independent-units", "compound-bubbles"}:
             raise ValueError(
                 "Local-patch execution currently supports only independent-units and "
@@ -4071,7 +4152,8 @@ def run_collapse_experiment(
     else:
         boundary_component_labels_path = (
             Path(panelized_boundary_component_labels_path)
-            if execution_mode == "panelized" and panelized_boundary_component_labels_path is not None
+            if execution_plan.base_backend == "panelized"
+            and panelized_boundary_component_labels_path is not None
             else None
         )
     if reused_base_experiment_dir is not None:
@@ -4263,13 +4345,18 @@ def run_collapse_experiment(
             hydraulic_context_runner=state_hydraulic_context_runner,
             hydraulic_context_kwargs=state_hydraulic_context_kwargs,
         )
-    if execution_mode == "panelized" and not base_only and variant_runner is generate_network_variant:
+    panelized_child_runner: Callable[..., NetworkVariantOutputs] | None = None
+    needs_panelized_child_runner = (
+        execution_plan.child_backend == "panelized"
+        or execution_plan.fallback_backend == "panelized"
+    )
+    if needs_panelized_child_runner and not base_only and variant_runner is generate_network_variant:
         child_boundary_labels = Path(panelized_boundary_component_labels_path) if panelized_boundary_component_labels_path else boundary_component_labels_path
         if child_boundary_labels is None:
             raise ValueError("Panelized child execution could not resolve base boundary-component labels.")
         run_root = Path(reviewed_links_path).resolve().parent.parent
         exits = json.loads((run_root / "panel_matching" / "panel_exit_sides.json").read_text())
-        variant_runner = _make_panelized_child_runner(
+        panelized_child_runner = _make_panelized_child_runner(
             source_panel_root=run_root / "panels", panel_plan_path=run_root / "panels" / "panel_plan.gpkg",
             panel_breaks_path=run_root / "manual_edits" / f"{root_example_id}_panel_breaks.gpkg",
             boundary_match_plan_path=run_root / "panel_matching" / "boundary_match_plan.json",
@@ -4279,7 +4366,13 @@ def run_collapse_experiment(
             run_name=root_example_id,
         )
         variant_kwargs["panelized_path_metrics"] = base_context.hierarchy_output_dir / "path_metrics.csv"
-    elif execution_mode == "local_patch" and not base_only and variant_runner is generate_network_variant:
+    if (
+        execution_plan.child_backend == "panelized"
+        and panelized_child_runner is not None
+        and variant_runner is generate_network_variant
+    ):
+        variant_runner = panelized_child_runner
+    elif execution_plan.child_backend == "local_patch" and not base_only and variant_runner is generate_network_variant:
         reference_centerline_path = Path(reviewed_links_path).with_name(
             f"{root_example_id}_centerline.gpkg"
         )
@@ -4287,9 +4380,19 @@ def run_collapse_experiment(
             raise FileNotFoundError(
                 "Local-patch execution requires the run-level single centerline beside "
                 f"the reviewed links: {reference_centerline_path}"
-            )
+        )
         variant_kwargs["local_patch_reference_centerline_path"] = reference_centerline_path
-        variant_runner = _make_local_patch_child_runner()
+        fallback_runner = (
+            panelized_child_runner
+            if execution_plan.fallback_backend == "panelized"
+            else generate_network_variant
+        )
+        if fallback_runner is None:
+            raise RuntimeError("Local-patch execution could not resolve its fallback backend.")
+        variant_runner = _make_local_patch_child_runner(
+            fallback_variant_runner=fallback_runner,
+            fallback_execution_mode=str(execution_plan.fallback_backend),
+        )
 
     state_records: list[dict[str, Any]] = [_state_record(base_context, mode)]
     transition_records: list[dict[str, Any]] = []
@@ -4327,6 +4430,7 @@ def run_collapse_experiment(
             "exit_sides": exit_sides,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "code_version": _git_revision(),
+            "execution_backends": execution_plan.as_manifest(),
             "root_paths": {
                 "cleaned_mask": str(Path(cleaned_mask_path).resolve()),
                 "reviewed_links": str(Path(reviewed_links_path).resolve()),
@@ -4420,6 +4524,7 @@ def run_collapse_experiment(
                     "debug_hierarchy": bool(debug_hierarchy),
                 },
             "variant": {
+                "execution_backends": execution_plan.as_manifest(),
                 "base_only": bool(base_only),
                 "requested_unit_ids": (
                     [int(unit_id) for unit_id in requested_unit_ids]
@@ -5098,11 +5203,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--execution-mode",
         choices=EXECUTION_MODES,
+        nargs="+",
         default="full_raster",
         help=(
             "Use full-raster processing, panelized processing, or the bounded local-patch "
-            "child workflow. local_patch is currently anchored-only and falls back per child "
-            "to full_raster when its safety contract cannot be satisfied."
+            "child workflow. Pass 'panelized local_patch' to use a panelized base, local-patch "
+            "children, and a panelized per-child fallback."
         ),
     )
     parser.add_argument(
@@ -5132,6 +5238,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    try:
+        execution_plan = resolve_execution_backend_plan(args.execution_mode)
+    except ValueError as exc:
+        parser.error(str(exc))
     equivalent_resistance_config = None
     equivalent_forcing_config = None
     if args.compute_equivalent_resistance:
@@ -5211,7 +5321,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "defer_child_hierarchy": args.defer_child_hierarchy,
         "requested_unit_ids": args.requested_unit_ids,
         "requested_compound_bubble_ids": args.requested_compound_bubble_ids,
-        "execution_mode": args.execution_mode,
+        "execution_mode": execution_plan.requested_modes,
         "panelized_width_samples_path": args.panelized_width_samples,
         "panelized_boundary_component_labels_path": args.panelized_boundary_component_labels,
     }
@@ -5226,7 +5336,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     anchored_source_experiment: Path | None = None
-    if args.execution_mode == "local_patch" and args.collapse_corridor_mode != "anchored":
+    if execution_plan.child_backend == "local_patch" and args.collapse_corridor_mode != "anchored":
         parser.error("--execution-mode local_patch currently requires --collapse-corridor-mode anchored.")
     if args.anchored_source_experiment is not None:
         if args.collapse_corridor_mode != "anchored":
@@ -5250,7 +5360,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     persist_realized_and_anchored = (
         args.collapse_corridor_mode in {"both", "anchored"}
         and anchored_source_experiment is None
-        and args.execution_mode != "local_patch"
+        and execution_plan.child_backend != "local_patch"
     )
     requested_modes = (
         ("anchored",)
@@ -5260,7 +5370,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     suffix_mode_outputs = (
         persist_realized_and_anchored
         or anchored_source_experiment is not None
-        or args.execution_mode == "local_patch"
+        or execution_plan.child_backend == "local_patch"
     )
     realized_output_dir_for_reuse: Path | None = anchored_source_experiment
     for collapse_corridor_mode in requested_modes:
@@ -5288,7 +5398,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             current_run_kwargs["base_state_variant_source_dir"] = str(
                 (realized_output_dir_for_reuse / "states" / "S000_base" / "variant").resolve()
             )
-            if args.execution_mode != "local_patch":
+            if execution_plan.child_backend != "local_patch":
                 current_run_kwargs["variant_runner"] = _make_realized_reuse_variant_runner(
                     realized_experiment_output_dir=realized_output_dir_for_reuse,
                     fallback_variant_runner=generate_network_variant,

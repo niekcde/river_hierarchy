@@ -20,6 +20,7 @@ from network_variants.collapse_experiment import (
     _copy_boundary_component_artifacts,
     _ensure_seed_direction_columns,
     _normalize_numeric_id_columns,
+    resolve_execution_backend_plan,
     _variant_analysis_links_path,
     _write_equivalent_transition_outputs,
     main,
@@ -28,6 +29,40 @@ from network_variants.collapse_experiment import (
 from network_variants.hydraulic_context import StateHydraulicContextOutputs
 from network_variants.variant_generation import NetworkVariantOutputs, VariantDirectionValidationError
 from rapid_tools.forcing import ForcingConfig
+
+
+@pytest.mark.parametrize(
+    ("requested", "base", "child", "fallback"),
+    [
+        ("full_raster", "full_raster", "full_raster", None),
+        ("panelized", "panelized", "panelized", None),
+        ("local_patch", "full_raster", "local_patch", "full_raster"),
+        (("panelized", "local_patch"), "panelized", "local_patch", "panelized"),
+        (("local_patch", "panelized"), "panelized", "local_patch", "panelized"),
+    ],
+)
+def test_resolve_execution_backend_plan(
+    requested: str | tuple[str, ...],
+    base: str,
+    child: str,
+    fallback: str | None,
+) -> None:
+    plan = resolve_execution_backend_plan(requested)
+
+    assert plan.base_backend == base
+    assert plan.child_backend == child
+    assert plan.fallback_backend == fallback
+
+
+@pytest.mark.parametrize(
+    "requested",
+    [(), ("full_raster", "local_patch"), ("full_raster", "panelized"), ("unknown",)],
+)
+def test_resolve_execution_backend_plan_rejects_unsupported_combinations(
+    requested: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError):
+        resolve_execution_backend_plan(requested)
 
 
 @pytest.mark.parametrize("reset_name", ["_reset_state_dir", "_reset_experiment_output_dir"])
@@ -2409,4 +2444,35 @@ def test_local_patch_child_runner_audits_ambiguous_merge_and_falls_back(tmp_path
     assert audit["fallback_stage"] == "merge"
     assert audit["fallback_code"] == "ambiguous_interface"
     assert outputs.manifest["execution_mode_requested"] == "local_patch"
+    assert outputs.manifest["local_patch_fallback_audit"] == str(audit_path.resolve())
+
+
+def test_local_patch_child_runner_can_use_panelized_fallback(tmp_path: Path) -> None:
+    output_dir = tmp_path / "variant"
+
+    def local_runner(**kwargs: Any):
+        raise collapse_experiment_module.LocalPatchFallbackRequested(
+            stage="planning",
+            code="unsafe_crop",
+            reason="The local crop crosses an unsafe interface.",
+            audit_path=output_dir / "local_patch_attempt" / "planning.json",
+        )
+
+    def panelized_runner(**kwargs: Any):
+        summary_dir = output_dir / "summary"
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(output_dir=output_dir, manifest={"variant_id": "S001_unit_7"})
+
+    runner = collapse_experiment_module._make_local_patch_child_runner(
+        fallback_variant_runner=panelized_runner,
+        local_variant_runner=local_runner,
+        fallback_execution_mode="panelized",
+    )
+    outputs = runner(output_dir=output_dir)
+
+    audit_path = output_dir / "local_patch_attempt" / "fallback_to_panelized.json"
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert audit["schema_version"] == "local-patch-fallback-v2"
+    assert audit["execution_mode_requested"] == "local_patch"
+    assert audit["execution_mode_used"] == "panelized"
     assert outputs.manifest["local_patch_fallback_audit"] == str(audit_path.resolve())
