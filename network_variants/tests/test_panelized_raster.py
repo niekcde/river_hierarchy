@@ -9,7 +9,7 @@ from shapely.geometry import LineString, box
 import geopandas as gpd
 
 import network_variants.panelized_raster as panelized_raster_module
-from network_variants.panelized_raster import apply_panel_collapse_edit, classify_panels_for_footprint, compute_panelized_base_width_families, compute_panelized_child_width_patch, compute_panelized_segmented_width_patch, compute_segmented_width_patch, materialize_affected_panel_masks, merge_panel_two_bank_widths, prepare_panel_state_workspace, regenerate_affected_panels, write_panel_origin_and_bank_labels, write_panelized_state_mosaic, write_state_bank_labels_windowed
+from network_variants.panelized_raster import apply_panel_collapse_edit, classify_panels_for_footprint, compute_panelized_base_width_families, compute_panelized_child_width_patch, compute_panelized_segmented_width_patch, compute_segmented_width_patch, materialize_affected_panel_masks, merge_panel_two_bank_widths, prepare_panel_state_workspace, regenerate_affected_panels, write_panel_origin_and_bank_labels, write_panelized_state_mosaic, write_panelized_state_virtual_mosaic, write_panelized_virtual_support_rasters, write_state_bank_labels_windowed
 
 
 def _write(path: Path, values: np.ndarray) -> None:
@@ -394,6 +394,72 @@ def test_state_mosaic_intersects_cropped_panel_bounds(tmp_path: Path) -> None:
         values = source.read(1)
     assert int(values.sum()) == 1
     assert values[2, 2] == 1
+
+
+def test_virtual_state_mosaic_and_support_rasters_match_materialized_values(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "parent.tif"
+    labels = tmp_path / "labels.tif"
+    panel_root = tmp_path / "panels"
+    (panel_root / "P001").mkdir(parents=True)
+    parent_values = np.zeros((10, 10), dtype="uint8")
+    panel_values = np.zeros((6, 6), dtype="uint8")
+    panel_values[2, 2] = 1
+    _write(parent, parent_values)
+    _write(labels, np.full((10, 10), 2, dtype="int32"))
+    with rasterio.open(
+        panel_root / "P001" / "mask.tif",
+        "w",
+        driver="GTiff",
+        height=6,
+        width=6,
+        count=1,
+        dtype="uint8",
+        transform=from_origin(0, 10, 1, 1),
+    ) as destination:
+        destination.write(panel_values, 1)
+    plan = tmp_path / "plan.gpkg"
+    gpd.GeoDataFrame(
+        {"panel_id": ["P001"]},
+        geometry=[box(0, 0, 10, 10)],
+        crs="EPSG:32611",
+    ).to_file(plan, layer="panel_cores", driver="GPKG")
+    materialized = write_panelized_state_mosaic(
+        parent_mask_path=parent,
+        panel_plan_path=plan,
+        state_panel_root=panel_root,
+        affected_panel_ids=["P001"],
+        output_mask_path=tmp_path / "materialized.tif",
+    )
+    virtual, publication = write_panelized_state_virtual_mosaic(
+        parent_mask_path=parent,
+        panel_plan_path=plan,
+        state_panel_root=panel_root,
+        affected_panel_ids=["P001"],
+        output_dir=tmp_path / "virtual",
+    )
+    with rasterio.open(materialized) as expected, rasterio.open(virtual) as actual:
+        assert np.array_equal(actual.read(1), expected.read(1))
+    origin, banks, removed, support = write_panelized_virtual_support_rasters(
+        base_mask_path=parent,
+        collapsed_patch_path=publication["overlay_path"],
+        boundary_component_labels_path=labels,
+        output_dir=tmp_path / "support",
+    )
+    with rasterio.open(origin) as source:
+        values = source.read(1)
+        assert values[2, 2] == 101
+        assert int(np.count_nonzero(values)) == 1
+    with rasterio.open(banks) as source:
+        assert source.shape == (10, 10)
+        # Component 2 is absorbed locally, and therefore remapped across its
+        # complete global extent by the virtual raster.
+        assert np.all(source.read(1) == 1)
+    # The newly wetted pixel overlaps component 2, so the state-bank builder
+    # correctly records that component as absorbed by the collapsed channel.
+    assert removed == [2]
+    assert support["origin"]["overlay_path"].endswith("origin_mask_patch.tif")
 
 
 def test_merge_panel_two_bank_widths(tmp_path: Path) -> None:

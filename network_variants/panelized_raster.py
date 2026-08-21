@@ -30,6 +30,7 @@ from network_variants.width_two_bank import (
     build_origin_mask,
     build_state_bank_labels,
 )
+from network_variants.virtual_raster import write_overlay_vrt
 
 
 def _serialize_width_values(values: np.ndarray) -> str:
@@ -1269,18 +1270,196 @@ def materialize_panelized_child_state(
         output_root=state_root / "merged",
         parent_directed_links_path=parent_directed_links_path,
     )
-    if not materialize_full_mask:
-        raise NotImplementedError(
-            "Virtual panelized states are not yet accepted by the shared child-state contract."
+    if materialize_full_mask:
+        collapsed_mask = write_panelized_state_mosaic(parent_mask_path=parent_mask_path, panel_plan_path=panel_plan_path, state_panel_root=state_panels, affected_panel_ids=plan["affected"], output_mask_path=state_root / "mask" / "collapsed_mask.tif")
+        mask_publication = {"mode": "materialized", "collapsed_mask": str(collapsed_mask.resolve())}
+    else:
+        collapsed_mask, mask_publication = write_panelized_state_virtual_mosaic(
+            parent_mask_path=parent_mask_path,
+            panel_plan_path=panel_plan_path,
+            state_panel_root=state_panels,
+            affected_panel_ids=plan["affected"],
+            output_dir=state_root / "mask",
         )
-    collapsed_mask = write_panelized_state_mosaic(parent_mask_path=parent_mask_path, panel_plan_path=panel_plan_path, state_panel_root=state_panels, affected_panel_ids=plan["affected"], output_mask_path=state_root / "mask" / "collapsed_mask.tif")
     return {
         "panel_plan": plan,
         "workspace": workspace,
         "edits": edits,
         "merged": merged,
         "collapsed_mask": str(collapsed_mask.resolve()),
+        "mask_publication": mask_publication,
     }
+
+
+def write_panelized_state_virtual_mosaic(
+    *,
+    parent_mask_path: str | Path,
+    panel_plan_path: str | Path,
+    state_panel_root: str | Path,
+    affected_panel_ids: list[str],
+    output_dir: str | Path,
+) -> tuple[Path, dict[str, object]]:
+    """Publish affected panel cores as one small patch over a full parent VRT."""
+    import geopandas as gpd
+
+    parent_mask_path = Path(parent_mask_path)
+    state_panel_root = Path(state_panel_root)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cores = gpd.read_file(panel_plan_path, layer="panel_cores").set_index("panel_id")
+    unknown = sorted(set(affected_panel_ids).difference(cores.index.astype(str)))
+    if unknown:
+        raise ValueError(f"Affected panel IDs are missing from the panel plan: {unknown}")
+    selected_cores = cores.loc[[str(value) for value in affected_panel_ids]]
+    patch_bounds = selected_cores.geometry.union_all().bounds
+
+    patch_path = output_dir / "collapsed_mask_patch.tif"
+    vrt_path = output_dir / "collapsed_mask.vrt"
+    with rasterio.open(parent_mask_path) as parent:
+        patch_window = from_bounds(*patch_bounds, transform=parent.transform).round_offsets().round_lengths()
+        patch_window = patch_window.intersection(Window(0, 0, parent.width, parent.height))
+        patch_values = parent.read(1, window=patch_window)
+        patch_transform = rasterio.windows.transform(patch_window, parent.transform)
+        for panel_id in [str(value) for value in affected_panel_ids]:
+            core = cores.loc[panel_id].geometry
+            with rasterio.open(state_panel_root / panel_id / "mask.tif") as panel:
+                patch_geometry = core.intersection(box(*panel.bounds))
+                if patch_geometry.is_empty:
+                    continue
+                destination_window = (
+                    from_bounds(*patch_geometry.bounds, transform=parent.transform)
+                    .round_offsets()
+                    .round_lengths()
+                )
+                destination_bounds = rasterio.windows.bounds(destination_window, parent.transform)
+                panel_window = (
+                    from_bounds(*destination_bounds, transform=panel.transform)
+                    .round_offsets()
+                    .round_lengths()
+                )
+                values = panel.read(1, window=panel_window)
+            expected_shape = (int(destination_window.height), int(destination_window.width))
+            if values.shape != expected_shape:
+                raise ValueError(
+                    f"Panel {panel_id} patch window has shape {values.shape}; "
+                    f"expected {expected_shape} in the parent grid."
+                )
+            core_mask = rasterize(
+                [(patch_geometry, 1)],
+                out_shape=expected_shape,
+                transform=rasterio.windows.transform(destination_window, parent.transform),
+                dtype="uint8",
+            ).astype(bool)
+            row_start = int(destination_window.row_off - patch_window.row_off)
+            col_start = int(destination_window.col_off - patch_window.col_off)
+            target = patch_values[
+                row_start : row_start + expected_shape[0],
+                col_start : col_start + expected_shape[1],
+            ]
+            if target.shape != expected_shape:
+                raise ValueError(f"Panel {panel_id} does not fit inside the virtual patch window.")
+            target[core_mask] = values[core_mask]
+
+        profile = parent.profile.copy()
+        for key in ("blockxsize", "blockysize", "tiled"):
+            profile.pop(key, None)
+        profile.update(
+            width=int(patch_window.width),
+            height=int(patch_window.height),
+            transform=patch_transform,
+            count=1,
+            compress="lzw",
+            tiled=False,
+        )
+        with rasterio.open(patch_path, "w", **profile) as destination:
+            destination.write(patch_values, 1)
+
+    overlay = write_overlay_vrt(
+        base_path=parent_mask_path,
+        overlay_path=patch_path,
+        output_path=vrt_path,
+    )
+    manifest = overlay.to_manifest()
+    manifest["mode"] = "virtual_patch"
+    manifest["affected_panel_ids"] = [str(value) for value in affected_panel_ids]
+    return vrt_path, manifest
+
+
+def write_panelized_virtual_support_rasters(
+    *,
+    base_mask_path: str | Path,
+    collapsed_patch_path: str | Path,
+    boundary_component_labels_path: str | Path,
+    output_dir: str | Path,
+) -> tuple[Path, Path, list[int], dict[str, object]]:
+    """Publish virtual origin and bank-label rasters for one panelized patch."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    origin_patch_path = output_dir / "origin_mask_patch.tif"
+    origin_vrt_path = output_dir / "origin_mask.vrt"
+    bank_patch_path = output_dir / "bank_labels_patch.tif"
+    bank_vrt_path = output_dir / "bank_labels.vrt"
+
+    with rasterio.open(base_mask_path) as base, rasterio.open(collapsed_patch_path) as child:
+        col_float, row_float = (~base.transform) * (child.transform.c, child.transform.f)
+        window = Window(
+            int(round(float(col_float))),
+            int(round(float(row_float))),
+            int(child.width),
+            int(child.height),
+        )
+        base_water = base.read(1, window=window) > 0
+        child_water = child.read(1) > 0
+        origin = np.zeros(base_water.shape, dtype=np.uint16)
+        origin[base_water] = ORIGIN_WET_LABEL
+        origin[child_water & ~base_water] = 101
+        profile = child.profile.copy()
+        for key in ("blockxsize", "blockysize", "tiled"):
+            profile.pop(key, None)
+        profile.update(dtype="uint16", count=1, nodata=0, compress="lzw", tiled=False)
+        with rasterio.open(origin_patch_path, "w", **profile) as destination:
+            destination.write(origin, 1)
+
+    origin_overlay = write_overlay_vrt(
+        base_path=base_mask_path,
+        overlay_path=origin_patch_path,
+        output_path=origin_vrt_path,
+        output_dtype="uint16",
+    )
+    with rasterio.open(boundary_component_labels_path) as boundary, rasterio.open(
+        origin_patch_path
+    ) as origin_source:
+        col_float, row_float = (~boundary.transform) * (
+            origin_source.transform.c,
+            origin_source.transform.f,
+        )
+        window = Window(
+            int(round(float(col_float))),
+            int(round(float(row_float))),
+            int(origin_source.width),
+            int(origin_source.height),
+        )
+        labels = boundary.read(1, window=window).astype(np.int32)
+        state_labels, removed = build_state_bank_labels(labels, origin_source.read(1))
+        profile = origin_source.profile.copy()
+        for key in ("blockxsize", "blockysize", "tiled"):
+            profile.pop(key, None)
+        profile.update(dtype="int32", count=1, nodata=0, compress="lzw", tiled=False)
+        with rasterio.open(bank_patch_path, "w", **profile) as destination:
+            destination.write(state_labels.astype(np.int32), 1)
+    bank_overlay = write_overlay_vrt(
+        base_path=boundary_component_labels_path,
+        overlay_path=bank_patch_path,
+        output_path=bank_vrt_path,
+        output_dtype="int32",
+        base_value_overrides={int(label): ORIGIN_WET_LABEL for label in removed},
+    )
+    manifest = {
+        "schema_version": "panelized-virtual-support-rasters-v1",
+        "origin": origin_overlay.to_manifest(),
+        "bank_labels": bank_overlay.to_manifest(),
+    }
+    return origin_vrt_path, bank_vrt_path, [int(value) for value in removed], manifest
 
 
 def write_panelized_state_mosaic(

@@ -43,6 +43,7 @@ from network_variants.local_patch_variant import (
     derive_local_exit_side_candidates,
     materialize_local_patch_variant,
 )
+from network_variants.virtual_raster import write_overlay_vrt
 from network_variants.variant_generation import (
     NetworkVariantOutputs,
     _apply_collapsed_selection_metadata,
@@ -189,6 +190,112 @@ def _copy_raster_with_local_edit(
     return collapsed_output_path, origin_output_path, int(np.count_nonzero(changed))
 
 
+def _write_virtual_rasters_with_local_edit(
+    *,
+    parent_mask_path: str | Path,
+    local_base_mask_path: str | Path,
+    local_collapsed_mask_path: str | Path,
+    local_origin_mask_path: str | Path,
+    cut_barrier_path: str | Path,
+    output_dir: str | Path,
+    name: str,
+) -> tuple[Path, Path, int, Path]:
+    """Publish full-extent VRT masks backed by one parent and one local patch."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    collapsed_patch_path = output_dir / f"{name}_collapsed_patch.tif"
+    origin_patch_path = output_dir / f"{name}_origin_patch.tif"
+    collapsed_vrt_path = output_dir / f"{name}_collapsed.vrt"
+    origin_vrt_path = output_dir / f"{name}_origin.vrt"
+
+    with rasterio.open(parent_mask_path) as parent, rasterio.open(local_base_mask_path) as base, \
+        rasterio.open(local_collapsed_mask_path) as collapsed, \
+        rasterio.open(local_origin_mask_path) as origin, rasterio.open(cut_barrier_path) as barrier:
+        local_sources = (base, collapsed, origin, barrier)
+        if any(source.shape != base.shape or source.transform != base.transform for source in local_sources):
+            raise ValueError("Local-patch mask products are not aligned.")
+        if any(source.crs != parent.crs for source in local_sources):
+            raise ValueError("Local-patch and parent masks do not share a CRS.")
+        col_float, row_float = (~parent.transform) * (base.transform.c, base.transform.f)
+        col_off = int(round(float(col_float)))
+        row_off = int(round(float(row_float)))
+        if abs(float(col_float) - col_off) > 1e-6 or abs(float(row_float) - row_off) > 1e-6:
+            raise ValueError("The local-patch raster origin is not aligned to the parent grid.")
+        window = Window(col_off, row_off, int(base.width), int(base.height))
+        if (
+            window.col_off < 0
+            or window.row_off < 0
+            or window.col_off + window.width > parent.width
+            or window.row_off + window.height > parent.height
+        ):
+            raise ValueError("The local-patch raster window lies outside the parent mask.")
+        if not np.allclose(
+            tuple(window_transform(window, parent.transform)),
+            tuple(base.transform),
+            rtol=0.0,
+            atol=1e-7,
+        ):
+            raise ValueError("The local-patch window does not reproduce its raster transform.")
+
+        base_values = base.read(1)
+        collapsed_values = collapsed.read(1)
+        origin_values = origin.read(1).astype(np.int32)
+        cut_values = barrier.read(1) > 0
+        changed = (base_values != collapsed_values) & ~cut_values
+        parent_window = parent.read(1, window=window)
+        collapsed_patch = parent_window.copy()
+        collapsed_patch[changed] = collapsed_values[changed]
+        origin_patch = (parent_window > 0).astype(np.int32)
+        origin_patch[changed] = origin_values[changed]
+
+        patch_profile = parent.profile.copy()
+        for key in ("blockxsize", "blockysize", "tiled"):
+            patch_profile.pop(key, None)
+        patch_profile.update(
+            width=int(base.width),
+            height=int(base.height),
+            transform=base.transform,
+            count=1,
+            compress="lzw",
+            tiled=False,
+        )
+        with rasterio.open(collapsed_patch_path, "w", **patch_profile) as destination:
+            destination.write(collapsed_patch, 1)
+        origin_profile = patch_profile.copy()
+        origin_profile.update(dtype="int32", nodata=0)
+        with rasterio.open(origin_patch_path, "w", **origin_profile) as destination:
+            destination.write(origin_patch, 1)
+
+    collapsed_overlay = write_overlay_vrt(
+        base_path=parent_mask_path,
+        overlay_path=collapsed_patch_path,
+        output_path=collapsed_vrt_path,
+    )
+    origin_overlay = write_overlay_vrt(
+        base_path=parent_mask_path,
+        overlay_path=origin_patch_path,
+        output_path=origin_vrt_path,
+        output_dtype="int32",
+    )
+    manifest_path = output_dir / "virtual_mask_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "local-patch-virtual-mask-v1",
+                "publication_mode": "virtual_patch",
+                "changed_pixels": int(np.count_nonzero(changed)),
+                "collapsed": collapsed_overlay.to_manifest(),
+                "origin": origin_overlay.to_manifest(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return collapsed_vrt_path, origin_vrt_path, int(np.count_nonzero(changed)), manifest_path
+
+
 def _write_full_bank_labels(
     *,
     boundary_labels_path: str | Path,
@@ -313,6 +420,7 @@ def _materialize_local_patch_network_variant_once(
     max_path_cutoff: int = 100,
     max_paths: int = 5000,
     local_patch_reference_centerline_path: str | Path | None = None,
+    local_patch_mask_publication: str = "materialized",
     computational_context_unit_id: int | None = None,
     local_patch_attempt_subdirectory: str | None = None,
     **_: Any,
@@ -325,6 +433,10 @@ def _materialize_local_patch_network_variant_once(
         raise ValueError("Local-patch execution requires explicit unit_ids.")
     if boundary_component_labels_path is None:
         raise ValueError("Local-patch execution requires global boundary-component labels.")
+    if local_patch_mask_publication not in {"materialized", "virtual_patch"}:
+        raise ValueError(
+            "Local-patch mask publication must be 'materialized' or 'virtual_patch'."
+        )
 
     output_dir = Path(output_dir)
     attempt_root = output_dir / "local_patch_attempt"
@@ -339,6 +451,7 @@ def _materialize_local_patch_network_variant_once(
     for stale_path in (
         output_dir / "summary" / "variant_manifest.json",
         attempt_dir / "fallback_to_full_raster.json",
+        attempt_dir / "fallback_to_panelized.json",
         attempt_dir / "exit_side_retry_summary.json",
     ):
         stale_path.unlink(missing_ok=True)
@@ -582,21 +695,47 @@ def _materialize_local_patch_network_variant_once(
         directory.mkdir(parents=True, exist_ok=True)
 
     name = f"{example_id}__{variant_id}"
-    collapsed_path, origin_path, changed_pixels = _copy_raster_with_local_edit(
-        parent_mask_path=cleaned_mask_path,
-        local_base_mask_path=raw_variant.output_paths["local_base_mask"],
-        local_collapsed_mask_path=raw_variant.output_paths["local_collapsed_mask"],
-        local_origin_mask_path=raw_variant.output_paths["local_origin_mask"],
-        cut_barrier_path=raw_variant.output_paths["main_bank_cut_barrier"],
-        collapsed_output_path=mask_dir / f"{name}_collapsed.tif",
-        origin_output_path=mask_dir / f"{name}_origin.tif",
-    )
+    virtual_mask_manifest_path: Path | None = None
+    if local_patch_mask_publication == "virtual_patch":
+        collapsed_path, origin_path, changed_pixels, virtual_mask_manifest_path = (
+            _write_virtual_rasters_with_local_edit(
+                parent_mask_path=cleaned_mask_path,
+                local_base_mask_path=raw_variant.output_paths["local_base_mask"],
+                local_collapsed_mask_path=raw_variant.output_paths["local_collapsed_mask"],
+                local_origin_mask_path=raw_variant.output_paths["local_origin_mask"],
+                cut_barrier_path=raw_variant.output_paths["main_bank_cut_barrier"],
+                output_dir=mask_dir,
+                name=name,
+            )
+        )
+    else:
+        collapsed_path, origin_path, changed_pixels = _copy_raster_with_local_edit(
+            parent_mask_path=cleaned_mask_path,
+            local_base_mask_path=raw_variant.output_paths["local_base_mask"],
+            local_collapsed_mask_path=raw_variant.output_paths["local_collapsed_mask"],
+            local_origin_mask_path=raw_variant.output_paths["local_origin_mask"],
+            cut_barrier_path=raw_variant.output_paths["main_bank_cut_barrier"],
+            collapsed_output_path=mask_dir / f"{name}_collapsed.tif",
+            origin_output_path=mask_dir / f"{name}_origin.tif",
+        )
     removed_labels = products.summary.get("removed_bank_component_labels", [])
-    bank_labels_path = _write_full_bank_labels(
-        boundary_labels_path=boundary_component_labels_path,
-        removed_labels=removed_labels,
-        output_path=mask_dir / f"{name}_bank_labels.tif",
-    )
+    virtual_bank_overlay: dict[str, object] | None = None
+    if local_patch_mask_publication == "virtual_patch":
+        bank_overlay = write_overlay_vrt(
+            base_path=boundary_component_labels_path,
+            overlay_path=products.output_paths["local_state_bank_labels"],
+            output_path=mask_dir / f"{name}_bank_labels.vrt",
+            output_dtype="int32",
+            base_value_overrides={int(label): 1 for label in removed_labels},
+        )
+        bank_labels_path = bank_overlay.vrt_path
+        virtual_bank_overlay = bank_overlay.to_manifest()
+    else:
+        bank_labels_path = _write_full_bank_labels(
+            boundary_labels_path=boundary_component_labels_path,
+            removed_labels=removed_labels,
+            output_path=mask_dir / f"{name}_bank_labels.tif",
+        )
 
     collapse_components = _annotate(pd.read_csv(raw_variant.output_paths["collapse_components"]), selected_ids)
     collapse_components_path = summary_dir / "collapse_components.csv"
@@ -709,6 +848,15 @@ def _materialize_local_patch_network_variant_once(
                 "attempts": exit_side_attempts,
             },
             "true_collapsed_pixel_count": changed_pixels,
+            "mask_publication": {
+                "mode": local_patch_mask_publication,
+                "manifest": (
+                    str(virtual_mask_manifest_path.resolve())
+                    if virtual_mask_manifest_path is not None
+                    else None
+                ),
+                "bank_labels": virtual_bank_overlay,
+            },
             "attempt_dir": str(attempt_dir.resolve()),
         },
         "output_paths": {

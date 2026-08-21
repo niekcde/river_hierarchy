@@ -617,8 +617,9 @@ This mode is deliberately separate from `full_raster` and `panelized`. It
 recalculates RivGraph and raster-derived widths only inside a validated crop,
 merges that result into the complete parent graph, and then uses the normal
 hierarchy/hydraulic pipeline. Strict unchanged one-to-one links inherit their
-parent products. The published collapsed mask remains a genuine full-extent
-mask, written blockwise from the parent plus the local collapse edit.
+parent products. In the standalone `local_patch` mode, the published collapsed
+mask remains a genuine full-extent mask, written blockwise from the parent plus
+the local collapse edit.
 
 Safety is per child. If topology planning, crop validation, or conservative
 interface merging is unsafe or ambiguous, that child automatically uses the
@@ -631,6 +632,36 @@ At present this execution mode supports only `independent-units` and
 the historical anchored CLI behavior, it does not first generate all realized
 children; only the requested anchored experiment is written (with the normal
 `__anchored` output suffix).
+
+### Panelized base with local-patch children
+
+Large examples can combine the two execution modes in one command:
+
+```bash
+--execution-mode panelized local_patch
+```
+
+This combination has fixed semantics:
+
+- `S000_base` is built with the established panelized workflow;
+- every derived child first uses the validated local-patch workflow;
+- an unsafe local child falls back to the panelized child workflow, never to a
+  whole-raster child run;
+- child collapsed, origin, and bank-label rasters are exposed as full-extent
+  GDAL VRTs backed by the unchanged parent plus a small aligned patch.
+
+The VRTs preserve the normal raster contract for downstream Rasterio/GDAL
+readers without copying the unchanged full raster into every child directory.
+When a collapsed channel absorbs a bank component, the bank-label VRT applies
+that label remapping over the component's complete global extent. The child
+manifest records `execution_backends`, `mask_publication`, the patch paths, and
+any panelized fallback audit.
+
+The hybrid mode remains anchored-only and supports `independent-units` and
+`compound-bubbles`. A compound experiment can independently build its own
+panelized base, or reuse the completed independent base with
+`--base-state-source`; base-state compatibility and manifest path rewriting are
+unchanged.
 
 ### Reusing a completed base state
 

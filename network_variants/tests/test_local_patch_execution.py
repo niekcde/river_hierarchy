@@ -13,6 +13,7 @@ from shapely.geometry import LineString
 from network_variants.local_patch_execution import (
     _copy_raster_with_local_edit,
     _selected_units_from_hierarchy_products,
+    _write_virtual_rasters_with_local_edit,
 )
 
 
@@ -74,6 +75,63 @@ def test_full_mask_materialization_applies_collapse_but_excludes_crop_cut(tmp_pa
     assert full_collapsed[1, 2] == 1
     assert full_origin[1, 2] == 1
     assert int(full_collapsed.sum()) == 15
+
+
+def test_virtual_mask_publication_matches_materialized_result(tmp_path: Path) -> None:
+    parent_transform = from_origin(298319.67, 5753293.79, 7.318, 7.318)
+    parent = np.ones((4, 4), dtype=np.uint8)
+    parent_path = _write(tmp_path / "parent.tif", parent, parent_transform)
+    local_window = Window(1, 1, 2, 2)
+    local_transform = window_transform(local_window, parent_transform)
+    local_base = np.ones((2, 2), dtype=np.uint8)
+    local_collapsed = local_base.copy()
+    local_collapsed[0, 0] = 0
+    local_collapsed[0, 1] = 0
+    local_origin = np.ones((2, 2), dtype=np.int32)
+    local_origin[0, 0] = 107
+    local_origin[0, 1] = 0
+    barrier = np.zeros((2, 2), dtype=np.uint8)
+    barrier[0, 1] = 1
+    paths = {
+        "base": _write(tmp_path / "local_base.tif", local_base, local_transform),
+        "collapsed": _write(tmp_path / "local_collapsed.tif", local_collapsed, local_transform),
+        "origin": _write(tmp_path / "local_origin.tif", local_origin, local_transform),
+        "barrier": _write(tmp_path / "barrier.tif", barrier, local_transform),
+    }
+    materialized_collapsed, materialized_origin, _ = _copy_raster_with_local_edit(
+        parent_mask_path=parent_path,
+        local_base_mask_path=paths["base"],
+        local_collapsed_mask_path=paths["collapsed"],
+        local_origin_mask_path=paths["origin"],
+        cut_barrier_path=paths["barrier"],
+        collapsed_output_path=tmp_path / "materialized_collapsed.tif",
+        origin_output_path=tmp_path / "materialized_origin.tif",
+    )
+    virtual_collapsed, virtual_origin, changed_pixels, manifest = (
+        _write_virtual_rasters_with_local_edit(
+            parent_mask_path=parent_path,
+            local_base_mask_path=paths["base"],
+            local_collapsed_mask_path=paths["collapsed"],
+            local_origin_mask_path=paths["origin"],
+            cut_barrier_path=paths["barrier"],
+            output_dir=tmp_path / "virtual",
+            name="case",
+        )
+    )
+    with rasterio.open(materialized_collapsed) as expected, rasterio.open(
+        virtual_collapsed
+    ) as actual:
+        assert actual.shape == expected.shape
+        assert actual.transform == expected.transform
+        assert np.array_equal(actual.read(1), expected.read(1))
+    with rasterio.open(materialized_origin) as expected, rasterio.open(
+        virtual_origin
+    ) as actual:
+        assert actual.dtypes[0] == "int32"
+        assert np.array_equal(actual.read(1), expected.read(1))
+    assert changed_pixels == 1
+    assert manifest.exists()
+    assert not (tmp_path / "virtual" / "case_collapsed.tif").exists()
 
 
 def test_selected_units_are_rebuilt_from_saved_base_hierarchy_without_redetection() -> None:

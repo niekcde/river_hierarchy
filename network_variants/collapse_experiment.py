@@ -87,6 +87,7 @@ from network_variants.panelized_raster import (
     compute_panelized_base_width_families,
     compute_panelized_child_width_patch,
     materialize_panelized_child_state,
+    write_panelized_virtual_support_rasters,
     write_state_bank_labels_windowed,
     write_state_origin_mask_windowed,
 )
@@ -319,19 +320,38 @@ def _finalize_panelized_child_result(
         directory.mkdir(parents=True, exist_ok=True)
 
     run_name = f"{example_id}__{variant_id}"
-    collapsed_mask_path = mask_dir / f"{run_name}_collapsed.tif"
-    shutil.copy2(collapsed_mask, collapsed_mask_path)
-    origin_mask_path = write_state_origin_mask_windowed(
-        base_mask_path=parent_mask_path,
-        collapsed_mask_path=collapsed_mask_path,
-        output_path=mask_dir / "origin_mask.tif",
-    )
-    bank_labels_path = mask_dir / "bank_labels.tif"
-    removed_bank_labels = write_state_bank_labels_windowed(
-        boundary_component_labels_path=boundary_component_labels_path,
-        origin_mask_path=origin_mask_path,
-        output_path=bank_labels_path,
-    )
+    mask_publication = dict(panelized_result.get("mask_publication", {}))
+    virtual_support_manifest: dict[str, object] | None = None
+    if mask_publication.get("mode") == "virtual_patch":
+        collapsed_mask_path = collapsed_mask
+        overlay_path = mask_publication.get("overlay_path")
+        if not overlay_path:
+            raise ValueError("Panelized virtual mask publication is missing its overlay path.")
+        (
+            origin_mask_path,
+            bank_labels_path,
+            removed_bank_labels,
+            virtual_support_manifest,
+        ) = write_panelized_virtual_support_rasters(
+            base_mask_path=parent_mask_path,
+            collapsed_patch_path=Path(str(overlay_path)),
+            boundary_component_labels_path=boundary_component_labels_path,
+            output_dir=mask_dir,
+        )
+    else:
+        collapsed_mask_path = mask_dir / f"{run_name}_collapsed.tif"
+        shutil.copy2(collapsed_mask, collapsed_mask_path)
+        origin_mask_path = write_state_origin_mask_windowed(
+            base_mask_path=parent_mask_path,
+            collapsed_mask_path=collapsed_mask_path,
+            output_path=mask_dir / "origin_mask.tif",
+        )
+        bank_labels_path = mask_dir / "bank_labels.tif"
+        removed_bank_labels = write_state_bank_labels_windowed(
+            boundary_component_labels_path=boundary_component_labels_path,
+            origin_mask_path=origin_mask_path,
+            output_path=bank_labels_path,
+        )
 
     raw_links = _normalize_numeric_id_columns(gpd.read_file(raw_links_path))
     raw_nodes = _normalize_numeric_id_columns(gpd.read_file(raw_nodes_path))
@@ -581,6 +601,8 @@ def _finalize_panelized_child_result(
             **width_patch_summary,
             "panel_plan": panelized_result["panel_plan"],
             "workspace": panelized_result.get("workspace", {}),
+            "mask_publication": mask_publication,
+            "virtual_support_rasters": virtual_support_manifest,
         },
         "width_product_inheritance": width_product_inheritance,
         "routing_width_application": routing_width_application,
@@ -2991,6 +3013,10 @@ def _make_panelized_child_runner(
             footprint=footprint, halo_distance=max(float(width), 1.0), run_name=run_name,
             exit_sides_by_panel=dict(exit_sides_by_panel), panel_runner=run_rivgraph_for_run,
             parent_directed_links_path=kwargs["reviewed_links_path"],
+            materialize_full_mask=(
+                str(kwargs.get("panelized_mask_publication", "materialized"))
+                != "virtual_patch"
+            ),
             all_touched=bool(kwargs.get("all_touched", True)),
         )
         return _finalize_panelized_child_result(
@@ -4382,6 +4408,9 @@ def run_collapse_experiment(
                 f"the reviewed links: {reference_centerline_path}"
         )
         variant_kwargs["local_patch_reference_centerline_path"] = reference_centerline_path
+        if execution_plan.is_hybrid_panelized_local_patch:
+            variant_kwargs["local_patch_mask_publication"] = "virtual_patch"
+            variant_kwargs["panelized_mask_publication"] = "virtual_patch"
         fallback_runner = (
             panelized_child_runner
             if execution_plan.fallback_backend == "panelized"

@@ -1,5 +1,25 @@
 # Panelized collapse implementation plan
 
+## Hybrid panelized/local execution status
+
+The production dispatcher now separates execution into explicit base, child,
+and fallback roles. `--execution-mode panelized local_patch` resolves to a
+panelized base, local-patch children, and panelized fallback children. Existing
+single-mode commands retain their prior behavior.
+
+Hybrid children publish small changed raster patches with full-extent GDAL VRT
+views. This removes repeated full-raster child copies while preserving the
+shared downstream raster interface, including global removal of absorbed bank
+component labels. Backend selection and raster publication are persisted in
+the experiment and child manifests. Focused and complete `network_variants`
+unit suites cover mode resolution, fallback provenance, and virtual-versus-
+materialized raster equality.
+
+Remaining acceptance work is example-level validation on panelized examples 41
+and 46: a contained child, a cross-panel child, a nested child, a compound
+bubble, and a deliberately forced fallback should be compared with the
+established panelized results before the hybrid mode is used for production.
+
 ## Problem
 
 Run 46's cleaned mask is 47,990 by 40,267 pixels (1.93 billion pixels). The
