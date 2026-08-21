@@ -21,7 +21,9 @@ from network_variants.local_patch_anchored import (
     anchor_local_patch_realized_graph,
 )
 from network_variants.local_patch_merge import (
+    _apply_realized_node_identity_policy,
     _boundary_bindings,
+    _eligible_same_endpoint_connector_ids,
     _force_boundary_node_matches,
     _orient_inserted_components_from_parent_order,
     _expected_cycle_reduction,
@@ -29,6 +31,7 @@ from network_variants.local_patch_merge import (
     _prune_directed_to_anchored_interval,
     _remove_post_direction_reverse_parent_duplicates,
     _snap_and_orient_geometry,
+    _selected_parent_node_ids,
     _trim_to_anchored_boundaries,
     _undirected_cycle_rank,
     merge_local_patch_variant,
@@ -72,6 +75,93 @@ def test_same_endpoint_projection_uses_only_bounded_exact_parent_connector() -> 
             same_endpoint_fallback_geometry=fallback,
             same_endpoint_reconstruction_limit_m=5.0,
         )
+
+
+def test_realized_identity_defers_selected_topology_to_shared_anchoring() -> None:
+    matches = pd.DataFrame(
+        [
+            {
+                "child_id_node": 10,
+                "matched_parent_node_id": 97,
+                "match_within_tolerance": True,
+                "match_distance": 9.0,
+                "match_method": "spatial_parent_match",
+                "cut_role": "",
+            },
+            {
+                "child_id_node": 11,
+                "matched_parent_node_id": 200,
+                "match_within_tolerance": True,
+                "match_distance": 9.0,
+                "match_method": "spatial_parent_match",
+                "cut_role": "",
+            },
+            {
+                "child_id_node": 12,
+                "matched_parent_node_id": 201,
+                "match_within_tolerance": True,
+                "match_distance": 70.0,
+                "match_method": "spatial_parent_match",
+                "cut_role": "",
+            },
+            {
+                "child_id_node": 13,
+                "matched_parent_node_id": 99,
+                "match_within_tolerance": True,
+                "match_distance": 80.0,
+                "match_method": "forced_anchored_boundary",
+                "cut_role": "upstream",
+            },
+        ]
+    )
+
+    result = _apply_realized_node_identity_policy(
+        matches,
+        merge_stage="local_realized",
+        protected_selected_parent_node_ids={97, 99},
+        identity_tolerance_m=12.5,
+    ).set_index("child_id_node")
+
+    assert not bool(result.loc[10, "identity_accepted"])
+    assert result.loc[10, "identity_decision"] == (
+        "defer_selected_topology_to_shared_anchoring"
+    )
+    assert bool(result.loc[11, "identity_accepted"])
+    assert int(result.loc[11, "identity_parent_node_id"]) == 200
+    assert not bool(result.loc[12, "identity_accepted"])
+    assert result.loc[12, "identity_decision"] == (
+        "spatial_candidate_outside_realized_identity_tolerance"
+    )
+    assert bool(result.loc[13, "identity_accepted"])
+    assert result.loc[13, "identity_decision"] == (
+        "forced_outer_computational_boundary"
+    )
+
+
+def test_selected_parent_node_ids_include_internal_and_external_interfaces() -> None:
+    parent_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 117, "id_us_node": 73, "id_ds_node": 79, "geometry": LineString([(0, 0), (1, 0)])},
+            {"id_link": 118, "id_us_node": 76, "id_ds_node": 73, "geometry": LineString([(-1, 0), (0, 0)])},
+            {"id_link": 999, "id_us_node": 79, "id_ds_node": 80, "geometry": LineString([(1, 0), (2, 0)])},
+        ],
+        crs="EPSG:3857",
+    )
+
+    assert _selected_parent_node_ids(parent_links, {117, 118}) == {73, 76, 79}
+
+
+def test_realized_reconstruction_excludes_selected_parent_connectors() -> None:
+    assert _eligible_same_endpoint_connector_ids(
+        [117, 900],
+        merge_stage="local_realized",
+        selected_parent_link_ids={117},
+    ) == [900]
+    assert _eligible_same_endpoint_connector_ids(
+        [117],
+        merge_stage="scientific_anchored",
+        selected_parent_link_ids={117},
+    ) == [117]
 
 
 def test_inserted_orientation_retries_with_fixed_parent_node_order_only_after_cycle() -> None:

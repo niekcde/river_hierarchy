@@ -40,7 +40,7 @@ from hierarchy_level_definition.graph_building.directed_network_checks import (
 )
 
 
-LOCAL_PATCH_REALIZED_ASSEMBLY_VERSION = "topology-local-realized-assembly-v2"
+LOCAL_PATCH_REALIZED_ASSEMBLY_VERSION = "topology-local-realized-assembly-v3"
 
 
 @dataclass(frozen=True, slots=True)

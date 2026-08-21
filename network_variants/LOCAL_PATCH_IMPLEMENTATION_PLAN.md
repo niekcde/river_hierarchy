@@ -472,3 +472,41 @@ The child manifest records `realized_assembly`, `shared_anchoring`, and
 outer-domain retries remain unchanged. The former local scientific merge is no
 longer called by production dispatch, although its implementation remains
 temporarily available for regression comparison and historical artifacts.
+
+### Selected-interface identity normalization
+
+The realized splice deliberately distinguishes three concepts that earlier
+versions conflated:
+
+1. a raw node can be spatially near a parent node;
+2. a raw node can inherit that parent node's identity during the computational
+   splice; and
+3. a scientific interface can be allocated later by shared anchoring.
+
+All parent nodes incident to a selected-unit link are protected during the
+local-realized splice. A spatial match to one of those nodes is retained in
+`node_merge_audit.csv` as a candidate, but the raw node receives a child-local
+ID and keeps its raw coordinate. The only exception is a hard outer
+computational-boundary binding. Non-selected parent identity is accepted only
+within the normal 1.25-pixel matching tolerance; the wider cut-terminal
+tolerance remains available for locating raster barriers but cannot authorize
+node identity.
+
+Shared anchoring then processes every graph-cut interface, including lateral
+inflow and outflow nodes as well as the nominal source and sink. It projects
+each interface onto the appropriate realized child reach and splits that reach
+where necessary. This makes path-internal lateral interfaces scientifically
+equivalent to nominal end interfaces without forcing their coordinates onto
+unrelated raw junctions.
+
+The old bounded same-endpoint reconstruction remains available only for
+unselected computational context. A parent connector belonging to the
+selected unit is ineligible because restoring it would reintroduce parent
+morphology before anchoring. Audits record both deferred node identities and
+any rejected selected-connector reconstruction candidate.
+
+The rollback point for the preceding behavior is commit `a03d0cb`
+(`feat(local-patch): checkpoint validated shared-anchoring baseline`). That
+checkpoint still permits broad realized identity matching and bounded selected
+parent-connector reconstruction; the following interface-normalization commit
+removes those two behaviors.

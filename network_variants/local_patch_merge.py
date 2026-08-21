@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import geopandas as gpd
 import networkx as nx
@@ -42,7 +42,7 @@ from network_variants.variant_generation import (
 )
 
 
-LOCAL_PATCH_MERGE_VERSION = "topology-local-patch-merge-v14"
+LOCAL_PATCH_MERGE_VERSION = "topology-local-patch-merge-v15"
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +389,107 @@ def _force_boundary_node_matches(
         values = sorted(matched.loc[duplicate, "matched_parent_node_id"].astype(int).unique())
         raise ValueError(f"Multiple local nodes map to the same parent node: {values}.")
     return result
+
+
+def _selected_parent_node_ids(
+    parent_links: gpd.GeoDataFrame,
+    selected_parent_link_ids: Iterable[int],
+) -> set[int]:
+    """Return every parent node touched by the scientifically selected links.
+
+    These nodes describe topology inside or on the edge of the selected unit.
+    During the local-realized splice they are location candidates only: shared
+    anchoring, which runs afterwards, is the authoritative stage that decides
+    which of them survive as child interfaces.
+    """
+    selected_ids = {int(value) for value in selected_parent_link_ids}
+    if not selected_ids:
+        return set()
+    selected = parent_links.loc[parent_links["id_link"].astype(int).isin(selected_ids)]
+    return set(selected["id_us_node"].astype(int)).union(
+        selected["id_ds_node"].astype(int)
+    )
+
+
+def _apply_realized_node_identity_policy(
+    node_match: pd.DataFrame,
+    *,
+    merge_stage: str,
+    protected_selected_parent_node_ids: set[int],
+    identity_tolerance_m: float,
+) -> pd.DataFrame:
+    """Separate spatial proximity from accepted parent-node identity.
+
+    The realized splice may use a generous spatial tolerance to associate raw
+    geometry with its parent context.  That does not authorize moving a raw
+    node onto a selected-unit node.  Selected topology remains child-native
+    until the shared realized-to-anchored transformation projects and splits
+    the scientific interfaces.  Outer computational cut bindings remain hard.
+    """
+    result = node_match.copy()
+    result["identity_candidate_parent_node_id"] = result[
+        "matched_parent_node_id"
+    ].where(result["match_within_tolerance"].fillna(False))
+    result["identity_accepted"] = False
+    result["identity_parent_node_id"] = np.nan
+    result["identity_decision"] = "new_local_node_no_spatial_candidate"
+    result["identity_tolerance_m"] = float(identity_tolerance_m)
+
+    for index, row in result.iterrows():
+        candidate = row.get("identity_candidate_parent_node_id")
+        if pd.isna(candidate):
+            continue
+        parent_id = int(candidate)
+        cut_role = str(row.get("cut_role", "") or "")
+        forced = bool(cut_role) or str(row.get("match_method", "")).startswith("forced_")
+        distance = pd.to_numeric(pd.Series([row.get("match_distance")]), errors="coerce").iloc[0]
+
+        if forced:
+            accepted = True
+            decision = "forced_outer_computational_boundary"
+        elif (
+            str(merge_stage) == "local_realized"
+            and parent_id in protected_selected_parent_node_ids
+        ):
+            accepted = False
+            decision = "defer_selected_topology_to_shared_anchoring"
+        elif (
+            str(merge_stage) == "local_realized"
+            and (pd.isna(distance) or float(distance) > float(identity_tolerance_m))
+        ):
+            accepted = False
+            decision = "spatial_candidate_outside_realized_identity_tolerance"
+        else:
+            accepted = True
+            decision = "accepted_parent_node_identity"
+
+        result.loc[index, "identity_accepted"] = bool(accepted)
+        result.loc[index, "identity_decision"] = decision
+        if accepted:
+            result.loc[index, "identity_parent_node_id"] = parent_id
+    return result
+
+
+def _eligible_same_endpoint_connector_ids(
+    connector_ids: Iterable[int],
+    *,
+    merge_stage: str,
+    selected_parent_link_ids: set[int],
+) -> list[int]:
+    """Exclude selected-unit connectors from realized reconstruction.
+
+    Reconstructing an unselected context connector can repair a compressed
+    outer splice. Reconstructing a selected connector would reintroduce parent
+    morphology before the scientific anchoring stage and is never allowed.
+    """
+    return [
+        int(parent_id)
+        for parent_id in connector_ids
+        if not (
+            str(merge_stage) == "local_realized"
+            and int(parent_id) in selected_parent_link_ids
+        )
+    ]
 
 
 def _trim_to_anchored_boundaries(
@@ -1927,6 +2028,22 @@ def merge_local_patch_variant(
     node_match = _force_boundary_node_matches(
         node_match, bindings, parent_order, directed_local_links
     )
+    selected_parent_ids = {int(value) for value in contract.selected_link_ids}
+    protected_selected_node_ids = _selected_parent_node_ids(
+        parent_links,
+        selected_parent_ids,
+    )
+    realized_identity_tolerance = float(
+        match_tolerance_m
+        if match_tolerance_m is not None
+        else pixel_size * 1.25
+    )
+    node_match = _apply_realized_node_identity_policy(
+        node_match,
+        merge_stage=str(merge_stage),
+        protected_selected_parent_node_ids=protected_selected_node_ids,
+        identity_tolerance_m=realized_identity_tolerance,
+    )
     link_match = _match_child_links_to_parent_links(
         parent_links, directed_local_links, match_tolerance=tolerance
     )
@@ -1938,21 +2055,13 @@ def merge_local_patch_variant(
     node_id_map: dict[int, int] = {}
     for row in node_match.sort_values("child_id_node").itertuples(index=False):
         raw_id = int(row.child_id_node)
-        if bool(row.match_within_tolerance) and not pd.isna(row.matched_parent_node_id):
-            node_id_map[raw_id] = int(row.matched_parent_node_id)
+        if bool(row.identity_accepted) and not pd.isna(row.identity_parent_node_id):
+            node_id_map[raw_id] = int(row.identity_parent_node_id)
         else:
             node_id_map[raw_id] = next_node
             next_node += 1
     node_match["final_node_id"] = node_match["child_id_node"].astype(int).map(node_id_map)
-    node_match["final_node_method"] = np.where(
-        node_match["match_method"].eq("forced_anchored_boundary"),
-        (
-            "trim_to_outer_computational_boundary"
-            if str(merge_stage) == "local_realized"
-            else "trim_to_anchored_inner_boundary"
-        ),
-        node_match["match_method"],
-    )
+    node_match["final_node_method"] = node_match["identity_decision"]
 
     parent_node_by_id = parent_nodes.set_index(parent_nodes["id_node"].astype(int), drop=False)
     parent_link_by_id = parent_links.set_index(parent_links["id_link"].astype(int), drop=False)
@@ -2015,6 +2124,10 @@ def merge_local_patch_variant(
             "parent_core_overlap_fraction": float(candidate["parent_core_overlap_fraction"]) if candidate is not None else np.nan,
             "merge_decision": "retain_parent" if strict else "insert_local",
             "decision_reason": reason,
+            "bounded_same_endpoint_reconstruction": False,
+            "same_endpoint_parent_connector_id": pd.NA,
+            "same_endpoint_reconstruction_limit_m": np.nan,
+            "same_endpoint_selected_connector_rejected": False,
             "realized_lineage_class": (
                 "unchanged_parent"
                 if strict
@@ -2088,17 +2201,31 @@ def merge_local_patch_variant(
         direct_parent_connector_ids = parent_connector_ids_by_pair.get(
             frozenset((int(final_us), int(final_ds))), []
         )
-        if len(direct_parent_connector_ids) == 1:
+        eligible_direct_parent_connector_ids = _eligible_same_endpoint_connector_ids(
+            direct_parent_connector_ids,
+            merge_stage=str(merge_stage),
+            selected_parent_link_ids=selected_parent_ids,
+        )
+        if (
+            str(merge_stage) == "local_realized"
+            and direct_parent_connector_ids
+            and not eligible_direct_parent_connector_ids
+        ):
+            for record in audit_records:
+                if int(record["raw_local_link_id"]) == raw_id:
+                    record["same_endpoint_selected_connector_rejected"] = True
+                    break
+        if len(eligible_direct_parent_connector_ids) == 1:
             # The matched raw branch can lie wholly beyond a very short
             # scientific interface, causing both exact boundary nodes to
             # project onto one raw endpoint. In that exceptional case the
             # unique direct parent connector is more authoritative than the
             # highest-overlap raw-link candidate.
             same_endpoint_fallback_geometry = parent_link_by_id.loc[
-                int(direct_parent_connector_ids[0])
+                int(eligible_direct_parent_connector_ids[0])
             ].geometry
             same_endpoint_fallback_parent_id = int(
-                direct_parent_connector_ids[0]
+                eligible_direct_parent_connector_ids[0]
             )
         elif candidate is not None:
             candidate_parent_id = int(candidate["parent_id_link"])
@@ -2108,6 +2235,10 @@ def merge_local_patch_variant(
             }
             if (
                 candidate_parent_id in parent_link_by_id.index
+                and not (
+                    str(merge_stage) == "local_realized"
+                    and candidate_parent_id in selected_parent_ids
+                )
                 and {int(final_us), int(final_ds)} == candidate_endpoints
             ):
                 same_endpoint_fallback_geometry = parent_link_by_id.loc[
@@ -2460,6 +2591,8 @@ def merge_local_patch_variant(
         "inserted_local_link_count": int(len(inserted)),
         "new_local_node_count": int(sum(value > max_parent_node for value in node_id_map.values())),
         "match_tolerance_m": tolerance,
+        "realized_node_identity_tolerance_m": realized_identity_tolerance,
+        "protected_selected_parent_node_ids": sorted(protected_selected_node_ids),
         "cut_terminal_tolerance_m": boundary_tolerance,
         "raw_cut_terminal_bindings": [],
         "matching_order": "provisional_direction_hints_then_trim_then_authoritative_parent_match",

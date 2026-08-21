@@ -38,7 +38,7 @@ from network_variants.variant_generation import (
 )
 
 
-LOCAL_PATCH_ANCHORED_ADAPTER_VERSION = "local-realized-shared-anchoring-v5"
+LOCAL_PATCH_ANCHORED_ADAPTER_VERSION = "local-realized-shared-anchoring-v6"
 COMPRESSED_INTERFACE_MAX_TOLERANCE_MULTIPLIER = 5.0
 PRE_ANCHOR_CANONICALIZATION_MIN_OVERLAP_FRACTION = 0.90
 
