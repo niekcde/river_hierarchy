@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
+import pandas as pd
 import rasterio
 from rasterio.transform import from_origin
 from rasterio.windows import Window, transform as window_transform
+from shapely.geometry import LineString
 
-from network_variants.local_patch_execution import _copy_raster_with_local_edit
+from network_variants.local_patch_execution import (
+    _copy_raster_with_local_edit,
+    _selected_units_from_hierarchy_products,
+)
 
 
 def _write(path: Path, values: np.ndarray, transform) -> Path:
@@ -68,3 +74,52 @@ def test_full_mask_materialization_applies_collapse_but_excludes_crop_cut(tmp_pa
     assert full_collapsed[1, 2] == 1
     assert full_origin[1, 2] == 1
     assert int(full_collapsed.sum()) == 15
+
+
+def test_selected_units_are_rebuilt_from_saved_base_hierarchy_without_redetection() -> None:
+    links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": 10,
+                "id_us_node": 1,
+                "id_ds_node": 2,
+                "geometry": LineString([(0, 0), (1, 1)]),
+            },
+            {
+                "id_link": 11,
+                "id_us_node": 1,
+                "id_ds_node": 2,
+                "geometry": LineString([(0, 0), (1, -1)]),
+            },
+        ],
+        crs="EPSG:3857",
+    )
+    summary = pd.DataFrame(
+        [
+            {
+                "unit_id": 7,
+                "bifurcation": 1,
+                "confluence": 2,
+                "n_paths": 2,
+                "class": "simple",
+                "min_path_length": 1.0,
+                "max_path_length": 1.5,
+            }
+        ]
+    )
+    membership = pd.DataFrame(
+        {"unit_id": [7, 7], "id_link": [10, 11]}
+    )
+
+    units = _selected_units_from_hierarchy_products(
+        selected_unit_ids=(7,),
+        unit_summary=summary,
+        unit_link_membership=membership,
+        parent_links=links,
+    )
+
+    assert set(units) == {7}
+    assert units[7].bifurcation == 1
+    assert units[7].confluence == 2
+    assert units[7].node_set == {1, 2}
+    assert units[7].edge_set == {(1, 2, 10), (1, 2, 11)}

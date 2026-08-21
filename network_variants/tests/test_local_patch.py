@@ -120,6 +120,7 @@ def test_contract_manifest_records_interface_and_merge_policy(tmp_path) -> None:
     assert manifest["sink_splice_anchor_node_id"] == 9
     assert manifest["collar_link_ids"] == [18, 14]
     assert manifest["local_context_link_ids"] == [16, 17, 18, 14]
+    assert manifest["computational_domain_link_ids"] == [16, 17]
     assert manifest["merge_policy"]["outside_splice_domain_action"] == "retain_base"
     assert manifest["merge_policy"]["collar_match_required"] is False
     assert (
@@ -167,7 +168,50 @@ def test_planner_selects_closed_unit_and_immediate_unowned_collars() -> None:
     assert result.contract.downstream_connector_link_ids == ()
 
 
-def test_planner_expands_open_member_to_complete_compound() -> None:
+def test_planner_outer_context_changes_core_but_not_selected_replacement() -> None:
+    links = _links(
+        [
+            (9, 0, 1),
+            (1, 1, 2),
+            (2, 1, 2),
+            (3, 2, 3),
+            (4, 1, 3),
+            (5, 3, 4),
+        ]
+    )
+    unit_summary = pd.DataFrame(
+        [
+            {"unit_id": 1, "bifurcation": 1, "confluence": 2},
+            {"unit_id": 2, "bifurcation": 1, "confluence": 3},
+        ]
+    )
+    membership = pd.DataFrame(
+        {
+            "unit_id": [1, 1, 2, 2, 2, 2],
+            "id_link": [1, 2, 1, 2, 3, 4],
+        }
+    )
+
+    result = plan_local_patch(
+        example_id="synthetic",
+        full_links=links,
+        unit_summary=unit_summary,
+        unit_link_membership=membership,
+        bubble_edge_resistance=pd.DataFrame(),
+        selected_unit_ids=[1],
+        computational_context_unit_id=2,
+    )
+
+    assert result.is_safe
+    assert result.contract is not None
+    assert result.contract.domain_type == "containing_compound"
+    assert set(result.contract.core_link_ids) == {1, 2, 3, 4}
+    assert set(result.contract.selected_link_ids) == {1, 2}
+    assert result.contract.anchored_replacement_link_ids == (1, 2)
+    assert result.audit["computational_context_unit_id"] == 2
+
+
+def test_planner_uses_closed_compound_context_for_open_member() -> None:
     links = _links(
         [
             (5, 0, 1),
@@ -203,7 +247,7 @@ def test_planner_expands_open_member_to_complete_compound() -> None:
     assert result.contract is not None
     assert result.contract.domain_type == "containing_compound"
     assert result.contract.selected_compound_bubble_id == 9
-    assert set(result.contract.core_link_ids) == {1, 2, 3, 4}
+    assert set(result.contract.computational_domain_link_ids) == {1, 2, 3, 4}
     assert set(result.contract.selected_link_ids) == {1, 2}
     assert result.contract.anchored_replacement_link_ids == (1, 2)
     assert result.contract.anchored_upstream_boundary_node_ids == (1,)
@@ -259,7 +303,7 @@ def test_planner_accepts_an_explicit_complete_compound_selection() -> None:
     assert result.contract.collar_link_ids == (5, 6)
 
 
-def test_planner_walks_across_owned_connector_to_first_unowned_collar() -> None:
+def test_planner_uses_immediate_owned_link_as_temporary_collar_context() -> None:
     links = _links(
         [
             (8, -2, -1),
@@ -291,10 +335,11 @@ def test_planner_walks_across_owned_connector_to_first_unowned_collar() -> None:
 
     assert result.is_safe
     assert result.contract is not None
-    assert result.contract.upstream_connector_link_ids == (5, 7)
-    assert result.contract.upstream_collar.base_link_id == 8
-    assert result.contract.source_splice_anchor_node_id == -2
-    assert result.contract.local_context_link_ids == (1, 2, 5, 7, 8, 6)
+    assert result.contract.upstream_connector_link_ids == ()
+    assert result.contract.upstream_collar.base_link_id == 5
+    assert result.contract.upstream_collar.unit_membership_count == 1
+    assert result.contract.source_splice_anchor_node_id == 0
+    assert result.contract.local_context_link_ids == (1, 2, 5, 6)
 
 
 def test_planner_requests_full_raster_for_ambiguous_external_interface() -> None:

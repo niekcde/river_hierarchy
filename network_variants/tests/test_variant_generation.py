@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import geopandas as gpd
+from geopandas.testing import assert_geodataframe_equal
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -11,12 +12,16 @@ from scipy.spatial import cKDTree
 from rasterio.transform import from_origin
 from shapely.geometry import LineString, Point
 
+from hierarchy_level_definition.graph_building.directed_network_checks import (
+    validate_single_inlet_single_outlet,
+)
 from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import StructuralUnit
 from network_variants.variant_generation import (
     _apply_collapsed_selection_metadata,
     _apply_collapse_components_to_mask,
     _apply_segmented_stub_width_inheritance,
     _assign_variant_directions,
+    _boundary_harmonic_orientation,
     _boundary_overlap_cut_targets,
     _build_oriented_child_graph,
     _componentize_units,
@@ -35,6 +40,7 @@ from network_variants.variant_generation import (
     _segment_collapsed_links_to_anchor_nodes,
     _trim_slice,
     compute_width_families,
+    derive_anchored_graph_from_realized,
 )
 from network_variants.width_two_bank import (
     BoundaryComponentIndex,
@@ -43,9 +49,161 @@ from network_variants.width_two_bank import (
     _select_local_controlling_pair,
     build_state_bank_labels,
 )
-from hierarchy_level_definition.graph_building.directed_network_checks import (
-    validate_single_inlet_single_outlet,
-)
+
+
+def test_boundary_harmonic_orientation_enforces_cut_terminals_on_symmetric_graph() -> None:
+    nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 0, "is_inlet": True, "is_outlet": False, "geometry": Point(0, 0)},
+            {"id_node": 1, "is_inlet": False, "is_outlet": False, "geometry": Point(1, 1)},
+            {"id_node": 2, "is_inlet": False, "is_outlet": False, "geometry": Point(1, -1)},
+            {"id_node": 3, "is_inlet": False, "is_outlet": True, "geometry": Point(2, 0)},
+        ],
+        crs="EPSG:3857",
+    )
+    pairs = {10: (0, 1), 11: (0, 2), 12: (1, 3), 13: (2, 3), 14: (1, 2)}
+    point = nodes.set_index("id_node").geometry.to_dict()
+    links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": link_id,
+                "id_nodes": f"{node_a}, {node_b}",
+                "geometry": LineString([point[node_a], point[node_b]]),
+            }
+            for link_id, (node_a, node_b) in pairs.items()
+        ],
+        crs=nodes.crs,
+    )
+
+    orientation = _boundary_harmonic_orientation(
+        edge_nodes=pairs,
+        child_links=links,
+        child_nodes=nodes,
+        child_inlet_nodes={0},
+        child_outlet_nodes={3},
+    )
+    graph = _build_oriented_child_graph(
+        child_nodes=nodes, orientation_by_link=orientation
+    )
+
+    assert nx.is_directed_acyclic_graph(nx.DiGraph(graph))
+    assert set(graph.successors(0)) == {1, 2}
+    assert set(graph.predecessors(3)) == {1, 2}
+
+
+def test_boundary_harmonic_orientation_supports_open_multi_interface_child() -> None:
+    nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 0, "is_inlet": True, "is_outlet": False, "geometry": Point(0, 1)},
+            {"id_node": 1, "is_inlet": True, "is_outlet": False, "geometry": Point(0, -1)},
+            {"id_node": 2, "is_inlet": False, "is_outlet": False, "geometry": Point(1, 0)},
+            {"id_node": 3, "is_inlet": False, "is_outlet": True, "geometry": Point(2, 0)},
+        ],
+        crs="EPSG:3857",
+    )
+    pairs = {10: (0, 2), 11: (1, 2), 12: (2, 3)}
+    points = nodes.set_index("id_node").geometry.to_dict()
+    links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": link_id,
+                "id_nodes": f"{node_a}, {node_b}",
+                "geometry": LineString([points[node_a], points[node_b]]),
+            }
+            for link_id, (node_a, node_b) in pairs.items()
+        ],
+        crs=nodes.crs,
+    )
+
+    orientation = _boundary_harmonic_orientation(
+        edge_nodes=pairs,
+        child_links=links,
+        child_nodes=nodes,
+        child_inlet_nodes={0, 1},
+        child_outlet_nodes={3},
+    )
+    graph = _build_oriented_child_graph(
+        child_nodes=nodes, orientation_by_link=orientation
+    )
+
+    assert nx.is_directed_acyclic_graph(nx.DiGraph(graph))
+    assert {node for node in graph if graph.in_degree(node) == 0} == {0, 1}
+    assert {node for node in graph if graph.out_degree(node) == 0} == {3}
+
+
+def test_boundary_harmonic_orientation_progresses_between_equal_value_sources() -> None:
+    nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 9, "geometry": Point(0, 0)},
+            {"id_node": 1, "geometry": Point(1, 0)},
+            {"id_node": 2, "geometry": Point(2, 0)},
+            {"id_node": 3, "geometry": Point(3, 0)},
+        ],
+        crs="EPSG:3857",
+    )
+    pairs = {10: (9, 1), 11: (1, 2), 12: (2, 3)}
+    points = nodes.set_index("id_node").geometry.to_dict()
+    links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": link_id,
+                "id_nodes": f"{node_a}, {node_b}",
+                "geometry": LineString([points[node_a], points[node_b]]),
+            }
+            for link_id, (node_a, node_b) in pairs.items()
+        ],
+        crs=nodes.crs,
+    )
+
+    orientation = _boundary_harmonic_orientation(
+        edge_nodes=pairs,
+        child_links=links,
+        child_nodes=nodes,
+        child_inlet_nodes={9, 1},
+        child_outlet_nodes={3},
+        allow_additional_topological_terminals=True,
+    )
+    graph = _build_oriented_child_graph(
+        child_nodes=nodes, orientation_by_link=orientation
+    )
+
+    assert orientation[10] == (9, 1)
+    assert nx.has_path(graph, 9, 3)
+    assert nx.has_path(graph, 1, 3)
+
+
+def test_boundary_harmonic_orientation_treats_shared_interface_as_internal() -> None:
+    nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 0, "geometry": Point(0, 0)},
+            {"id_node": 1, "geometry": Point(1, 0)},
+            {"id_node": 2, "geometry": Point(2, 0)},
+        ],
+        crs="EPSG:3857",
+    )
+    pairs = {10: (0, 1), 11: (1, 2)}
+    points = nodes.set_index("id_node").geometry.to_dict()
+    links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": link_id,
+                "id_nodes": f"{node_a}, {node_b}",
+                "geometry": LineString([points[node_a], points[node_b]]),
+            }
+            for link_id, (node_a, node_b) in pairs.items()
+        ],
+        crs=nodes.crs,
+    )
+
+    orientation = _boundary_harmonic_orientation(
+        edge_nodes=pairs,
+        child_links=links,
+        child_nodes=nodes,
+        child_inlet_nodes={0, 1},
+        child_outlet_nodes={1, 2},
+    )
+
+    assert orientation == {10: (0, 1), 11: (1, 2)}
 
 
 def _unit(unit_id: int, node_ids: set[int], edge_keys: set[tuple[int, int, int]]) -> StructuralUnit:
@@ -624,6 +782,52 @@ def test_apply_collapse_components_to_mask_labels_only_added_pixels(tmp_path: Pa
     assert set(edit_geometries["geometry_role"]) == {"footprint", "edit", "collapse_domain"}
 
 
+def test_collapse_mask_rejects_adjacent_unit_hole_inside_wide_footprint(tmp_path: Path) -> None:
+    mask = np.zeros((30, 30), dtype=np.uint8)
+    # Selected left unit.
+    mask[4, 4:16] = 1
+    mask[15, 4:16] = 1
+    mask[4:16, 4] = 1
+    mask[4:16, 15] = 1
+    # Smaller neighbouring unit sharing the selected unit's right-hand link.
+    mask[7, 15:21] = 1
+    mask[12, 15:21] = 1
+    mask[7:13, 20] = 1
+
+    mask_path = tmp_path / "adjacent_units.tif"
+    transform = from_origin(0, 30, 1, 1)
+    with rasterio.open(
+        mask_path, "w", driver="GTiff", height=30, width=30, count=1,
+        dtype="uint8", crs="EPSG:3857", transform=transform,
+    ) as destination:
+        destination.write(mask, 1)
+
+    links = gpd.GeoDataFrame(
+        [
+            {"id_link": 1, "wid_adj": 12.0, "geometry": LineString([(4.5, 25.5), (15.5, 25.5)])},
+            {"id_link": 2, "wid_adj": 12.0, "geometry": LineString([(4.5, 14.5), (15.5, 14.5)])},
+            {"id_link": 3, "wid_adj": 12.0, "geometry": LineString([(4.5, 14.5), (4.5, 25.5)])},
+            {"id_link": 4, "wid_adj": 12.0, "geometry": LineString([(15.5, 14.5), (15.5, 25.5)])},
+        ],
+        geometry="geometry", crs="EPSG:3857",
+    )
+    component = {
+        "component_id": "C1", "unit_ids": [1], "link_ids": [1, 2, 3, 4],
+        "node_ids": [10, 11], "compound_bubble_ids": [], "n_units": 1,
+        "n_links": 4, "n_nodes": 2,
+    }
+
+    collapsed, _, _, component_frame, edits = _apply_collapse_components_to_mask(
+        mask_path, [component], links,
+        preferred_width_field="wid_adj", buffer_scale=0.5,
+    )
+
+    assert collapsed[10, 10]  # selected unit interior is filled
+    assert not collapsed[9, 18]  # neighbouring unit interior remains dry
+    assert int(component_frame.loc[0, "rejected_neighbour_pixels"]) > 0
+    assert "candidate_edit_rejected" in set(edits["geometry_role"])
+
+
 def test_resolve_link_by_progression_prefers_upstream_source_distance() -> None:
     resolved = _resolve_link_by_progression(
         node_a=7,
@@ -683,6 +887,63 @@ def test_resolve_single_remaining_link_uses_progression_when_both_directions_val
     )
 
     assert resolved == ((2, 3), "global_progression_rule")
+
+
+def test_resolve_single_remaining_link_uses_width_only_for_enabled_ambiguous_tiebreak() -> None:
+    child_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 0, "is_inlet": True, "is_outlet": False, "geometry": Point(0, 0)},
+            {"id_node": 1, "is_inlet": False, "is_outlet": False, "geometry": Point(10, 5)},
+            {"id_node": 2, "is_inlet": False, "is_outlet": False, "geometry": Point(10, -5)},
+            {"id_node": 3, "is_inlet": False, "is_outlet": True, "geometry": Point(20, 0)},
+        ],
+        crs="EPSG:3857",
+    )
+    rows = [
+        (100, 0, 1, 558.0),
+        (101, 1, 3, 232.0),
+        (102, 0, 2, 187.0),
+        (103, 2, 3, 661.0),
+        (104, 1, 2, 679.0),
+    ]
+    points = child_nodes.set_index("id_node").geometry.to_dict()
+    child_links = gpd.GeoDataFrame(
+        [
+            {
+                "id_link": link_id,
+                "id_us_node": node_a,
+                "id_ds_node": node_b,
+                "wid_adj": width,
+                "len": float(points[node_a].distance(points[node_b])),
+                "geometry": LineString([points[node_a], points[node_b]]),
+            }
+            for link_id, node_a, node_b, width in rows
+        ],
+        crs="EPSG:3857",
+    )
+    edge_nodes = {
+        link_id: (node_a, node_b) for link_id, node_a, node_b, _ in rows
+    }
+    orientation = {
+        100: (0, 1),
+        101: (1, 3),
+        102: (0, 2),
+        103: (2, 3),
+    }
+
+    resolved = _resolve_single_remaining_link(
+        link_id=104,
+        edge_nodes=edge_nodes,
+        geometry_order_by_link={104: (2, 1)},
+        orientation_by_link=orientation,
+        child_nodes=child_nodes,
+        child_inlet_nodes={0},
+        child_outlet_nodes={3},
+        child_links=child_links,
+        allow_width_continuity_tiebreak=True,
+    )
+
+    assert resolved == ((1, 2), "singleton_width_continuity_wid_adj")
 
 
 def test_matching_and_direction_assignment_populates_upstream_downstream_nodes() -> None:
@@ -1285,6 +1546,58 @@ def test_segment_collapsed_links_to_anchor_nodes_splits_link_at_nominal_parent_n
     assert (11, 3) in matched_pairs
     assert any(parent_id == 1 for _, parent_id in matched_pairs)
     assert any(parent_id == 2 for _, parent_id in matched_pairs)
+
+    expected_link_match = _match_child_links_to_parent_links(
+        parent_links,
+        updated_links,
+        match_tolerance=1.0,
+    )
+    expected_link_lineage = _resolve_link_lineage(
+        parent_graph=parent_graph,
+        directed_child_links=updated_links,
+        node_match=updated_node_match,
+        link_match=expected_link_match,
+        match_tolerance=1.0,
+    )
+    transformed = derive_anchored_graph_from_realized(
+        parent_links=parent_links,
+        parent_nodes=parent_nodes,
+        realized_links=child_links,
+        realized_nodes=child_nodes,
+        realized_node_match=node_match,
+        realized_link_match=pd.DataFrame(),
+        realized_link_lineage=link_lineage,
+        selected_unit_ids=[1],
+        units_by_id={1: _unit(1, {1, 2}, {(1, 2, 1)})},
+        match_tolerance=1.0,
+    )
+    assert_geodataframe_equal(
+        transformed.directed_links.reset_index(drop=True),
+        updated_links.reset_index(drop=True),
+        check_like=True,
+    )
+    assert_geodataframe_equal(
+        transformed.directed_nodes.reset_index(drop=True),
+        updated_nodes.reset_index(drop=True),
+        check_like=True,
+    )
+    pd.testing.assert_frame_equal(
+        transformed.node_match.reset_index(drop=True),
+        updated_node_match.reset_index(drop=True),
+        check_like=True,
+    )
+    pd.testing.assert_frame_equal(
+        transformed.link_match.reset_index(drop=True),
+        expected_link_match.reset_index(drop=True),
+        check_like=True,
+    )
+    pd.testing.assert_frame_equal(
+        transformed.link_lineage.reset_index(drop=True),
+        expected_link_lineage.reset_index(drop=True),
+        check_like=True,
+    )
+    assert transformed.anchor_segmentation_summary == summary
+    assert transformed.direction_summary["validation_report"] == summary["validation_report"]
 
 
 def test_segment_collapsed_links_to_anchor_nodes_clips_target_corridor_across_two_links() -> None:

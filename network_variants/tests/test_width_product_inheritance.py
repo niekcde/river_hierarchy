@@ -186,3 +186,52 @@ def test_changed_link_clears_stale_routing_fields_but_keeps_measurement() -> Non
     assert links.loc[0, "wid_adj_wet"] == 15.0
     assert np.isnan(links.loc[0, "wid_adj_routing"])
     assert links.loc[0, "width_qc_reason"] is None
+
+
+def test_inherited_samples_are_copied_when_changed_sample_table_has_no_schema() -> None:
+    parent_links = _links(
+        [
+            {
+                "id_link": 10,
+                "wid_adj_wet": 11.0,
+                "geometry": LineString([(0, 0), (1, 0)]),
+            }
+        ]
+    )
+    child_links = _links(
+        [
+            {
+                "id_link": 100,
+                "geometry": LineString([(1, 0), (0, 0)]),
+            }
+        ]
+    )
+    lineage = pd.DataFrame(
+        {
+            "id_link": [100],
+            "lineage_type": ["unchanged_1to1"],
+            "dominant_parent_link_id": [10],
+        }
+    )
+    parent_samples = pd.DataFrame(
+        {
+            "id_link": [10, 10],
+            "sample_index": [0, 1],
+            "width_wet": [10.0, 12.0],
+            "x": [0.25, 0.75],
+            "y": [0.0, 0.0],
+        }
+    )
+
+    _links_out, samples, summary = inherit_unchanged_link_width_products(
+        child_links=child_links,
+        child_width_samples=pd.DataFrame(),
+        parent_links=parent_links,
+        parent_width_samples=parent_samples,
+        link_lineage=lineage,
+    )
+
+    assert samples["id_link"].tolist() == [100, 100]
+    assert samples["sample_index"].tolist() == [0, 1]
+    assert samples["width_wet"].tolist() == [10.0, 12.0]
+    assert summary["inherited_link_ids"] == [100]

@@ -2793,9 +2793,30 @@ def _materialize_copied_base_state_variant(
             routing_manifest.setdefault("files", {})["link_audit"] = local_audit.name
         routing_manifest_path.write_text(json.dumps(routing_manifest, indent=2), encoding="utf-8")
 
-    directed_links = next((destination / "directed").glob("*S000_base_directed_links.gpkg"), None)
-    directed_nodes = next((destination / "directed").glob("*S000_base_directed_nodes.gpkg"), None)
-    collapsed_mask = next((destination / "mask").glob("*S000_base_collapsed.tif"), None)
+    directed_links = next(
+        (
+            path
+            for path in (destination / "directed").glob("*S000_base_directed_links.gpkg")
+            if not path.name.startswith("._")
+        ),
+        None,
+    )
+    directed_nodes = next(
+        (
+            path
+            for path in (destination / "directed").glob("*S000_base_directed_nodes.gpkg")
+            if not path.name.startswith("._")
+        ),
+        None,
+    )
+    collapsed_mask = next(
+        (
+            path
+            for path in (destination / "mask").glob("*S000_base_collapsed.tif")
+            if not path.name.startswith("._")
+        ),
+        None,
+    )
     if directed_links is None or directed_nodes is None or collapsed_mask is None:
         raise FileNotFoundError(
             f"Copied base variant is missing required S000_base artifacts in {destination}."

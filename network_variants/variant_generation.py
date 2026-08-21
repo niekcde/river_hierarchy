@@ -23,9 +23,11 @@ import pandas as pd
 import rasterio
 from rasterio.features import rasterize, shapes
 from rasterio.transform import xy as raster_xy
-from scipy.ndimage import binary_fill_holes
+from scipy.ndimage import binary_fill_holes, label as label_connected_components
+from scipy.sparse import lil_matrix
+from scipy.sparse.linalg import spsolve
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, Point, shape as shapely_shape
-from shapely.ops import linemerge, substring, unary_union
+from shapely.ops import linemerge, polygonize, substring, unary_union
 
 if __package__ is None or __package__ == "":
     repo_root = Path(__file__).resolve().parents[1]
@@ -42,6 +44,8 @@ from hierarchy_level_definition.metrics.unit_metrics import (
     edge_width_samples_from_attrs,
 )
 from hierarchy_level_definition.graph_building.directed_network_checks import (
+    ValidationReport,
+    build_degree_frame,
     build_directed_graph,
     validate_single_inlet_single_outlet,
 )
@@ -162,6 +166,25 @@ class NetworkVariantOutputs:
     boundary_component_labels_path: Path | None = None
     origin_mask_path: Path | None = None
     rivgraph_distance_path: Path | None = None
+
+
+@dataclass
+class AnchoredGraphTransformation:
+    """Graph products from the shared realized-to-anchored transformation.
+
+    This contract deliberately contains no raster or serialization concerns.
+    Full-raster and local-patch execution can therefore apply the exact same
+    scientific anchoring operation once each has produced a valid realized
+    full-network graph and its parent-matching products.
+    """
+
+    directed_links: gpd.GeoDataFrame
+    directed_nodes: gpd.GeoDataFrame
+    node_match: pd.DataFrame
+    link_match: pd.DataFrame
+    link_lineage: pd.DataFrame
+    anchor_segmentation_summary: dict[str, Any]
+    direction_summary: dict[str, Any]
 
 
 class VariantDirectionValidationError(RuntimeError):
@@ -1005,6 +1028,76 @@ def _vectorize_mask(mask: np.ndarray, transform: Any) -> list[Any]:
     ]
 
 
+def _selected_link_interior_geometry(
+    reviewed_links: gpd.GeoDataFrame,
+    link_ids: Sequence[int],
+) -> Any:
+    """Return the polygonal interior explicitly enclosed by selected links.
+
+    Collapse footprints are intentionally wider than the selected centerlines.
+    At a shared link that buffer may also enclose a neighbouring unit.  The
+    selected link cycles, rather than the buffer, therefore define ownership of
+    candidate dry components.
+    """
+    selected_ids = {int(value) for value in link_ids}
+    selected = reviewed_links.loc[
+        reviewed_links["id_link"].astype(int).isin(selected_ids)
+    ]
+    linework = [geometry for geometry in selected.geometry if geometry is not None and not geometry.is_empty]
+    polygons = list(polygonize(unary_union(linework))) if linework else []
+    return unary_union(polygons) if polygons else GeometryCollection()
+
+
+def _owned_hole_pixels(
+    candidate_add: np.ndarray,
+    *,
+    selected_interior: Any,
+    transform: Any,
+    minimum_overlap_fraction: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
+    """Partition proposed hole fills into selected and neighbouring components."""
+    if not np.any(candidate_add):
+        empty = np.zeros(candidate_add.shape, dtype=bool)
+        return empty, empty.copy(), []
+    if selected_interior is None or selected_interior.is_empty:
+        raise ValueError(
+            "Selected collapse links do not form a polygonal interior; refusing "
+            "unconstrained hole filling."
+        )
+    interior_mask = rasterize(
+        [(selected_interior, 1)],
+        out_shape=candidate_add.shape,
+        transform=transform,
+        fill=0,
+        all_touched=False,
+        dtype="uint8",
+    ).astype(bool)
+    labels, count = label_connected_components(
+        candidate_add,
+        structure=np.ones((3, 3), dtype=np.uint8),
+    )
+    accepted = np.zeros(candidate_add.shape, dtype=bool)
+    rejected = np.zeros(candidate_add.shape, dtype=bool)
+    audit: list[dict[str, Any]] = []
+    for candidate_id in range(1, int(count) + 1):
+        pixels = labels == candidate_id
+        pixel_count = int(np.count_nonzero(pixels))
+        overlap_count = int(np.count_nonzero(pixels & interior_mask))
+        overlap_fraction = float(overlap_count / pixel_count) if pixel_count else 0.0
+        is_owned = bool(overlap_fraction >= float(minimum_overlap_fraction))
+        (accepted if is_owned else rejected)[pixels] = True
+        audit.append(
+            {
+                "candidate_component_id": int(candidate_id),
+                "candidate_pixels": pixel_count,
+                "selected_interior_overlap_pixels": overlap_count,
+                "selected_interior_overlap_fraction": overlap_fraction,
+                "ownership_status": "accepted_selected_unit" if is_owned else "rejected_neighbouring_unit",
+            }
+        )
+    return accepted, rejected, audit
+
+
 def _apply_collapse_components_to_mask(
     parent_mask_path: str | Path,
     components: list[dict[str, Any]],
@@ -1060,8 +1153,18 @@ def _apply_collapse_components_to_mask(
             dtype="uint8",
         ).astype(bool)
         component_water = parent_mask & footprint_mask
-        component_filled = binary_fill_holes(component_water)
-        component_add = component_filled & (~component_water)
+        candidate_filled = binary_fill_holes(component_water)
+        candidate_add = candidate_filled & (~component_water)
+        selected_interior = _selected_link_interior_geometry(
+            reviewed_links,
+            component["link_ids"],
+        )
+        component_add, rejected_add, ownership_audit = _owned_hole_pixels(
+            candidate_add,
+            selected_interior=selected_interior,
+            transform=transform,
+        )
+        component_filled = component_water | component_add
         add_union |= component_add
         origin_mask[component_add] = scope_label
 
@@ -1090,6 +1193,10 @@ def _apply_collapse_components_to_mask(
                 "width_scope_area": scope_area,
                 "added_pixels": added_pixels,
                 "added_area": added_area,
+                "candidate_added_pixels": int(candidate_add.sum()),
+                "rejected_neighbour_pixels": int(rejected_add.sum()),
+                "rejected_neighbour_area": float(rejected_add.sum() * pixel_area),
+                "component_ownership_audit": json.dumps(ownership_audit, sort_keys=True),
             }
         )
 
@@ -1123,6 +1230,18 @@ def _apply_collapse_components_to_mask(
                     "component_id": component["component_id"],
                     "geometry_role": "edit",
                     "action": "add",
+                    "width_scope_label": scope_label,
+                    "unit_ids": _serialize_int_list(component["unit_ids"]),
+                    "geometry": geometry,
+                }
+            )
+
+        for geometry in _vectorize_mask(rejected_add, transform):
+            geometry_records.append(
+                {
+                    "component_id": component["component_id"],
+                    "geometry_role": "candidate_edit_rejected",
+                    "action": "reject",
                     "width_scope_label": scope_label,
                     "unit_ids": _serialize_int_list(component["unit_ids"]),
                     "geometry": geometry,
@@ -2945,6 +3064,11 @@ def _segment_collapsed_links_to_anchor_nodes(
         for index, (segment_geometry, segment_parent_path) in enumerate(zip(segments, parent_path_segments)):
             new_row = _line_length_fields_updated(row_data, segment_geometry)
             new_row["geometry"] = segment_geometry
+            # Preserve the source link's pre-anchor provenance verbatim.
+            # Splitting a changed realized link at scientific interfaces does
+            # not prove that any resulting piece is an unchanged parent link.
+            # The local-patch adapter revalidates both eligibility and parent
+            # identity after segmentation.
             if "idx_link" in new_row and index < len(idx_link_segments):
                 new_row["idx_link"] = idx_link_segments[index]
             if "wid_pix" in new_row and index < len(wid_pix_segments):
@@ -3079,6 +3203,296 @@ def _build_oriented_child_graph(
     for link_id, (upstream, downstream) in orientation_by_link.items():
         graph.add_edge(int(upstream), int(downstream), key=int(link_id), id_link=int(link_id))
     return graph
+
+
+def _boundary_harmonic_orientation(
+    *,
+    edge_nodes: Mapping[int, tuple[int, int]],
+    child_links: gpd.GeoDataFrame,
+    child_nodes: gpd.GeoDataFrame,
+    child_inlet_nodes: set[int],
+    child_outlet_nodes: set[int],
+    allow_additional_topological_terminals: bool = False,
+    fixed_orientation_by_link: Mapping[int, tuple[int, int]] | None = None,
+    fixed_node_potential_by_node: Mapping[int, float] | None = None,
+) -> dict[int, tuple[int, int]]:
+    """Orient a connected local graph down a cut-constrained harmonic potential.
+
+    ``fixed_orientation_by_link`` supplies authoritative directions for links
+    inherited unchanged from a parent graph.  They participate in the
+    potential and reachability scaffold but are never reoriented.  This is
+    required for a local replacement assembled from alternating inherited and
+    regenerated segments: solving only the regenerated subset can hide the
+    true source or sink attachment.
+    """
+    prescribed_sources = {int(value) for value in child_inlet_nodes}
+    prescribed_sinks = {int(value) for value in child_outlet_nodes}
+    sources = set(prescribed_sources)
+    sinks = set(prescribed_sinks)
+    # An open/interconnected selected unit may use one scientific interface
+    # node for both incoming and outgoing external continuations. Such a node
+    # is not a Dirichlet endpoint of the local potential problem: assigning it
+    # both 1 and 0 is contradictory. Keep it as an internal harmonic node and
+    # constrain the solve with the remaining role-exclusive interfaces.
+    shared_interfaces = sources.intersection(sinks)
+    sources.difference_update(shared_interfaces)
+    sinks.difference_update(shared_interfaces)
+    if not sources or not sinks:
+        raise ValueError(
+            "Boundary-potential direction fallback requires at least one prescribed "
+            "role-exclusive inlet and outlet."
+        )
+
+    node_ids = sorted(int(value) for value in child_nodes["id_node"])
+    graph = nx.Graph()
+    graph.add_nodes_from(node_ids)
+    links_by_id = child_links.set_index(child_links["id_link"].astype(int), drop=False)
+    conductance: dict[tuple[int, int], float] = {}
+    for link_id, (node_a, node_b) in edge_nodes.items():
+        length = float(links_by_id.loc[int(link_id)].geometry.length)
+        weight = 1.0 / max(length, 1e-9)
+        pair = tuple(sorted((int(node_a), int(node_b))))
+        conductance[pair] = conductance.get(pair, 0.0) + weight
+        graph.add_edge(*pair)
+    if not nx.is_connected(graph) or not sources.union(sinks).issubset(graph.nodes):
+        raise ValueError(
+            "Boundary-potential direction fallback requires one connected graph "
+            "containing every prescribed boundary."
+        )
+
+    supplied_node_potential = {
+        int(node_id): float(value)
+        for node_id, value in dict(fixed_node_potential_by_node or {}).items()
+        if int(node_id) in graph
+    }
+    if supplied_node_potential:
+        missing_prescribed = sorted(
+            prescribed_sources.union(prescribed_sinks).difference(
+                supplied_node_potential
+            )
+        )
+        if missing_prescribed:
+            raise ValueError(
+                "Parent-order boundary potential is missing prescribed interfaces: "
+                f"{missing_prescribed}."
+            )
+        boundary_values = supplied_node_potential
+    else:
+        boundary_values = {node_id: 1.0 for node_id in sources}
+        boundary_values.update({node_id: 0.0 for node_id in sinks})
+    internal = [node_id for node_id in node_ids if node_id not in boundary_values]
+    potential = dict(boundary_values)
+    if internal:
+        index = {node_id: idx for idx, node_id in enumerate(internal)}
+        matrix = lil_matrix((len(internal), len(internal)), dtype=float)
+        right = np.zeros(len(internal), dtype=float)
+        adjacency: dict[int, dict[int, float]] = {node_id: {} for node_id in node_ids}
+        for (node_a, node_b), weight in conductance.items():
+            adjacency[node_a][node_b] = adjacency[node_a].get(node_b, 0.0) + weight
+            adjacency[node_b][node_a] = adjacency[node_b].get(node_a, 0.0) + weight
+        for node_id in internal:
+            row = index[node_id]
+            for neighbor, weight in adjacency[node_id].items():
+                matrix[row, row] += weight
+                if neighbor in index:
+                    matrix[row, index[neighbor]] -= weight
+                else:
+                    right[row] += weight * boundary_values[neighbor]
+        solution = np.asarray(spsolve(matrix.tocsr(), right), dtype=float)
+        if not np.isfinite(solution).all():
+            raise ValueError("Boundary-potential direction fallback produced non-finite values.")
+        potential.update({node_id: float(solution[index[node_id]]) for node_id in internal})
+
+    fixed_orientation = {
+        int(link_id): (int(nodes[0]), int(nodes[1]))
+        for link_id, nodes in dict(fixed_orientation_by_link or {}).items()
+    }
+    unknown_fixed_ids = sorted(set(fixed_orientation).difference(edge_nodes))
+    if unknown_fixed_ids:
+        raise ValueError(
+            "Fixed boundary-potential orientations reference absent links: "
+            f"{unknown_fixed_ids}."
+        )
+    for link_id, endpoints in fixed_orientation.items():
+        if set(endpoints) != set(map(int, edge_nodes[int(link_id)])):
+            raise ValueError(
+                "Fixed boundary-potential orientation endpoints disagree with "
+                f"link {link_id}: fixed={endpoints}, graph={edge_nodes[int(link_id)]}."
+            )
+
+    orientation: dict[int, tuple[int, int]] = {}
+    tie_tolerance = 1e-12
+    distance_to_sink = nx.multi_source_dijkstra_path_length(
+        graph, sinks, weight=None
+    )
+    distance_from_source = nx.multi_source_dijkstra_path_length(
+        graph, sources, weight=None
+    )
+    for link_id, (node_a, node_b) in edge_nodes.items():
+        node_a, node_b = int(node_a), int(node_b)
+        if int(link_id) in fixed_orientation:
+            orientation[int(link_id)] = fixed_orientation[int(link_id)]
+            continue
+        difference = float(potential[node_a] - potential[node_b])
+        if difference > tie_tolerance:
+            orientation[int(link_id)] = (node_a, node_b)
+        elif difference < -tie_tolerance:
+            orientation[int(link_id)] = (node_b, node_a)
+        else:
+            # Equal-potential connectors occur particularly between multiple
+            # prescribed interfaces. Node-ID order is acyclic but can point a
+            # source-source connector away from the downstream network. Use
+            # cut-to-cut progression first, then a deterministic ID tie-break.
+            # Greater sink distance and smaller source distance are upstream.
+            rank_a = (
+                int(distance_to_sink[node_a]),
+                -int(distance_from_source[node_a]),
+                -int(node_a),
+            )
+            rank_b = (
+                int(distance_to_sink[node_b]),
+                -int(distance_from_source[node_b]),
+                -int(node_b),
+            )
+            orientation[int(link_id)] = (
+                (node_a, node_b) if rank_a > rank_b else (node_b, node_a)
+            )
+
+    directed = _build_oriented_child_graph(
+        child_nodes=child_nodes, orientation_by_link=orientation
+    )
+    if shared_interfaces or allow_additional_topological_terminals:
+        weak_component_count = nx.number_weakly_connected_components(directed)
+        unreachable_sources = sorted(
+            source
+            for source in prescribed_sources
+            if not any(
+                sink in directed and nx.has_path(directed, source, sink)
+                for sink in prescribed_sinks
+            )
+        )
+        unreachable_sinks = sorted(
+            sink
+            for sink in prescribed_sinks
+            if not any(
+                source in directed and nx.has_path(directed, source, sink)
+                for source in prescribed_sources
+            )
+        )
+        shared_issues = []
+        if weak_component_count != 1:
+            shared_issues.append(
+                f"Expected one weak component, found {weak_component_count}."
+            )
+        if unreachable_sources:
+            shared_issues.append(
+                f"Unreachable prescribed sources: {unreachable_sources}."
+            )
+        if unreachable_sinks:
+            shared_issues.append(
+                f"Unreachable prescribed sinks: {unreachable_sinks}."
+            )
+        report_issues = shared_issues
+    else:
+        report = _validate_variant_direction_boundaries(
+            directed,
+            child_inlet_nodes=sources,
+            child_outlet_nodes=sinks,
+            require_flag_match=True,
+        )
+        report_issues = list(report.issues)
+    if report_issues or not nx.is_directed_acyclic_graph(nx.DiGraph(directed)):
+        raise ValueError(
+            "Boundary-potential direction fallback did not produce a valid cut-to-cut DAG: "
+            f"{report_issues}"
+        )
+    return orientation
+
+
+def _validate_variant_direction_boundaries(
+    graph: nx.MultiDiGraph,
+    *,
+    child_inlet_nodes: Collection[int],
+    child_outlet_nodes: Collection[int],
+    require_flag_match: bool,
+) -> ValidationReport:
+    """Validate either a closed child or an open multi-interface child DAG.
+
+    A local crop of a member of a compound unit can legitimately have several
+    anchored inflow and/or outflow interfaces.  Those prescribed interfaces,
+    rather than a global one-inlet/one-outlet rule, are authoritative until the
+    local graph is merged back into the globally closed parent network.
+    """
+    expected_sources = sorted({int(value) for value in child_inlet_nodes})
+    expected_sinks = sorted({int(value) for value in child_outlet_nodes})
+    if len(expected_sources) == 1 and len(expected_sinks) == 1:
+        return validate_single_inlet_single_outlet(
+            graph, require_flag_match=require_flag_match
+        )
+
+    degree_frame = build_degree_frame(graph)
+    weak_components = [
+        sorted(int(node) for node in component)
+        for component in nx.weakly_connected_components(graph)
+    ]
+    source_nodes = sorted(
+        int(node)
+        for node in degree_frame.loc[degree_frame["is_source"], "node_id"]
+    )
+    sink_nodes = sorted(
+        int(node)
+        for node in degree_frame.loc[degree_frame["is_sink"], "node_id"]
+    )
+    isolated_nodes = sorted(
+        int(node)
+        for node in degree_frame.loc[degree_frame["is_isolated"], "node_id"]
+    )
+    flagged_inlets = sorted(
+        int(node)
+        for node in degree_frame.loc[degree_frame["flag_is_inlet"], "node_id"]
+    )
+    flagged_outlets = sorted(
+        int(node)
+        for node in degree_frame.loc[degree_frame["flag_is_outlet"], "node_id"]
+    )
+    issues: list[str] = []
+    if len(weak_components) != 1:
+        issues.append(
+            f"Expected one weakly connected component, found {len(weak_components)}."
+        )
+    if isolated_nodes:
+        issues.append(
+            "Found isolated node(s) with zero in-degree and zero out-degree: "
+            f"{isolated_nodes}."
+        )
+    if source_nodes != expected_sources:
+        issues.append(
+            f"Expected prescribed local source nodes {expected_sources}, found {source_nodes}."
+        )
+    if sink_nodes != expected_sinks:
+        issues.append(
+            f"Expected prescribed local sink nodes {expected_sinks}, found {sink_nodes}."
+        )
+    if require_flag_match and flagged_inlets != expected_sources:
+        issues.append(
+            f"Expected inlet flags {expected_sources}, found {flagged_inlets}."
+        )
+    if require_flag_match and flagged_outlets != expected_sinks:
+        issues.append(
+            f"Expected outlet flags {expected_sinks}, found {flagged_outlets}."
+        )
+    return ValidationReport(
+        n_nodes=graph.number_of_nodes(),
+        n_edges=graph.number_of_edges(),
+        n_weak_components=len(weak_components),
+        weak_components=weak_components,
+        source_nodes=source_nodes,
+        sink_nodes=sink_nodes,
+        isolated_nodes=isolated_nodes,
+        flagged_inlets=flagged_inlets,
+        flagged_outlets=flagged_outlets,
+        issues=issues,
+    )
 
 
 def _link_length_lookup(child_links: gpd.GeoDataFrame) -> dict[int, float]:
@@ -3240,6 +3654,7 @@ def _search_local_direction_repair(
     child_inlet_nodes: set[int],
     child_outlet_nodes: set[int],
     require_acyclic: bool = True,
+    require_flag_match: bool = False,
     max_candidate_links: int = MAX_LOCAL_DIRECTION_REPAIR_LINKS,
 ) -> dict[int, tuple[int, int]] | None:
     candidate_links = sorted(int(link_id) for link_id in candidate_link_ids)
@@ -3297,7 +3712,9 @@ def _search_local_direction_repair(
             child_nodes=child_nodes,
             orientation_by_link=proposal,
         )
-        report = validate_single_inlet_single_outlet(candidate_graph, require_flag_match=False)
+        report = validate_single_inlet_single_outlet(
+            candidate_graph, require_flag_match=require_flag_match
+        )
         if not report.is_valid:
             continue
         if require_acyclic and not nx.is_directed_acyclic_graph(nx.DiGraph(candidate_graph)):
@@ -3330,6 +3747,7 @@ def _repair_unresolved_link_components(
     parent_order_lookup: Mapping[int, int],
     child_inlet_nodes: set[int],
     child_outlet_nodes: set[int],
+    require_flag_match: bool = False,
 ) -> dict[int, tuple[int, int]]:
     repaired: dict[int, tuple[int, int]] = {}
     for component in _link_components(unresolved_links, incident_links):
@@ -3348,6 +3766,7 @@ def _repair_unresolved_link_components(
             child_inlet_nodes=child_inlet_nodes,
             child_outlet_nodes=child_outlet_nodes,
             require_acyclic=True,
+            require_flag_match=require_flag_match,
         )
         if assignment is None:
             expanded = _expand_candidate_link_ids(
@@ -3369,6 +3788,7 @@ def _repair_unresolved_link_components(
                 child_inlet_nodes=child_inlet_nodes,
                 child_outlet_nodes=child_outlet_nodes,
                 require_acyclic=True,
+                require_flag_match=require_flag_match,
             )
         if assignment is None:
             continue
@@ -3391,6 +3811,7 @@ def _repair_invalid_directionality(
     parent_order_lookup: Mapping[int, int],
     child_inlet_nodes: set[int],
     child_outlet_nodes: set[int],
+    require_flag_match: bool = False,
 ) -> dict[int, tuple[int, int]]:
     repaired = {
         int(link_id): (int(upstream), int(downstream))
@@ -3402,7 +3823,9 @@ def _repair_invalid_directionality(
             child_nodes=child_nodes,
             orientation_by_link=repaired,
         )
-        report = validate_single_inlet_single_outlet(graph, require_flag_match=False)
+        report = validate_single_inlet_single_outlet(
+            graph, require_flag_match=require_flag_match
+        )
         require_acyclic = nx.is_directed_acyclic_graph(nx.DiGraph(graph))
         if report.is_valid and (not require_acyclic or nx.is_directed_acyclic_graph(nx.DiGraph(graph))):
             return repaired
@@ -3437,6 +3860,7 @@ def _repair_invalid_directionality(
                 child_inlet_nodes=child_inlet_nodes,
                 child_outlet_nodes=child_outlet_nodes,
                 require_acyclic=require_acyclic,
+                require_flag_match=require_flag_match,
             )
             if assignment is None:
                 expanded = _expand_candidate_link_ids(
@@ -3458,6 +3882,7 @@ def _repair_invalid_directionality(
                     child_inlet_nodes=child_inlet_nodes,
                     child_outlet_nodes=child_outlet_nodes,
                     require_acyclic=require_acyclic,
+                    require_flag_match=require_flag_match,
                 )
             if assignment is None:
                 continue
@@ -3482,6 +3907,8 @@ def _resolve_single_remaining_link(
     child_inlet_nodes: set[int],
     child_outlet_nodes: set[int],
     child_links: gpd.GeoDataFrame,
+    require_flag_match: bool = False,
+    allow_width_continuity_tiebreak: bool = False,
 ) -> tuple[tuple[int, int], str] | None:
     node_a, node_b = edge_nodes[int(link_id)]
     geometry_order = geometry_order_by_link.get(int(link_id))
@@ -3501,14 +3928,113 @@ def _resolve_single_remaining_link(
         for oriented_link_id, (upstream, downstream) in orientation_by_link.items():
             child_graph.add_edge(upstream, downstream, key=int(oriented_link_id), id_link=int(oriented_link_id))
         child_graph.add_edge(candidate[0], candidate[1], key=int(link_id), id_link=int(link_id))
-        report = validate_single_inlet_single_outlet(child_graph, require_flag_match=False)
+        report = validate_single_inlet_single_outlet(
+            child_graph, require_flag_match=require_flag_match
+        )
         if report.is_valid:
             valid_candidates.append((candidate, "singleton_validation_rule"))
 
-    if not valid_candidates:
-        return None
     if len(valid_candidates) == 1:
         return valid_candidates[0]
+
+    if allow_width_continuity_tiebreak:
+        # This is deliberately a last-resort rule. It is only called after
+        # parent matching and exact component repair leave one link unresolved
+        # and both directions pass the graph-validity gate. Use one width
+        # semantic shared by the unresolved link and every incident oriented
+        # link; never mix routing, wet, and legacy widths in one balance.
+        incident_link_ids = {
+            int(candidate_link_id)
+            for candidate_link_id, endpoints in edge_nodes.items()
+            if int(candidate_link_id) == int(link_id)
+            or int(node_a) in map(int, endpoints)
+            or int(node_b) in map(int, endpoints)
+        }
+        width_by_link: dict[int, float] | None = None
+        width_field: str | None = None
+        indexed_links = child_links.set_index(
+            child_links["id_link"].astype(int), drop=False
+        )
+        for candidate_field in (
+            "wid_adj_routing",
+            "wid_adj_wet",
+            "wid_adj",
+            "wid",
+        ):
+            if candidate_field not in indexed_links.columns:
+                continue
+            candidate_widths: dict[int, float] = {}
+            for candidate_link_id in incident_link_ids:
+                if candidate_link_id not in indexed_links.index:
+                    break
+                value = pd.to_numeric(
+                    pd.Series([
+                        indexed_links.loc[candidate_link_id, candidate_field]
+                    ]),
+                    errors="coerce",
+                ).iloc[0]
+                if not np.isfinite(value) or float(value) <= 0.0:
+                    break
+                candidate_widths[candidate_link_id] = float(value)
+            if len(candidate_widths) == len(incident_link_ids):
+                width_by_link = candidate_widths
+                width_field = candidate_field
+                break
+
+        if width_by_link is not None and width_field is not None:
+            width_candidate_pool = (
+                valid_candidates
+                if valid_candidates
+                else [
+                    ((int(node_a), int(node_b)), ""),
+                    ((int(node_b), int(node_a)), ""),
+                ]
+            )
+            scored: list[tuple[float, tuple[int, int]]] = []
+            for candidate, _ in width_candidate_pool:
+                trial_orientation = {
+                    **{int(key): tuple(map(int, value)) for key, value in orientation_by_link.items()},
+                    int(link_id): tuple(map(int, candidate)),
+                }
+                node_scores: list[float] = []
+                for node_id in (int(node_a), int(node_b)):
+                    incoming_width = sum(
+                        width_by_link[candidate_link_id]
+                        for candidate_link_id, (_, downstream) in trial_orientation.items()
+                        if candidate_link_id in width_by_link
+                        and int(downstream) == node_id
+                    )
+                    outgoing_width = sum(
+                        width_by_link[candidate_link_id]
+                        for candidate_link_id, (upstream, _) in trial_orientation.items()
+                        if candidate_link_id in width_by_link
+                        and int(upstream) == node_id
+                    )
+                    if incoming_width > 0.0 and outgoing_width > 0.0:
+                        node_scores.append(
+                            abs(math.log(incoming_width / outgoing_width))
+                        )
+                if len(node_scores) == 2:
+                    scored.append((float(sum(node_scores)), candidate))
+            if len(scored) == 2:
+                scored.sort(key=lambda item: item[0])
+                best_score, best_candidate = scored[0]
+                second_score = scored[1][0]
+                if (
+                    best_score + 0.05 < second_score
+                    and best_score <= second_score * 0.9
+                ):
+                    return (
+                        best_candidate,
+                        (
+                            f"singleton_width_continuity_{width_field}"
+                            if valid_candidates
+                            else f"singleton_width_continuity_provisional_{width_field}"
+                        ),
+                    )
+
+    if not valid_candidates:
+        return None
 
     resolved = _resolve_link_by_progression(
         node_a=node_a,
@@ -3534,6 +4060,9 @@ def _assign_variant_directions(
     parent_nodes: gpd.GeoDataFrame,
     node_match: pd.DataFrame,
     link_match: pd.DataFrame,
+    canonicalize_parent_boundaries: bool = True,
+    require_child_boundary_flag_match: bool = False,
+    allow_boundary_potential_fallback: bool = False,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, Mapping[str, Any]]:
     child_links = child_links.copy()
     child_nodes = child_nodes.copy()
@@ -3725,6 +4254,21 @@ def _assign_variant_directions(
             unresolved_links.remove(link_id)
             changed = True
 
+    used_boundary_potential_fallback = False
+    if unresolved_links and allow_boundary_potential_fallback:
+        orientation_by_link = _boundary_harmonic_orientation(
+            edge_nodes=edge_nodes,
+            child_links=child_links,
+            child_nodes=child_nodes,
+            child_inlet_nodes=child_inlet_nodes,
+            child_outlet_nodes=child_outlet_nodes,
+        )
+        orientation_source = {
+            int(link_id): "boundary_harmonic_fallback" for link_id in orientation_by_link
+        }
+        unresolved_links = []
+        used_boundary_potential_fallback = True
+
     if unresolved_links:
         if len(unresolved_links) == 1:
             link_id = int(unresolved_links[0])
@@ -3737,6 +4281,7 @@ def _assign_variant_directions(
                 child_inlet_nodes=child_inlet_nodes,
                 child_outlet_nodes=child_outlet_nodes,
                 child_links=child_links,
+                require_flag_match=require_child_boundary_flag_match,
             )
             if resolved is not None:
                 oriented_pair, method = resolved
@@ -3758,6 +4303,7 @@ def _assign_variant_directions(
             parent_order_lookup=parent_order_lookup,
             child_inlet_nodes=child_inlet_nodes,
             child_outlet_nodes=child_outlet_nodes,
+            require_flag_match=require_child_boundary_flag_match,
         )
         for link_id, oriented_pair in repaired_orientations.items():
             orientation_by_link[int(link_id)] = oriented_pair
@@ -3765,6 +4311,26 @@ def _assign_variant_directions(
         unresolved_links = [
             int(link_id) for link_id in unresolved_links if int(link_id) not in repaired_orientations
         ]
+
+    if len(unresolved_links) == 1:
+        link_id = int(unresolved_links[0])
+        resolved = _resolve_single_remaining_link(
+            link_id=link_id,
+            edge_nodes=edge_nodes,
+            geometry_order_by_link=geometry_order_by_link,
+            orientation_by_link=orientation_by_link,
+            child_nodes=child_nodes,
+            child_inlet_nodes=child_inlet_nodes,
+            child_outlet_nodes=child_outlet_nodes,
+            child_links=child_links,
+            require_flag_match=require_child_boundary_flag_match,
+            allow_width_continuity_tiebreak=True,
+        )
+        if resolved is not None:
+            oriented_pair, method = resolved
+            orientation_by_link[link_id] = oriented_pair
+            orientation_source[link_id] = method
+            unresolved_links = []
 
     if unresolved_links:
         raise ValueError(
@@ -3782,7 +4348,12 @@ def _assign_variant_directions(
         orientation_by_link=orientation_by_link,
     )
 
-    report = validate_single_inlet_single_outlet(child_graph, require_flag_match=False)
+    report = _validate_variant_direction_boundaries(
+        child_graph,
+        child_inlet_nodes=child_inlet_nodes,
+        child_outlet_nodes=child_outlet_nodes,
+        require_flag_match=require_child_boundary_flag_match,
+    )
     if not report.is_valid or not nx.is_directed_acyclic_graph(nx.DiGraph(child_graph)):
         repaired_orientation = _repair_invalid_directionality(
             orientation_by_link=orientation_by_link,
@@ -3796,6 +4367,7 @@ def _assign_variant_directions(
             parent_order_lookup=parent_order_lookup,
             child_inlet_nodes=child_inlet_nodes,
             child_outlet_nodes=child_outlet_nodes,
+            require_flag_match=require_child_boundary_flag_match,
         )
         for link_id, oriented_pair in repaired_orientation.items():
             if orientation_by_link.get(int(link_id)) != oriented_pair:
@@ -3805,16 +4377,50 @@ def _assign_variant_directions(
             child_nodes=child_nodes,
             orientation_by_link=orientation_by_link,
         )
-        report = validate_single_inlet_single_outlet(child_graph, require_flag_match=False)
+        report = _validate_variant_direction_boundaries(
+            child_graph,
+            child_inlet_nodes=child_inlet_nodes,
+            child_outlet_nodes=child_outlet_nodes,
+            require_flag_match=require_child_boundary_flag_match,
+        )
+
+    if (
+        allow_boundary_potential_fallback
+        and (not report.is_valid or not nx.is_directed_acyclic_graph(nx.DiGraph(child_graph)))
+    ):
+        orientation_by_link = _boundary_harmonic_orientation(
+            edge_nodes=edge_nodes,
+            child_links=child_links,
+            child_nodes=child_nodes,
+            child_inlet_nodes=child_inlet_nodes,
+            child_outlet_nodes=child_outlet_nodes,
+        )
+        orientation_source = {
+            int(link_id): "boundary_harmonic_fallback" for link_id in orientation_by_link
+        }
+        used_boundary_potential_fallback = True
+        child_graph = _build_oriented_child_graph(
+            child_nodes=child_nodes,
+            orientation_by_link=orientation_by_link,
+        )
+        report = _validate_variant_direction_boundaries(
+            child_graph,
+            child_inlet_nodes=child_inlet_nodes,
+            child_outlet_nodes=child_outlet_nodes,
+            require_flag_match=require_child_boundary_flag_match,
+        )
 
     topology_source_nodes = sorted(int(node_id) for node_id in report.source_nodes)
     topology_sink_nodes = sorted(int(node_id) for node_id in report.sink_nodes)
-    canonical_source_nodes, canonical_sink_nodes, canonical_issues = _resolve_canonical_child_boundary_nodes(
-        parent_nodes=parent_nodes,
-        node_match=node_match,
-        topology_source_nodes=topology_source_nodes,
-        topology_sink_nodes=topology_sink_nodes,
-    )
+    if canonicalize_parent_boundaries:
+        canonical_source_nodes, canonical_sink_nodes, canonical_issues = _resolve_canonical_child_boundary_nodes(
+            parent_nodes=parent_nodes,
+            node_match=node_match,
+            topology_source_nodes=topology_source_nodes,
+            topology_sink_nodes=topology_sink_nodes,
+        )
+    else:
+        canonical_source_nodes, canonical_sink_nodes, canonical_issues = set(), set(), []
     source_nodes = (
         sorted(int(node_id) for node_id in canonical_source_nodes)
         if canonical_source_nodes
@@ -3932,6 +4538,10 @@ def _assign_variant_directions(
         "topology_sink_nodes": topology_sink_nodes,
         "canonical_source_nodes": sorted(int(node_id) for node_id in canonical_source_nodes),
         "canonical_sink_nodes": sorted(int(node_id) for node_id in canonical_sink_nodes),
+        "canonicalize_parent_boundaries": bool(canonicalize_parent_boundaries),
+        "require_child_boundary_flag_match": bool(require_child_boundary_flag_match),
+        "allow_boundary_potential_fallback": bool(allow_boundary_potential_fallback),
+        "used_boundary_potential_fallback": bool(used_boundary_potential_fallback),
     }
     return directed_links, directed_nodes, summary
 
@@ -4524,6 +5134,115 @@ def generate_network_variant(
     return results
 
 
+def derive_anchored_graph_from_realized(
+    *,
+    parent_links: gpd.GeoDataFrame,
+    parent_nodes: gpd.GeoDataFrame,
+    realized_links: gpd.GeoDataFrame,
+    realized_nodes: gpd.GeoDataFrame,
+    realized_node_match: pd.DataFrame,
+    realized_link_match: pd.DataFrame,
+    realized_link_lineage: pd.DataFrame,
+    selected_unit_ids: Sequence[int],
+    units_by_id: Mapping[int, StructuralUnit],
+    match_tolerance: float,
+) -> AnchoredGraphTransformation:
+    """Apply the established scientific anchoring transform to a realized graph.
+
+    The function is intentionally independent of how the realized graph was
+    generated.  It preserves the existing full-raster algorithm exactly:
+    determine the selected parent interval, split/project collapsed child
+    links at the parent anchor nodes, then rebuild link matching and lineage.
+    Raster-derived width products are handled by the caller after this graph
+    transformation.
+    """
+
+    resolved_unit_ids = [int(unit_id) for unit_id in selected_unit_ids]
+    missing_unit_ids = sorted(
+        unit_id for unit_id in resolved_unit_ids if unit_id not in units_by_id
+    )
+    if missing_unit_ids:
+        raise ValueError(
+            "The following selected unit_ids were not found in the reviewed graph: "
+            f"{missing_unit_ids}"
+        )
+
+    parent_node_order, parent_graph, _ = _infer_parent_node_order(
+        parent_links,
+        parent_nodes,
+    )
+    nominal_upstream_node, nominal_downstream_node = _selection_anchor_nodes(
+        resolved_unit_ids=resolved_unit_ids,
+        units_by_id=units_by_id,
+    )
+    selection_edge_pairs = _selection_edge_pairs(
+        resolved_unit_ids=resolved_unit_ids,
+        units_by_id=units_by_id,
+    )
+    (
+        directed_links,
+        directed_nodes,
+        node_match,
+        anchor_segmentation_summary,
+    ) = _segment_collapsed_links_to_anchor_nodes(
+        parent_graph=parent_graph,
+        parent_nodes=parent_nodes,
+        parent_node_order=parent_node_order,
+        directed_links=realized_links,
+        directed_nodes=realized_nodes,
+        node_match=realized_node_match,
+        link_match=realized_link_match,
+        link_lineage=realized_link_lineage,
+        selection_edge_pairs=selection_edge_pairs,
+        nominal_upstream_node=nominal_upstream_node,
+        nominal_downstream_node=nominal_downstream_node,
+    )
+    link_match = _match_child_links_to_parent_links(
+        parent_links,
+        directed_links,
+        match_tolerance=float(match_tolerance),
+    )
+    link_lineage = _resolve_link_lineage(
+        parent_graph=parent_graph,
+        directed_child_links=directed_links,
+        node_match=node_match,
+        link_match=link_match,
+        match_tolerance=float(match_tolerance),
+    )
+    validation_report = anchor_segmentation_summary.get("validation_report", {})
+    direction_summary = {
+        "is_valid": bool(validation_report.get("is_valid", False)),
+        "source_node": validation_report.get("source_nodes", [None])[0]
+        if validation_report.get("source_nodes")
+        else None,
+        "sink_node": validation_report.get("sink_nodes", [None])[0]
+        if validation_report.get("sink_nodes")
+        else None,
+        "source_nodes": validation_report.get("source_nodes", []),
+        "sink_nodes": validation_report.get("sink_nodes", []),
+        "n_oriented_links": int(len(directed_links)),
+        "n_node_matches": int(
+            node_match["match_within_tolerance"].fillna(False).sum()
+        )
+        if "match_within_tolerance" in node_match.columns
+        else 0,
+        "n_link_matches": int(link_match["child_id_link"].nunique())
+        if "child_id_link" in link_match.columns
+        else 0,
+        "issues": list(anchor_segmentation_summary.get("issues", [])),
+        "validation_report": validation_report,
+    }
+    return AnchoredGraphTransformation(
+        directed_links=directed_links,
+        directed_nodes=directed_nodes,
+        node_match=node_match,
+        link_match=link_match,
+        link_lineage=link_lineage,
+        anchor_segmentation_summary=anchor_segmentation_summary,
+        direction_summary=direction_summary,
+    )
+
+
 def derive_anchored_variant_from_realized(
     *,
     source_output_dir: str | Path,
@@ -4708,53 +5427,25 @@ def derive_anchored_variant_from_realized(
     stage_timings["load_and_bank_setup_seconds"] = time.perf_counter() - setup_started
 
     segmentation_started = time.perf_counter()
-    parent_node_order, _, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
-    _, parent_graph, _ = _infer_parent_node_order(reviewed_links, reviewed_nodes)
-    nominal_upstream_node, nominal_downstream_node = _selection_anchor_nodes(
-        resolved_unit_ids=selected_unit_ids,
-        units_by_id=units_by_id,
-    )
-    selection_edge_pairs = _selection_edge_pairs(
-        resolved_unit_ids=selected_unit_ids,
-        units_by_id=units_by_id,
-    )
-    directed_links, directed_nodes, node_match, anchor_segmentation_summary = _segment_collapsed_links_to_anchor_nodes(
-        parent_graph=parent_graph,
+    anchored_graph = derive_anchored_graph_from_realized(
+        parent_links=reviewed_links,
         parent_nodes=reviewed_nodes,
-        parent_node_order=parent_node_order,
-        directed_links=directed_links,
-        directed_nodes=directed_nodes,
-        node_match=node_match,
-        link_match=link_match,
-        link_lineage=link_lineage,
-        selection_edge_pairs=selection_edge_pairs,
-        nominal_upstream_node=nominal_upstream_node,
-        nominal_downstream_node=nominal_downstream_node,
-    )
-    link_match = _match_child_links_to_parent_links(
-        reviewed_links,
-        directed_links,
+        realized_links=directed_links,
+        realized_nodes=directed_nodes,
+        realized_node_match=node_match,
+        realized_link_match=link_match,
+        realized_link_lineage=link_lineage,
+        selected_unit_ids=selected_unit_ids,
+        units_by_id=units_by_id,
         match_tolerance=float(match_tolerance),
     )
-    link_lineage = _resolve_link_lineage(
-        parent_graph=parent_graph,
-        directed_child_links=directed_links,
-        node_match=node_match,
-        link_match=link_match,
-        match_tolerance=float(match_tolerance),
-    )
-    direction_summary = {
-        "is_valid": bool(anchor_segmentation_summary.get("validation_report", {}).get("is_valid", False)),
-        "source_node": anchor_segmentation_summary.get("validation_report", {}).get("source_nodes", [None])[0],
-        "sink_node": anchor_segmentation_summary.get("validation_report", {}).get("sink_nodes", [None])[0],
-        "source_nodes": anchor_segmentation_summary.get("validation_report", {}).get("source_nodes", []),
-        "sink_nodes": anchor_segmentation_summary.get("validation_report", {}).get("sink_nodes", []),
-        "n_oriented_links": int(len(directed_links)),
-        "n_node_matches": int(node_match["match_within_tolerance"].fillna(False).sum()) if "match_within_tolerance" in node_match.columns else 0,
-        "n_link_matches": int(link_match["child_id_link"].nunique()) if "child_id_link" in link_match.columns else 0,
-        "issues": list(anchor_segmentation_summary.get("issues", [])),
-        "validation_report": anchor_segmentation_summary.get("validation_report", {}),
-    }
+    directed_links = anchored_graph.directed_links
+    directed_nodes = anchored_graph.directed_nodes
+    node_match = anchored_graph.node_match
+    link_match = anchored_graph.link_match
+    link_lineage = anchored_graph.link_lineage
+    anchor_segmentation_summary = anchored_graph.anchor_segmentation_summary
+    direction_summary = anchored_graph.direction_summary
     stage_timings["anchor_segmentation_and_matching_seconds"] = (
         time.perf_counter() - segmentation_started
     )

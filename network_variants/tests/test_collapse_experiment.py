@@ -269,10 +269,13 @@ def test_copied_base_localizes_nested_routing_audit_reference(tmp_path: Path) ->
     (source / "directed" / "99__S000_base_directed_links.gpkg").touch()
     (source / "directed" / "99__S000_base_directed_nodes.gpkg").touch()
     (source / "mask" / "99__S000_base_collapsed.tif").touch()
+    (source / "directed" / "._99__S000_base_directed_links.gpkg").touch()
+    (source / "directed" / "._99__S000_base_directed_nodes.gpkg").touch()
+    (source / "mask" / "._99__S000_base_collapsed.tif").touch()
     state_dir = tmp_path / "destination" / "states" / "S000_base"
     context = SimpleNamespace(state_dir=state_dir)
 
-    collapse_experiment_module._materialize_copied_base_state_variant(
+    copied = collapse_experiment_module._materialize_copied_base_state_variant(
         context=context,
         source_variant_dir=source,
         example_id="99",
@@ -289,6 +292,13 @@ def test_copied_base_localizes_nested_routing_audit_reference(tmp_path: Path) ->
         ).read_text(encoding="utf-8")
     )
     assert copied_manifest["files"]["link_audit"] == "routing_width_application.csv"
+    assert not copied.directed_links_path.name.startswith("._")
+    assert not copied.directed_nodes_path.name.startswith("._")
+    assert not copied.collapsed_mask_path.name.startswith("._")
+    assert not any(
+        path.name.startswith("._")
+        for path in (state_dir / "variant").rglob("*")
+    )
 
 
 def _make_variant_runner():

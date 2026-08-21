@@ -6,7 +6,7 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, box
 
 from network_variants.local_patch import (
     LocalPatchCollar,
@@ -14,7 +14,9 @@ from network_variants.local_patch import (
     LocalPatchRasterPolicy,
 )
 from network_variants.local_patch_raster import _cut_center_points
+from network_variants.local_patch_raster import _cut_is_contained_or_clipped_at_global_edge
 from network_variants.local_patch_raster import _resolve_main_bank_component_ids
+from network_variants.local_patch_raster import MainBankCut
 from network_variants.local_patch_raster import build_local_patch_base_raster
 
 
@@ -116,6 +118,92 @@ def test_short_collars_extend_to_minimum_reference_centerline_context() -> None:
     assert sink[1:] == (20.0, True)
     assert source[0].equals_exact(Point(50, 85), 1e-9)
     assert sink[0].equals_exact(Point(50, 15), 1e-9)
+
+
+def test_long_collar_is_cut_at_bounded_closed_domain_context() -> None:
+    links, nodes = _network()
+    links.loc[links["id_link"].eq(1), "len"] = 50.0
+    links.loc[links["id_link"].eq(3), "len"] = 50.0
+    source, sink = _cut_center_points(
+        nodes=nodes,
+        links=links,
+        contract=_contract(),
+        reference_centerline=LineString([(50, 0), (50, 100)]),
+    )
+    assert source[1:] == (10.0, False)
+    assert sink[1:] == (10.0, False)
+    assert source[0].equals_exact(Point(50, 75), 1e-9)
+    assert sink[0].equals_exact(Point(50, 25), 1e-9)
+
+
+def test_context_cut_clamps_to_global_reference_centerline_boundary() -> None:
+    links, nodes = _network()
+    contract = _contract()
+    contract = LocalPatchContract(
+        example_id=contract.example_id,
+        selection_type=contract.selection_type,
+        selected_unit_ids=contract.selected_unit_ids,
+        domain_type=contract.domain_type,
+        core_link_ids=contract.core_link_ids,
+        upstream_collar=contract.upstream_collar,
+        downstream_collar=contract.downstream_collar,
+        raster_policy=LocalPatchRasterPolicy(
+            minimum_halo_m=10,
+            halo_expansion_step_m=10,
+            maximum_halo_m=10,
+            minimum_collar_context_m=40,
+        ),
+    )
+
+    source, sink = _cut_center_points(
+        nodes=nodes,
+        links=links,
+        contract=contract,
+        reference_centerline=LineString([(50, 10), (50, 90)]),
+    )
+
+    assert source[0].equals_exact(Point(50, 90), 1e-9)
+    assert sink[0].equals_exact(Point(50, 10), 1e-9)
+    assert source[1:] == (25.0, True)
+    assert sink[1:] == (25.0, True)
+
+
+def _edge_cut(*, outside_tail: float) -> MainBankCut:
+    return MainBankCut(
+        role="upstream",
+        anchor_node_id=1,
+        anchor_x=50.0,
+        anchor_y=5.0,
+        first_bank_component_id=1,
+        second_bank_component_id=2,
+        first_endpoint_x=-float(outside_tail),
+        first_endpoint_y=5.0,
+        second_endpoint_x=60.0,
+        second_endpoint_y=5.0,
+        first_bank_distance_m=50.0,
+        second_bank_distance_m=10.0,
+        bank_overlap_m=4.0,
+        inner_boundary_node_id=2,
+        outer_anchor_node_id=1,
+        context_distance_from_boundary_m=10.0,
+        extended_beyond_outer_anchor=False,
+    )
+
+
+def test_global_edge_accepts_only_short_terminal_bank_overlap_tail() -> None:
+    raster = box(0, 0, 100, 100)
+    assert _cut_is_contained_or_clipped_at_global_edge(
+        _edge_cut(outside_tail=3.0),
+        crop_polygon=raster,
+        full_raster_polygon=raster,
+        pixel_size=1.0,
+    )
+    assert not _cut_is_contained_or_clipped_at_global_edge(
+        _edge_cut(outside_tail=20.0),
+        crop_polygon=raster,
+        full_raster_polygon=raster,
+        pixel_size=1.0,
+    )
 
 
 def test_main_bank_summary_ignores_macos_sidecar(tmp_path) -> None:

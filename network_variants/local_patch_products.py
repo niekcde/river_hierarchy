@@ -20,6 +20,7 @@ import pandas as pd
 import rasterio
 from rasterio.transform import rowcol
 
+from network_variants.local_patch_anchored import LocalPatchAnchoredResult
 from network_variants.local_patch_merge import LocalPatchMergeResult
 from network_variants.local_patch_variant import LocalPatchVariantResult
 from network_variants.routing_width_application import (
@@ -39,10 +40,23 @@ from network_variants.variant_generation import (
     compute_width_families,
 )
 from network_variants.width_two_bank import build_state_bank_labels
-from network_variants.width_product_inheritance import WIDTH_INHERITANCE_FIELDS
+from network_variants.width_product_inheritance import (
+    WIDTH_INHERITANCE_FIELDS,
+    inherit_unchanged_link_width_products,
+)
 
 
-LOCAL_PATCH_PRODUCTS_VERSION = "topology-local-patch-products-v1"
+LOCAL_PATCH_PRODUCTS_VERSION = "topology-local-patch-products-v3"
+
+
+LENGTH_INHERITANCE_FIELDS = (
+    "len",
+    "len_adj",
+    "link_length_m",
+    "parent_link_length_m",
+    "sinuosity",
+    "n_nodes",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +148,31 @@ def _attach_changed_link_pixels(
             result.at[index, "wid_pix"] = None
         sample_counts[link_id] = len(indices)
     return result, sample_counts
+
+
+def _strict_width_measurement_link_ids(
+    child_links: gpd.GeoDataFrame,
+    *,
+    parent_links: gpd.GeoDataFrame,
+    parent_samples: pd.DataFrame,
+    lineage: pd.DataFrame,
+) -> set[int]:
+    """Return links rejected by the authoritative inheritance contract."""
+    classified_links, _, _ = inherit_unchanged_link_width_products(
+        child_links=child_links,
+        child_width_samples=pd.DataFrame(),
+        parent_links=parent_links,
+        parent_width_samples=parent_samples,
+        link_lineage=lineage,
+    )
+    return set(
+        classified_links.loc[
+            classified_links["width_inheritance_status"].eq(
+                "changed_requires_evaluation"
+            ),
+            "id_link",
+        ].astype(int)
+    )
 
 
 def _local_link_lineage(
@@ -229,9 +268,48 @@ def _refresh_changed_lengths_and_legacy_widths(
     return result
 
 
+def _inherit_unchanged_length_fields(
+    links: gpd.GeoDataFrame,
+    *,
+    parent_links: gpd.GeoDataFrame,
+    inheritance: Mapping[str, Any],
+    measured_link_ids: set[int],
+) -> tuple[gpd.GeoDataFrame, dict[int, int], list[str]]:
+    """Copy parent length products for every strictly inherited child link."""
+    result = links.copy()
+    parent_by_id = parent_links.set_index(parent_links["id_link"].astype(int), drop=False)
+    parent_map = {
+        int(child_id): int(parent_id)
+        for child_id, parent_id in dict(
+            inheritance.get("parent_link_by_child_link", {})
+        ).items()
+    }
+    inherited_map = {
+        child_id: parent_id
+        for child_id, parent_id in parent_map.items()
+        if child_id not in measured_link_ids
+    }
+    copied_fields = [
+        field
+        for field in LENGTH_INHERITANCE_FIELDS
+        if field in result.columns and field in parent_links.columns
+    ]
+    for child_id, parent_id in inherited_map.items():
+        if parent_id not in parent_by_id.index:
+            raise ValueError(
+                f"Length inheritance references absent parent link {parent_id}."
+            )
+        child_index = result.index[result["id_link"].astype(int).eq(child_id)]
+        if len(child_index) != 1:
+            raise ValueError(f"Expected one child link {child_id} for length inheritance.")
+        for field in copied_fields:
+            result.at[child_index[0], field] = parent_by_id.loc[parent_id, field]
+    return result, inherited_map, copied_fields
+
+
 def materialize_local_patch_width_length_products(
     *,
-    merge_result: LocalPatchMergeResult,
+    merge_result: LocalPatchMergeResult | LocalPatchAnchoredResult,
     variant_result: LocalPatchVariantResult,
     parent_width_links_path: str | Path,
     parent_nodes_path: str | Path,
@@ -244,13 +322,21 @@ def materialize_local_patch_width_length_products(
     collapse_corridor_mode: str = "anchored",
 ) -> LocalPatchProductResult:
     """Create complete Phase-6 width/length products for a merged local state."""
-    if merge_result.status != "complete_conservative_merge":
-        raise ValueError("Phase-6 products require a complete conservative merge.")
+    if merge_result.status not in {
+        "complete_conservative_merge",
+        "complete_shared_anchored_graph",
+    }:
+        raise ValueError(
+            "Phase-6 products require a complete conservative or shared anchored graph."
+        )
     if variant_result.status != "complete_raw_local_variant":
         raise ValueError("Phase-6 products require a complete raw local variant.")
 
-    child_links = gpd.read_file(merge_result.output_paths["merged_links"])
-    child_nodes = gpd.read_file(merge_result.output_paths["merged_nodes"])
+    shared_anchored = merge_result.status == "complete_shared_anchored_graph"
+    link_path_key = "anchored_links" if shared_anchored else "merged_links"
+    node_path_key = "anchored_nodes" if shared_anchored else "merged_nodes"
+    child_links = gpd.read_file(merge_result.output_paths[link_path_key])
+    child_nodes = gpd.read_file(merge_result.output_paths[node_path_key])
     parent_links = gpd.read_file(parent_width_links_path).to_crs(child_links.crs)
     parent_nodes = gpd.read_file(parent_nodes_path).to_crs(child_nodes.crs)
     parent_samples = pd.read_csv(parent_width_samples_path)
@@ -266,29 +352,30 @@ def materialize_local_patch_width_length_products(
     # unsuitable for distinguishing core overlap from touch-only lineage.
     with rasterio.open(variant_result.output_paths["local_collapsed_mask"]) as source:
         match_tolerance = float(max(abs(source.transform.a), abs(source.transform.e))) * 1.25
-    lineage = _local_link_lineage(
-        child_links,
-        child_nodes,
-        parent_links,
-        parent_nodes,
-        match_tolerance=match_tolerance,
-    )
+    if shared_anchored:
+        lineage = pd.read_csv(merge_result.output_paths["anchored_link_lineage"])
+    else:
+        lineage = _local_link_lineage(
+            child_links,
+            child_nodes,
+            parent_links,
+            parent_nodes,
+            match_tolerance=match_tolerance,
+        )
     child_links = child_links.drop(
         columns=[column for column in lineage.columns if column in child_links.columns and column != "id_link"],
         errors="ignore",
     ).merge(lineage, on="id_link", how="left", validate="1:1")
-    changed_ids = set(
-        lineage.loc[lineage["lineage_type"].ne("unchanged_1to1"), "id_link"].astype(int)
-    )
-    # Phase-5 inserted IDs are allocated above the parent ID domain.  They must
-    # always carry local raster pixels, even when tolerant overlap lineage calls
-    # them 1:1 candidates; the stricter inheritance contract can still reject
-    # those candidates after exact geometry/topology comparison.
-    parent_link_ids = set(parent_links["id_link"].astype(int))
-    changed_ids.update(
-        int(value)
-        for value in child_links["id_link"].astype(int)
-        if int(value) not in parent_link_ids
+    # Use the exact same strict inheritance decision that the downstream width
+    # assembly uses.  Lineage alone is only a candidate: a nominal unchanged
+    # link can still require measurement when its geometry is not exactly the
+    # parent geometry.  Every such link must receive local-raster pixel indices
+    # before it is passed to the width runner.
+    changed_ids = _strict_width_measurement_link_ids(
+        child_links,
+        parent_links=parent_links,
+        parent_samples=parent_samples,
+        lineage=lineage,
     )
     child_links, pixel_sample_counts = _attach_changed_link_pixels(
         child_links,
@@ -317,6 +404,14 @@ def materialize_local_patch_width_length_products(
         bank_labels_path=bank_labels_path,
     )
     measured_set = set(int(value) for value in measured_ids)
+    enriched, inherited_parent_map, inherited_length_fields = (
+        _inherit_unchanged_length_fields(
+            enriched,
+            parent_links=parent_links,
+            inheritance=inheritance,
+            measured_link_ids=measured_set,
+        )
+    )
     enriched = _refresh_changed_lengths_and_legacy_widths(enriched, samples, measured_set)
     segmented_summary: dict[str, Any] = {"applied_count": 0, "applied_link_ids": []}
     if str(collapse_corridor_mode) == "anchored":
@@ -334,7 +429,12 @@ def materialize_local_patch_width_length_products(
         "inherited_unchanged_1to1",
     )
     enriched["product_source_parent_link_id"] = pd.array(
-        [pd.NA if int(value) in measured_set else int(value) for value in enriched["id_link"]],
+        [
+            pd.NA
+            if int(value) in measured_set
+            else inherited_parent_map.get(int(value), pd.NA)
+            for value in enriched["id_link"]
+        ],
         dtype="Int64",
     )
 
@@ -392,8 +492,21 @@ def materialize_local_patch_width_length_products(
         },
         "removed_bank_component_labels": removed_bank_labels,
         "width_product_inheritance": inheritance,
+        "length_product_inheritance": {
+            "inherited_link_count": int(len(inherited_parent_map)),
+            "inherited_fields": inherited_length_fields,
+            "parent_link_by_child_link": {
+                str(key): int(value)
+                for key, value in sorted(inherited_parent_map.items())
+            },
+        },
         "segmented_stub_width_inheritance": segmented_summary,
         "routing_width_application": routing_summary,
+        "graph_product_stage": (
+            "shared_scientific_anchored"
+            if shared_anchored
+            else "legacy_local_scientific_merge"
+        ),
     }
     result = LocalPatchProductResult(
         status="complete_width_length_products",

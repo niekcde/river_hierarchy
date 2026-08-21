@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import math
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
@@ -26,7 +27,7 @@ from shapely.ops import linemerge
 from network_variants.local_patch import LocalPatchContract
 
 
-LOCAL_PATCH_RASTER_PLANNER_VERSION = "topology-local-patch-raster-v2"
+LOCAL_PATCH_RASTER_PLANNER_VERSION = "topology-local-patch-raster-v5"
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,14 +360,6 @@ def _cut_center_points(
         ]
         if len(selected) != 1:
             raise ValueError(f"Could not resolve collar link {collar.base_link_id}.")
-        stored_length = pd.to_numeric(
-            pd.Series([selected.iloc[0].get("len")]), errors="coerce"
-        ).iloc[0]
-        collar_length = (
-            float(stored_length)
-            if not pd.isna(stored_length) and float(stored_length) > 0
-            else float(selected.iloc[0].geometry.length)
-        )
         inner_measure = float(reference_centerline.project(inner))
         outer_measure = float(reference_centerline.project(outer))
         direction = float(np.sign(outer_measure - inner_measure))
@@ -376,19 +369,33 @@ def _cut_center_points(
                 "reference-centerline projection."
             )
         minimum_context = float(contract.raster_policy.minimum_collar_context_m)
-        if collar_length >= minimum_context:
-            cut_measure = outer_measure
-            extended = False
-        else:
-            cut_measure = inner_measure + direction * minimum_context
-            extended = True
-        if cut_measure < 0 or cut_measure > float(reference_centerline.length):
+        outer_context = abs(outer_measure - inner_measure)
+        # The external collar establishes the correct side of the complete
+        # closed domain.  Its outer node does not define crop length: very long
+        # collars can move a cut tens of kilometres away and cause RivGraph's
+        # skeleton terminal to stop far from the cut.  Keep the context bounded
+        # and reproducible at the configured minimum distance.
+        requested_measure = inner_measure + direction * minimum_context
+        cut_measure = min(
+            max(float(requested_measure), 0.0),
+            float(reference_centerline.length),
+        )
+        clamped_to_global_boundary = not math.isclose(
+            float(cut_measure), float(requested_measure), rel_tol=0.0, abs_tol=1e-9
+        )
+        context_distance = abs(float(cut_measure) - inner_measure)
+        if context_distance <= 0:
             raise ValueError(
-                f"A {minimum_context:.1f} m context cut for collar {collar.base_link_id} "
-                "falls beyond the reference centerline."
+                f"Collar {collar.base_link_id} terminates at the global reference-centerline "
+                "boundary and provides no positive cut context."
             )
+        extended = bool(
+            outer_context < minimum_context or clamped_to_global_boundary
+        )
         cut_point = reference_centerline.interpolate(cut_measure)
-        results.append((Point(cut_point.x, cut_point.y), abs(cut_measure - inner_measure), extended))
+        results.append(
+            (Point(cut_point.x, cut_point.y), context_distance, extended)
+        )
     return results[0], results[1]
 
 
@@ -732,6 +739,37 @@ def _cut_crossing_records(
     return tuple(records)
 
 
+def _cut_is_contained_or_clipped_at_global_edge(
+    cut: MainBankCut,
+    *,
+    crop_polygon: Any,
+    full_raster_polygon: Any,
+    pixel_size: float,
+) -> bool:
+    """Accept only a terminal overlap tail clipped by the true raster edge.
+
+    Bank cuts intentionally extend a few pixels into land.  At a dataset
+    source/sink that overlap may lie outside the source raster, where no larger
+    crop can contain it.  This exception is deliberately narrow: the anchor
+    and the complete in-raster part must be in the crop, and the omitted length
+    may not exceed the configured bank overlap plus a small pixel tolerance.
+    Water-contact and unauthorized-edge checks remain mandatory downstream.
+    """
+    geometry = cut.geometry
+    tolerance = max(float(pixel_size) * 0.05, 1e-8)
+    if crop_polygon.buffer(tolerance).covers(geometry):
+        return True
+    anchor = Point(float(cut.anchor_x), float(cut.anchor_y))
+    if not full_raster_polygon.buffer(tolerance).covers(anchor):
+        return False
+    in_raster = geometry.intersection(full_raster_polygon)
+    if in_raster.is_empty or not crop_polygon.buffer(tolerance).covers(in_raster):
+        return False
+    omitted_length = max(0.0, float(geometry.length) - float(in_raster.length))
+    allowed_tail = float(cut.bank_overlap_m) + 2.0 * float(pixel_size)
+    return omitted_length <= allowed_tail + tolerance
+
+
 def _validate_cut_attempt(
     *,
     seeded_component_ids: tuple[int, ...],
@@ -835,6 +873,7 @@ def build_local_patch_base_raster(
             )
         if mask_source.crs is None or not mask_source.crs.is_projected:
             raise ValueError("The cleaned mask requires a projected CRS.")
+        full_raster_polygon = box(*mask_source.bounds)
         links = context_links.to_crs(mask_source.crs)
         nodes = full_nodes.to_crs(mask_source.crs)
         if reference_centerline_path is None:
@@ -933,7 +972,13 @@ def build_local_patch_base_raster(
                 *rasterio.windows.bounds(window, mask_source.transform)
             )
             cuts_contained = tuple(
-                bool(crop_polygon.covers(cut.geometry)) for cut in bank_cuts
+                _cut_is_contained_or_clipped_at_global_edge(
+                    cut,
+                    crop_polygon=crop_polygon,
+                    full_raster_polygon=full_raster_polygon,
+                    pixel_size=pixel_size,
+                )
+                for cut in bank_cuts
             )
             crossings = _cut_crossing_records(bank_cuts, cut_contact_counts)
             reasons = _validate_cut_attempt(

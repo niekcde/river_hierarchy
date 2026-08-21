@@ -244,10 +244,11 @@ def inherit_unchanged_link_width_products(
     ).astype(int)
 
     inherited_child_ids = set(inherited)
-    if "id_link" in result_samples.columns and inherited_child_ids:
-        result_samples = result_samples.loc[
-            ~pd.to_numeric(result_samples["id_link"], errors="coerce").isin(inherited_child_ids)
-        ].copy()
+    if inherited_child_ids:
+        if "id_link" in result_samples.columns:
+            result_samples = result_samples.loc[
+                ~pd.to_numeric(result_samples["id_link"], errors="coerce").isin(inherited_child_ids)
+            ].copy()
         if "id_link" in parent_width_samples.columns:
             copied_samples: list[pd.DataFrame] = []
             parent_sample_ids = pd.to_numeric(parent_width_samples["id_link"], errors="coerce")

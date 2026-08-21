@@ -21,17 +21,28 @@ import pandas as pd
 import rasterio
 from rasterio.windows import Window, transform as window_transform
 
+from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import (
+    StructuralUnit,
+)
 from network_variants.local_patch import (
     plan_local_patch,
     write_local_patch_planning_result,
 )
-from network_variants.local_patch_merge import merge_local_patch_variant
+from network_variants.local_patch_anchored import anchor_local_patch_realized_graph
+from network_variants.local_patch_merge import (
+    _expected_cycle_reduction,
+    _undirected_cycle_rank,
+)
 from network_variants.local_patch_products import materialize_local_patch_width_length_products
+from network_variants.local_patch_realized import assemble_local_patch_realized_graph
 from network_variants.local_patch_raster import (
     build_local_patch_base_raster,
     write_local_patch_raster_result,
 )
-from network_variants.local_patch_variant import materialize_local_patch_variant
+from network_variants.local_patch_variant import (
+    derive_local_exit_side_candidates,
+    materialize_local_patch_variant,
+)
 from network_variants.variant_generation import (
     NetworkVariantOutputs,
     _apply_collapsed_selection_metadata,
@@ -42,7 +53,19 @@ from network_variants.variant_generation import (
 )
 
 
-LOCAL_PATCH_EXECUTION_VERSION = "topology-local-patch-execution-v1"
+LOCAL_PATCH_EXECUTION_VERSION = "topology-local-patch-execution-v9"
+
+
+def _retryable_local_exit_failure(error: Exception) -> bool:
+    reason = str(error)
+    return any(
+        marker in reason
+        for marker in (
+            "Raw local RivGraph",
+            "anchored boundary node",
+            "Anchored local boundaries are not connected",
+        )
+    )
 
 
 class LocalPatchFallbackRequested(RuntimeError):
@@ -191,7 +214,83 @@ def _annotate(frame: pd.DataFrame | gpd.GeoDataFrame, unit_ids: Sequence[int]):
     return _apply_collapsed_selection_metadata(frame, unit_ids=unit_ids, group_label=None)
 
 
-def materialize_local_patch_network_variant(
+def _selected_units_from_hierarchy_products(
+    *,
+    selected_unit_ids: Sequence[int],
+    unit_summary: pd.DataFrame,
+    unit_link_membership: pd.DataFrame,
+    parent_links: gpd.GeoDataFrame,
+) -> dict[int, StructuralUnit]:
+    """Rebuild the graph fields needed by shared scientific anchoring.
+
+    The base hierarchy already stores each selected unit's link membership and
+    summary. Reconstructing only those units avoids rerunning full unit
+    detection for every local child while retaining the exact parent edge IDs
+    used by the original analysis.
+    """
+    summary = unit_summary.copy()
+    summary["unit_id"] = pd.to_numeric(summary["unit_id"], errors="raise").astype(int)
+    membership = unit_link_membership.copy()
+    membership["unit_id"] = pd.to_numeric(
+        membership["unit_id"], errors="raise"
+    ).astype(int)
+    membership["id_link"] = pd.to_numeric(
+        membership["id_link"], errors="raise"
+    ).astype(int)
+    links = parent_links.copy()
+    links["id_link"] = pd.to_numeric(links["id_link"], errors="raise").astype(int)
+    link_index = links.set_index("id_link", drop=False)
+
+    result: dict[int, StructuralUnit] = {}
+    for unit_id in tuple(dict.fromkeys(int(value) for value in selected_unit_ids)):
+        rows = summary.loc[summary["unit_id"].eq(unit_id)]
+        if len(rows) != 1:
+            raise ValueError(
+                f"Expected one hierarchy summary row for selected unit {unit_id}, "
+                f"found {len(rows)}."
+            )
+        row = rows.iloc[0]
+        link_ids = tuple(
+            sorted(
+                membership.loc[membership["unit_id"].eq(unit_id), "id_link"]
+                .drop_duplicates()
+                .astype(int)
+            )
+        )
+        missing_link_ids = sorted(set(link_ids).difference(link_index.index.astype(int)))
+        if not link_ids or missing_link_ids:
+            raise ValueError(
+                f"Selected unit {unit_id} has invalid base link membership; "
+                f"links={list(link_ids)}, missing={missing_link_ids}."
+            )
+        edge_set = {
+            (
+                int(link_index.loc[link_id, "id_us_node"]),
+                int(link_index.loc[link_id, "id_ds_node"]),
+                int(link_id),
+            )
+            for link_id in link_ids
+        }
+        node_set = {
+            int(node_id)
+            for upstream, downstream, _ in edge_set
+            for node_id in (upstream, downstream)
+        }
+        result[unit_id] = StructuralUnit(
+            unit_id=int(unit_id),
+            bifurcation=int(row["bifurcation"]),
+            confluence=int(row["confluence"]),
+            n_paths=int(row.get("n_paths", 0)),
+            unit_class=str(row.get("class", "")),
+            min_path_length=float(row.get("min_path_length", 0.0)),
+            max_path_length=float(row.get("max_path_length", 0.0)),
+            node_set=node_set,
+            edge_set=edge_set,
+        )
+    return result
+
+
+def _materialize_local_patch_network_variant_once(
     *,
     cleaned_mask_path: str | Path,
     reviewed_links_path: str | Path,
@@ -214,6 +313,8 @@ def materialize_local_patch_network_variant(
     max_path_cutoff: int = 100,
     max_paths: int = 5000,
     local_patch_reference_centerline_path: str | Path | None = None,
+    computational_context_unit_id: int | None = None,
+    local_patch_attempt_subdirectory: str | None = None,
     **_: Any,
 ) -> NetworkVariantOutputs:
     """Build one canonical child state using the validated local-patch phases."""
@@ -226,7 +327,21 @@ def materialize_local_patch_network_variant(
         raise ValueError("Local-patch execution requires global boundary-component labels.")
 
     output_dir = Path(output_dir)
-    attempt_dir = output_dir / "local_patch_attempt"
+    attempt_root = output_dir / "local_patch_attempt"
+    attempt_dir = attempt_root
+    if local_patch_attempt_subdirectory:
+        attempt_dir = attempt_root / "outer_domain_retries" / str(
+            local_patch_attempt_subdirectory
+        )
+    # A rerun may reuse the same state directory. Invalidate success/fallback
+    # markers before doing any work so a failed retry cannot be mistaken for
+    # the result of an earlier attempt.
+    for stale_path in (
+        output_dir / "summary" / "variant_manifest.json",
+        attempt_dir / "fallback_to_full_raster.json",
+        attempt_dir / "exit_side_retry_summary.json",
+    ):
+        stale_path.unlink(missing_ok=True)
     parent_variant_dir = _variant_dir_from_parent_links(reviewed_links_path)
     parent_state_dir = parent_variant_dir.parent
     hierarchy_dir = parent_state_dir / "hierarchy"
@@ -251,15 +366,24 @@ def materialize_local_patch_network_variant(
 
     parent_links = gpd.read_file(reviewed_links_path)
     parent_nodes = gpd.read_file(reviewed_nodes_path)
+    unit_summary = pd.read_csv(unit_summary_path)
+    unit_link_membership = pd.read_csv(membership_path)
+    selected_units_by_id = _selected_units_from_hierarchy_products(
+        selected_unit_ids=selected_ids,
+        unit_summary=unit_summary,
+        unit_link_membership=unit_link_membership,
+        parent_links=parent_links,
+    )
     planning = plan_local_patch(
         example_id=str(example_id),
         full_links=parent_links,
-        unit_summary=pd.read_csv(unit_summary_path),
-        unit_link_membership=pd.read_csv(membership_path),
+        unit_summary=unit_summary,
+        unit_link_membership=unit_link_membership,
         bubble_edge_resistance=pd.read_csv(bubble_path),
         selected_unit_ids=selected_ids,
         selection_type=str(selection_type or "unit"),
         selected_compound_bubble_id=compound_bubble_id,
+        computational_context_unit_id=computational_context_unit_id,
     )
     planning_path = write_local_patch_planning_result(
         planning, attempt_dir / "planning" / "local_patch_planning_result.json"
@@ -291,32 +415,153 @@ def materialize_local_patch_network_variant(
             reason=str(raster_result.fallback_reason or "No safe local crop was found."),
             audit_path=audit_path,
         )
-    raw_variant = materialize_local_patch_variant(
-        contract=contract,
-        raster_result=raster_result,
-        reviewed_links_path=reviewed_links_path,
-        reviewed_nodes_path=reviewed_nodes_path,
-        exit_sides=exit_sides,
-        output_dir=attempt_dir / "variant",
-        preferred_width_field=preferred_width_field,
-        footprint_buffer_scale=footprint_buffer_scale,
-        all_touched=all_touched,
-        allow_noop=allow_noop,
-        single_thread=single_thread,
-        verbose_rivgraph=verbose_rivgraph,
-        max_path_cutoff=max_path_cutoff,
-        max_paths=max_paths,
+    exit_side_candidates = derive_local_exit_side_candidates(raster_result)
+    exit_side_attempts: list[dict[str, Any]] = []
+    raw_variant = None
+    realized = None
+    anchored = None
+    first_retryable_error: Exception | None = None
+    for attempt_index, candidate_exit_sides in enumerate(exit_side_candidates):
+        candidate_root = (
+            attempt_dir
+            if attempt_index == 0
+            else attempt_dir / "exit_side_retries" / candidate_exit_sides
+        )
+        # RivGraph derives output names from the selected run name. Reusing a
+        # candidate directory across reruns or progressively larger outer
+        # domains can otherwise mix skeletons, transforms, and vector files
+        # from different masks. These directories contain reproducible attempt
+        # products only; planning/raster inputs remain untouched.
+        for generated_dir in (
+            candidate_root / "variant",
+            candidate_root / "realized",
+            candidate_root / "anchored",
+        ):
+            if generated_dir.exists():
+                shutil.rmtree(generated_dir)
+        try:
+            candidate_variant = materialize_local_patch_variant(
+                contract=contract,
+                raster_result=raster_result,
+                reviewed_links_path=reviewed_links_path,
+                reviewed_nodes_path=reviewed_nodes_path,
+                exit_sides=exit_sides,
+                output_dir=candidate_root / "variant",
+                preferred_width_field=preferred_width_field,
+                footprint_buffer_scale=footprint_buffer_scale,
+                all_touched=all_touched,
+                allow_noop=allow_noop,
+                single_thread=single_thread,
+                verbose_rivgraph=verbose_rivgraph,
+                max_path_cutoff=max_path_cutoff,
+                max_paths=max_paths,
+                local_exit_sides_override=(
+                    None if attempt_index == 0 else candidate_exit_sides
+                ),
+            )
+            candidate_realized = assemble_local_patch_realized_graph(
+                contract=contract,
+                raster_result=raster_result,
+                variant_result=candidate_variant,
+                parent_links_path=reviewed_links_path,
+                parent_nodes_path=reviewed_nodes_path,
+                output_dir=candidate_root / "realized",
+            )
+            with rasterio.open(candidate_variant.output_paths["local_collapsed_mask"]) as source:
+                anchoring_match_tolerance = float(
+                    max(abs(source.transform.a), abs(source.transform.e))
+                ) * 1.25
+            candidate_anchored = anchor_local_patch_realized_graph(
+                realized_result=candidate_realized,
+                parent_links_path=reviewed_links_path,
+                parent_nodes_path=reviewed_nodes_path,
+                selected_unit_ids=selected_ids,
+                units_by_id=selected_units_by_id,
+                output_dir=candidate_root / "anchored",
+                match_tolerance_m=anchoring_match_tolerance,
+            )
+        except ValueError as error:
+            exit_side_attempts.append(
+                {
+                    "exit_sides": candidate_exit_sides,
+                    "status": "failed",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+            if not _retryable_local_exit_failure(error):
+                raise
+            if first_retryable_error is None:
+                first_retryable_error = error
+            continue
+        exit_side_attempts.append(
+            {
+                "exit_sides": candidate_exit_sides,
+                "status": "selected",
+                "error_type": "",
+                "error": "",
+            }
+        )
+        raw_variant = candidate_variant
+        realized = candidate_realized
+        anchored = candidate_anchored
+        break
+    retry_summary_path = attempt_dir / "exit_side_retry_summary.json"
+    retry_summary_path.write_text(
+        json.dumps(
+            {
+                "method": "bounded_validation_driven_exit_side_retry",
+                "candidate_exit_sides": list(exit_side_candidates),
+                "attempts": exit_side_attempts,
+                "selected_exit_sides": next(
+                    (
+                        row["exit_sides"]
+                        for row in exit_side_attempts
+                        if row["status"] == "selected"
+                    ),
+                    None,
+                ),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
     )
-    merge = merge_local_patch_variant(
-        contract=contract,
-        raster_result=raster_result,
-        variant_result=raw_variant,
-        parent_links_path=reviewed_links_path,
-        parent_nodes_path=reviewed_nodes_path,
-        output_dir=attempt_dir / "merge",
-    )
+    if raw_variant is None or realized is None or anchored is None:
+        if first_retryable_error is not None:
+            raise first_retryable_error
+        raise RuntimeError("No local exit-side candidate produced a mergeable local graph.")
+    final_anchored_links = gpd.read_file(anchored.output_paths["anchored_links"])
+    parent_cycle_rank = _undirected_cycle_rank(parent_links)
+    anchored_cycle_rank = _undirected_cycle_rank(final_anchored_links)
+    observed_cycle_reduction = int(parent_cycle_rank - anchored_cycle_rank)
+    expected_cycle_reduction = _expected_cycle_reduction(raw_variant)
+    final_collapse_topology_validation = {
+        "method": "final_shared_anchored_cycle_rank_reduction",
+        "parent_cycle_rank": int(parent_cycle_rank),
+        "anchored_cycle_rank": int(anchored_cycle_rank),
+        "observed_cycle_reduction": int(observed_cycle_reduction),
+        "expected_cycle_reduction": (
+            int(expected_cycle_reduction)
+            if expected_cycle_reduction is not None
+            else None
+        ),
+        "passed": bool(
+            expected_cycle_reduction is None
+            or observed_cycle_reduction == int(expected_cycle_reduction)
+        ),
+    }
+    if not final_collapse_topology_validation["passed"]:
+        raise ValueError(
+            "Final shared-anchored local graph is inconsistent with the raster edit: "
+            f"filled selected components={expected_cycle_reduction}, "
+            f"observed cycle-rank reduction={observed_cycle_reduction}, "
+            f"parent cycle rank={parent_cycle_rank}, "
+            f"anchored cycle rank={anchored_cycle_rank}."
+        )
     products = materialize_local_patch_width_length_products(
-        merge_result=merge,
+        merge_result=anchored,
         variant_result=raw_variant,
         parent_width_links_path=reviewed_links_path,
         parent_nodes_path=reviewed_nodes_path,
@@ -362,7 +607,9 @@ def materialize_local_patch_network_variant(
         edit_geometries.to_file(mask_dir / "collapse_edit_geometries.gpkg", driver="GPKG")
 
     enriched_links = _annotate(gpd.read_file(products.output_paths["links_with_width_families"]), selected_ids)
-    directed_nodes = _annotate(gpd.read_file(merge.output_paths["merged_nodes"]), selected_ids)
+    directed_nodes = _annotate(
+        gpd.read_file(anchored.output_paths["anchored_nodes"]), selected_ids
+    )
     directed_links = enriched_links.copy()
     directed_links_path = directed_dir / f"{name}_directed_links.gpkg"
     directed_nodes_path = directed_dir / f"{name}_directed_nodes.gpkg"
@@ -418,7 +665,9 @@ def materialize_local_patch_network_variant(
     node_sword_match = pd.DataFrame(directed_nodes[node_sword_columns]).rename(columns={"id_node": "child_id_node"})
     node_sword_match.to_csv(matching_dir / "node_sword_match.csv", index=False)
 
-    direction_report = dict(merge.summary.get("validation_report", {}))
+    direction_report = dict(
+        anchored.summary.get("direction_summary", {}).get("validation_report", {})
+    )
     (directed_dir / "direction_validation_report.json").write_text(
         json.dumps(direction_report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -450,8 +699,15 @@ def materialize_local_patch_network_variant(
         "local_patch": {
             "planning": planning.to_manifest(),
             "raster": raster_result.to_manifest(),
-            "merge": merge.to_manifest(),
+            "realized_assembly": realized.to_manifest(),
+            "shared_anchoring": anchored.to_manifest(),
+            "collapse_topology_validation": final_collapse_topology_validation,
             "products": products.to_manifest(),
+            "exit_side_retry": {
+                "summary_path": str(retry_summary_path.resolve()),
+                "candidate_exit_sides": list(exit_side_candidates),
+                "attempts": exit_side_attempts,
+            },
             "true_collapsed_pixel_count": changed_pixels,
             "attempt_dir": str(attempt_dir.resolve()),
         },
@@ -509,6 +765,133 @@ def materialize_local_patch_network_variant(
         origin_mask_path=origin_path,
         rivgraph_distance_path=None,
     )
+
+
+def _parse_parent_ids(value: Any) -> tuple[int, ...]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ()
+    values = value if isinstance(value, (list, tuple)) else str(value).strip("[]").split(",")
+    resolved: list[int] = []
+    for item in values:
+        try:
+            resolved.append(int(float(str(item).strip())))
+        except (TypeError, ValueError):
+            continue
+    return tuple(dict.fromkeys(resolved))
+
+
+def _outer_context_candidates(
+    unit_summary: pd.DataFrame,
+    selected_unit_ids: Sequence[int],
+) -> tuple[int, ...]:
+    """Return progressively larger primary parents for one selected unit."""
+    selected = tuple(dict.fromkeys(int(value) for value in selected_unit_ids))
+    if len(selected) != 1:
+        return ()
+    by_id = unit_summary.set_index(pd.to_numeric(unit_summary["unit_id"], errors="coerce"))
+    current = int(selected[0])
+    candidates: list[int] = []
+    visited = {current}
+    while current in by_id.index:
+        row = by_id.loc[current]
+        primary = pd.to_numeric(pd.Series([row.get("primary_parent_id")]), errors="coerce").iloc[0]
+        if pd.notna(primary):
+            parent = int(primary)
+        else:
+            parents = _parse_parent_ids(row.get("parents"))
+            parent = int(parents[0]) if parents else -1
+        if parent < 0 or parent in visited:
+            break
+        candidates.append(parent)
+        visited.add(parent)
+        current = parent
+    return tuple(candidates)
+
+
+def materialize_local_patch_network_variant(**kwargs: Any) -> NetworkVariantOutputs:
+    """Run the selected domain, then progressively larger enclosing domains.
+
+    The retry changes computational raster context only.  The selected unit IDs
+    and anchored replacement links remain identical, so an outer-domain retry
+    cannot broaden the scientific collapse selection.
+    """
+    try:
+        return _materialize_local_patch_network_variant_once(**kwargs)
+    except (LocalPatchFallbackRequested, ValueError) as first_error:
+        selected_ids = tuple(int(value) for value in (kwargs.get("unit_ids") or ()))
+        if len(selected_ids) != 1:
+            raise
+        parent_variant_dir = _variant_dir_from_parent_links(kwargs["reviewed_links_path"])
+        unit_summary_path = parent_variant_dir.parent / "hierarchy" / "unit_summary.csv"
+        if not unit_summary_path.exists():
+            raise
+        candidates = _outer_context_candidates(pd.read_csv(unit_summary_path), selected_ids)
+        if not candidates:
+            raise
+
+        attempts: list[dict[str, Any]] = [
+            {
+                "context_unit_id": None,
+                "status": "failed",
+                "error_type": type(first_error).__name__,
+                "error": str(first_error),
+            }
+        ]
+        last_error: Exception = first_error
+        for context_unit_id in candidates:
+            try:
+                result = _materialize_local_patch_network_variant_once(
+                    **kwargs,
+                    computational_context_unit_id=int(context_unit_id),
+                    local_patch_attempt_subdirectory=f"context_unit_{int(context_unit_id)}",
+                )
+            except (LocalPatchFallbackRequested, ValueError) as error:
+                attempts.append(
+                    {
+                        "context_unit_id": int(context_unit_id),
+                        "status": "failed",
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    }
+                )
+                last_error = error
+                continue
+            attempts.append(
+                {
+                    "context_unit_id": int(context_unit_id),
+                    "status": "selected",
+                    "error_type": "",
+                    "error": "",
+                }
+            )
+            output_dir = Path(kwargs["output_dir"])
+            summary_path = output_dir / "local_patch_attempt" / "outer_domain_retry_summary.json"
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "method": "progressive_enclosing_unit_context_retry",
+                        "selected_unit_ids": list(selected_ids),
+                        "attempts": attempts,
+                        "selected_context_unit_id": int(context_unit_id),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            result.manifest.setdefault("local_patch", {})["outer_domain_retry"] = {
+                "summary_path": str(summary_path.resolve()),
+                "selected_context_unit_id": int(context_unit_id),
+                "attempts": attempts,
+            }
+            manifest_path = output_dir / "summary" / "variant_manifest.json"
+            manifest_path.write_text(
+                json.dumps(result.manifest, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            return result
+        raise last_error
 
 
 __all__ = [
