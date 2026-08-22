@@ -432,6 +432,44 @@ def test_resolve_example_reach_filter_uses_dist_out_and_endpoint_buffer(tmp_path
     assert metadata["downstream_reach_id"] == 80
 
 
+def test_resolve_example_reach_filter_falls_back_when_only_one_station_is_matched(
+    tmp_path: Path,
+) -> None:
+    sword_dir = tmp_path / "sword"
+    sword_dir.mkdir()
+    example_station_path = tmp_path / "examples.gpkg"
+    gpd.GeoDataFrame(
+        {
+            "station_key": ["US:up", "US:down"],
+            "example_ids": ["41", "41"],
+        },
+        geometry=[Point(-150, 65), Point(-156, 65)],
+        crs="EPSG:4326",
+    ).to_file(example_station_path, driver="GPKG")
+    station_match_path = tmp_path / "matches.gpkg"
+    gpd.GeoDataFrame(
+        {
+            "station_key": ["US:up"],
+            "reach_id": [100],
+            "sword_region": ["na"],
+        },
+        geometry=[Point(-150, 65)],
+        crs="EPSG:4326",
+    ).to_file(station_match_path, driver="GPKG")
+
+    metadata = _resolve_example_reach_filter(
+        example_id="41",
+        sword_node_source_path=sword_dir,
+        example_station_source_path=example_station_path,
+        station_match_source_path=station_match_path,
+        reach_buffer_steps=2,
+    )
+
+    assert metadata["scope"] == "bbox_only"
+    assert metadata["reason"] == "insufficient_station_matches_for_corridor"
+    assert metadata["station_match_count"] == 1
+
+
 def test_match_variant_nodes_to_sword_applies_example_reach_filter_to_geo_file(tmp_path: Path, monkeypatch) -> None:
     directed_nodes = _node_frame(
         [
@@ -500,3 +538,53 @@ def test_match_variant_nodes_to_sword_applies_example_reach_filter_to_geo_file(t
     assert match_metadata["scope"] == "example_reach_corridor"
     assert match_metadata["candidate_reach_ids"] == [70, 80, 90, 100]
     assert enriched_nodes.loc[0, "sword_region"] == "sa"
+
+
+def test_match_variant_nodes_to_sword_retries_bbox_when_corridor_is_spatially_empty(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    directed_nodes = _node_frame([{"id_node": 10, "geometry": Point(10.4, 0.0)}])
+    parent_nodes = _node_frame([{"id_node": 1, "geometry": Point(0.0, 0.0)}])
+    node_match = pd.DataFrame(
+        {
+            "child_id_node": [10],
+            "matched_parent_node_id": [pd.NA],
+            "parent_node_order": [pd.NA],
+        }
+    )
+    sword_path = tmp_path / "sword_nodes.gpkg"
+    gpd.GeoDataFrame(
+        {
+            "node_id": [601],
+            "reach_id": [60],
+            "sword_region": ["sa"],
+            "dist_out": [250.0],
+            "wse": [9.5],
+        },
+        geometry=[Point(10.5, 0.0)],
+        crs="EPSG:3857",
+    ).to_file(sword_path, driver="GPKG")
+    monkeypatch.setattr(
+        "network_variants.sword_matching._resolve_example_reach_filter",
+        lambda **kwargs: {
+            "scope": "example_reach_corridor",
+            "reason": "",
+            "candidate_region": "sa",
+            "candidate_reach_ids": [90],
+            "candidate_reach_count": 1,
+        },
+    )
+
+    enriched, _, metadata = match_variant_nodes_to_sword(
+        directed_nodes=directed_nodes,
+        parent_nodes=parent_nodes,
+        node_match=node_match,
+        sword_node_source_path=sword_path,
+        sword_wse_field="wse",
+        example_id="41",
+    )
+
+    assert int(enriched.loc[0, "sword_node_id"]) == 601
+    assert metadata["scope"] == "bbox_fallback"
+    assert metadata["reason"] == "corridor_nodes_empty_fallback_to_bbox"

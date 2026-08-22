@@ -289,6 +289,7 @@ def _resolve_example_reach_filter(
         "candidate_region": None,
         "candidate_reach_ids": [],
         "candidate_reach_count": 0,
+        "station_match_count": 0,
         "upstream_station_key": None,
         "downstream_station_key": None,
         "upstream_reach_id": None,
@@ -345,8 +346,12 @@ def _resolve_example_reach_filter(
         metadata["reason"] = f"station_match_missing_columns:{','.join(sorted(missing_columns))}"
         return metadata
     station_matches = station_matches.loc[station_matches["station_key"].isin(station_keys)].copy()
+    metadata["station_match_count"] = int(station_matches["station_key"].nunique())
     if station_matches.empty:
         metadata["reason"] = "station_matches_not_found"
+        return metadata
+    if station_matches["station_key"].nunique() < 2:
+        metadata["reason"] = "insufficient_station_matches_for_corridor"
         return metadata
 
     try:
@@ -708,6 +713,17 @@ def match_variant_nodes_to_sword(
             regions=([str(reach_filter_metadata["candidate_region"])] if reach_filter_metadata.get("candidate_region") else None),
             reach_ids=(reach_filter_metadata.get("candidate_reach_ids") or None),
         )
+        if sword_nodes.empty and reach_filter_metadata.get("scope") == "example_reach_corridor":
+            sword_nodes = load_sword_node_reference(
+                sword_node_source_path,
+                bbox_wgs84=_bbox_in_wgs84(child_nodes),
+                sword_wse_field=sword_wse_field,
+                regions=None,
+                reach_ids=None,
+            )
+            if not sword_nodes.empty:
+                match_metadata["scope"] = "bbox_fallback"
+                match_metadata["reason"] = "corridor_nodes_empty_fallback_to_bbox"
 
     if not sword_nodes.empty:
         source_by_id: dict[int, dict[str, Any]] = {

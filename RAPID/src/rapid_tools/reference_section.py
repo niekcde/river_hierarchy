@@ -34,6 +34,16 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def _validate_reference_slope(slope_summary: Mapping[str, Any]) -> None:
+    slope = pd.to_numeric(pd.Series([slope_summary.get("slope")]), errors="coerce").iloc[0]
+    if not np.isfinite(slope) or float(slope) <= 0:
+        raise ValueError(
+            "Reference-section slope could not be resolved to a positive finite value "
+            f"(source_method={slope_summary.get('source_method')!r}, "
+            f"anchor_count={slope_summary.get('anchor_count')!r})."
+        )
+
+
 def _validate_single_source_sink_path(
     directed_links_path: str | Path,
     directed_nodes_path: str | Path,
@@ -380,9 +390,12 @@ def ensure_reference_section_geometry(
             required.append(Path(raw))
         if required and all(path.exists() for path in required):
             variant_output_dir = Path(str(cached_paths["variant_output_dir"])).expanduser().resolve()
+            directed_nodes_path = Path(
+                str(cached_paths["directed_nodes_path"])
+            ).expanduser().resolve()
             path_validation = _validate_single_source_sink_path(
                 cached_paths["directed_links_path"],
-                cached_paths["directed_nodes_path"],
+                directed_nodes_path,
             )
             refreshed_width_summary = _load_width_summary(
                 Path(str(cached_paths["link_width_samples_path"])).expanduser().resolve(),
@@ -394,6 +407,17 @@ def ensure_reference_section_geometry(
                 cached["width_summary"] = refreshed_width_summary
             if cached.get("path_validation") != path_validation:
                 cached["path_validation"] = path_validation
+            slope_summary = cached.get("slope_summary") or {}
+            cached_slope = pd.to_numeric(
+                pd.Series([slope_summary.get("slope")]), errors="coerce"
+            ).iloc[0]
+            if not np.isfinite(cached_slope) or float(cached_slope) <= 0:
+                slope_summary = compute_section_slope_reference(
+                    gpd.read_file(directed_nodes_path),
+                    config=SlopeConfig(),
+                )
+                cached["slope_summary"] = slope_summary
+            _validate_reference_slope(slope_summary)
             reference_paths["geometry_summary"].write_text(json.dumps(cached, indent=2))
             return cached
 
@@ -417,6 +441,7 @@ def ensure_reference_section_geometry(
         width_percentile=width_percentile,
     )
     slope_summary = compute_section_slope_reference(nodes, config=SlopeConfig())
+    _validate_reference_slope(slope_summary)
 
     summary = {
         "example_id": variant_summary["example_id"],

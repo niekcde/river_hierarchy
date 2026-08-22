@@ -353,6 +353,69 @@ def test_reference_section_cache_refreshes_width_summary_without_rebuilding_vari
     assert json.loads(summary_path.read_text())["width_summary"] == summary["width_summary"]
 
 
+def test_reference_section_cache_refreshes_nonfinite_slope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment_dir = tmp_path / "experiment"
+    reference_dir = experiment_dir / "reference_section"
+    variant_dir = reference_dir / "variant"
+    widths_dir = variant_dir / "widths"
+    directed_dir = variant_dir / "directed"
+    widths_dir.mkdir(parents=True)
+    directed_dir.mkdir(parents=True)
+    pd.DataFrame([{"state_role": "base"}]).to_csv(
+        experiment_dir / "state_registry.csv", index=False
+    )
+    (experiment_dir / "experiment_manifest.json").write_text(
+        json.dumps({"example_id": "41"})
+    )
+    samples_path = widths_dir / "link_width_samples.csv"
+    pd.DataFrame({"wid_adj_routing": [225.0]}).to_csv(samples_path, index=False)
+    pd.DataFrame({"wid_adj_routing": [225.0]}).to_csv(
+        widths_dir / "link_width_families.csv", index=False
+    )
+    links_path = directed_dir / "links.gpkg"
+    nodes_path = directed_dir / "nodes.gpkg"
+    _write_single_path_graph(links_path, nodes_path)
+    summary_path = reference_dir / "reference_section_summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "width_summary": {"sample_field": "wid_adj_routing"},
+                "slope_summary": {
+                    "slope": float("nan"),
+                    "source_method": "missing_dist_out",
+                    "anchor_count": 0,
+                },
+                "paths": {
+                    "variant_output_dir": str(variant_dir.resolve()),
+                    "directed_links_path": str(links_path.resolve()),
+                    "directed_nodes_path": str(nodes_path.resolve()),
+                    "link_width_samples_path": str(samples_path.resolve()),
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "rapid_tools.reference_section.compute_section_slope_reference",
+        lambda nodes, config: {
+            "slope": 0.0001,
+            "source_method": "test_refresh",
+            "anchor_count": 2,
+        },
+    )
+
+    summary = ensure_reference_section_geometry(
+        experiment_dir,
+        width_sample_field="wid_adj_routing",
+        width_percentile=None,
+    )
+
+    assert summary["slope_summary"]["slope"] == 0.0001
+    assert summary["slope_summary"]["source_method"] == "test_refresh"
+
+
 def test_reference_section_geometry_uses_injected_panelized_builder(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
