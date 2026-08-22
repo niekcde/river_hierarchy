@@ -1079,9 +1079,6 @@ def merge_panelized_state(
         panel_root=state_panel_root,
         run_name=run_name,
         output_dir=core_dir,
-        fallback_directed_links_path=(
-            Path(parent_directed_links_path) if parent_directed_links_path is not None else None
-        ),
         overwrite=True,
         boundary_match_plan_path=Path(boundary_match_plan_path),
     )
@@ -1096,6 +1093,11 @@ def merge_panelized_state(
         panel_root=state_panel_root,
         run_name=run_name,
         output_dir=core_dir,
+        fallback_directed_links_path=(
+            Path(parent_directed_links_path)
+            if parent_directed_links_path is not None
+            else None
+        ),
         overwrite=True,
     )
     rivgraph_dir = output_root / "rivgraph"

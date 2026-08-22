@@ -17,6 +17,51 @@ def _write(path: Path, values: np.ndarray) -> None:
         dst.write(values, 1)
 
 
+def test_panelized_merge_passes_parent_fallback_only_to_direction_assignment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: dict[str, dict[str, object]] = {}
+
+    def capture(name):
+        def runner(**kwargs):
+            calls[name] = kwargs
+            return {}
+
+        return runner
+
+    monkeypatch.setattr(
+        "rivgraph_centerline.panelization.build_core_boundary_network",
+        capture("build"),
+    )
+    monkeypatch.setattr(
+        "rivgraph_centerline.panelization.rebuild_core_network_nodes",
+        capture("nodes"),
+    )
+    monkeypatch.setattr(
+        "rivgraph_centerline.panelization.assign_core_network_direction",
+        capture("direction"),
+    )
+    monkeypatch.setattr(
+        "rivgraph_centerline.panelization.publish_panelized_rivgraph_handoff",
+        capture("publish"),
+    )
+    parent = tmp_path / "parent_directed_links.gpkg"
+
+    panelized_raster_module.merge_panelized_state(
+        panel_plan_path=tmp_path / "panel_plan.gpkg",
+        panel_breaks_path=tmp_path / "panel_breaks.gpkg",
+        boundary_match_plan_path=tmp_path / "boundary_match_plan.json",
+        state_panel_root=tmp_path / "panels",
+        run_name="41",
+        output_root=tmp_path / "merged",
+        parent_directed_links_path=parent,
+    )
+
+    assert "fallback_directed_links_path" not in calls["build"]
+    assert calls["direction"]["fallback_directed_links_path"] == parent
+
+
 def test_windowed_bank_labels_and_panel_edit(tmp_path: Path) -> None:
     labels = np.array([[2, 2, 2], [2, 3, 2], [2, 2, 2]], dtype="int32")
     origin = np.array([[1, 1, 1], [1, 101, 1], [1, 1, 1]], dtype="uint16")
