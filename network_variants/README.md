@@ -663,6 +663,16 @@ panelized base, or reuse the completed independent base with
 `--base-state-source`; base-state compatibility and manifest path rewriting are
 unchanged.
 
+When `--equivalent-kb-mode based_reference_section` is enabled, a panelized
+base also constructs the all-units reference section through the panelized
+collapse and boundary-merge workflow. The reference section is one special
+`realized` selection containing every detected base unit; it does not use the
+local-patch backend because its footprint spans the network. The resulting
+width, slope, forcing, and BASED calculations are unchanged. Until both
+reference-section summaries have been written, the experiment manifest records
+`stop_reason: reference_kb_prepass_pending` and does not constitute a reusable
+hydraulic base.
+
 ### Reusing a completed base state
 
 Independent-unit and compound-bubble experiments can either build their base

@@ -339,6 +339,79 @@ def test_reference_section_cache_refreshes_width_summary_without_rebuilding_vari
     assert json.loads(summary_path.read_text())["width_summary"] == summary["width_summary"]
 
 
+def test_reference_section_geometry_uses_injected_panelized_builder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    experiment_dir = tmp_path / "experiment"
+    experiment_dir.mkdir()
+    pd.DataFrame([{"state_role": "base"}]).to_csv(
+        experiment_dir / "state_registry.csv", index=False
+    )
+    (experiment_dir / "experiment_manifest.json").write_text(
+        json.dumps({"example_id": "41", "exit_sides": "EW"}),
+        encoding="utf-8",
+    )
+    calls: list[dict[str, object]] = []
+
+    def builder(**kwargs):
+        calls.append(kwargs)
+        variant_dir = Path(kwargs["reference_paths"]["variant"])
+        widths = variant_dir / "widths"
+        directed = variant_dir / "directed"
+        widths.mkdir(parents=True)
+        directed.mkdir(parents=True)
+        pd.DataFrame({"wid_adj_routing": [310.0]}).to_csv(
+            widths / "link_width_families.csv", index=False
+        )
+        pd.DataFrame({"wid_adj_routing": [310.0]}).to_csv(
+            widths / "link_width_samples.csv", index=False
+        )
+        links_path = directed / "links.gpkg"
+        nodes_path = directed / "nodes.gpkg"
+        links_path.touch()
+        nodes_path.touch()
+        return {
+            "construction_backend": "panelized",
+            "example_id": "41",
+            "exit_sides": "EW",
+            "unit_ids": [1, 2],
+            "variant_output_dir": variant_dir,
+            "directed_links_path": links_path,
+            "directed_nodes_path": nodes_path,
+            "centerline_path": None,
+            "collapsed_mask_path": variant_dir / "mask.vrt",
+            "boundary_component_labels_path": None,
+            "link_width_samples_path": widths / "link_width_samples.csv",
+            "manifest_path": variant_dir / "summary" / "variant_manifest.json",
+        }
+
+    monkeypatch.setattr(
+        "rapid_tools.reference_section.gpd.read_file",
+        lambda path: gpd.GeoDataFrame({"id_node": [1, 2]}, geometry=[None, None]),
+    )
+    monkeypatch.setattr(
+        "rapid_tools.reference_section.compute_section_slope_reference",
+        lambda nodes, config: {
+            "slope": 0.001,
+            "source_method": "test",
+            "anchor_count": 2,
+        },
+    )
+
+    summary = ensure_reference_section_geometry(
+        experiment_dir,
+        width_sample_field="wid_adj_routing",
+        width_percentile=None,
+        variant_builder=builder,
+    )
+
+    assert len(calls) == 1
+    assert summary["construction_backend"] == "panelized"
+    assert summary["n_reference_units_collapsed"] == 2
+    assert summary["width_summary"]["width_reference_m"] == 310.0
+
+
 def test_reference_section_kb_accepts_direct_summary_without_percentile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -97,7 +97,10 @@ from network_variants.local_patch_execution import (
 )
 from rivgraph_centerline.workflow import run_rivgraph_for_run
 from rapid_tools.forcing import ForcingConfig, prepare_forcing_table
-from rapid_tools.reference_section import compute_reference_section_kb
+from rapid_tools.reference_section import (
+    REFERENCE_SECTION_VARIANT_ID,
+    compute_reference_section_kb,
+)
 
 
 EXPERIMENT_MODES = (
@@ -954,6 +957,7 @@ def _resolve_equivalent_reference_kb_summary(
     equivalent_kb_width_percentile: float | None,
     equivalent_forcing_table_runner: Callable[..., tuple[pd.DataFrame, dict[str, object]]],
     equivalent_reference_kb_summary_runner: Callable[..., dict[str, Any]],
+    reference_section_variant_builder: Callable[..., Mapping[str, Any]] | None = None,
 ) -> tuple[BubbleEquivalentResistanceConfig, dict[str, Any] | None, dict[str, object] | None]:
     if not _needs_equivalent_reference_kb_prepass(equivalent_resistance_config):
         return (
@@ -977,12 +981,17 @@ def _resolve_equivalent_reference_kb_summary(
         equivalent_forcing_path,
         config=forcing_config,
     )
+    reference_kwargs: dict[str, Any] = {
+        "forcing": forcing_table,
+        "width_sample_field": equivalent_kb_width_sample_field,
+        "width_percentile": equivalent_kb_width_percentile,
+        "model_path": equivalent_kb_model_path,
+    }
+    if reference_section_variant_builder is not None:
+        reference_kwargs["variant_builder"] = reference_section_variant_builder
     reference_kb_summary = equivalent_reference_kb_summary_runner(
         experiment_dir,
-        forcing=forcing_table,
-        width_sample_field=equivalent_kb_width_sample_field,
-        width_percentile=equivalent_kb_width_percentile,
-        model_path=equivalent_kb_model_path,
+        **reference_kwargs,
     )
     resolved_config = replace(
         equivalent_resistance_config,
@@ -3049,6 +3058,86 @@ def _make_panelized_child_runner(
     return runner
 
 
+def _make_panelized_reference_section_builder(
+    *,
+    panelized_variant_runner: Callable[..., NetworkVariantOutputs],
+    base_context: ExperimentStateContext,
+    base_variant_outputs: BaseStateVariantOutputs,
+    base_analysis_links_path: Path,
+    example_id: str,
+    exit_sides: str,
+    preferred_width_field: str,
+    footprint_buffer_scale: float,
+    all_touched: bool,
+    bank_candidate_neighbors_max: int,
+    sword_node_source_path: str | Path | None,
+    sword_wse_field: str | None,
+    sword_match_tolerance: float | None,
+    sword_example_station_source_path: str | Path | None,
+    sword_station_match_source_path: str | Path | None,
+    sword_reach_buffer_steps: int,
+) -> Callable[..., Mapping[str, Any]]:
+    """Build the all-units reference section through the panelized child path."""
+    if base_context.workflow is None:
+        raise ValueError("Panelized reference-section construction requires the base hierarchy.")
+    unit_summary = base_context.workflow.unit_summary
+    if "unit_id" not in unit_summary.columns:
+        raise ValueError("Base unit summary is missing unit_id for the reference section.")
+    unit_ids = sorted(
+        pd.to_numeric(unit_summary["unit_id"], errors="coerce")
+        .dropna()
+        .astype(int)
+        .unique()
+        .tolist()
+    )
+    if not unit_ids:
+        raise ValueError("No base units were available for the panelized reference section.")
+
+    def builder(**kwargs: Any) -> Mapping[str, Any]:
+        reference_paths = kwargs["reference_paths"]
+        variant_dir = Path(reference_paths["variant"])
+        outputs = panelized_variant_runner(
+            cleaned_mask_path=base_variant_outputs.collapsed_mask_path,
+            reviewed_links_path=base_analysis_links_path,
+            reviewed_nodes_path=base_variant_outputs.directed_nodes_path,
+            unit_ids=unit_ids,
+            variant_id=REFERENCE_SECTION_VARIANT_ID,
+            example_id=example_id,
+            output_dir=variant_dir,
+            group_label=None,
+            selection_type="reference_section_all_units",
+            collapse_corridor_mode="realized",
+            preferred_width_field=preferred_width_field,
+            footprint_buffer_scale=footprint_buffer_scale,
+            all_touched=all_touched,
+            bank_candidate_neighbors_max=bank_candidate_neighbors_max,
+            sword_node_source_path=sword_node_source_path,
+            sword_wse_field=sword_wse_field,
+            sword_match_tolerance=sword_match_tolerance,
+            sword_example_station_source_path=sword_example_station_source_path,
+            sword_station_match_source_path=sword_station_match_source_path,
+            sword_reach_buffer_steps=sword_reach_buffer_steps,
+            panelized_path_metrics=base_context.hierarchy_output_dir / "path_metrics.csv",
+            panelized_mask_publication="virtual_patch",
+        )
+        return {
+            "construction_backend": "panelized",
+            "example_id": example_id,
+            "exit_sides": exit_sides,
+            "unit_ids": unit_ids,
+            "variant_output_dir": outputs.output_dir,
+            "directed_links_path": outputs.directed_links_path,
+            "directed_nodes_path": outputs.directed_nodes_path,
+            "centerline_path": outputs.rivgraph_centerline_path,
+            "collapsed_mask_path": outputs.collapsed_mask_path,
+            "boundary_component_labels_path": outputs.boundary_component_labels_path,
+            "link_width_samples_path": outputs.output_dir / "widths" / "link_width_samples.csv",
+            "manifest_path": outputs.output_dir / "summary" / "variant_manifest.json",
+        }
+
+    return builder
+
+
 def _materialize_base_state_variant(
     *,
     context: ExperimentStateContext,
@@ -4117,12 +4206,9 @@ def run_collapse_experiment(
             source_equivalent_config = source_hierarchy.get(
                 "equivalent_resistance_config"
             )
-            source_reference_summary = source_hierarchy.get(
-                "equivalent_reference_kb_summary"
-            )
-            if source_equivalent_config is None or source_reference_summary is None:
+            if source_equivalent_config is None:
                 mismatches.append(
-                    "equivalent resistance: source base has no reusable reference-Kb configuration"
+                    "equivalent resistance: source base has no compatible requested configuration"
                 )
             else:
                 comparison_fields = (
@@ -4184,7 +4270,11 @@ def run_collapse_experiment(
         )
     if reused_base_experiment_dir is not None:
         source_reference = reused_base_experiment_dir / "reference_section"
-        if source_reference.is_dir():
+        source_reference_complete = (
+            (source_reference / "reference_section_summary.json").is_file()
+            and (source_reference / "reference_kb_summary.json").is_file()
+        )
+        if source_reference_complete:
             _copytree_transactional(source_reference, output_path / "reference_section")
         source_solver_cache = (
             reused_base_experiment_dir / "equivalent_resistance" / "solve_cache"
@@ -4372,11 +4462,12 @@ def run_collapse_experiment(
             hydraulic_context_kwargs=state_hydraulic_context_kwargs,
         )
     panelized_child_runner: Callable[..., NetworkVariantOutputs] | None = None
+    reference_section_variant_builder: Callable[..., Mapping[str, Any]] | None = None
     needs_panelized_child_runner = (
         execution_plan.child_backend == "panelized"
         or execution_plan.fallback_backend == "panelized"
     )
-    if needs_panelized_child_runner and not base_only and variant_runner is generate_network_variant:
+    if needs_panelized_child_runner and variant_runner is generate_network_variant:
         child_boundary_labels = Path(panelized_boundary_component_labels_path) if panelized_boundary_component_labels_path else boundary_component_labels_path
         if child_boundary_labels is None:
             raise ValueError("Panelized child execution could not resolve base boundary-component labels.")
@@ -4392,6 +4483,25 @@ def run_collapse_experiment(
             run_name=root_example_id,
         )
         variant_kwargs["panelized_path_metrics"] = base_context.hierarchy_output_dir / "path_metrics.csv"
+        if execution_plan.base_backend == "panelized":
+            reference_section_variant_builder = _make_panelized_reference_section_builder(
+                panelized_variant_runner=panelized_child_runner,
+                base_context=base_context,
+                base_variant_outputs=base_variant_outputs,
+                base_analysis_links_path=base_analysis_links_path,
+                example_id=root_example_id,
+                exit_sides=exit_sides,
+                preferred_width_field=preferred_width_field,
+                footprint_buffer_scale=footprint_buffer_scale,
+                all_touched=all_touched,
+                bank_candidate_neighbors_max=bank_candidate_neighbors_max,
+                sword_node_source_path=sword_node_source_path,
+                sword_wse_field=sword_wse_field,
+                sword_match_tolerance=sword_match_tolerance,
+                sword_example_station_source_path=sword_example_station_source_path,
+                sword_station_match_source_path=sword_station_match_source_path,
+                sword_reach_buffer_steps=sword_reach_buffer_steps,
+            )
     if (
         execution_plan.child_backend == "panelized"
         and panelized_child_runner is not None
@@ -4433,7 +4543,14 @@ def run_collapse_experiment(
         else None
     )
     equivalent_forcing_metadata: dict[str, object] | None = None
-    stop_reason = "base_state_only"
+    reference_kb_prepass_required = _needs_equivalent_reference_kb_prepass(
+        active_equivalent_resistance_config
+    )
+    stop_reason = (
+        "reference_kb_prepass_pending"
+        if reference_kb_prepass_required
+        else "base_state_only"
+    )
     terminal_state_id = base_context.state_id
 
     def write_metadata() -> None:
@@ -4480,6 +4597,18 @@ def run_collapse_experiment(
             "n_equivalent_transition_rows": n_equivalent_transition_rows,
             "n_equivalent_transitions_with_matches": n_equivalent_transitions_with_matches,
             "terminal_state_id": terminal_state_id,
+            "reference_kb_prepass": {
+                "required": bool(reference_kb_prepass_required),
+                "complete": bool(
+                    not reference_kb_prepass_required
+                    or equivalent_reference_kb_summary is not None
+                ),
+                "construction_backend": (
+                    execution_plan.base_backend
+                    if reference_kb_prepass_required
+                    else None
+                ),
+            },
             "stop_reason": stop_reason,
             "base_state_reuse": {
                 "requested": base_state_variant_source_dir is not None,
@@ -4618,6 +4747,7 @@ def run_collapse_experiment(
                 equivalent_kb_width_percentile=equivalent_kb_width_percentile,
                 equivalent_forcing_table_runner=equivalent_forcing_table_runner,
                 equivalent_reference_kb_summary_runner=equivalent_reference_kb_summary_runner,
+                reference_section_variant_builder=reference_section_variant_builder,
             )
         )
         unit_workflow_kwargs["equivalent_resistance_config"] = active_equivalent_resistance_config
@@ -4636,6 +4766,7 @@ def run_collapse_experiment(
             },
         )
         state_records[0] = _state_record(base_context, mode)
+        stop_reason = "base_state_only"
         write_metadata()
 
     if base_only:

@@ -65,6 +65,64 @@ def test_resolve_execution_backend_plan_rejects_unsupported_combinations(
         resolve_execution_backend_plan(requested)
 
 
+def test_panelized_reference_section_builder_collapses_every_base_unit(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, Any]] = []
+    variant_dir = tmp_path / "reference_section" / "variant"
+
+    def panelized_runner(**kwargs: Any):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            output_dir=variant_dir,
+            directed_links_path=variant_dir / "directed_links.gpkg",
+            directed_nodes_path=variant_dir / "directed_nodes.gpkg",
+            rivgraph_centerline_path=None,
+            collapsed_mask_path=variant_dir / "collapsed_mask.vrt",
+            boundary_component_labels_path=tmp_path / "boundary_labels.tif",
+            manifest={},
+        )
+
+    base_context = SimpleNamespace(
+        workflow=SimpleNamespace(
+            unit_summary=pd.DataFrame({"unit_id": [7, 3, 7, 11]})
+        ),
+        hierarchy_output_dir=tmp_path / "states" / "S000_base" / "hierarchy",
+    )
+    base_outputs = SimpleNamespace(
+        collapsed_mask_path=tmp_path / "base_mask.tif",
+        directed_nodes_path=tmp_path / "base_nodes.gpkg",
+    )
+    builder = collapse_experiment_module._make_panelized_reference_section_builder(
+        panelized_variant_runner=panelized_runner,
+        base_context=base_context,
+        base_variant_outputs=base_outputs,
+        base_analysis_links_path=tmp_path / "base_links.gpkg",
+        example_id="41",
+        exit_sides="EW",
+        preferred_width_field="wid_adj_routing",
+        footprint_buffer_scale=0.5,
+        all_touched=True,
+        bank_candidate_neighbors_max=2048,
+        sword_node_source_path=None,
+        sword_wse_field="wse_obs_p50",
+        sword_match_tolerance=None,
+        sword_example_station_source_path=None,
+        sword_station_match_source_path=None,
+        sword_reach_buffer_steps=2,
+    )
+
+    summary = builder(reference_paths={"variant": variant_dir})
+
+    assert len(calls) == 1
+    assert calls[0]["unit_ids"] == [3, 7, 11]
+    assert calls[0]["collapse_corridor_mode"] == "realized"
+    assert calls[0]["panelized_mask_publication"] == "virtual_patch"
+    assert calls[0]["selection_type"] == "reference_section_all_units"
+    assert summary["construction_backend"] == "panelized"
+    assert summary["unit_ids"] == [3, 7, 11]
+
+
 @pytest.mark.parametrize("reset_name", ["_reset_state_dir", "_reset_experiment_output_dir"])
 def test_reset_directory_ignores_missing_entry_race(
     tmp_path: Path,
@@ -1186,6 +1244,12 @@ def test_based_reference_section_kb_is_resolved_for_equivalent_resistance(tmp_pa
     assert manifest_config["kb_mode"] == "based_reference_section"
     assert manifest_config["reference_kb_summary"]["kb_value"] == pytest.approx(7.5)
     assert results.manifest["options"]["hierarchy"]["equivalent_reference_kb_summary"]["kb_value"] == pytest.approx(7.5)
+    assert results.manifest["reference_kb_prepass"] == {
+        "required": True,
+        "complete": True,
+        "construction_backend": "full_raster",
+    }
+    assert results.manifest["stop_reason"] != "reference_kb_prepass_pending"
 
     base_row = results.state_registry.loc[results.state_registry["state_id"] == "S000_base"].iloc[0]
     assert int(base_row["n_equivalent_bubbles"]) == 1

@@ -4,7 +4,7 @@ import json
 import sys
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import geopandas as gpd
 import numpy as np
@@ -264,6 +264,7 @@ def _build_reference_section_variant(
     )
 
     return {
+        "construction_backend": "full_raster",
         "example_id": example_id,
         "exit_sides": exit_sides,
         "unit_ids": unit_ids,
@@ -283,6 +284,7 @@ def ensure_reference_section_geometry(
     *,
     width_sample_field: str,
     width_percentile: float | None,
+    variant_builder: Callable[..., Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     experiment_path = Path(experiment_dir).expanduser().resolve()
     registry_path = experiment_path / "state_registry.csv"
@@ -316,12 +318,13 @@ def ensure_reference_section_geometry(
                 reference_paths["geometry_summary"].write_text(json.dumps(cached, indent=2))
             return cached
 
-    variant_summary = _build_reference_section_variant(
+    builder = variant_builder or _build_reference_section_variant
+    variant_summary = dict(builder(
         experiment_dir=experiment_path,
         experiment_manifest=experiment_manifest,
         registry=registry,
         reference_paths=reference_paths,
-    )
+    ))
     nodes = gpd.read_file(variant_summary["directed_nodes_path"])
     variant_output_dir = Path(variant_summary["variant_output_dir"])
     width_summary = _load_width_summary(
@@ -335,6 +338,9 @@ def ensure_reference_section_geometry(
     summary = {
         "example_id": variant_summary["example_id"],
         "reference_variant_id": REFERENCE_SECTION_VARIANT_ID,
+        "construction_backend": str(
+            variant_summary.get("construction_backend", "full_raster")
+        ),
         "single_thread": True,
         "exit_sides": variant_summary["exit_sides"],
         "n_reference_units_collapsed": int(len(variant_summary["unit_ids"])),
@@ -424,6 +430,7 @@ def compute_reference_section_kb(
     width_sample_field: str,
     width_percentile: float | None,
     model_path: str | Path | None = None,
+    variant_builder: Callable[..., Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     experiment_path = Path(experiment_dir).expanduser().resolve()
     reference_paths = _reference_section_paths(experiment_path)
@@ -431,6 +438,7 @@ def compute_reference_section_kb(
         experiment_path,
         width_sample_field=width_sample_field,
         width_percentile=width_percentile,
+        variant_builder=variant_builder,
     )
     discharge = pd.to_numeric(forcing["discharge_cms"], errors="coerce")
     discharge = discharge[np.isfinite(discharge)]
@@ -452,6 +460,9 @@ def compute_reference_section_kb(
     summary = {
         "example_id": geometry_summary["example_id"],
         "kb_source_method": "based_reference_section",
+        "reference_section_construction_backend": str(
+            geometry_summary.get("construction_backend", "full_raster")
+        ),
         "kb_value": kb_value,
         "reference_discharge_cms": q_ref,
         "reference_width_m": width_ref,

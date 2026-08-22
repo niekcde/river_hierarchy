@@ -15,6 +15,14 @@ the experiment and child manifests. Focused and complete `network_variants`
 unit suites cover mode resolution, fallback provenance, and virtual-versus-
 materialized raster equality.
 
+The BASED reference-section prepass now follows the base backend. For a
+panelized base, all detected units are collapsed in one special panelized
+`realized` state and merged with the standard panel boundary identities. The
+same reference width, section slope, forcing, and BASED model are then applied.
+An early manifest checkpoint explicitly remains
+`reference_kb_prepass_pending`, preventing an interrupted geometry build from
+being mistaken for a reusable base.
+
 Remaining acceptance work is example-level validation on panelized examples 41
 and 46: a contained child, a cross-panel child, a nested child, a compound
 bubble, and a deliberately forced fallback should be compared with the
