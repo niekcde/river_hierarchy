@@ -59,6 +59,10 @@ def _default_station_match_source_path() -> Path:
     return _repo_root() / "SWORD_gauge_match" / "outputs" / "selected_event_stations_same_main_path.gpkg"
 
 
+def _example_reach_summary_source_path(example_station_path: Path) -> Path:
+    return example_station_path.parent / "hierarchy_example_reach_summary.csv"
+
+
 def _first_existing(columns: Sequence[str], candidates: Sequence[str]) -> str | None:
     available = set(columns)
     for candidate in candidates:
@@ -274,6 +278,122 @@ def _reverse_adjacency(adjacency: Mapping[int, set[int]]) -> dict[int, set[int]]
     return reverse
 
 
+def _parse_reach_ids(value: Any) -> list[int]:
+    if value is None or value is pd.NA or pd.isna(value):
+        return []
+    return [int(match.group(0)) for match in re.finditer(r"\d+", str(value))]
+
+
+def _parse_station_keys(value: Any) -> list[str]:
+    if value is None or value is pd.NA or pd.isna(value):
+        return []
+    return [part.strip() for part in re.split(r"[;,]", str(value)) if part.strip()]
+
+
+def _resolve_example_reach_summary_filter(
+    *,
+    summary_path: Path,
+    example_numeric_id: int,
+    sword_node_source_path: Path,
+    reach_buffer_steps: int,
+) -> dict[str, Any] | None:
+    """Resolve the authoritative precomputed reach corridor for one example."""
+
+    if not summary_path.exists():
+        return None
+    summary = pd.read_csv(summary_path)
+    if "example_id" not in summary.columns:
+        return None
+    rows = summary.loc[
+        pd.to_numeric(summary["example_id"], errors="coerce").eq(int(example_numeric_id))
+    ].copy()
+    if rows.empty or "reaches_between" not in rows.columns:
+        return None
+    rows["_reach_count"] = rows["reaches_between"].map(lambda value: len(_parse_reach_ids(value)))
+    rows = rows.loc[rows["_reach_count"].gt(0)].sort_values(
+        "_reach_count", ascending=False, kind="mergesort"
+    )
+    if rows.empty:
+        return None
+
+    row = rows.iloc[0]
+    corridor_reaches = set(_parse_reach_ids(row["reaches_between"]))
+    upstream_reaches = _parse_reach_ids(row.get("upstream_reach_ids"))
+    downstream_reaches = _parse_reach_ids(row.get("downstream_reach_ids"))
+    corridor_reaches.update(upstream_reaches)
+    corridor_reaches.update(downstream_reaches)
+    regions = _parse_station_keys(row.get("sword_region"))
+    if not corridor_reaches or len(regions) != 1:
+        return None
+
+    region = regions[0].lower()
+    candidate_reaches = set(corridor_reaches)
+    buffer_status = "not_requested"
+    if int(reach_buffer_steps) > 0 and upstream_reaches and downstream_reaches:
+        try:
+            build_downstream_adjacency, _, load_reach_topology, _, scan_sword_parquet_dir = (
+                _maybe_import_reach_tools()
+            )
+            catalog = scan_sword_parquet_dir(sword_node_source_path)
+            topology = load_reach_topology(
+                catalog,
+                region,
+                columns=(
+                    "reach_id",
+                    "rch_id_dn",
+                    "rch_id_dn_main",
+                    "rch_id_dn_1",
+                    "rch_id_dn_2",
+                    "rch_id_dn_3",
+                    "rch_id_dn_4",
+                    "dist_out",
+                ),
+            )
+            adjacency = build_downstream_adjacency(
+                topology, reach_id_col="reach_id", downstream_col=None
+            )
+            reverse_adjacency = _reverse_adjacency(adjacency)
+            candidate_reaches.update(
+                _limited_traverse(
+                    reverse_adjacency,
+                    upstream_reaches,
+                    max_steps=reach_buffer_steps,
+                )
+            )
+            candidate_reaches.update(
+                _limited_traverse(
+                    adjacency,
+                    downstream_reaches,
+                    max_steps=reach_buffer_steps,
+                )
+            )
+            buffer_status = "applied"
+        except (ModuleNotFoundError, ValueError, KeyError):
+            # The authoritative corridor remains usable without its optional
+            # endpoint buffer. Record this rather than replacing it with a
+            # broader spatial search.
+            buffer_status = "unavailable_authoritative_corridor_retained"
+
+    upstream_keys = _parse_station_keys(row.get("upstream_station_keys"))
+    downstream_keys = _parse_station_keys(row.get("downstream_station_keys"))
+    station_keys = set(upstream_keys) | set(downstream_keys)
+    return {
+        "scope": "example_reach_corridor",
+        "reason": "",
+        "corridor_source": "example_reach_summary",
+        "example_reach_summary_source": str(summary_path.resolve()),
+        "example_reach_summary_buffer_status": buffer_status,
+        "station_match_count": int(len(station_keys)),
+        "candidate_region": region,
+        "candidate_reach_ids": sorted(int(value) for value in candidate_reaches),
+        "candidate_reach_count": int(len(candidate_reaches)),
+        "upstream_station_key": upstream_keys[0] if upstream_keys else None,
+        "downstream_station_key": downstream_keys[0] if downstream_keys else None,
+        "upstream_reach_id": upstream_reaches[0] if upstream_reaches else None,
+        "downstream_reach_id": downstream_reaches[0] if downstream_reaches else None,
+    }
+
+
 def _resolve_example_reach_filter(
     *,
     example_id: str | int | None,
@@ -285,7 +405,10 @@ def _resolve_example_reach_filter(
     metadata: dict[str, Any] = {
         "scope": "bbox_only",
         "reason": "",
+        "corridor_source": None,
         "example_numeric_id": None,
+        "example_reach_summary_source": None,
+        "example_reach_summary_buffer_status": None,
         "candidate_region": None,
         "candidate_reach_ids": [],
         "candidate_reach_count": 0,
@@ -315,10 +438,21 @@ def _resolve_example_reach_filter(
 
     example_station_path = Path(example_station_source_path) if example_station_source_path is not None else _default_example_station_source_path()
     station_match_path = Path(station_match_source_path) if station_match_source_path is not None else _default_station_match_source_path()
+    reach_summary_path = _example_reach_summary_source_path(example_station_path)
     metadata["example_station_source"] = str(example_station_path.resolve())
     metadata["station_match_source"] = str(station_match_path.resolve())
+    metadata["example_reach_summary_source"] = str(reach_summary_path.resolve())
     if not example_station_path.exists():
         metadata["reason"] = "example_station_source_missing"
+        return metadata
+    summary_filter = _resolve_example_reach_summary_filter(
+        summary_path=reach_summary_path,
+        example_numeric_id=example_numeric_id,
+        sword_node_source_path=node_source_path,
+        reach_buffer_steps=reach_buffer_steps,
+    )
+    if summary_filter is not None:
+        metadata.update(summary_filter)
         return metadata
     if not station_match_path.exists():
         metadata["reason"] = "station_match_source_missing"
@@ -431,6 +565,7 @@ def _resolve_example_reach_filter(
     metadata["candidate_reach_ids"] = candidate_reach_ids
     metadata["candidate_reach_count"] = int(len(candidate_reach_ids))
     metadata["scope"] = "example_reach_corridor"
+    metadata["corridor_source"] = "station_matches"
     return metadata
 
 
@@ -635,7 +770,10 @@ def match_variant_nodes_to_sword(
     match_metadata: dict[str, Any] = {
         "scope": "bbox_only",
         "reason": "",
+        "corridor_source": None,
         "example_numeric_id": _infer_numeric_example_id(example_id),
+        "example_reach_summary_source": None,
+        "example_reach_summary_buffer_status": None,
         "candidate_region": None,
         "candidate_reach_count": 0,
         "candidate_reach_ids": [],

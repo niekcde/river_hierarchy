@@ -470,6 +470,63 @@ def test_resolve_example_reach_filter_falls_back_when_only_one_station_is_matche
     assert metadata["station_match_count"] == 1
 
 
+def test_resolve_example_reach_filter_prefers_authoritative_reach_summary(
+    tmp_path: Path,
+) -> None:
+    sword_dir = tmp_path / "sword"
+    sword_dir.mkdir()
+    example_station_path = tmp_path / "hierarchy_examples_filtered.gpkg"
+    gpd.GeoDataFrame(
+        {
+            "station_key": ["US:up", "US:down"],
+            "example_ids": ["41", "41"],
+        },
+        geometry=[Point(-150, 65), Point(-156, 65)],
+        crs="EPSG:4326",
+    ).to_file(example_station_path, driver="GPKG")
+    station_match_path = tmp_path / "selected_event_stations.gpkg"
+    gpd.GeoDataFrame(
+        {
+            "station_key": ["US:other"],
+            "reach_id": [999],
+            "sword_region": ["na"],
+        },
+        geometry=[Point(-145, 66)],
+        crs="EPSG:4326",
+    ).to_file(station_match_path, driver="GPKG")
+    pd.DataFrame(
+        {
+            "example_id": [41],
+            "sword_region": ["na"],
+            "route_status": ["ok"],
+            "route_found": [True],
+            "upstream_station_keys": ["US:up"],
+            "downstream_station_keys": ["US:down"],
+            "upstream_reach_ids": [100],
+            "downstream_reach_ids": [80],
+            "reaches_between": ["100;90;80"],
+        }
+    ).to_csv(tmp_path / "hierarchy_example_reach_summary.csv", index=False)
+
+    metadata = _resolve_example_reach_filter(
+        example_id="41",
+        sword_node_source_path=sword_dir,
+        example_station_source_path=example_station_path,
+        station_match_source_path=station_match_path,
+        reach_buffer_steps=0,
+    )
+
+    assert metadata["scope"] == "example_reach_corridor"
+    assert metadata["corridor_source"] == "example_reach_summary"
+    assert metadata["candidate_region"] == "na"
+    assert metadata["candidate_reach_ids"] == [80, 90, 100]
+    assert metadata["upstream_station_key"] == "US:up"
+    assert metadata["downstream_station_key"] == "US:down"
+    assert metadata["upstream_reach_id"] == 100
+    assert metadata["downstream_reach_id"] == 80
+    assert metadata["station_match_count"] == 2
+
+
 def test_match_variant_nodes_to_sword_applies_example_reach_filter_to_geo_file(tmp_path: Path, monkeypatch) -> None:
     directed_nodes = _node_frame(
         [
