@@ -102,8 +102,11 @@ def _core_owned_width_samples(
     source_segments: list[object],
     source_rows: dict[tuple[str, int], object],
     panel_root: Path,
+    excluded_sample_keys: set[tuple[str, int, int]] | None = None,
 ) -> tuple[list[float], list[tuple[float, float]], list[dict[str, object]]]:
     """Return ordered, core-owned RivGraph width samples for one merged link."""
+    excluded_sample_keys = excluded_sample_keys or set()
+    selected_sample_keys: set[tuple[str, int, int]] = set()
     pieces: list[tuple[float, list[float], list[tuple[float, float]], list[dict[str, object]]]] = []
     for segment in source_segments:
         panel = str(segment.panel_id)
@@ -119,8 +122,19 @@ def _core_owned_width_samples(
             xs, ys = rasterio.transform.xy(mask.transform, rows, cols, offset="center")
             pixel_size = max(abs(float(mask.transform.a)), abs(float(mask.transform.e)))
         coordinates = list(zip(map(float, xs), map(float, ys)))
-        owned = [Point(coordinate).distance(segment.geometry) <= pixel_size * 0.75 for coordinate in coordinates]
-        selected = [(width, coordinate, index) for width, coordinate, index, keep in zip(widths, coordinates, indices, owned) if keep]
+        selected = []
+        for width, coordinate, index in zip(widths, coordinates, indices):
+            point = Point(coordinate)
+            sample_key = (panel, source_link_id, int(index))
+            owned = (
+                point.distance(segment.geometry) <= pixel_size * 0.75
+                and point.distance(merged_geometry) <= pixel_size * 0.75
+                and sample_key not in excluded_sample_keys
+                and sample_key not in selected_sample_keys
+            )
+            if owned:
+                selected.append((width, coordinate, index))
+                selected_sample_keys.add(sample_key)
         if not selected:
             continue
         selected_widths = [float(item[0]) for item in selected]
@@ -144,6 +158,23 @@ def _core_owned_width_samples(
         [coordinate for _, _, coordinates, _ in pieces for coordinate in coordinates],
         [record for _, _, _, records in pieces for record in records],
     )
+
+
+def _material_source_segment_ids(
+    merged_part: LineString,
+    source_segments: gpd.GeoDataFrame,
+) -> list[str]:
+    """Return source segments with linear overlap, excluding endpoint touches."""
+    selected: list[str] = []
+    for row in source_segments.itertuples(index=False):
+        overlap_length = float(merged_part.intersection(row.geometry).length)
+        numerical_floor = max(
+            1e-7,
+            min(float(merged_part.length), float(row.geometry.length)) * 1e-10,
+        )
+        if overlap_length > numerical_floor:
+            selected.append(str(row.segment_id))
+    return selected
 
 
 def _build_panelized_reference_centerline(
@@ -309,8 +340,28 @@ def build_core_boundary_network(*, plan_path: Path, breaks_path: Path, panel_roo
         else:
             unioned = unary_union(lines)
             geom = linemerge(unioned) if isinstance(unioned, MultiLineString) else unioned
+        assigned_segment_ids: set[str] = set()
         for part_index, part in enumerate(_line_parts(geom)):
-            merged_rows.append({"global_link_id": len(merged_rows), "source_segments": ";".join(frame.segment_id), "geometry": part})
+            source_segment_ids = _material_source_segment_ids(part, frame)
+            if not source_segment_ids:
+                raise ValueError(
+                    f"Merged part {part_index} in group {group!r} has no materially "
+                    "overlapping source segment."
+                )
+            assigned_segment_ids.update(source_segment_ids)
+            merged_rows.append(
+                {
+                    "global_link_id": len(merged_rows),
+                    "source_segments": ";".join(source_segment_ids),
+                    "geometry": part,
+                }
+            )
+        missing_segment_ids = sorted(set(frame.segment_id.astype(str)).difference(assigned_segment_ids))
+        if missing_segment_ids:
+            raise ValueError(
+                f"Merge group {group!r} lost source segments while assigning split-link "
+                f"provenance: {missing_segment_ids}."
+            )
     merged = gpd.GeoDataFrame(merged_rows, geometry="geometry", crs=cores.crs)
     output_dir.mkdir(parents=True, exist_ok=True)
     seg.to_file(output_dir / "core_segments.gpkg", layer="core_segments", driver="GPKG")
@@ -744,6 +795,7 @@ def publish_panelized_rivgraph_handoff(
     segment_by_id = segments.set_index("segment_id")
     enriched_records: list[dict[str, object]] = []
     width_sample_records: list[dict[str, object]] = []
+    assigned_sample_keys: set[tuple[str, int, int]] = set()
     for row in links.itertuples(index=False):
         source_segments = []
         for segment_id in str(row.source_segments).split(";"):
@@ -755,7 +807,22 @@ def publish_panelized_rivgraph_handoff(
             source_segments=source_segments,
             source_rows=source_rows,
             panel_root=panel_root,
+            excluded_sample_keys=assigned_sample_keys,
         )
+        sample_keys = {
+            (
+                str(source["panel_id"]),
+                int(source["source_link_id"]),
+                int(source["source_pixel_index"]),
+            )
+            for source in provenance
+        }
+        if sample_keys.intersection(assigned_sample_keys):
+            raise ValueError(
+                f"Merged link {row.global_link_id} reuses width samples already assigned "
+                "to another merged link."
+            )
+        assigned_sample_keys.update(sample_keys)
         metrics = _rivgraph_width_metrics(widths, coordinates)
         record = {
             "id_link": int(row.global_link_id),
@@ -842,7 +909,11 @@ def publish_panelized_rivgraph_handoff(
     published_nodes.to_file(output_nodes, driver="GPKG")
     reference_centerline.to_file(output_centerline, driver="GPKG")
     network_centerlines.to_file(output_network_centerlines, driver="GPKG")
-    pd.DataFrame.from_records(width_sample_records).to_csv(rivgraph_dir / f"{run_name}_link_width_samples.csv", index=False)
+    width_samples = pd.DataFrame.from_records(width_sample_records)
+    source_key_columns = ["panel_id", "source_link_id", "source_pixel_index"]
+    if width_samples.duplicated(source_key_columns).any():
+        raise ValueError("Panelized handoff contains duplicate source width-sample assignments.")
+    width_samples.to_csv(rivgraph_dir / f"{run_name}_link_width_samples.csv", index=False)
     manifest = {
         "mode": "panelized",
         "links": str(output_links),
@@ -850,6 +921,10 @@ def publish_panelized_rivgraph_handoff(
         "centerline": str(output_centerline),
         "network_centerlines": str(output_network_centerlines),
         "link_width_samples": str(rivgraph_dir / f"{run_name}_link_width_samples.csv"),
+        "width_sample_count": int(len(width_samples)),
+        "unique_source_width_sample_count": int(
+            width_samples[source_key_columns].drop_duplicates().shape[0]
+        ),
         "unavailable_full_mask_products": ["skeleton", "distance_transform", "link_directions_raster"],
     }
     (rivgraph_dir / f"{run_name}_panelized_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")

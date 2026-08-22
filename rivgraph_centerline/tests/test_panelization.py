@@ -16,6 +16,8 @@ if str(SRC_ROOT) not in sys.path:
 
 from rivgraph_centerline.panelization import (
     _build_panelized_reference_centerline,
+    _core_owned_width_samples,
+    _material_source_segment_ids,
     _ordered_panel_exit_config,
     _provisional_panel_grid,
     assign_core_network_direction,
@@ -25,6 +27,70 @@ from rivgraph_centerline.panelization import (
     rebuild_core_network_nodes,
     write_panelized_mask_mosaic,
 )
+
+
+def test_split_merged_parts_keep_only_materially_overlapping_source_segments() -> None:
+    crs = "EPSG:32611"
+    source_segments = gpd.GeoDataFrame(
+        {"segment_id": ["P001:1:0", "P002:2:0", "P003:3:0"]},
+        geometry=[
+            LineString([(0, 0), (10, 0)]),
+            LineString([(10, 0), (20, 0)]),
+            LineString([(20, 0), (30, 0)]),
+        ],
+        crs=crs,
+    )
+
+    assert _material_source_segment_ids(
+        LineString([(0, 0), (10, 0)]), source_segments
+    ) == ["P001:1:0"]
+    assert _material_source_segment_ids(
+        LineString([(10, 0), (30, 0)]), source_segments
+    ) == ["P002:2:0", "P003:3:0"]
+
+
+def test_core_owned_width_samples_do_not_spill_beyond_merged_part(tmp_path: Path) -> None:
+    panel_root = tmp_path / "panels"
+    panel_dir = panel_root / "P001"
+    panel_dir.mkdir(parents=True)
+    profile = {
+        "driver": "GTiff",
+        "height": 1,
+        "width": 3,
+        "count": 1,
+        "dtype": "uint8",
+        "crs": "EPSG:32611",
+        "transform": from_origin(0, 1, 1, 1),
+    }
+    with rasterio.open(panel_dir / "mask.tif", "w", **profile) as target:
+        target.write(np.ones((1, 3), dtype="uint8"), 1)
+    segment = gpd.GeoDataFrame(
+        {
+            "segment_id": ["P001:1:0"],
+            "panel_id": ["P001"],
+            "source_link_id": [1],
+        },
+        geometry=[LineString([(0.5, 0.5), (2.5, 0.5)])],
+        crs="EPSG:32611",
+    ).iloc[0]
+    source_rows = {
+        ("P001", 1): {
+            "wid_pix": "10, 20, 30",
+            "idx_link": "0, 1, 2",
+        }
+    }
+
+    widths, coordinates, provenance = _core_owned_width_samples(
+        merged_geometry=LineString([(0.5, 0.5), (1.5, 0.5)]),
+        source_segments=[segment],
+        source_rows=source_rows,
+        panel_root=panel_root,
+        excluded_sample_keys={("P001", 1, 0)},
+    )
+
+    assert widths == [20.0]
+    assert coordinates == [(1.5, 0.5)]
+    assert [row["source_pixel_index"] for row in provenance] == [1]
 
 
 def test_panel_breaks_and_plan_create_four_irregular_core_outputs(tmp_path: Path) -> None:

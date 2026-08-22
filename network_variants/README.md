@@ -682,6 +682,13 @@ The same invariant is checked again before a new or cached reference section is
 used for BASED. This strict rule does not apply to normal base and child
 networks, where genuine multi-channel units are expected.
 
+When a panel merge group resolves into multiple final link parts, each part
+retains only the source panel segments with material linear overlap. Width
+samples are additionally clipped to that final part and a source pixel may be
+assigned to only one merged link. The panelized manifest records both the total
+and unique source-sample counts so accidental cross-link duplication fails
+before the expensive two-bank width calculation begins.
+
 Hierarchy detection treats validated `id_us_node` and `id_ds_node` as the
 authoritative flow direction. `id_nodes` remains an endpoint field and is
 normalized to the validated order in new panelized outputs. Reused base states
