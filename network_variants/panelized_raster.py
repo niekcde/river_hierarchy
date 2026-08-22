@@ -1060,6 +1060,7 @@ def merge_panelized_state(
     run_name: str,
     output_root: str | Path,
     parent_directed_links_path: str | Path | None = None,
+    require_single_source_sink_path: bool = False,
 ) -> dict[str, str]:
     """Merge a mixed reused/regenerated panel workspace into a directed state."""
     from rivgraph_centerline.panelization import (
@@ -1098,6 +1099,7 @@ def merge_panelized_state(
             if parent_directed_links_path is not None
             else None
         ),
+        require_single_source_sink_path=bool(require_single_source_sink_path),
         overwrite=True,
     )
     rivgraph_dir = output_root / "rivgraph"
@@ -1249,6 +1251,7 @@ def materialize_panelized_child_state(
     parent_directed_links_path: str | Path | None = None,
     materialize_full_mask: bool = True,
     all_touched: bool = True,
+    require_single_source_sink_path: bool = False,
 ) -> dict[str, object]:
     """Materialize one child state from a footprint using only affected panels."""
     source_panel_root, state_root = Path(source_panel_root), Path(state_root)
@@ -1271,6 +1274,7 @@ def materialize_panelized_child_state(
         run_name=run_name,
         output_root=state_root / "merged",
         parent_directed_links_path=parent_directed_links_path,
+        require_single_source_sink_path=bool(require_single_source_sink_path),
     )
     if materialize_full_mask:
         collapsed_mask = write_panelized_state_mosaic(parent_mask_path=parent_mask_path, panel_plan_path=panel_plan_path, state_panel_root=state_panels, affected_panel_ids=plan["affected"], output_mask_path=state_root / "mask" / "collapsed_mask.tif")

@@ -26,7 +26,11 @@ from hierarchy_level_definition.metrics import (
     compute_unit_metrics,
     summarize_by_hierarchy_level,
 )
-from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import analyze_network, load_network
+from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import (
+    DIRECTED_GRAPH_SCHEMA_VERSION,
+    analyze_network,
+    load_network,
+)
 
 
 @dataclass
@@ -286,6 +290,7 @@ def write_unit_workflow_outputs(
         "optimal_n_groups": optimal_n_groups,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "code_version": _git_revision(),
+        "directed_graph_schema": DIRECTED_GRAPH_SCHEMA_VERSION,
         **metrics_config,
         **collapse_config,
         "equivalent_resistance_config": equivalent_resistance_config,

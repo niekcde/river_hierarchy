@@ -36,6 +36,9 @@ from hierarchy_level_definition.run_unit_workflow import (
     run_unit_workflow,
     write_unit_workflow_outputs,
 )
+from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import (
+    DIRECTED_GRAPH_SCHEMA_VERSION,
+)
 from hierarchy_level_definition.metrics import (
     BubbleEquivalentResistanceConfig,
     LENGTH_FIELD_CANDIDATES,
@@ -2288,6 +2291,18 @@ def _load_unit_workflow_outputs(output_dir: str | Path) -> UnitWorkflowOutputs:
     return UnitWorkflowOutputs(**frames)
 
 
+def _hierarchy_uses_current_directed_graph_schema(source_variant_dir: str | Path) -> bool:
+    manifest_path = (
+        Path(source_variant_dir).resolve().parent
+        / "hierarchy"
+        / "unit_workflow_manifest.json"
+    )
+    if not manifest_path.exists():
+        return False
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return manifest.get("directed_graph_schema") == DIRECTED_GRAPH_SCHEMA_VERSION
+
+
 def _copy_completed_base_state_products(
     *,
     source_variant_dir: str | Path,
@@ -2841,6 +2856,74 @@ def _build_unit_link_membership(
     return membership, link_summary
 
 
+def _refresh_reused_base_unit_metadata(
+    *,
+    variant_outputs: BaseStateVariantOutputs,
+    workflow: UnitWorkflowOutputs,
+) -> None:
+    """Replace stale copied unit annotations without recomputing base widths."""
+    membership, link_summary = _build_unit_link_membership(
+        path_metrics=workflow.path_metrics,
+        unit_metrics=workflow.unit_metrics,
+    )
+    summary_dir = Path(variant_outputs.output_dir) / "summary"
+    width_dir = Path(variant_outputs.output_dir) / "widths"
+    membership.to_csv(summary_dir / "unit_link_membership.csv", index=False)
+    metadata_columns = [column for column in link_summary.columns if column != "id_link"]
+
+    def refreshed(frame: pd.DataFrame) -> pd.DataFrame:
+        result = frame.drop(columns=metadata_columns, errors="ignore").merge(
+            link_summary,
+            on="id_link",
+            how="left",
+            validate="1:1",
+        )
+        for column, default in (
+            ("unit_ids", ""),
+            ("n_units", 0),
+            ("root_unit_ids", ""),
+            ("collapse_levels", ""),
+            ("compound_unit_ids", ""),
+            ("compound_bubble_ids", ""),
+            ("unit_classes", ""),
+            ("unit_topodynamic_classes", ""),
+        ):
+            if column not in result.columns:
+                result[column] = default
+            elif column == "n_units":
+                result[column] = (
+                    pd.to_numeric(result[column], errors="coerce").fillna(0).astype(int)
+                )
+            else:
+                result[column] = result[column].astype("string").fillna(default)
+        if {"id_nodes", "id_us_node", "id_ds_node"}.issubset(result.columns):
+            complete = result[["id_us_node", "id_ds_node"]].notna().all(axis=1)
+            result.loc[complete, "id_nodes"] = [
+                f"{int(upstream)}, {int(downstream)}"
+                for upstream, downstream in zip(
+                    result.loc[complete, "id_us_node"],
+                    result.loc[complete, "id_ds_node"],
+                )
+            ]
+        return result
+
+    for path in (
+        Path(variant_outputs.directed_links_path),
+        width_dir / "links_with_width_families.gpkg",
+    ):
+        if not path.exists():
+            continue
+        frame = refreshed(gpd.read_file(path))
+        path.unlink()
+        gpd.GeoDataFrame(frame, geometry="geometry", crs=frame.crs).to_file(
+            path,
+            driver="GPKG",
+        )
+    family_path = width_dir / "link_width_families.csv"
+    if family_path.exists():
+        refreshed(pd.read_csv(family_path)).to_csv(family_path, index=False)
+
+
 def _selected_unit_link_ids(path_metrics: pd.DataFrame, unit_ids: Sequence[int]) -> list[int]:
     """Resolve selected units to the reviewed-link IDs recorded by hierarchy paths."""
     selected = path_metrics.loc[path_metrics["unit_id"].astype(int).isin([int(unit_id) for unit_id in unit_ids])]
@@ -3027,6 +3110,9 @@ def _make_panelized_child_runner(
                 != "virtual_patch"
             ),
             all_touched=bool(kwargs.get("all_touched", True)),
+            require_single_source_sink_path=bool(
+                kwargs.get("require_single_source_sink_path", False)
+            ),
         )
         return _finalize_panelized_child_result(
             panelized_result=result,
@@ -3119,6 +3205,7 @@ def _make_panelized_reference_section_builder(
             sword_reach_buffer_steps=sword_reach_buffer_steps,
             panelized_path_metrics=base_context.hierarchy_output_dir / "path_metrics.csv",
             panelized_mask_publication="virtual_patch",
+            require_single_source_sink_path=True,
         )
         return {
             "construction_backend": "panelized",
@@ -4111,6 +4198,7 @@ def run_collapse_experiment(
     reused_base_experiment_dir: Path | None = None
     reused_base_manifest: dict[str, Any] | None = None
     base_reuse_compatibility_validated = False
+    base_reuse_hierarchy_schema_current = True
     if base_state_variant_source_dir is not None:
         reused_base_experiment_dir = _source_experiment_dir_from_base_variant(
             base_state_variant_source_dir
@@ -4122,6 +4210,11 @@ def run_collapse_experiment(
                 f"{source_manifest_path}"
             )
         reused_base_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        base_reuse_hierarchy_schema_current = (
+            _hierarchy_uses_current_directed_graph_schema(
+                base_state_variant_source_dir
+            )
+        )
         missing_base_artifacts = _missing_completed_base_state_artifacts(
             base_state_variant_source_dir
         )
@@ -4429,7 +4522,27 @@ def run_collapse_experiment(
         variant_output_dir=base_variant_outputs.output_dir,
         directed_links_path=base_variant_outputs.directed_links_path,
     )
-    if reused_base_workflow is not None:
+    if reused_base_workflow is not None and not base_reuse_hierarchy_schema_current:
+        base_context = _run_state_hierarchy(
+            state_id=base_state_id,
+            parent_state_id=None,
+            depth=0,
+            state_dir=states_dir / base_state_id,
+            cleaned_mask_path=base_variant_outputs.collapsed_mask_path,
+            reviewed_links_path=base_analysis_links_path,
+            reviewed_nodes_path=base_variant_outputs.directed_nodes_path,
+            directed_links_path=base_variant_outputs.directed_links_path,
+            selection=None,
+            unit_workflow_runner=unit_workflow_runner,
+            unit_workflow_writer=unit_workflow_writer,
+            unit_workflow_kwargs=unit_workflow_kwargs,
+        )
+        _refresh_reused_base_unit_metadata(
+            variant_outputs=base_variant_outputs,
+            workflow=base_context.workflow,
+        )
+        reused_base_workflow = None
+    elif reused_base_workflow is not None:
         base_context.cleaned_mask_path = base_variant_outputs.collapsed_mask_path
         base_context.reviewed_links_path = base_variant_outputs.directed_links_path
         base_context.reviewed_nodes_path = base_variant_outputs.directed_nodes_path
@@ -4621,6 +4734,13 @@ def run_collapse_experiment(
                 "variant_reused": base_state_variant_source_dir is not None,
                 "hierarchy_reused": reused_base_workflow is not None,
                 "hydraulic_context_reused": reused_base_workflow is not None,
+                "hierarchy_schema_current": bool(
+                    base_reuse_hierarchy_schema_current
+                ),
+                "hierarchy_recomputed_for_schema": bool(
+                    base_state_variant_source_dir is not None
+                    and not base_reuse_hierarchy_schema_current
+                ),
                 "boundary_components_reused": boundary_component_artifact_source_dir is not None,
                 "solver_cache_seeded": bool(
                     reused_base_experiment_dir is not None

@@ -34,10 +34,25 @@ from rapid_tools.reference_section import (
     _build_reference_section_variant,
     _load_width_summary,
     _reference_section_paths,
+    _validate_single_source_sink_path,
     compute_reference_section_kb,
     ensure_reference_section_geometry,
 )
 from rapid_tools.slope import SlopeConfig, compute_link_slopes
+
+
+def _write_single_path_graph(links_path: Path, nodes_path: Path) -> None:
+    crs = "EPSG:32631"
+    gpd.GeoDataFrame(
+        {"id_link": [10], "id_us_node": [1], "id_ds_node": [2]},
+        geometry=[LineString([(0, 0), (10, 0)])],
+        crs=crs,
+    ).to_file(links_path, driver="GPKG")
+    gpd.GeoDataFrame(
+        {"id_node": [1, 2]},
+        geometry=[Point(0, 0), Point(10, 0)],
+        crs=crs,
+    ).to_file(nodes_path, driver="GPKG")
 
 
 def _write_state(
@@ -300,8 +315,7 @@ def test_reference_section_cache_refreshes_width_summary_without_rebuilding_vari
     )
     directed_links_path = directed_dir / "links.gpkg"
     directed_nodes_path = directed_dir / "nodes.gpkg"
-    directed_links_path.touch()
-    directed_nodes_path.touch()
+    _write_single_path_graph(directed_links_path, directed_nodes_path)
 
     summary_path = reference_dir / "reference_section_summary.json"
     summary_path.write_text(
@@ -369,8 +383,7 @@ def test_reference_section_geometry_uses_injected_panelized_builder(
         )
         links_path = directed / "links.gpkg"
         nodes_path = directed / "nodes.gpkg"
-        links_path.touch()
-        nodes_path.touch()
+        _write_single_path_graph(links_path, nodes_path)
         return {
             "construction_backend": "panelized",
             "example_id": "41",
@@ -386,10 +399,6 @@ def test_reference_section_geometry_uses_injected_panelized_builder(
             "manifest_path": variant_dir / "summary" / "variant_manifest.json",
         }
 
-    monkeypatch.setattr(
-        "rapid_tools.reference_section.gpd.read_file",
-        lambda path: gpd.GeoDataFrame({"id_node": [1, 2]}, geometry=[None, None]),
-    )
     monkeypatch.setattr(
         "rapid_tools.reference_section.compute_section_slope_reference",
         lambda nodes, config: {
@@ -410,6 +419,32 @@ def test_reference_section_geometry_uses_injected_panelized_builder(
     assert summary["construction_backend"] == "panelized"
     assert summary["n_reference_units_collapsed"] == 2
     assert summary["width_summary"]["width_reference_m"] == 310.0
+
+
+def test_reference_section_rejects_parallel_source_to_sink_paths(tmp_path: Path) -> None:
+    links_path = tmp_path / "links.gpkg"
+    nodes_path = tmp_path / "nodes.gpkg"
+    crs = "EPSG:32631"
+    gpd.GeoDataFrame(
+        {
+            "id_link": [10, 11],
+            "id_us_node": [1, 1],
+            "id_ds_node": [2, 2],
+        },
+        geometry=[
+            LineString([(0, 0), (10, 0)]),
+            LineString([(0, 0), (5, 1), (10, 0)]),
+        ],
+        crs=crs,
+    ).to_file(links_path, driver="GPKG")
+    gpd.GeoDataFrame(
+        {"id_node": [1, 2]},
+        geometry=[Point(0, 0), Point(10, 0)],
+        crs=crs,
+    ).to_file(nodes_path, driver="GPKG")
+
+    with pytest.raises(ValueError, match="exactly one directed source-to-sink path"):
+        _validate_single_source_sink_path(links_path, nodes_path)
 
 
 def test_reference_section_kb_accepts_direct_summary_without_percentile(

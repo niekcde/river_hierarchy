@@ -12,6 +12,9 @@ from shapely.ops import unary_union
 
 from hierarchy_level_definition.metrics import BubbleEquivalentResistanceConfig
 from hierarchy_level_definition.run_unit_workflow import UnitWorkflowOutputs, write_unit_workflow_outputs
+from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import (
+    DIRECTED_GRAPH_SCHEMA_VERSION,
+)
 import network_variants.collapse_experiment as collapse_experiment_module
 from network_variants.collapse_experiment import (
     BaseStateVariantOutputs,
@@ -119,8 +122,31 @@ def test_panelized_reference_section_builder_collapses_every_base_unit(
     assert calls[0]["collapse_corridor_mode"] == "realized"
     assert calls[0]["panelized_mask_publication"] == "virtual_patch"
     assert calls[0]["selection_type"] == "reference_section_all_units"
+    assert calls[0]["require_single_source_sink_path"] is True
     assert summary["construction_backend"] == "panelized"
     assert summary["unit_ids"] == [3, 7, 11]
+
+
+def test_reused_hierarchy_schema_must_match_current_version(tmp_path: Path) -> None:
+    variant_dir = tmp_path / "states" / "S000_base" / "variant"
+    hierarchy_dir = variant_dir.parent / "hierarchy"
+    hierarchy_dir.mkdir(parents=True)
+    manifest = hierarchy_dir / "unit_workflow_manifest.json"
+
+    assert not collapse_experiment_module._hierarchy_uses_current_directed_graph_schema(
+        variant_dir
+    )
+    manifest.write_text(json.dumps({"directed_graph_schema": "legacy"}), encoding="utf-8")
+    assert not collapse_experiment_module._hierarchy_uses_current_directed_graph_schema(
+        variant_dir
+    )
+    manifest.write_text(
+        json.dumps({"directed_graph_schema": DIRECTED_GRAPH_SCHEMA_VERSION}),
+        encoding="utf-8",
+    )
+    assert collapse_experiment_module._hierarchy_uses_current_directed_graph_schema(
+        variant_dir
+    )
 
 
 @pytest.mark.parametrize("reset_name", ["_reset_state_dir", "_reset_experiment_output_dir"])

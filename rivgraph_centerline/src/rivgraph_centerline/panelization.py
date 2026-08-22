@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import geopandas as gpd
+import networkx as nx
 import numpy as np
 import pandas as pd
 import rasterio
@@ -458,6 +459,7 @@ def assign_core_network_direction(
     run_name: str,
     output_dir: Path,
     fallback_directed_links_path: Path | None = None,
+    require_single_source_sink_path: bool = False,
     endpoint_tolerance_m: float = 0.01,
     overwrite: bool = False,
 ) -> dict[str, object]:
@@ -580,6 +582,110 @@ def assign_core_network_direction(
     result["id_ds_node"] = pd.array(downstream_ids, dtype="Int64")
     result["direction_status"] = status
     result = gpd.GeoDataFrame(result, geometry=geometries, crs=links.crs)
+
+    global_path_assigned: list[int] = []
+    global_path_overridden: list[int] = []
+    if require_single_source_sink_path:
+        if fallback_links is None:
+            raise ValueError(
+                "Single-path panel direction completion requires a directed parent network."
+            )
+        parent_sources = sorted(
+            set(fallback_links["id_us_node"].astype(int)).difference(
+                fallback_links["id_ds_node"].astype(int)
+            )
+        )
+        parent_sinks = sorted(
+            set(fallback_links["id_ds_node"].astype(int)).difference(
+                fallback_links["id_us_node"].astype(int)
+            )
+        )
+        if len(parent_sources) != 1 or len(parent_sinks) != 1:
+            raise ValueError(
+                "Single-path panel direction completion requires exactly one parent "
+                f"source and sink; found sources={parent_sources}, sinks={parent_sinks}."
+            )
+
+        node_points: dict[int, Point] = {}
+        for row in links.itertuples(index=False):
+            node_points.setdefault(int(row.id_node_a), Point(row.geometry.coords[0]))
+            node_points.setdefault(int(row.id_node_b), Point(row.geometry.coords[-1]))
+        degree_graph = nx.MultiGraph()
+        for row in links.itertuples(index=False):
+            degree_graph.add_edge(
+                int(row.id_node_a),
+                int(row.id_node_b),
+                key=int(row.global_link_id),
+            )
+        if not nx.is_connected(degree_graph):
+            raise ValueError("Collapsed reference-section merge is not connected.")
+        endpoints = sorted(node for node in degree_graph if degree_graph.degree(node) == 1)
+        internal_bad = sorted(
+            node for node in degree_graph
+            if degree_graph.degree(node) not in {1, 2}
+        )
+        if (
+            len(endpoints) != 2
+            or internal_bad
+            or degree_graph.number_of_edges() != degree_graph.number_of_nodes() - 1
+        ):
+            raise ValueError(
+                "Collapsed reference-section merge is not a single undirected path: "
+                f"endpoints={endpoints}, non_path_degree_nodes={internal_bad}, "
+                f"nodes={degree_graph.number_of_nodes()}, edges={degree_graph.number_of_edges()}."
+            )
+
+        def parent_boundary_point(node_id: int, *, upstream: bool) -> Point:
+            field = "id_us_node" if upstream else "id_ds_node"
+            matches = fallback_links.loc[fallback_links[field].astype(int).eq(node_id)]
+            row = matches.iloc[0]
+            coordinates = list(row.geometry.coords)
+            return Point(coordinates[0] if upstream else coordinates[-1])
+
+        parent_source_point = parent_boundary_point(parent_sources[0], upstream=True)
+        parent_sink_point = parent_boundary_point(parent_sinks[0], upstream=False)
+        source_node = min(endpoints, key=lambda node: node_points[node].distance(parent_source_point))
+        sink_node = min(endpoints, key=lambda node: node_points[node].distance(parent_sink_point))
+        if source_node == sink_node:
+            raise ValueError("Parent source and sink mapped to the same merged endpoint.")
+        boundary_tolerance = max(float(endpoint_tolerance_m), 0.01)
+        if (
+            node_points[source_node].distance(parent_source_point) > boundary_tolerance
+            or node_points[sink_node].distance(parent_sink_point) > boundary_tolerance
+        ):
+            raise ValueError(
+                "Collapsed reference-section endpoints do not match the directed parent "
+                "source and sink within the merge tolerance."
+            )
+
+        node_path = nx.shortest_path(nx.Graph(degree_graph), source_node, sink_node)
+        order = {node: index for index, node in enumerate(node_path)}
+        original_geometry = links.set_index("global_link_id").geometry
+        for index, row in result.iterrows():
+            first, second = int(row.id_node_a), int(row.id_node_b)
+            if abs(order[first] - order[second]) != 1:
+                raise ValueError(
+                    f"Merged link {row.global_link_id} does not connect adjacent nodes "
+                    "on the sole source-to-sink path."
+                )
+            expected_us, expected_ds = (
+                (first, second) if order[first] < order[second] else (second, first)
+            )
+            old_us = row.id_us_node
+            if pd.isna(old_us):
+                result.at[index, "direction_status"] = "global_single_path"
+                global_path_assigned.append(int(row.global_link_id))
+            elif int(old_us) != expected_us:
+                result.at[index, "direction_status"] = "global_single_path_override"
+                global_path_overridden.append(int(row.global_link_id))
+            result.at[index, "id_us_node"] = expected_us
+            result.at[index, "id_ds_node"] = expected_ds
+            geometry = original_geometry.loc[int(row.global_link_id)]
+            coordinates = list(geometry.coords)
+            result.at[index, "geometry"] = (
+                geometry if expected_us == first else LineString(coordinates[::-1])
+            )
+        ambiguous = []
     output_dir.mkdir(parents=True, exist_ok=True)
     result.to_file(directed_output, layer="merged_links", driver="GPKG")
     report = {
@@ -588,6 +694,11 @@ def assign_core_network_direction(
         "panel_vote_assigned_link_count": int((result.direction_status == "assigned").sum()),
         "parent_inherited_link_count": len(inherited),
         "parent_inherited_global_link_ids": inherited,
+        "global_single_path_assigned_link_count": len(global_path_assigned),
+        "global_single_path_assigned_global_link_ids": global_path_assigned,
+        "global_single_path_override_link_count": len(global_path_overridden),
+        "global_single_path_override_global_link_ids": global_path_overridden,
+        "single_source_sink_path_required": bool(require_single_source_sink_path),
         "ambiguous_link_count": len(ambiguous),
         "ambiguous_global_link_ids": ambiguous,
         "output": str(directed_output),
@@ -651,7 +762,7 @@ def publish_panelized_rivgraph_handoff(
             # Global raster indices do not exist for a panelized handoff.
             # Keep RivGraph's string field type and mark the value unavailable.
             "idx_link": "",
-            "id_nodes": f"{int(row.id_node_a)}, {int(row.id_node_b)}",
+            "id_nodes": f"{int(row.id_us_node)}, {int(row.id_ds_node)}",
             "n_nodes": 2,
             "id_us_node": int(row.id_us_node),
             "id_ds_node": int(row.id_ds_node),

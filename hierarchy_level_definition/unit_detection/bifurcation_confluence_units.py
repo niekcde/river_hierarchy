@@ -11,6 +11,9 @@ import networkx as nx
 import pandas as pd
 
 
+DIRECTED_GRAPH_SCHEMA_VERSION = "validated-us-ds-v1"
+
+
 @dataclass
 class UnitPath:
     path_id: int
@@ -159,9 +162,30 @@ def build_graph(
         node_id = int(attrs["id_node"])
         graph.add_node(node_id, **attrs)
 
+    has_upstream = "id_us_node" in links.columns
+    has_downstream = "id_ds_node" in links.columns
+    if has_upstream != has_downstream:
+        raise ValueError(
+            "Directed graph construction requires both id_us_node and id_ds_node "
+            "when either field is present."
+        )
+
     for row in links.itertuples(index=False):
         attrs = row._asdict()
-        u, v = parse_id_nodes(attrs["id_nodes"])
+        stored_u, stored_v = parse_id_nodes(attrs["id_nodes"])
+        if has_upstream:
+            if pd.isna(attrs["id_us_node"]) or pd.isna(attrs["id_ds_node"]):
+                raise ValueError(
+                    f"Link {attrs.get('id_link')} has incomplete validated direction fields."
+                )
+            u, v = int(attrs["id_us_node"]), int(attrs["id_ds_node"])
+            if sorted((stored_u, stored_v)) != sorted((u, v)):
+                raise ValueError(
+                    f"Link {attrs.get('id_link')} has inconsistent endpoints: "
+                    f"id_nodes={attrs['id_nodes']!r}, id_us_node={u}, id_ds_node={v}."
+                )
+        else:
+            u, v = stored_u, stored_v
         edge_key = int(attrs["id_link"])
         graph.add_edge(u, v, key=edge_key, **attrs)
 

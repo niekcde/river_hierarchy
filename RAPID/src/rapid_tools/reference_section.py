@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import geopandas as gpd
+import networkx as nx
 import numpy as np
 import pandas as pd
 
@@ -31,6 +32,78 @@ BASED_PAPER_DOI = "https://doi.org/10.1038/s41586-024-07964-2"
 
 def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
+
+
+def _validate_single_source_sink_path(
+    directed_links_path: str | Path,
+    directed_nodes_path: str | Path,
+) -> dict[str, Any]:
+    """Require the all-units reference product to be one complete directed path."""
+    links = gpd.read_file(directed_links_path)
+    nodes = gpd.read_file(directed_nodes_path)
+    required = {"id_link", "id_us_node", "id_ds_node"}
+    missing = required.difference(links.columns)
+    if missing:
+        raise ValueError(
+            "Reference-section links are missing directed graph fields: "
+            f"{sorted(missing)}."
+        )
+    if links.empty or nodes.empty:
+        raise ValueError("Reference-section graph must contain links and nodes.")
+    if links[["id_us_node", "id_ds_node"]].isna().any().any():
+        raise ValueError("Reference-section graph contains unresolved link directions.")
+
+    graph = nx.MultiDiGraph()
+    graph.add_nodes_from(nodes["id_node"].astype(int).tolist())
+    for row in links.itertuples(index=False):
+        graph.add_edge(
+            int(row.id_us_node),
+            int(row.id_ds_node),
+            key=int(row.id_link),
+        )
+    if not nx.is_weakly_connected(graph):
+        raise ValueError("Reference-section graph is not weakly connected.")
+    if not nx.is_directed_acyclic_graph(nx.DiGraph(graph)):
+        raise ValueError("Reference-section graph is not a DAG.")
+    sources = sorted(node for node in graph if graph.in_degree(node) == 0)
+    sinks = sorted(node for node in graph if graph.out_degree(node) == 0)
+    if len(sources) != 1 or len(sinks) != 1:
+        raise ValueError(
+            "Reference-section graph must have exactly one source and one sink; "
+            f"found sources={sources}, sinks={sinks}."
+        )
+
+    paths = []
+    for edge_path in nx.all_simple_edge_paths(graph, sources[0], sinks[0]):
+        paths.append(edge_path)
+        if len(paths) > 1:
+            break
+    if len(paths) != 1:
+        raise ValueError(
+            "Reference-section graph must contain exactly one directed source-to-sink "
+            f"path; found {'more than one' if len(paths) > 1 else 'none'}."
+        )
+    edge_path = paths[0]
+    path_nodes = {sources[0], sinks[0]}
+    path_link_ids: list[int] = []
+    for upstream, downstream, key in edge_path:
+        path_nodes.update((int(upstream), int(downstream)))
+        path_link_ids.append(int(key))
+    if len(edge_path) != graph.number_of_edges() or path_nodes != set(graph.nodes):
+        raise ValueError(
+            "Reference-section graph contains links or nodes outside its sole "
+            "source-to-sink path."
+        )
+    return {
+        "is_valid": True,
+        "source_node_id": int(sources[0]),
+        "sink_node_id": int(sinks[0]),
+        "path_count": 1,
+        "path_link_count": int(len(path_link_ids)),
+        "path_link_ids": path_link_ids,
+        "node_count": int(graph.number_of_nodes()),
+        "link_count": int(graph.number_of_edges()),
+    }
 
 
 def _ensure_repo_imports() -> None:
@@ -307,6 +380,10 @@ def ensure_reference_section_geometry(
             required.append(Path(raw))
         if required and all(path.exists() for path in required):
             variant_output_dir = Path(str(cached_paths["variant_output_dir"])).expanduser().resolve()
+            path_validation = _validate_single_source_sink_path(
+                cached_paths["directed_links_path"],
+                cached_paths["directed_nodes_path"],
+            )
             refreshed_width_summary = _load_width_summary(
                 Path(str(cached_paths["link_width_samples_path"])).expanduser().resolve(),
                 variant_output_dir / "widths" / "link_width_families.csv",
@@ -315,7 +392,9 @@ def ensure_reference_section_geometry(
             )
             if cached.get("width_summary") != refreshed_width_summary:
                 cached["width_summary"] = refreshed_width_summary
-                reference_paths["geometry_summary"].write_text(json.dumps(cached, indent=2))
+            if cached.get("path_validation") != path_validation:
+                cached["path_validation"] = path_validation
+            reference_paths["geometry_summary"].write_text(json.dumps(cached, indent=2))
             return cached
 
     builder = variant_builder or _build_reference_section_variant
@@ -326,6 +405,10 @@ def ensure_reference_section_geometry(
         reference_paths=reference_paths,
     ))
     nodes = gpd.read_file(variant_summary["directed_nodes_path"])
+    path_validation = _validate_single_source_sink_path(
+        variant_summary["directed_links_path"],
+        variant_summary["directed_nodes_path"],
+    )
     variant_output_dir = Path(variant_summary["variant_output_dir"])
     width_summary = _load_width_summary(
         Path(variant_summary["link_width_samples_path"]),
@@ -342,6 +425,7 @@ def ensure_reference_section_geometry(
             variant_summary.get("construction_backend", "full_raster")
         ),
         "single_thread": True,
+        "path_validation": path_validation,
         "exit_sides": variant_summary["exit_sides"],
         "n_reference_units_collapsed": int(len(variant_summary["unit_ids"])),
         "reference_unit_ids": variant_summary["unit_ids"],

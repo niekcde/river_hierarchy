@@ -668,10 +668,32 @@ base also constructs the all-units reference section through the panelized
 collapse and boundary-merge workflow. The reference section is one special
 `realized` selection containing every detected base unit; it does not use the
 local-patch backend because its footprint spans the network. The resulting
-width, slope, forcing, and BASED calculations are unchanged. Until both
-reference-section summaries have been written, the experiment manifest records
-`stop_reason: reference_kb_prepass_pending` and does not constitute a reusable
-hydraulic base.
+width, slope, forcing, and BASED calculations are unchanged.
+
+The all-units reference product has a stricter graph contract than an ordinary
+variant: after every detected unit has been collapsed, **every link and node
+must belong to exactly one directed source-to-sink path**. Panel direction
+votes and exact parent matches are used first. If those local assignments leave
+ties, the merger may complete or correct their direction only when the complete
+merged graph is already a unique undirected path whose endpoints coincide with
+the parent's unique source and sink. Parallel sections, branches, cycles,
+disconnected fragments, additional sources/sinks, or unused links are rejected.
+The same invariant is checked again before a new or cached reference section is
+used for BASED. This strict rule does not apply to normal base and child
+networks, where genuine multi-channel units are expected.
+
+Hierarchy detection treats validated `id_us_node` and `id_ds_node` as the
+authoritative flow direction. `id_nodes` remains an endpoint field and is
+normalized to the validated order in new panelized outputs. Reused base states
+whose hierarchy manifest predates this directed-graph schema retain their
+expensive raster-derived widths, but their hierarchy annotations and dependent
+hydraulic context are rebuilt once. This prevents an old reversed `id_nodes`
+string from hiding an outer unit and leaving parallel paths in the fully
+collapsed reference section.
+
+Until both reference-section summaries have been written, the experiment
+manifest records `stop_reason: reference_kb_prepass_pending` and does not
+constitute a reusable hydraulic base.
 
 ### Reusing a completed base state
 
@@ -710,7 +732,9 @@ Omitting this option keeps the fully independent behavior and recalculates the
 compound experiment's base. Supplying it avoids repeating width measurement,
 hierarchy detection, SWORD matching, slopes, hydraulic context, reference
 geometry, and the base resistance solve. Child states are still generated and
-solved normally.
+solved normally. The sole exception is a base created with an older hierarchy
+direction schema: its masks and widths are still reused, while hierarchy and
+dependent hydraulic products are refreshed under the current schema.
 
 ### Recommended Parent Review Workflow
 
