@@ -261,6 +261,24 @@ def _replace_text(value: str, replacements: Sequence[tuple[str, str]]) -> str:
     return result
 
 
+def _promotion_replacements(
+    *,
+    repair: Path,
+    target: Path,
+    item: PromotionItem,
+) -> tuple[tuple[str, str], ...]:
+    return (
+        (str(item.repair_state_dir), str(item.target_state_dir)),
+        (str(repair), str(target)),
+        (
+            f"network_variants/output/repairs/{repair.name}",
+            f"network_variants/output/{target.name}",
+        ),
+        (item.repair_state_id, item.target_state_id),
+        (item.repair_transition_id, item.target_transition_id),
+    )
+
+
 def _rebase_frame(frame: pd.DataFrame, replacements: Sequence[tuple[str, str]]) -> pd.DataFrame:
     result = frame.copy()
     for column in result.columns:
@@ -350,6 +368,31 @@ def _atomic_write_json(value: dict[str, Any], path: Path) -> None:
     os.replace(temporary, path)
 
 
+def _update_experiment_manifest_counts(
+    manifest: dict[str, Any],
+    *,
+    states: pd.DataFrame,
+    transitions: pd.DataFrame,
+    equivalent_transitions: pd.DataFrame,
+) -> None:
+    statuses = states.get("status", pd.Series("complete", index=states.index)).fillna("complete").astype(str)
+    manifest["n_states"] = int(len(states))
+    manifest["n_complete_states"] = int(statuses.eq("complete").sum())
+    manifest["n_hierarchy_deferred_states"] = int(
+        statuses.eq("hydraulic_complete_hierarchy_deferred").sum()
+    )
+    manifest["n_failed_states"] = int(statuses.eq("failed").sum())
+    if "is_compound_state" in states:
+        manifest["n_compound_states"] = int(states["is_compound_state"].fillna(False).astype(bool).sum())
+    manifest["n_transitions"] = int(len(transitions))
+    manifest["n_equivalent_transition_rows"] = int(len(equivalent_transitions))
+    matched = pd.to_numeric(
+        transitions.get("n_equivalent_bubbles_matched", pd.Series(0, index=transitions.index)),
+        errors="coerce",
+    ).fillna(0)
+    manifest["n_equivalent_transitions_with_matches"] = int(matched.gt(0).sum())
+
+
 def _replace_registry_row(
     target: pd.DataFrame,
     repair: pd.DataFrame,
@@ -426,11 +469,10 @@ def apply_promotion_plan(
         for item in plan.items:
             staging = target / "states" / f".{item.target_state_id}.promotion-{uuid4().hex}"
             shutil.copytree(item.repair_state_dir, staging, ignore=shutil.ignore_patterns("._*"))
-            replacements = (
-                (str(item.repair_state_dir), str(item.target_state_dir)),
-                (str(repair), str(target)),
-                (item.repair_state_id, item.target_state_id),
-                (item.repair_transition_id, item.target_transition_id),
+            replacements = _promotion_replacements(
+                repair=repair,
+                target=target,
+                item=item,
             )
             _rewrite_tree(staging, replacements)
             _validate_staged_outputs(staging, item.target_state_dir)
@@ -502,6 +544,12 @@ def apply_promotion_plan(
         )
         manifest["repair_promotions"] = history
         manifest["last_repair_promotion_at"] = history[-1]["generated_at"]
+        _update_experiment_manifest_counts(
+            manifest,
+            states=target_states,
+            transitions=target_transitions,
+            equivalent_transitions=target_equivalent,
+        )
         _atomic_write_json(manifest, target / "experiment_manifest.json")
 
         if refresh_equivalent_resistance:

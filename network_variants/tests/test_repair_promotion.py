@@ -46,6 +46,16 @@ def _write_experiment(root: Path, *, state_id: str, unit_id: int, local: bool) -
     )
     _write_json(state / "variant" / "directed" / "direction_validation_report.json", {"is_valid": True})
     _write_json(state / "stage_timings.json", {"hierarchy_status": "complete"})
+    _write_json(
+        state / "hierarchy" / "unit_workflow_manifest.json",
+        {
+            "input_links_path": (
+                f"network_variants/output/repairs/{root.name}/states/{state_id}/"
+                f"variant/directed/99__{state_id}_directed_links.gpkg"
+                if local else str(output)
+            )
+        },
+    )
     (state / "old_marker.txt").write_text("repair" if local else "target", encoding="utf-8")
 
     pd.DataFrame(
@@ -135,6 +145,9 @@ def test_apply_promotion_rebases_state_and_registries_with_backup(tmp_path) -> N
     assert Path(manifest["output_paths"]["directed_links"]).exists()
     assert not list(promoted.rglob("*S001_unit_7*"))
     assert not list(promoted.rglob("._*"))
+    hierarchy_manifest = json.loads((promoted / "hierarchy" / "unit_workflow_manifest.json").read_text())
+    assert "output/target/" in hierarchy_manifest["input_links_path"]
+    assert "/repairs/" not in hierarchy_manifest["input_links_path"]
     state_registry = pd.read_csv(target / "state_registry.csv")
     child = state_registry.loc[state_registry["state_role"].eq("derived")].iloc[0]
     assert child["state_id"] == "S042_unit_7"
@@ -148,6 +161,8 @@ def test_apply_promotion_rebases_state_and_registries_with_backup(tmp_path) -> N
     assert equivalent.iloc[0]["Lambda_K"] == 1.25
     root_manifest = json.loads((target / "experiment_manifest.json").read_text())
     assert root_manifest["repair_promotions"][-1]["unit_ids"] == [7]
+    assert root_manifest["n_complete_states"] == 2
+    assert root_manifest["n_failed_states"] == 0
 
 
 def test_apply_promotion_rolls_back_state_and_metadata_when_refresh_fails(
