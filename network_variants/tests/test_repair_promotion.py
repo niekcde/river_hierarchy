@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
+import network_variants.repair_promotion as repair_promotion
 from network_variants.repair_promotion import apply_promotion_plan, build_promotion_plan
 
 
@@ -16,7 +18,7 @@ def _write_json(path: Path, value: dict) -> None:
 def _write_experiment(root: Path, *, state_id: str, unit_id: int, local: bool) -> None:
     state = root / "states" / state_id
     state.mkdir(parents=True)
-    output = state / "variant" / "directed" / "links.gpkg"
+    output = state / "variant" / "directed" / f"99__{state_id}_directed_links.gpkg"
     output.parent.mkdir(parents=True)
     output.write_text("fixture", encoding="utf-8")
     if local:
@@ -110,6 +112,9 @@ def test_apply_promotion_rebases_state_and_registries_with_backup(tmp_path) -> N
     repair.mkdir(); target.mkdir()
     _write_experiment(repair, state_id="S001_unit_7", unit_id=7, local=True)
     _write_experiment(target, state_id="S042_unit_7", unit_id=7, local=False)
+    # Failed legacy states may have no authoritative equivalent-transition row.
+    empty_equivalent = pd.read_csv(target / "equivalent_transition_registry.csv").iloc[0:0]
+    empty_equivalent.to_csv(target / "equivalent_transition_registry.csv", index=False)
     plan = build_promotion_plan(repair, target)
 
     backup = apply_promotion_plan(
@@ -125,6 +130,8 @@ def test_apply_promotion_rebases_state_and_registries_with_backup(tmp_path) -> N
     assert manifest["execution_mode_used"] == "local_patch"
     assert str(target.resolve()) in manifest["output_paths"]["directed_links"]
     assert "S042_unit_7" in manifest["output_paths"]["directed_links"]
+    assert Path(manifest["output_paths"]["directed_links"]).exists()
+    assert not list(promoted.rglob("*S001_unit_7*"))
     state_registry = pd.read_csv(target / "state_registry.csv")
     child = state_registry.loc[state_registry["state_role"].eq("derived")].iloc[0]
     assert child["state_id"] == "S042_unit_7"
@@ -139,3 +146,27 @@ def test_apply_promotion_rebases_state_and_registries_with_backup(tmp_path) -> N
     root_manifest = json.loads((target / "experiment_manifest.json").read_text())
     assert root_manifest["repair_promotions"][-1]["unit_ids"] == [7]
 
+
+def test_apply_promotion_rolls_back_state_and_metadata_when_refresh_fails(
+    tmp_path, monkeypatch
+) -> None:
+    repair = tmp_path / "repair"
+    target = tmp_path / "target"
+    repair.mkdir(); target.mkdir()
+    _write_experiment(repair, state_id="S001_unit_7", unit_id=7, local=True)
+    _write_experiment(target, state_id="S042_unit_7", unit_id=7, local=False)
+    original_registry = (target / "state_registry.csv").read_bytes()
+    original_manifest = (target / "experiment_manifest.json").read_bytes()
+    plan = build_promotion_plan(repair, target)
+
+    def fail_refresh(_target):
+        raise RuntimeError("synthetic aggregate refresh failure")
+
+    monkeypatch.setattr(repair_promotion, "_refresh_equivalent_resistance", fail_refresh)
+    with pytest.raises(RuntimeError, match="synthetic aggregate refresh failure"):
+        apply_promotion_plan(plan, backup_root=tmp_path / "backup")
+
+    restored = target / "states" / "S042_unit_7"
+    assert (restored / "old_marker.txt").read_text() == "target"
+    assert (target / "state_registry.csv").read_bytes() == original_registry
+    assert (target / "experiment_manifest.json").read_bytes() == original_manifest

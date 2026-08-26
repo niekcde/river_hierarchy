@@ -282,6 +282,41 @@ def _rewrite_tree(root: Path, replacements: Sequence[tuple[str, str]]) -> None:
         rewritten = _replace_text(text, replacements)
         if rewritten != text:
             path.write_text(rewritten, encoding="utf-8")
+    # Manifests contain canonical filenames that include the state ID.  Rebase
+    # those filesystem names as well as their textual references.  Rename
+    # bottom-up so a renamed directory never invalidates a pending child path.
+    paths = sorted(root.rglob("*"), key=lambda path: len(path.parts), reverse=True)
+    for path in paths:
+        rebased_name = _replace_text(path.name, replacements)
+        if rebased_name == path.name:
+            continue
+        destination = path.with_name(rebased_name)
+        if destination.exists():
+            raise FileExistsError(
+                f"Cannot rebase promoted artifact because the destination exists: {destination}"
+            )
+        path.rename(destination)
+
+
+def _validate_staged_outputs(staging: Path, target_state_dir: Path) -> None:
+    manifest = _load_json(staging / "variant" / "summary" / "variant_manifest.json")
+    missing: list[str] = []
+    for key, value in (manifest.get("output_paths") or {}).items():
+        if not isinstance(value, str) or not value:
+            continue
+        output = Path(value)
+        try:
+            relative = output.relative_to(target_state_dir)
+        except ValueError:
+            # Parent/base references legitimately live outside the promoted
+            # child directory and are not part of this staged state.
+            continue
+        if not (staging / relative).exists():
+            missing.append(key)
+    if missing:
+        raise ValueError(
+            f"Staged promoted state {target_state_dir.name} is missing rebased outputs: {missing}."
+        )
 
 
 def _atomic_write_csv(frame: pd.DataFrame, path: Path) -> None:
@@ -379,6 +414,7 @@ def apply_promotion_plan(
                 (item.repair_transition_id, item.target_transition_id),
             )
             _rewrite_tree(staging, replacements)
+            _validate_staged_outputs(staging, item.target_state_dir)
             staged[item.unit_id] = staging
 
             repair_state_index = repair_state_rows[item.unit_id].name
@@ -399,18 +435,28 @@ def apply_promotion_plan(
             )
 
             repair_equivalent_index = repair_equivalent_rows[item.unit_id].name
-            target_equivalent_index = target_equivalent_rows[item.unit_id].name
             repaired_eq = _rebase_frame(
                 repair_equivalent.loc[[repair_equivalent_index]], replacements
             ).iloc[0]
-            for column in target_equivalent.columns:
-                if column in repaired_eq.index:
-                    target_equivalent.at[target_equivalent_index, column] = repaired_eq[column]
-            target_equivalent.at[target_equivalent_index, "transition_id"] = item.target_transition_id
-            target_equivalent.at[target_equivalent_index, "parent_state_id"] = str(
+            repaired_eq = repaired_eq.copy()
+            repaired_eq["transition_id"] = item.target_transition_id
+            repaired_eq["parent_state_id"] = str(
                 target_transitions.at[target_transition_index, "parent_state_id"]
             )
-            target_equivalent.at[target_equivalent_index, "child_state_id"] = item.target_state_id
+            repaired_eq["child_state_id"] = item.target_state_id
+            for column in repaired_eq.index:
+                if column not in target_equivalent.columns:
+                    target_equivalent[column] = pd.NA
+            if item.unit_id in target_equivalent_rows:
+                target_equivalent_index = target_equivalent_rows[item.unit_id].name
+                for column in target_equivalent.columns:
+                    if column in repaired_eq.index:
+                        target_equivalent.at[target_equivalent_index, column] = repaired_eq[column]
+            else:
+                target_equivalent = pd.concat(
+                    [target_equivalent, repaired_eq.to_frame().T], ignore_index=True
+                )
+                target_equivalent_rows[item.unit_id] = target_equivalent.iloc[-1]
 
         for item in plan.items:
             backup_state = backup / "states" / item.target_state_id
@@ -471,4 +517,3 @@ def apply_promotion_plan(
             elif current.exists():
                 current.unlink()
         raise
-
