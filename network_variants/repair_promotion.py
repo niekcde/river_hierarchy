@@ -59,6 +59,11 @@ EQUIVALENT_AGGREGATE_FILES = (
     "equivalent_resistance_manifest.json",
 )
 
+# RivGraph's distance transform is an intermediate aid for width generation.
+# A completed state can legitimately omit it once the final width products
+# exist.  Promotion still requires every other non-empty manifest output.
+OPTIONAL_COMPLETED_STATE_OUTPUTS = {"rivgraph_distance"}
+
 
 @dataclass(frozen=True)
 class PromotionItem:
@@ -69,6 +74,7 @@ class PromotionItem:
     target_transition_id: str
     repair_state_dir: Path
     target_state_dir: Path
+    execution_mode: str
 
 
 @dataclass(frozen=True)
@@ -123,7 +129,11 @@ def _rows_by_unit(frame: pd.DataFrame, *, state_registry: bool) -> dict[int, pd.
     return rows
 
 
-def _validate_local_repair_state(state_dir: Path) -> None:
+def _validate_repair_state(
+    state_dir: Path,
+    *,
+    allow_successful_fallback: bool = False,
+) -> str:
     manifest_path = state_dir / "variant" / "summary" / "variant_manifest.json"
     direction_path = state_dir / "variant" / "directed" / "direction_validation_report.json"
     timing_path = state_dir / "stage_timings.json"
@@ -131,39 +141,55 @@ def _validate_local_repair_state(state_dir: Path) -> None:
         if not path.exists():
             raise ValueError(f"Repair state is incomplete; required file is missing: {path}")
     manifest = _load_json(manifest_path)
-    if manifest.get("execution_mode_used") != "local_patch":
+    execution_mode = str(manifest.get("execution_mode_used"))
+    if execution_mode != "local_patch" and not (
+        allow_successful_fallback and execution_mode in {"full_raster", "panelized"}
+    ):
         raise ValueError(
-            f"Repair state {state_dir.name} used {manifest.get('execution_mode_used')!r}, "
-            "not 'local_patch'."
+            f"Repair state {state_dir.name} used {execution_mode!r}, not 'local_patch'. "
+            "Successful fallback promotion requires explicit opt-in."
         )
     if manifest.get("ready_for_graph_matching") is not True or manifest.get("ready_for_rapid") is not True:
         raise ValueError(f"Repair state {state_dir.name} is not ready for graph matching and RAPID.")
-    local = manifest.get("local_patch") or {}
-    required_statuses = {
-        "planning": "safe",
-        "raster": "safe",
-        "realized_assembly": "complete_local_realized_graph",
-        "shared_anchoring": "complete_shared_anchored_graph",
-        "products": "complete_width_length_products",
-    }
-    for section, expected in required_statuses.items():
-        actual = (local.get(section) or {}).get("status")
-        if actual != expected:
+    if execution_mode == "local_patch":
+        local = manifest.get("local_patch") or {}
+        required_statuses = {
+            "planning": "safe",
+            "raster": "safe",
+            "realized_assembly": "complete_local_realized_graph",
+            "shared_anchoring": "complete_shared_anchored_graph",
+            "products": "complete_width_length_products",
+        }
+        for section, expected in required_statuses.items():
+            actual = (local.get(section) or {}).get("status")
+            if actual != expected:
+                raise ValueError(
+                    f"Repair state {state_dir.name} has {section} status {actual!r}; expected {expected!r}."
+                )
+        if (local.get("collapse_topology_validation") or {}).get("passed") is not True:
+            raise ValueError(f"Repair state {state_dir.name} failed collapse-topology validation.")
+    else:
+        fallback_audit = manifest.get("local_patch_fallback_audit")
+        if not fallback_audit or not Path(str(fallback_audit)).exists():
             raise ValueError(
-                f"Repair state {state_dir.name} has {section} status {actual!r}; expected {expected!r}."
+                f"Fallback repair state {state_dir.name} lacks its local-patch fallback audit."
             )
-    if (local.get("collapse_topology_validation") or {}).get("passed") is not True:
-        raise ValueError(f"Repair state {state_dir.name} failed collapse-topology validation.")
     if _load_json(direction_path).get("is_valid") is not True:
         raise ValueError(f"Repair state {state_dir.name} failed direction validation.")
     if _load_json(timing_path).get("hierarchy_status") != "complete":
         raise ValueError(f"Repair state {state_dir.name} has incomplete hierarchy processing.")
     missing = [
         key for key, value in (manifest.get("output_paths") or {}).items()
-        if isinstance(value, str) and value and not Path(value).exists()
+        if (
+            key not in OPTIONAL_COMPLETED_STATE_OUTPUTS
+            and isinstance(value, str)
+            and value
+            and not Path(value).exists()
+        )
     ]
     if missing:
         raise ValueError(f"Repair state {state_dir.name} is missing manifest outputs: {missing}.")
+    return execution_mode
 
 
 def build_promotion_plan(
@@ -171,6 +197,7 @@ def build_promotion_plan(
     target_experiment: str | Path,
     *,
     unit_ids: Sequence[int] | None = None,
+    allow_successful_fallback: bool = False,
 ) -> PromotionPlan:
     repair = Path(repair_experiment).expanduser().resolve()
     target = Path(target_experiment).expanduser().resolve()
@@ -213,9 +240,16 @@ def build_promotion_plan(
     items: list[PromotionItem] = []
     for unit in candidates:
         repair_row = repair_state_rows[unit]
+        if str(repair_row.get("status", "complete")) != "complete":
+            if requested is not None:
+                raise ValueError(f"Repair unit {unit} is not complete.")
+            continue
         repair_state_dir = Path(str(repair_row["state_dir"])).resolve()
         try:
-            _validate_local_repair_state(repair_state_dir)
+            execution_mode = _validate_repair_state(
+                repair_state_dir,
+                allow_successful_fallback=allow_successful_fallback,
+            )
         except ValueError:
             if requested is not None:
                 raise
@@ -247,6 +281,7 @@ def build_promotion_plan(
                 target_transition_id=str(target_transition_row["transition_id"]),
                 repair_state_dir=repair_state_dir,
                 target_state_dir=target_state_dir,
+                execution_mode=execution_mode,
             )
         )
     if not items:
@@ -336,8 +371,10 @@ def _rewrite_tree(root: Path, replacements: Sequence[tuple[str, str]]) -> None:
 
 
 def _validate_staged_outputs(staging: Path, target_state_dir: Path) -> None:
-    manifest = _load_json(staging / "variant" / "summary" / "variant_manifest.json")
+    manifest_path = staging / "variant" / "summary" / "variant_manifest.json"
+    manifest = _load_json(manifest_path)
     missing: list[str] = []
+    normalized_optional: list[str] = []
     for key, value in (manifest.get("output_paths") or {}).items():
         if not isinstance(value, str) or not value:
             continue
@@ -349,10 +386,20 @@ def _validate_staged_outputs(staging: Path, target_state_dir: Path) -> None:
             # child directory and are not part of this staged state.
             continue
         if not (staging / relative).exists():
-            missing.append(key)
+            if key in OPTIONAL_COMPLETED_STATE_OUTPUTS:
+                manifest["output_paths"][key] = None
+                normalized_optional.append(key)
+            else:
+                missing.append(key)
     if missing:
         raise ValueError(
             f"Staged promoted state {target_state_dir.name} is missing rebased outputs: {missing}."
+        )
+    if normalized_optional:
+        manifest["promotion_normalized_optional_outputs"] = sorted(normalized_optional)
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
 
 
@@ -540,6 +587,9 @@ def apply_promotion_plan(
                 "state_mapping": {
                     item.repair_state_id: item.target_state_id for item in plan.items
                 },
+                "execution_modes": {
+                    str(item.unit_id): item.execution_mode for item in plan.items
+                },
             }
         )
         manifest["repair_promotions"] = history
@@ -556,7 +606,10 @@ def apply_promotion_plan(
             _refresh_equivalent_resistance(target)
 
         for item in plan.items:
-            _validate_local_repair_state(item.target_state_dir)
+            _validate_repair_state(
+                item.target_state_dir,
+                allow_successful_fallback=item.execution_mode in {"full_raster", "panelized"},
+            )
         (backup / "promotion_plan.json").write_text(
             json.dumps(plan.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )

@@ -27,6 +27,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("target_experiment")
     parser.add_argument("--unit-id", action="append", type=int, default=None)
     parser.add_argument("--apply", action="store_true", help="Apply the validated plan.")
+    parser.add_argument(
+        "--allow-successful-fallback",
+        action="store_true",
+        help=(
+            "Explicitly permit completed full-raster or panelized fallback states. "
+            "Fallback audit, direction, readiness, hierarchy, and equivalent-transition "
+            "validation remain mandatory."
+        ),
+    )
     parser.add_argument("--backup-root", default=None)
     parser.add_argument(
         "--skip-equivalent-refresh", action="store_true",
@@ -41,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
         args.repair_experiment,
         args.target_experiment,
         unit_ids=args.unit_id,
+        allow_successful_fallback=args.allow_successful_fallback,
     )
     print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
     if not args.apply:
@@ -57,4 +67,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

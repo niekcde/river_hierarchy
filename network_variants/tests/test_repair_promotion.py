@@ -34,6 +34,14 @@ def _write_experiment(root: Path, *, state_id: str, unit_id: int, local: bool) -
     else:
         local_patch = {}
         mode = "full_raster"
+    fallback_audit = None
+    if not local:
+        fallback_path = state / "variant" / "local_patch_attempt" / "fallback_to_full_raster.json"
+        _write_json(
+            fallback_path,
+            {"execution_mode_used": "full_raster", "fallback_reason": "synthetic safe fallback"},
+        )
+        fallback_audit = str(fallback_path.resolve())
     _write_json(
         state / "variant" / "summary" / "variant_manifest.json",
         {
@@ -41,6 +49,7 @@ def _write_experiment(root: Path, *, state_id: str, unit_id: int, local: bool) -
             "ready_for_graph_matching": True,
             "ready_for_rapid": True,
             "local_patch": local_patch,
+            "local_patch_fallback_audit": fallback_audit,
             "output_paths": {"directed_links": str(output.resolve())},
         },
     )
@@ -188,3 +197,51 @@ def test_apply_promotion_rolls_back_state_and_metadata_when_refresh_fails(
     assert (restored / "old_marker.txt").read_text() == "target"
     assert (target / "state_registry.csv").read_bytes() == original_registry
     assert (target / "experiment_manifest.json").read_bytes() == original_manifest
+
+
+def test_successful_fallback_promotion_requires_explicit_opt_in(tmp_path) -> None:
+    repair = tmp_path / "repair"
+    target = tmp_path / "target"
+    repair.mkdir(); target.mkdir()
+    _write_experiment(repair, state_id="S001_unit_7", unit_id=7, local=False)
+    _write_experiment(target, state_id="S042_unit_7", unit_id=7, local=False)
+
+    with pytest.raises(ValueError, match="explicit opt-in"):
+        build_promotion_plan(repair, target, unit_ids=[7])
+
+    plan = build_promotion_plan(
+        repair,
+        target,
+        unit_ids=[7],
+        allow_successful_fallback=True,
+    )
+    assert plan.items[0].execution_mode == "full_raster"
+
+    repair_manifest_path = (
+        repair / "states" / "S001_unit_7" / "variant" / "summary" / "variant_manifest.json"
+    )
+    repair_manifest = json.loads(repair_manifest_path.read_text())
+    repair_manifest["output_paths"]["rivgraph_distance"] = str(
+        repair / "states" / "S001_unit_7" / "variant" / "rivgraph" / "missing_dist.tif"
+    )
+    repair_manifest_path.write_text(json.dumps(repair_manifest), encoding="utf-8")
+
+    plan = build_promotion_plan(
+        repair,
+        target,
+        unit_ids=[7],
+        allow_successful_fallback=True,
+    )
+    apply_promotion_plan(
+        plan,
+        backup_root=tmp_path / "fallback-backup",
+        refresh_equivalent_resistance=False,
+    )
+    promoted_manifest = json.loads(
+        (
+            target / "states" / "S042_unit_7" / "variant" / "summary" /
+            "variant_manifest.json"
+        ).read_text()
+    )
+    assert promoted_manifest["output_paths"]["rivgraph_distance"] is None
+    assert promoted_manifest["promotion_normalized_optional_outputs"] == ["rivgraph_distance"]
