@@ -1125,7 +1125,13 @@ def _materialize_with_collar_context_retries(
             "selected_minimum_collar_context_m": selected_distance,
             "attempts": attempts,
         }
-        Path(result.output_paths["manifest"]).write_text(
+        manifest_path = Path(result.output_dir) / "summary" / "variant_manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                "Successful local-patch result is missing its canonical variant manifest: "
+                f"{manifest_path}"
+            )
+        manifest_path.write_text(
             json.dumps(result.manifest, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )

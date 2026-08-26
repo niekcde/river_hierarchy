@@ -59,7 +59,7 @@ def test_collar_context_retry_is_bounded_and_recorded(tmp_path, monkeypatch) -> 
         manifest_path.write_text("{}\n", encoding="utf-8")
         return SimpleNamespace(
             manifest={},
-            output_paths={"manifest": str(manifest_path)},
+            output_dir=tmp_path,
         )
 
     monkeypatch.setattr(
@@ -75,7 +75,7 @@ def test_collar_context_retry_is_bounded_and_recorded(tmp_path, monkeypatch) -> 
     retry = result.manifest["local_patch"]["collar_context_retry"]
     assert retry["selected_minimum_collar_context_m"] == 1500.0
     assert [row["status"] for row in retry["attempts"]] == ["failed", "selected"]
-    saved = json.loads(Path(result.output_paths["manifest"]).read_text())
+    saved = json.loads((Path(result.output_dir) / "summary" / "variant_manifest.json").read_text())
     assert saved["local_patch"]["collar_context_retry"] == retry
 
 
