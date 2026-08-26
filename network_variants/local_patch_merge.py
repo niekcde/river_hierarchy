@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 import geopandas as gpd
 import networkx as nx
@@ -42,7 +42,7 @@ from network_variants.variant_generation import (
 )
 
 
-LOCAL_PATCH_MERGE_VERSION = "topology-local-patch-merge-v15"
+LOCAL_PATCH_MERGE_VERSION = "topology-local-patch-merge-v16"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1760,13 +1760,32 @@ def _undirected_cycle_rank(links: gpd.GeoDataFrame) -> int:
 
 def _expected_cycle_reduction(
     variant_result: LocalPatchVariantResult,
+    *,
+    parent_links: gpd.GeoDataFrame | None = None,
+    selected_link_ids: Sequence[int] | None = None,
 ) -> int | None:
-    """Count independently filled selected land components.
+    """Return the independent-cycle count removed by the selected topology.
 
-    Filling one selected island removes one independent water-network cycle.
-    The component-ownership audit is produced directly by the mask edit, so it
-    is independent of both local and full-raster vectorization.
+    The scientific expectation comes from the selected parent subgraph, not
+    from the number of raster land components filled.  A compound or nested
+    selection can contain several filled components that represent fewer
+    independent graph cycles.  The raster audit remains a legacy fallback for
+    callers that do not have the parent topology available.
     """
+    if parent_links is not None and selected_link_ids is not None:
+        selected_ids = {int(value) for value in selected_link_ids}
+        selected = parent_links.loc[
+            pd.to_numeric(parent_links["id_link"], errors="coerce").isin(selected_ids)
+        ]
+        if len(selected) != len(selected_ids):
+            present = set(pd.to_numeric(selected["id_link"], errors="coerce").dropna().astype(int))
+            missing = sorted(selected_ids.difference(present))
+            raise ValueError(
+                "Could not derive selected-parent cycle rank because parent links "
+                f"are missing: {missing}."
+            )
+        return _undirected_cycle_rank(selected)
+
     path_value = variant_result.output_paths.get("collapse_components")
     if not path_value:
         return None
@@ -2513,7 +2532,11 @@ def merge_local_patch_variant(
     parent_cycle_rank = _undirected_cycle_rank(parent_links)
     merged_cycle_rank = _undirected_cycle_rank(merged_links)
     observed_cycle_reduction = int(parent_cycle_rank - merged_cycle_rank)
-    expected_cycle_reduction = _expected_cycle_reduction(variant_result)
+    expected_cycle_reduction = _expected_cycle_reduction(
+        variant_result,
+        parent_links=parent_links,
+        selected_link_ids=contract.selected_link_ids,
+    )
     if (
         expected_cycle_reduction is not None
         and observed_cycle_reduction != int(expected_cycle_reduction)
@@ -2521,7 +2544,7 @@ def merge_local_patch_variant(
     ):
         raise ValueError(
             "Local-patch collapse topology is inconsistent with the raster edit: "
-            f"filled selected components={expected_cycle_reduction}, "
+            f"selected-parent cycle rank={expected_cycle_reduction}, "
             f"observed cycle-rank reduction={observed_cycle_reduction}, "
             f"parent cycle rank={parent_cycle_rank}, "
             f"merged cycle rank={merged_cycle_rank}."
@@ -2608,7 +2631,7 @@ def merge_local_patch_variant(
             direction_validation_deferred
         ),
         "collapse_topology_validation": {
-            "method": "filled_selected_components_equal_cycle_rank_reduction",
+            "method": "selected_parent_subgraph_cycle_rank_reduction",
             "parent_cycle_rank": int(parent_cycle_rank),
             "merged_cycle_rank": int(merged_cycle_rank),
             "observed_cycle_reduction": int(observed_cycle_reduction),

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Literal, Sequence
 
 import geopandas as gpd
+import networkx as nx
 import numpy as np
 import pandas as pd
 import rasterio
@@ -27,7 +28,7 @@ from shapely.ops import linemerge
 from network_variants.local_patch import LocalPatchContract
 
 
-LOCAL_PATCH_RASTER_PLANNER_VERSION = "topology-local-patch-raster-v5"
+LOCAL_PATCH_RASTER_PLANNER_VERSION = "topology-local-patch-raster-v7"
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,9 +351,115 @@ def _cut_center_points(
     contract: LocalPatchContract,
     reference_centerline: LineString,
 ) -> tuple[tuple[Point, float, bool], tuple[Point, float, bool]]:
-    """Return computational cut centers with minimum along-centerline context."""
+    """Return collar-end cut centers with a minimum amount of context.
+
+    The complete first parent link outside the computational domain is the
+    preferred raster collar.  Its outer node is therefore the cut center when
+    that link is already at least ``minimum_collar_context_m`` long.  Short
+    collars are the only case in which the cut is extended farther along the
+    reference centerline.  This keeps the raster boundary on an explicit
+    parent-network interface while retaining enough context for RivGraph.
+    """
     results: list[tuple[Point, float, bool]] = []
-    for collar in (contract.upstream_collar, contract.downstream_collar):
+    node_index = nodes.set_index(pd.to_numeric(nodes["id_node"], errors="raise").astype(int))
+
+    directed_graph = nx.MultiDiGraph()
+    for row in links.itertuples(index=False):
+        directed_graph.add_edge(int(row.id_us_node), int(row.id_ds_node), key=int(row.id_link))
+    global_sources = [
+        int(node_id)
+        for node_id in directed_graph
+        if directed_graph.in_degree(node_id) == 0 and directed_graph.out_degree(node_id) > 0
+    ]
+    global_sinks = [
+        int(node_id)
+        for node_id in directed_graph
+        if directed_graph.out_degree(node_id) == 0 and directed_graph.in_degree(node_id) > 0
+    ]
+
+    def reference_flow_direction() -> float:
+        if len(global_sources) != 1 or len(global_sinks) != 1:
+            raise ValueError(
+                "Could not infer reference-centerline flow from unique global source/sink nodes."
+            )
+        source_measure = float(
+            reference_centerline.project(node_index.loc[global_sources[0]].geometry)
+        )
+        sink_measure = float(
+            reference_centerline.project(node_index.loc[global_sinks[0]].geometry)
+        )
+        direction = float(np.sign(sink_measure - source_measure))
+        if direction == 0:
+            raise ValueError(
+                "Global source and sink share one reference-centerline projection."
+            )
+        return direction
+
+    def point_along_link_from_node(row: pd.Series, node_id: int, distance: float) -> Point:
+        geometry = row.geometry
+        if isinstance(geometry, MultiLineString):
+            geometry = linemerge(geometry)
+        if not isinstance(geometry, LineString) or geometry.is_empty:
+            raise ValueError(
+                f"Collar continuation link {int(row['id_link'])} is not a continuous line."
+            )
+        node_point = node_index.loc[int(node_id)].geometry
+        from_start = Point(geometry.coords[0]).distance(node_point)
+        from_end = Point(geometry.coords[-1]).distance(node_point)
+        measure = min(float(distance), float(geometry.length))
+        if from_start <= from_end:
+            return geometry.interpolate(measure)
+        return geometry.interpolate(float(geometry.length) - measure)
+
+    def directed_network_extension(
+        *, role: str, collar, remaining_distance: float
+    ) -> tuple[Point, float, bool]:
+        """Walk a unique parent continuation when centerline projections tie."""
+        current = int(collar.outer_splice_anchor_node_id)
+        visited_links = {int(collar.base_link_id)}
+        forbidden_links = {int(value) for value in contract.core_link_ids}
+        travelled = 0.0
+        while remaining_distance - travelled > 1e-9:
+            if role == "upstream":
+                candidates = links.loc[
+                    pd.to_numeric(links["id_ds_node"], errors="coerce").eq(current)
+                ]
+                next_field = "id_us_node"
+            else:
+                candidates = links.loc[
+                    pd.to_numeric(links["id_us_node"], errors="coerce").eq(current)
+                ]
+                next_field = "id_ds_node"
+            candidates = candidates.loc[
+                ~pd.to_numeric(candidates["id_link"], errors="coerce")
+                .astype("Int64")
+                .isin(visited_links.union(forbidden_links))
+            ]
+            if len(candidates) != 1:
+                raise ValueError(
+                    f"Collar {collar.base_link_id} has identical reference-centerline "
+                    f"projections and {len(candidates)} directed external continuations "
+                    f"at node {current}; the outward cut direction is ambiguous."
+                )
+            row = candidates.iloc[0]
+            link_id = int(row["id_link"])
+            link_length = float(row.geometry.length)
+            needed = float(remaining_distance - travelled)
+            if link_length >= needed:
+                return (
+                    point_along_link_from_node(row, current, needed),
+                    float(travelled + needed),
+                    True,
+                )
+            travelled += link_length
+            visited_links.add(link_id)
+            current = int(row[next_field])
+        return node_index.loc[current].geometry, float(travelled), True
+
+    for role, collar in (
+        ("upstream", contract.upstream_collar),
+        ("downstream", contract.downstream_collar),
+    ):
         inner = _node_point(nodes, collar.domain_boundary_node_id)
         outer = _node_point(nodes, collar.outer_splice_anchor_node_id)
         selected = links.loc[
@@ -360,39 +467,74 @@ def _cut_center_points(
         ]
         if len(selected) != 1:
             raise ValueError(f"Could not resolve collar link {collar.base_link_id}.")
-        inner_measure = float(reference_centerline.project(inner))
-        outer_measure = float(reference_centerline.project(outer))
-        direction = float(np.sign(outer_measure - inner_measure))
-        if direction == 0:
-            raise ValueError(
-                f"Inner and outer nodes of collar {collar.base_link_id} have the same "
-                "reference-centerline projection."
-            )
         minimum_context = float(contract.raster_policy.minimum_collar_context_m)
-        outer_context = abs(outer_measure - inner_measure)
-        # The external collar establishes the correct side of the complete
-        # closed domain.  Its outer node does not define crop length: very long
-        # collars can move a cut tens of kilometres away and cause RivGraph's
-        # skeleton terminal to stop far from the cut.  Keep the context bounded
-        # and reproducible at the configured minimum distance.
-        requested_measure = inner_measure + direction * minimum_context
-        cut_measure = min(
-            max(float(requested_measure), 0.0),
-            float(reference_centerline.length),
-        )
-        clamped_to_global_boundary = not math.isclose(
-            float(cut_measure), float(requested_measure), rel_tol=0.0, abs_tol=1e-9
-        )
-        context_distance = abs(float(cut_measure) - inner_measure)
+        collar_geometry = selected.geometry.iloc[0]
+        collar_length = float(collar_geometry.length)
+        if collar_length >= minimum_context:
+            cut_point = Point(float(outer.x), float(outer.y))
+            context_distance = collar_length
+            clamped_to_global_boundary = False
+            extended = False
+        else:
+            remaining_context = float(minimum_context - collar_length)
+            inner_measure = float(reference_centerline.project(inner))
+            outer_measure = float(reference_centerline.project(outer))
+            direction = float(np.sign(outer_measure - inner_measure))
+            if direction == 0:
+                try:
+                    cut_point, extension_distance, extended = directed_network_extension(
+                        role=role,
+                        collar=collar,
+                        remaining_distance=remaining_context,
+                    )
+                    context_distance = float(collar_length + extension_distance)
+                    clamped_to_global_boundary = False
+                except ValueError as continuation_error:
+                    flow_direction = reference_flow_direction()
+                    role_direction = (
+                        -flow_direction if role == "upstream" else flow_direction
+                    )
+                    requested_measure = outer_measure + role_direction * remaining_context
+                    cut_measure = min(
+                        max(float(requested_measure), 0.0),
+                        float(reference_centerline.length),
+                    )
+                    clamped_to_global_boundary = not math.isclose(
+                        float(cut_measure),
+                        float(requested_measure),
+                        rel_tol=0.0,
+                        abs_tol=1e-9,
+                    )
+                    extension_distance = abs(float(cut_measure) - outer_measure)
+                    if extension_distance <= 0:
+                        raise continuation_error
+                    context_distance = float(collar_length + extension_distance)
+                    interpolated = reference_centerline.interpolate(cut_measure)
+                    cut_point = Point(float(interpolated.x), float(interpolated.y))
+                    extended = True
+            else:
+                requested_measure = outer_measure + direction * remaining_context
+                cut_measure = min(
+                    max(float(requested_measure), 0.0),
+                    float(reference_centerline.length),
+                )
+                clamped_to_global_boundary = not math.isclose(
+                    float(cut_measure),
+                    float(requested_measure),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+                extension_distance = abs(float(cut_measure) - outer_measure)
+                context_distance = float(collar_length + extension_distance)
+                interpolated = reference_centerline.interpolate(cut_measure)
+                cut_point = Point(float(interpolated.x), float(interpolated.y))
+                extended = True
         if context_distance <= 0:
             raise ValueError(
                 f"Collar {collar.base_link_id} terminates at the global reference-centerline "
                 "boundary and provides no positive cut context."
             )
-        extended = bool(
-            outer_context < minimum_context or clamped_to_global_boundary
-        )
-        cut_point = reference_centerline.interpolate(cut_measure)
+        extended = bool(extended or clamped_to_global_boundary)
         results.append(
             (Point(cut_point.x, cut_point.y), context_distance, extended)
         )

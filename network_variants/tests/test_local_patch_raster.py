@@ -120,20 +120,18 @@ def test_short_collars_extend_to_minimum_reference_centerline_context() -> None:
     assert sink[0].equals_exact(Point(50, 15), 1e-9)
 
 
-def test_long_collar_is_cut_at_bounded_closed_domain_context() -> None:
+def test_long_collar_is_cut_at_outer_parent_node() -> None:
     links, nodes = _network()
-    links.loc[links["id_link"].eq(1), "len"] = 50.0
-    links.loc[links["id_link"].eq(3), "len"] = 50.0
     source, sink = _cut_center_points(
         nodes=nodes,
         links=links,
         contract=_contract(),
         reference_centerline=LineString([(50, 0), (50, 100)]),
     )
-    assert source[1:] == (10.0, False)
-    assert sink[1:] == (10.0, False)
-    assert source[0].equals_exact(Point(50, 75), 1e-9)
-    assert sink[0].equals_exact(Point(50, 25), 1e-9)
+    assert source[1:] == (15.0, False)
+    assert sink[1:] == (15.0, False)
+    assert source[0].equals_exact(Point(50, 80), 1e-9)
+    assert sink[0].equals_exact(Point(50, 20), 1e-9)
 
 
 def test_context_cut_clamps_to_global_reference_centerline_boundary() -> None:
@@ -166,6 +164,124 @@ def test_context_cut_clamps_to_global_reference_centerline_boundary() -> None:
     assert sink[0].equals_exact(Point(50, 10), 1e-9)
     assert source[1:] == (25.0, True)
     assert sink[1:] == (25.0, True)
+
+
+def test_equal_centerline_projections_follow_unique_directed_parent_continuation() -> None:
+    links = gpd.GeoDataFrame(
+        [
+            {"id_link": 0, "id_us_node": 9, "id_ds_node": 10, "geometry": LineString([(-30, 70), (-10, 70)])},
+            {"id_link": 1, "id_us_node": 10, "id_ds_node": 11, "geometry": LineString([(-10, 70), (0, 70)])},
+            {"id_link": 2, "id_us_node": 11, "id_ds_node": 12, "geometry": LineString([(0, 70), (0, 30)])},
+            {"id_link": 3, "id_us_node": 12, "id_ds_node": 13, "geometry": LineString([(0, 30), (10, 30)])},
+            {"id_link": 4, "id_us_node": 13, "id_ds_node": 14, "geometry": LineString([(10, 30), (30, 30)])},
+        ],
+        crs="EPSG:3857",
+    )
+    nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": node_id, "geometry": Point(x, y)}
+            for node_id, x, y in (
+                (9, -30, 70), (10, -10, 70), (11, 0, 70),
+                (12, 0, 30), (13, 10, 30), (14, 30, 30),
+            )
+        ],
+        crs=links.crs,
+    )
+    contract = LocalPatchContract(
+        example_id="synthetic",
+        selection_type="unit",
+        selected_unit_ids=(1,),
+        domain_type="closed_unit",
+        core_link_ids=(2,),
+        upstream_collar=LocalPatchCollar(
+            role="upstream", base_link_id=1, base_upstream_node_id=10,
+            base_downstream_node_id=11, domain_boundary_node_id=11,
+            outer_splice_anchor_node_id=10,
+        ),
+        downstream_collar=LocalPatchCollar(
+            role="downstream", base_link_id=3, base_upstream_node_id=12,
+            base_downstream_node_id=13, domain_boundary_node_id=12,
+            outer_splice_anchor_node_id=13,
+        ),
+        raster_policy=LocalPatchRasterPolicy(
+            minimum_halo_m=10, halo_expansion_step_m=10, maximum_halo_m=10,
+            minimum_collar_context_m=20,
+        ),
+    )
+    source, sink = _cut_center_points(
+        nodes=nodes,
+        links=links,
+        contract=contract,
+        reference_centerline=LineString([(0, 0), (0, 100)]),
+    )
+    assert source[0].equals_exact(Point(-20, 70), 1e-9)
+    assert sink[0].equals_exact(Point(20, 30), 1e-9)
+    assert source[1:] == (20.0, True)
+    assert sink[1:] == (20.0, True)
+
+
+def test_equal_centerline_projections_use_global_flow_when_continuation_branches() -> None:
+    links = gpd.GeoDataFrame(
+        [
+            {"id_link": 0, "id_us_node": 8, "id_ds_node": 14, "geometry": LineString([(0, 90), (-10, 80)])},
+            {"id_link": 1, "id_us_node": 14, "id_ds_node": 9, "geometry": LineString([(-10, 80), (0, 70)])},
+            {"id_link": 2, "id_us_node": 8, "id_ds_node": 15, "geometry": LineString([(0, 90), (10, 80)])},
+            {"id_link": 3, "id_us_node": 15, "id_ds_node": 9, "geometry": LineString([(10, 80), (0, 70)])},
+            {"id_link": 4, "id_us_node": 9, "id_ds_node": 10, "geometry": LineString([(0, 70), (10, 70)])},
+            {"id_link": 5, "id_us_node": 10, "id_ds_node": 11, "geometry": LineString([(10, 70), (0, 30)])},
+            {"id_link": 6, "id_us_node": 11, "id_ds_node": 12, "geometry": LineString([(0, 30), (10, 30)])},
+            {"id_link": 7, "id_us_node": 12, "id_ds_node": 16, "geometry": LineString([(10, 30), (-10, 20)])},
+            {"id_link": 8, "id_us_node": 16, "id_ds_node": 13, "geometry": LineString([(-10, 20), (0, 10)])},
+            {"id_link": 9, "id_us_node": 12, "id_ds_node": 17, "geometry": LineString([(10, 30), (10, 20)])},
+            {"id_link": 10, "id_us_node": 17, "id_ds_node": 13, "geometry": LineString([(10, 20), (0, 10)])},
+            {"id_link": 11, "id_us_node": 13, "id_ds_node": 18, "geometry": LineString([(0, 10), (0, 0)])},
+        ],
+        crs="EPSG:3857",
+    )
+    nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": node_id, "geometry": Point(x, y)}
+            for node_id, x, y in (
+                (8, 0, 90), (14, -10, 80), (15, 10, 80),
+                (9, 0, 70), (10, 10, 70), (11, 0, 30), (12, 10, 30),
+                (16, -10, 20), (17, 10, 20), (13, 0, 10), (18, 0, 0),
+            )
+        ],
+        crs=links.crs,
+    )
+    contract = LocalPatchContract(
+        example_id="synthetic",
+        selection_type="unit",
+        selected_unit_ids=(1,),
+        domain_type="closed_unit",
+        core_link_ids=(5,),
+        upstream_collar=LocalPatchCollar(
+            role="upstream", base_link_id=4, base_upstream_node_id=9,
+            base_downstream_node_id=10, domain_boundary_node_id=10,
+            outer_splice_anchor_node_id=9,
+        ),
+        downstream_collar=LocalPatchCollar(
+            role="downstream", base_link_id=6, base_upstream_node_id=11,
+            base_downstream_node_id=12, domain_boundary_node_id=11,
+            outer_splice_anchor_node_id=12,
+        ),
+        raster_policy=LocalPatchRasterPolicy(
+            minimum_halo_m=10, halo_expansion_step_m=10, maximum_halo_m=10,
+            minimum_collar_context_m=20,
+        ),
+    )
+
+    source, sink = _cut_center_points(
+        nodes=nodes,
+        links=links,
+        contract=contract,
+        reference_centerline=LineString([(0, 0), (0, 100)]),
+    )
+
+    assert source[0].equals_exact(Point(0, 80), 1e-9)
+    assert sink[0].equals_exact(Point(0, 20), 1e-9)
+    assert source[1:] == (20.0, True)
+    assert sink[1:] == (20.0, True)
 
 
 def _edge_cut(*, outside_tail: float) -> MainBankCut:

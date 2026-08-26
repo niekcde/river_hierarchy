@@ -18,7 +18,7 @@ import geopandas as gpd
 import networkx as nx
 import pandas as pd
 from shapely.geometry import LineString, MultiLineString, Point
-from shapely.ops import linemerge, substring
+from shapely.ops import linemerge, polygonize, substring, unary_union
 
 from hierarchy_level_definition.graph_building.directed_network_checks import (
     build_directed_graph,
@@ -38,9 +38,437 @@ from network_variants.variant_generation import (
 )
 
 
-LOCAL_PATCH_ANCHORED_ADAPTER_VERSION = "local-realized-shared-anchoring-v6"
+LOCAL_PATCH_ANCHORED_ADAPTER_VERSION = "local-realized-shared-anchoring-v8"
 COMPRESSED_INTERFACE_MAX_TOLERANCE_MULTIPLIER = 5.0
 PRE_ANCHOR_CANONICALIZATION_MIN_OVERLAP_FRACTION = 0.90
+
+
+def _undirected_rank(links: gpd.GeoDataFrame) -> int:
+    graph = nx.MultiGraph()
+    for row in links.itertuples(index=False):
+        graph.add_edge(int(row.id_us_node), int(row.id_ds_node), key=int(row.id_link))
+    if graph.number_of_nodes() == 0:
+        return 0
+    return int(
+        graph.number_of_edges()
+        - graph.number_of_nodes()
+        + nx.number_connected_components(graph)
+    )
+
+
+def _prune_exact_inserted_context_duplicates(
+    *,
+    anchored_links: gpd.GeoDataFrame,
+    anchored_nodes: gpd.GeoDataFrame,
+    anchored_lineage: pd.DataFrame,
+    parent_links: gpd.GeoDataFrame,
+    selected_parent_link_ids: set[int],
+    inserted_realized_link_ids: set[int],
+    source_id: int,
+    sink_id: int,
+    tolerance_m: float,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, pd.DataFrame, dict[str, Any]]:
+    """Remove an inserted exact duplicate of retained child context.
+
+    This compares child links to one another, not to a potentially ambiguous
+    parent match. A candidate must share directed endpoints and essentially
+    identical geometry with a non-inserted retained link. The repair is kept
+    only when it independently restores the selected unit's exact cycle-rank
+    reduction and leaves a valid one-source/one-sink DAG.
+    """
+    skipped = {
+        "method": "exact_inserted_child_context_deduplication",
+        "applied": False,
+        "reason": "not_applicable",
+        "removed_link_ids": [],
+    }
+    provenance_field = "local_patch_source_realized_link_id"
+    if provenance_field not in anchored_links.columns or not inserted_realized_link_ids:
+        return anchored_links, anchored_nodes, anchored_lineage, skipped
+    source_ids = pd.to_numeric(
+        anchored_links[provenance_field], errors="coerce"
+    ).astype("Int64")
+    inserted_mask = source_ids.isin(inserted_realized_link_ids)
+    inserted = anchored_links.loc[inserted_mask]
+    retained = anchored_links.loc[~inserted_mask]
+    remove_ids: set[int] = set()
+    geometry_tolerance = max(float(tolerance_m) * 0.05, 1e-6)
+    for row in inserted.itertuples(index=False):
+        same_endpoints = retained.loc[
+            retained["id_us_node"].astype(int).eq(int(row.id_us_node))
+            & retained["id_ds_node"].astype(int).eq(int(row.id_ds_node))
+        ]
+        if any(
+            row.geometry.hausdorff_distance(candidate) <= geometry_tolerance
+            and abs(float(row.geometry.length) - float(candidate.length))
+            <= geometry_tolerance
+            for candidate in same_endpoints.geometry
+        ):
+            remove_ids.add(int(row.id_link))
+    if not remove_ids:
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "no_exact_inserted_child_context_duplicate",
+        }
+
+    candidate_links = anchored_links.loc[
+        ~anchored_links["id_link"].astype(int).isin(remove_ids)
+    ].copy()
+    used_node_ids = set(candidate_links["id_us_node"].astype(int)).union(
+        candidate_links["id_ds_node"].astype(int)
+    )
+    candidate_nodes = anchored_nodes.loc[
+        anchored_nodes["id_node"].astype(int).isin(used_node_ids)
+    ].copy()
+    candidate_links, candidate_nodes = _refresh_topology(
+        candidate_links,
+        candidate_nodes,
+        source_id=int(source_id),
+        sink_id=int(sink_id),
+    )
+    selected = parent_links.loc[
+        parent_links["id_link"].astype(int).isin(selected_parent_link_ids)
+    ]
+    expected_reduction = _undirected_rank(selected)
+    observed_reduction = _undirected_rank(parent_links) - _undirected_rank(
+        candidate_links
+    )
+    candidate_graph = build_directed_graph(
+        candidate_links, candidate_nodes, prefer_explicit_direction=True
+    )
+    report = validate_single_inlet_single_outlet(candidate_graph)
+    is_dag = nx.is_directed_acyclic_graph(candidate_graph)
+    if observed_reduction != expected_reduction or not report.is_valid or not is_dag:
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "candidate_deduplication_failed_topology_gate",
+            "candidate_link_ids": sorted(remove_ids),
+            "expected_cycle_rank_reduction": int(expected_reduction),
+            "observed_cycle_rank_reduction": int(observed_reduction),
+            "direction_issues": list(report.issues),
+            "is_dag": bool(is_dag),
+        }
+    candidate_lineage = anchored_lineage.loc[
+        ~anchored_lineage["id_link"].astype(int).isin(remove_ids)
+    ].copy()
+    return candidate_links, candidate_nodes, candidate_lineage, {
+        "method": "exact_inserted_child_context_deduplication",
+        "applied": True,
+        "reason": "exact_inserted_child_context_duplicate_removed",
+        "removed_link_ids": sorted(remove_ids),
+        "geometry_tolerance_m": float(geometry_tolerance),
+        "expected_cycle_rank_reduction": int(expected_reduction),
+        "observed_cycle_rank_reduction": int(observed_reduction),
+    }
+
+
+def _prune_external_inserted_context(
+    *,
+    anchored_links: gpd.GeoDataFrame,
+    anchored_nodes: gpd.GeoDataFrame,
+    anchored_lineage: pd.DataFrame,
+    parent_links: gpd.GeoDataFrame,
+    selected_parent_link_ids: set[int],
+    inserted_realized_link_ids: set[int],
+    source_id: int,
+    sink_id: int,
+    tolerance_m: float,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, pd.DataFrame, dict[str, Any]]:
+    """Discard inserted context lying clearly outside the selected footprint."""
+    skipped = {
+        "method": "selected_multipolygon_external_inserted_context_pruning",
+        "applied": False,
+        "reason": "not_applicable",
+        "removed_link_ids": [],
+    }
+    provenance_field = "local_patch_source_realized_link_id"
+    if provenance_field not in anchored_links.columns or not inserted_realized_link_ids:
+        return anchored_links, anchored_nodes, anchored_lineage, skipped
+    selected = parent_links.loc[
+        parent_links["id_link"].astype(int).isin(selected_parent_link_ids)
+    ]
+    faces = list(polygonize(unary_union(list(selected.geometry))))
+    if not faces:
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "selected_parent_geometry_did_not_polygonize",
+        }
+    footprint = unary_union(faces).buffer(max(float(tolerance_m) * 2.0, 1e-6))
+    inserted_mask = (
+        pd.to_numeric(anchored_links[provenance_field], errors="coerce")
+        .astype("Int64")
+        .isin(inserted_realized_link_ids)
+    )
+    remove_ids = {
+        int(row.id_link)
+        for row in anchored_links.loc[inserted_mask].itertuples(index=False)
+        if float(row.geometry.intersection(footprint).length)
+        / max(float(row.geometry.length), 1e-9)
+        < 0.50
+    }
+    if not remove_ids:
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "no_clearly_external_inserted_context",
+            "selected_polygon_count": int(len(faces)),
+        }
+
+    candidate_links = anchored_links.loc[
+        ~anchored_links["id_link"].astype(int).isin(remove_ids)
+    ].copy()
+    used_node_ids = set(candidate_links["id_us_node"].astype(int)).union(
+        candidate_links["id_ds_node"].astype(int)
+    )
+    candidate_nodes = anchored_nodes.loc[
+        anchored_nodes["id_node"].astype(int).isin(used_node_ids)
+    ].copy()
+    candidate_links, candidate_nodes = _refresh_topology(
+        candidate_links,
+        candidate_nodes,
+        source_id=int(source_id),
+        sink_id=int(sink_id),
+    )
+    expected_reduction = _undirected_rank(selected)
+    observed_reduction = _undirected_rank(parent_links) - _undirected_rank(
+        candidate_links
+    )
+    candidate_graph = build_directed_graph(
+        candidate_links, candidate_nodes, prefer_explicit_direction=True
+    )
+    report = validate_single_inlet_single_outlet(candidate_graph)
+    is_dag = nx.is_directed_acyclic_graph(candidate_graph)
+    if observed_reduction != expected_reduction or not report.is_valid or not is_dag:
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "candidate_external_pruning_failed_topology_gate",
+            "candidate_link_ids": sorted(remove_ids),
+            "selected_polygon_count": int(len(faces)),
+            "expected_cycle_rank_reduction": int(expected_reduction),
+            "observed_cycle_rank_reduction": int(observed_reduction),
+            "direction_issues": list(report.issues),
+            "is_dag": bool(is_dag),
+        }
+    candidate_lineage = anchored_lineage.loc[
+        ~anchored_lineage["id_link"].astype(int).isin(remove_ids)
+    ].copy()
+    return candidate_links, candidate_nodes, candidate_lineage, {
+        "method": "selected_multipolygon_external_inserted_context_pruning",
+        "applied": True,
+        "reason": "clearly_external_inserted_context_removed",
+        "removed_link_ids": sorted(remove_ids),
+        "selected_polygon_count": int(len(faces)),
+        "inside_fraction_threshold": 0.50,
+        "expected_cycle_rank_reduction": int(expected_reduction),
+        "observed_cycle_rank_reduction": int(observed_reduction),
+    }
+
+
+def _prune_unambiguous_external_inserted_path(
+    *,
+    anchored_links: gpd.GeoDataFrame,
+    anchored_nodes: gpd.GeoDataFrame,
+    anchored_lineage: pd.DataFrame,
+    parent_links: gpd.GeoDataFrame,
+    parent_nodes: gpd.GeoDataFrame,
+    selected_parent_link_ids: set[int],
+    inserted_realized_link_ids: set[int],
+    source_id: int,
+    sink_id: int,
+    tolerance_m: float,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, pd.DataFrame, dict[str, Any]]:
+    """Cull a clearly external duplicate path from a two-interface collapse.
+
+    This deliberately does not use parent-line matching.  It activates only
+    when the selected parent topology has exactly two external interfaces and
+    polygonizes into one or more faces.  Inserted local paths are scored by
+    their overlap with the complete selected multipolygon.  Pruning is accepted
+    only when one path is spatially unambiguous and the exact expected global
+    cycle-rank reduction and directed graph contract are restored.
+    """
+    skipped = {
+        "method": "selected_multipolygon_inserted_path_pruning",
+        "applied": False,
+        "reason": "not_applicable",
+        "removed_link_ids": [],
+    }
+    if not selected_parent_link_ids or not inserted_realized_link_ids:
+        return anchored_links, anchored_nodes, anchored_lineage, skipped
+    parent_ids = pd.to_numeric(parent_links["id_link"], errors="coerce")
+    selected = parent_links.loc[parent_ids.isin(selected_parent_link_ids)].copy()
+    if len(selected) != len(selected_parent_link_ids):
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "selected_parent_links_missing",
+        }
+
+    selected_nodes = set(selected["id_us_node"].astype(int)).union(
+        selected["id_ds_node"].astype(int)
+    )
+    outside = parent_links.loc[~parent_ids.isin(selected_parent_link_ids)]
+    interface_ids = sorted(
+        node_id
+        for node_id in selected_nodes
+        if (
+            outside["id_us_node"].astype(int).eq(node_id)
+            | outside["id_ds_node"].astype(int).eq(node_id)
+        ).any()
+    )
+    if len(interface_ids) != 2:
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "selected_domain_does_not_have_two_interfaces",
+            "interface_parent_node_ids": interface_ids,
+        }
+
+    faces = list(polygonize(unary_union(list(selected.geometry))))
+    if not faces:
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "selected_parent_geometry_did_not_polygonize",
+        }
+    footprint = unary_union(faces).buffer(max(float(tolerance_m) * 2.0, 1e-6))
+
+    node_index = anchored_nodes.set_index(
+        pd.to_numeric(anchored_nodes["id_node"], errors="raise").astype(int),
+        drop=False,
+    )
+    parent_node_index = parent_nodes.set_index(
+        pd.to_numeric(parent_nodes["id_node"], errors="raise").astype(int),
+        drop=False,
+    )
+    child_interfaces: list[int] = []
+    for parent_id in interface_ids:
+        target = parent_node_index.loc[parent_id].geometry
+        if parent_id in node_index.index and node_index.loc[parent_id].geometry.distance(target) <= tolerance_m * 2.0:
+            child_interfaces.append(int(parent_id))
+            continue
+        distances = anchored_nodes.geometry.distance(target)
+        nearest_index = distances.idxmin()
+        if float(distances.loc[nearest_index]) > tolerance_m * 2.0:
+            return anchored_links, anchored_nodes, anchored_lineage, {
+                **skipped,
+                "reason": "selected_interface_not_stably_allocated",
+                "interface_parent_node_ids": interface_ids,
+            }
+        child_interfaces.append(int(anchored_nodes.loc[nearest_index, "id_node"]))
+    if len(set(child_interfaces)) != 2:
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "selected_interfaces_share_one_child_node",
+        }
+
+    provenance_field = "local_patch_source_realized_link_id"
+    if provenance_field not in anchored_links.columns:
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "inserted_link_provenance_missing",
+        }
+    inserted = anchored_links.loc[
+        pd.to_numeric(anchored_links[provenance_field], errors="coerce")
+        .astype("Int64")
+        .isin(inserted_realized_link_ids)
+    ].copy()
+    graph = nx.MultiGraph()
+    for row in inserted.itertuples(index=False):
+        graph.add_edge(int(row.id_us_node), int(row.id_ds_node), key=int(row.id_link))
+    first, second = child_interfaces
+    if first not in graph or second not in graph or not nx.has_path(graph, first, second):
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "inserted_subgraph_does_not_connect_selected_interfaces",
+        }
+
+    paths: list[set[int]] = []
+    for path_index, edge_path in enumerate(
+        nx.all_simple_edge_paths(graph, first, second, cutoff=graph.number_of_nodes())
+    ):
+        if path_index >= 100:
+            return anchored_links, anchored_nodes, anchored_lineage, {
+                **skipped,
+                "reason": "too_many_inserted_interface_paths",
+            }
+        paths.append({int(edge[2]) for edge in edge_path})
+    if len(paths) < 2:
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "no_duplicate_inserted_interface_path",
+        }
+
+    inserted_by_id = inserted.set_index(inserted["id_link"].astype(int), drop=False)
+    path_scores: list[tuple[float, float, set[int]]] = []
+    for path in paths:
+        total_length = sum(float(inserted_by_id.loc[link_id].geometry.length) for link_id in path)
+        inside_length = sum(
+            float(inserted_by_id.loc[link_id].geometry.intersection(footprint).length)
+            for link_id in path
+        )
+        path_scores.append((inside_length / max(total_length, 1e-9), total_length, path))
+    path_scores.sort(key=lambda item: (-item[0], item[1], sorted(item[2])))
+    best_score, _, retained_path = path_scores[0]
+    second_score = path_scores[1][0]
+    if best_score < 0.50 or (best_score - second_score) < 0.50:
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "selected_footprint_path_not_unambiguous",
+            "best_inside_fraction": float(best_score),
+            "second_inside_fraction": float(second_score),
+        }
+
+    # Remove only edges that participate in an alternate interface-to-interface
+    # path.  Inserted side branches that are not part of either route are not
+    # evidence of external leakage and must survive this narrowly scoped repair.
+    interface_path_ids = set().union(*paths)
+    remove_ids = interface_path_ids.difference(retained_path)
+    if not remove_ids:
+        return anchored_links, anchored_nodes, anchored_lineage, skipped
+    candidate_links = anchored_links.loc[
+        ~anchored_links["id_link"].astype(int).isin(remove_ids)
+    ].copy()
+    used_node_ids = set(candidate_links["id_us_node"].astype(int)).union(
+        candidate_links["id_ds_node"].astype(int)
+    )
+    candidate_nodes = anchored_nodes.loc[
+        anchored_nodes["id_node"].astype(int).isin(used_node_ids)
+    ].copy()
+    candidate_links, candidate_nodes = _refresh_topology(
+        candidate_links,
+        candidate_nodes,
+        source_id=int(source_id),
+        sink_id=int(sink_id),
+    )
+    expected_reduction = _undirected_rank(selected)
+    observed_reduction = _undirected_rank(parent_links) - _undirected_rank(candidate_links)
+    candidate_graph = build_directed_graph(
+        candidate_links, candidate_nodes, prefer_explicit_direction=True
+    )
+    report = validate_single_inlet_single_outlet(candidate_graph)
+    is_dag = nx.is_directed_acyclic_graph(candidate_graph)
+    if observed_reduction != expected_reduction or not report.is_valid or not is_dag:
+        return anchored_links, anchored_nodes, anchored_lineage, {
+            **skipped,
+            "reason": "candidate_pruning_failed_topology_gate",
+            "expected_cycle_rank_reduction": int(expected_reduction),
+            "observed_cycle_rank_reduction": int(observed_reduction),
+            "direction_issues": list(report.issues),
+            "is_dag": bool(is_dag),
+        }
+    candidate_lineage = anchored_lineage.loc[
+        ~anchored_lineage["id_link"].astype(int).isin(remove_ids)
+    ].copy()
+    return candidate_links, candidate_nodes, candidate_lineage, {
+        "method": "selected_multipolygon_inserted_path_pruning",
+        "applied": True,
+        "reason": "unambiguous_external_inserted_path_removed",
+        "interface_parent_node_ids": interface_ids,
+        "interface_child_node_ids": child_interfaces,
+        "selected_polygon_count": int(len(faces)),
+        "best_inside_fraction": float(best_score),
+        "second_inside_fraction": float(second_score),
+        "removed_link_ids": sorted(remove_ids),
+        "retained_inserted_path_link_ids": sorted(retained_path),
+        "expected_cycle_rank_reduction": int(expected_reduction),
+        "observed_cycle_rank_reduction": int(observed_reduction),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +628,31 @@ def _canonicalize_unchanged_parent_links(
         parent_ds_match_distance = float(
             child_ds_point_before.distance(parent_ds_point)
         )
+
+        # Pre-anchor lineage is necessary but not sufficient for exact parent
+        # canonicalization. Segmentation can leave a child with substantial
+        # parent overlap while one endpoint belongs to changed local geometry.
+        # Snapping such a link to the complete parent connector invents an
+        # interface and can reverse the anchored interval. Preserve it as
+        # changed unless both endpoint identities are spatially stable.
+        if general_canonicalization_allowed and any(
+            distance > match_tolerance
+            for distance in (
+                parent_us_match_distance,
+                parent_ds_match_distance,
+            )
+        ):
+            provenance_excluded_records.append(
+                {
+                    "child_id_link": child_id,
+                    "parent_id_link": parent_id,
+                    "reason": "pre_anchor_parent_endpoints_not_stable",
+                    "parent_us_match_distance_m": parent_us_match_distance,
+                    "parent_ds_match_distance_m": parent_ds_match_distance,
+                    "match_tolerance_m": float(match_tolerance),
+                }
+            )
+            continue
 
         parent_geometry = parent_row.geometry
         if isinstance(parent_geometry, MultiLineString):
@@ -735,11 +1188,82 @@ def anchor_local_patch_realized_graph(
             },
             "validation_method": "direct_validation_after_no_op_segmentation",
         }
+    inserted_realized_link_ids: set[int] = set()
+    splice_audit_path = realized_result.output_paths.get("link_lineage_audit")
+    if splice_audit_path and Path(splice_audit_path).exists():
+        splice_audit = pd.read_csv(splice_audit_path)
+        if {"merge_decision", "final_link_id"}.issubset(splice_audit.columns):
+            inserted_realized_link_ids = set(
+                pd.to_numeric(
+                    splice_audit.loc[
+                        splice_audit["merge_decision"].astype(str).eq("insert_local"),
+                        "final_link_id",
+                    ],
+                    errors="coerce",
+                )
+                .dropna()
+                .astype(int)
+            )
+    (
+        deduplicated_links,
+        deduplicated_nodes,
+        deduplicated_lineage,
+        exact_context_deduplication,
+    ) = _prune_exact_inserted_context_duplicates(
+        anchored_links=transformed.directed_links,
+        anchored_nodes=transformed.directed_nodes,
+        anchored_lineage=transformed.link_lineage,
+        parent_links=parent_links,
+        selected_parent_link_ids=selected_parent_link_ids,
+        inserted_realized_link_ids=inserted_realized_link_ids,
+        source_id=int(parent_report.source_nodes[0]),
+        sink_id=int(parent_report.sink_nodes[0]),
+        tolerance_m=tolerance,
+    )
+    inserted_realized_link_ids.difference_update(
+        exact_context_deduplication["removed_link_ids"]
+    )
+    (
+        external_context_links,
+        external_context_nodes,
+        external_context_lineage,
+        external_context_pruning,
+    ) = _prune_external_inserted_context(
+        anchored_links=deduplicated_links,
+        anchored_nodes=deduplicated_nodes,
+        anchored_lineage=deduplicated_lineage,
+        parent_links=parent_links,
+        selected_parent_link_ids=selected_parent_link_ids,
+        inserted_realized_link_ids=inserted_realized_link_ids,
+        source_id=int(parent_report.source_nodes[0]),
+        sink_id=int(parent_report.sink_nodes[0]),
+        tolerance_m=tolerance,
+    )
+    inserted_realized_link_ids.difference_update(
+        external_context_pruning["removed_link_ids"]
+    )
+    (
+        footprint_links,
+        footprint_nodes,
+        footprint_lineage,
+        selected_footprint_pruning,
+    ) = _prune_unambiguous_external_inserted_path(
+        anchored_links=external_context_links,
+        anchored_nodes=external_context_nodes,
+        anchored_lineage=external_context_lineage,
+        parent_links=parent_links,
+        parent_nodes=parent_nodes,
+        selected_parent_link_ids=selected_parent_link_ids,
+        inserted_realized_link_ids=inserted_realized_link_ids,
+        source_id=int(parent_report.source_nodes[0]),
+        sink_id=int(parent_report.sink_nodes[0]),
+        tolerance_m=tolerance,
+    )
     anchored_links, anchored_nodes, canonicalization_summary = (
         _canonicalize_unchanged_parent_links(
-            anchored_links=transformed.directed_links,
-            anchored_nodes=transformed.directed_nodes,
-            anchored_lineage=transformed.link_lineage,
+            anchored_links=footprint_links,
+            anchored_nodes=footprint_nodes,
+            anchored_lineage=footprint_lineage,
             parent_links=parent_links,
             parent_nodes=parent_nodes,
             source_id=int(parent_report.source_nodes[0]),
@@ -825,6 +1349,9 @@ def anchor_local_patch_realized_graph(
         "realized_node_count": int(len(realized_nodes)),
         "anchored_node_count": int(len(anchored_nodes)),
         "unchanged_parent_canonicalization": canonicalization_summary,
+        "exact_inserted_context_deduplication": exact_context_deduplication,
+        "external_inserted_context_pruning": external_context_pruning,
+        "selected_footprint_pruning": selected_footprint_pruning,
         "anchor_segmentation_summary": transformed.anchor_segmentation_summary,
         "direction_summary": direction_summary,
     }

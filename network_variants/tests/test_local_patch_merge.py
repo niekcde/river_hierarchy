@@ -18,6 +18,9 @@ from hierarchy_level_definition.unit_detection.bifurcation_confluence_units impo
 from network_variants.local_patch import LocalPatchCollar, LocalPatchContract, LocalPatchRasterPolicy
 from network_variants.local_patch_anchored import (
     _canonicalize_unchanged_parent_links,
+    _prune_exact_inserted_context_duplicates,
+    _prune_external_inserted_context,
+    _prune_unambiguous_external_inserted_path,
     anchor_local_patch_realized_graph,
 )
 from network_variants.local_patch_merge import (
@@ -48,6 +51,187 @@ from network_variants.local_patch_realized import (
 from network_variants.local_patch_raster import build_local_patch_base_raster
 from network_variants.local_patch_variant import LocalPatchVariantResult
 from network_variants.variant_generation import derive_anchored_graph_from_realized
+
+
+def test_exact_inserted_context_duplicate_is_removed_only_through_topology_gate() -> None:
+    parent_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 0, "id_us_node": 0, "id_ds_node": 1, "geometry": LineString([(-5, 0), (0, 0)])},
+            {"id_link": 1, "id_us_node": 1, "id_ds_node": 2, "geometry": LineString([(0, 0), (5, 2), (10, 0)])},
+            {"id_link": 2, "id_us_node": 1, "id_ds_node": 2, "geometry": LineString([(0, 0), (5, -2), (10, 0)])},
+            {"id_link": 3, "id_us_node": 2, "id_ds_node": 3, "geometry": LineString([(10, 0), (15, 0)])},
+        ],
+        crs="EPSG:3857",
+    )
+    child_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 0, "id_us_node": 0, "id_ds_node": 1, "local_patch_source_realized_link_id": np.nan, "geometry": LineString([(-5, 0), (0, 0)])},
+            {"id_link": 10, "id_us_node": 1, "id_ds_node": 2, "local_patch_source_realized_link_id": 10, "geometry": LineString([(0, 0), (10, 0)])},
+            {"id_link": 3, "id_us_node": 2, "id_ds_node": 3, "local_patch_source_realized_link_id": np.nan, "geometry": LineString([(10, 0), (15, 0)])},
+            {"id_link": 11, "id_us_node": 2, "id_ds_node": 3, "local_patch_source_realized_link_id": 11, "geometry": LineString([(10, 0), (15, 0)])},
+        ],
+        crs=parent_links.crs,
+    )
+    nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": node_id, "geometry": Point(x, 0)}
+            for node_id, x in ((0, -5), (1, 0), (2, 10), (3, 15))
+        ],
+        crs=parent_links.crs,
+    )
+    lineage = pd.DataFrame(
+        {
+            "id_link": [0, 10, 3, 11],
+            "lineage_type": [
+                "unchanged_1to1",
+                "collapsed_many_to_one",
+                "unchanged_1to1",
+                "changed_local",
+            ],
+        }
+    )
+
+    links, result_nodes, result_lineage, summary = (
+        _prune_exact_inserted_context_duplicates(
+            anchored_links=child_links,
+            anchored_nodes=nodes,
+            anchored_lineage=lineage,
+            parent_links=parent_links,
+            selected_parent_link_ids={1, 2},
+            inserted_realized_link_ids={10, 11},
+            source_id=0,
+            sink_id=3,
+            tolerance_m=1.0,
+        )
+    )
+
+    assert summary["applied"] is True
+    assert summary["removed_link_ids"] == [11]
+    assert set(links["id_link"].astype(int)) == {0, 3, 10}
+    assert set(result_nodes["id_node"].astype(int)) == {0, 1, 2, 3}
+    assert set(result_lineage["id_link"].astype(int)) == {0, 3, 10}
+
+
+def test_external_inserted_context_is_removed_only_through_topology_gate() -> None:
+    parent_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 0, "id_us_node": 0, "id_ds_node": 1, "geometry": LineString([(-20, 0), (0, 0)])},
+            {"id_link": 1, "id_us_node": 1, "id_ds_node": 2, "geometry": LineString([(0, 0), (5, 2), (10, 0)])},
+            {"id_link": 2, "id_us_node": 1, "id_ds_node": 2, "geometry": LineString([(0, 0), (5, -2), (10, 0)])},
+            {"id_link": 3, "id_us_node": 2, "id_ds_node": 3, "geometry": LineString([(10, 0), (20, 0)])},
+        ],
+        crs="EPSG:3857",
+    )
+    child_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 0, "id_us_node": 0, "id_ds_node": 1, "local_patch_source_realized_link_id": np.nan, "geometry": LineString([(-20, 0), (0, 0)])},
+            {"id_link": 10, "id_us_node": 1, "id_ds_node": 2, "local_patch_source_realized_link_id": 10, "geometry": LineString([(0, 0), (10, 0)])},
+            {"id_link": 3, "id_us_node": 2, "id_ds_node": 3, "local_patch_source_realized_link_id": np.nan, "geometry": LineString([(10, 0), (20, 0)])},
+            {"id_link": 11, "id_us_node": 0, "id_ds_node": 4, "local_patch_source_realized_link_id": 11, "geometry": LineString([(-20, 0), (-10, 8)])},
+            {"id_link": 12, "id_us_node": 4, "id_ds_node": 1, "local_patch_source_realized_link_id": 12, "geometry": LineString([(-10, 8), (0, 0)])},
+        ],
+        crs=parent_links.crs,
+    )
+    nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": node_id, "geometry": Point(x, y)}
+            for node_id, x, y in (
+                (0, -20, 0), (1, 0, 0), (2, 10, 0), (3, 20, 0), (4, -10, 8)
+            )
+        ],
+        crs=parent_links.crs,
+    )
+    lineage = pd.DataFrame(
+        {
+            "id_link": [0, 10, 3, 11, 12],
+            "lineage_type": [
+                "unchanged_1to1",
+                "collapsed_many_to_one",
+                "unchanged_1to1",
+                "changed_local",
+                "changed_local",
+            ],
+        }
+    )
+
+    links, result_nodes, result_lineage, summary = _prune_external_inserted_context(
+        anchored_links=child_links,
+        anchored_nodes=nodes,
+        anchored_lineage=lineage,
+        parent_links=parent_links,
+        selected_parent_link_ids={1, 2},
+        inserted_realized_link_ids={10, 11, 12},
+        source_id=0,
+        sink_id=3,
+        tolerance_m=1.0,
+    )
+
+    assert summary["applied"] is True
+    assert summary["removed_link_ids"] == [11, 12]
+    assert set(links["id_link"].astype(int)) == {0, 3, 10}
+    assert set(result_nodes["id_node"].astype(int)) == {0, 1, 2, 3}
+    assert set(result_lineage["id_link"].astype(int)) == {0, 3, 10}
+
+
+def test_selected_polygon_prunes_only_unambiguous_external_inserted_path() -> None:
+    parent_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 0, "id_us_node": 0, "id_ds_node": 1, "geometry": LineString([(-5, 0), (0, 0)])},
+            {"id_link": 1, "id_us_node": 1, "id_ds_node": 2, "geometry": LineString([(0, 0), (5, 2), (10, 0)])},
+            {"id_link": 2, "id_us_node": 1, "id_ds_node": 2, "geometry": LineString([(0, 0), (5, -2), (10, 0)])},
+            {"id_link": 3, "id_us_node": 2, "id_ds_node": 3, "geometry": LineString([(10, 0), (15, 0)])},
+            {"id_link": 4, "id_us_node": 0, "id_ds_node": 3, "geometry": LineString([(-5, 0), (5, 12), (15, 0)])},
+        ],
+        crs="EPSG:3857",
+    )
+    parent_nodes = gpd.GeoDataFrame(
+        [{"id_node": i, "geometry": Point(x, y)} for i, x, y in ((0, -5, 0), (1, 0, 0), (2, 10, 0), (3, 15, 0))],
+        crs=parent_links.crs,
+    )
+    child_links = gpd.GeoDataFrame(
+        [
+            parent_links.loc[parent_links.id_link.eq(i)].iloc[0].to_dict() for i in (0, 3, 4)
+        ]
+        + [
+            {"id_link": 10, "id_us_node": 1, "id_ds_node": 2, "local_patch_source_realized_link_id": 10, "geometry": LineString([(0, 0), (5, 0), (10, 0)])},
+            {"id_link": 11, "id_us_node": 1, "id_ds_node": 4, "local_patch_source_realized_link_id": 11, "geometry": LineString([(0, 0), (0, 10)])},
+            {"id_link": 12, "id_us_node": 4, "id_ds_node": 5, "local_patch_source_realized_link_id": 12, "geometry": LineString([(0, 10), (10, 10)])},
+            {"id_link": 13, "id_us_node": 5, "id_ds_node": 2, "local_patch_source_realized_link_id": 13, "geometry": LineString([(10, 10), (10, 0)])},
+        ],
+        crs=parent_links.crs,
+    )
+    child_links["local_patch_source_realized_link_id"] = pd.to_numeric(
+        child_links["local_patch_source_realized_link_id"], errors="coerce"
+    ).astype("Int64")
+    child_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": i, "geometry": Point(x, y)}
+            for i, x, y in ((0, -5, 0), (1, 0, 0), (2, 10, 0), (3, 15, 0), (4, 0, 10), (5, 10, 10))
+        ],
+        crs=parent_links.crs,
+    )
+    lineage = pd.DataFrame(
+        {"id_link": child_links.id_link.astype(int), "lineage_type": "changed_local"}
+    )
+
+    links, nodes, result_lineage, summary = _prune_unambiguous_external_inserted_path(
+        anchored_links=child_links,
+        anchored_nodes=child_nodes,
+        anchored_lineage=lineage,
+        parent_links=parent_links,
+        parent_nodes=parent_nodes,
+        selected_parent_link_ids={1, 2},
+        inserted_realized_link_ids={10, 11, 12, 13},
+        source_id=0,
+        sink_id=3,
+        tolerance_m=0.1,
+    )
+
+    assert summary["applied"] is True, summary
+    assert summary["removed_link_ids"] == [11, 12, 13]
+    assert set(links.id_link.astype(int)) == {0, 3, 4, 10}
+    assert set(nodes.id_node.astype(int)) == {0, 1, 2, 3}
+    assert set(result_lineage.id_link.astype(int)) == {0, 3, 4, 10}
 
 
 def test_same_endpoint_projection_uses_only_bounded_exact_parent_connector() -> None:
@@ -298,6 +482,64 @@ def test_parent_canonicalization_keeps_nodes_and_incident_links_geometrically_co
     assert Point(link_by_id.loc[21].geometry.coords[0]).equals(Point(10, 0))
     assert summary["canonicalized_node_count"] == 2
     assert summary["maximum_node_move_m"] == pytest.approx(0.5)
+
+
+def test_parent_canonicalization_requires_stable_endpoints_even_with_provenance() -> None:
+    parent_links = gpd.GeoDataFrame(
+        [{"id_link": 10, "id_us_node": 1, "id_ds_node": 2, "geometry": LineString([(0, 0), (10, 0)])}],
+        crs="EPSG:3857",
+    )
+    parent_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 1, "geometry": Point(0, 0)},
+            {"id_node": 2, "geometry": Point(10, 0)},
+        ],
+        crs="EPSG:3857",
+    )
+    changed_geometry = LineString([(0, 0), (15, 1)])
+    child_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 20, "id_us_node": 101, "id_ds_node": 102, "geometry": changed_geometry},
+            {"id_link": 21, "id_us_node": 102, "id_ds_node": 103, "geometry": LineString([(15, 1), (20, 0)])},
+        ],
+        crs="EPSG:3857",
+    )
+    child_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 101, "geometry": Point(0, 0)},
+            {"id_node": 102, "geometry": Point(15, 1)},
+            {"id_node": 103, "geometry": Point(20, 0)},
+        ],
+        crs="EPSG:3857",
+    )
+    lineage = pd.DataFrame(
+        [
+            {"id_link": 20, "lineage_type": "unchanged_1to1", "dominant_parent_link_id": 10},
+            {"id_link": 21, "lineage_type": "changed_local", "dominant_parent_link_id": pd.NA},
+        ]
+    )
+
+    links, nodes, summary = _canonicalize_unchanged_parent_links(
+        anchored_links=child_links,
+        anchored_nodes=child_nodes,
+        anchored_lineage=lineage,
+        parent_links=parent_links,
+        parent_nodes=parent_nodes,
+        source_id=101,
+        sink_id=103,
+        match_tolerance_m=1.0,
+        canonicalizable_child_link_ids={20},
+        canonicalizable_parent_by_child_link_id={20: 10},
+    )
+
+    assert links.loc[links["id_link"].eq(20)].iloc[0].geometry.equals_exact(
+        changed_geometry, 0.0
+    )
+    assert nodes.set_index("id_node").loc[102].geometry.equals(Point(15, 1))
+    assert summary["canonicalized_link_count"] == 0
+    assert summary["post_anchor_matches_excluded_by_provenance"][0]["reason"] == (
+        "pre_anchor_parent_endpoints_not_stable"
+    )
 
 
 def test_parent_canonicalization_preserves_post_anchor_match_without_unchanged_provenance() -> None:
@@ -863,6 +1105,16 @@ def test_collapse_topology_contract_counts_filled_components_and_cycles(
         crs="EPSG:3857",
     )
     assert _undirected_cycle_rank(links) == 2
+    # The selected topology is authoritative when supplied. Two filled raster
+    # components can belong to a subgraph with only one independent cycle.
+    assert (
+        _expected_cycle_reduction(
+            variant,
+            parent_links=links,
+            selected_link_ids=(1, 2, 3),
+        )
+        == 1
+    )
 
 
 def test_post_direction_reverse_parent_duplicate_requires_geometry_match() -> None:

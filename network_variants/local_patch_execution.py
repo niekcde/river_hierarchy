@@ -9,6 +9,7 @@ code path.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -54,7 +55,9 @@ from network_variants.variant_generation import (
 )
 
 
-LOCAL_PATCH_EXECUTION_VERSION = "topology-local-patch-execution-v9"
+LOCAL_PATCH_EXECUTION_VERSION = "topology-local-patch-execution-v11"
+
+COLLAR_CONTEXT_RETRY_DISTANCES_M = (1500.0, 2000.0)
 
 
 def _retryable_local_exit_failure(error: Exception) -> bool:
@@ -65,6 +68,17 @@ def _retryable_local_exit_failure(error: Exception) -> bool:
             "Raw local RivGraph",
             "anchored boundary node",
             "Anchored local boundaries are not connected",
+        )
+    )
+
+
+def _retryable_collar_context_failure(error: Exception) -> bool:
+    reason = str(error)
+    return any(
+        marker in reason
+        for marker in (
+            "No local link or node lies within",
+            "Raw local RivGraph has no unambiguous",
         )
     )
 
@@ -258,6 +272,11 @@ def _write_virtual_rasters_with_local_edit(
             count=1,
             compress="lzw",
             tiled=False,
+            # Zero is a real collapse edit, not transparency.  The overlay is
+            # already bounded by its VRT destination window, so inheriting the
+            # parent mask's zero nodata value would silently reveal the parent
+            # water pixel wherever the patch deliberately writes zero.
+            nodata=None,
         )
         with rasterio.open(collapsed_patch_path, "w", **patch_profile) as destination:
             destination.write(collapsed_patch, 1)
@@ -423,6 +442,8 @@ def _materialize_local_patch_network_variant_once(
     local_patch_mask_publication: str = "materialized",
     computational_context_unit_id: int | None = None,
     local_patch_attempt_subdirectory: str | None = None,
+    exclude_closed_two_link_replacement: bool = False,
+    minimum_collar_context_m_override: float | None = None,
     **_: Any,
 ) -> NetworkVariantOutputs:
     """Build one canonical child state using the validated local-patch phases."""
@@ -509,6 +530,24 @@ def _materialize_local_patch_network_variant_once(
             audit_path=planning_path,
         )
     contract = planning.contract
+    if minimum_collar_context_m_override is not None:
+        requested_context = float(minimum_collar_context_m_override)
+        if requested_context <= 0:
+            raise ValueError("minimum_collar_context_m_override must be positive.")
+        contract = replace(
+            contract,
+            raster_policy=replace(
+                contract.raster_policy,
+                minimum_collar_context_m=max(
+                    float(contract.raster_policy.minimum_collar_context_m),
+                    requested_context,
+                ),
+            ),
+        )
+        planning = replace(planning, contract=contract)
+        planning_path = write_local_patch_planning_result(
+            planning, attempt_dir / "planning" / "local_patch_planning_result.json"
+        )
     raster_result = build_local_patch_base_raster(
         contract=contract,
         full_links=parent_links,
@@ -579,6 +618,14 @@ def _materialize_local_patch_network_variant_once(
                 parent_links_path=reviewed_links_path,
                 parent_nodes_path=reviewed_nodes_path,
                 output_dir=candidate_root / "realized",
+                boundary_match_tolerance_pixels=(
+                    12.0
+                    if minimum_collar_context_m_override is not None
+                    and float(minimum_collar_context_m_override) >= 2000.0
+                    else 10.0
+                    if minimum_collar_context_m_override is not None
+                    else 8.0
+                ),
             )
             with rasterio.open(candidate_variant.output_paths["local_collapsed_mask"]) as source:
                 anchoring_match_tolerance = float(
@@ -649,9 +696,13 @@ def _materialize_local_patch_network_variant_once(
     parent_cycle_rank = _undirected_cycle_rank(parent_links)
     anchored_cycle_rank = _undirected_cycle_rank(final_anchored_links)
     observed_cycle_reduction = int(parent_cycle_rank - anchored_cycle_rank)
-    expected_cycle_reduction = _expected_cycle_reduction(raw_variant)
+    expected_cycle_reduction = _expected_cycle_reduction(
+        raw_variant,
+        parent_links=parent_links,
+        selected_link_ids=contract.selected_link_ids,
+    )
     final_collapse_topology_validation = {
-        "method": "final_shared_anchored_cycle_rank_reduction",
+        "method": "final_shared_anchored_selected_parent_cycle_rank_reduction",
         "parent_cycle_rank": int(parent_cycle_rank),
         "anchored_cycle_rank": int(anchored_cycle_rank),
         "observed_cycle_reduction": int(observed_cycle_reduction),
@@ -668,7 +719,7 @@ def _materialize_local_patch_network_variant_once(
     if not final_collapse_topology_validation["passed"]:
         raise ValueError(
             "Final shared-anchored local graph is inconsistent with the raster edit: "
-            f"filled selected components={expected_cycle_reduction}, "
+            f"selected-parent cycle rank={expected_cycle_reduction}, "
             f"observed cycle-rank reduction={observed_cycle_reduction}, "
             f"parent cycle rank={parent_cycle_rank}, "
             f"anchored cycle rank={anchored_cycle_rank}."
@@ -683,6 +734,7 @@ def _materialize_local_patch_network_variant_once(
         example_id=str(example_id),
         variant_id=str(variant_id),
         collapse_corridor_mode=collapse_corridor_mode,
+        exclude_closed_two_link_replacement=exclude_closed_two_link_replacement,
     )
 
     summary_dir = output_dir / "summary"
@@ -867,6 +919,7 @@ def _materialize_local_patch_network_variant_once(
             "bank_labels": str(bank_labels_path.resolve()),
             "boundary_component_labels": str(Path(boundary_component_labels_path).resolve()),
             "collapse_components": str(collapse_components_path.resolve()),
+            "edit_geometries": str((mask_dir / "collapse_edit_geometries.gpkg").resolve()),
             "link_width_families": str((widths_dir / "link_width_families.csv").resolve()),
             "link_width_samples": str((widths_dir / "link_width_samples.csv").resolve()),
             "links_with_width_families": str(enriched_links_path.resolve()),
@@ -956,6 +1009,132 @@ def _outer_context_candidates(
     return tuple(candidates)
 
 
+def _is_outer_context_retryable(error: Exception) -> bool:
+    """Return whether a larger enclosing raster domain can address ``error``.
+
+    Outer-domain retries are for insufficient crop/context only.  They cannot
+    repair topology validation, shared-anchoring direction, cycle-rank, or
+    hydraulic-product failures and previously obscured those root causes with
+    an unrelated error at the enclosing unit's boundary.
+    """
+    message = str(error)
+    retryable_fragments = (
+        "No safe local crop",
+        "No local link or node lies within",
+        "Raw local RivGraph has no unambiguous",
+        "Required context cut lies beyond",
+        "Collar endpoints share one reference-centerline projection",
+        "identical reference-centerline projections",
+        "Exact anchored boundary is not reached",
+    )
+    return any(fragment in message for fragment in retryable_fragments)
+
+
+def _write_outer_domain_retry_summary(
+    *,
+    output_dir: str | Path,
+    selected_ids: Sequence[int],
+    attempts: Sequence[Mapping[str, Any]],
+    selected_context_unit_id: int | None,
+) -> Path:
+    summary_path = Path(output_dir) / "local_patch_attempt" / "outer_domain_retry_summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(
+        json.dumps(
+            {
+                "method": "progressive_enclosing_unit_context_retry",
+                "selected_unit_ids": [int(value) for value in selected_ids],
+                "attempts": [dict(row) for row in attempts],
+                "selected_context_unit_id": (
+                    int(selected_context_unit_id)
+                    if selected_context_unit_id is not None
+                    else None
+                ),
+                "root_error_preserved": True,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return summary_path
+
+
+def _materialize_with_collar_context_retries(
+    **kwargs: Any,
+) -> NetworkVariantOutputs:
+    """Retry only boundary-proximity failures with bounded longer collars."""
+    attempts: list[dict[str, Any]] = []
+    base_subdirectory = kwargs.get("local_patch_attempt_subdirectory")
+    last_error: Exception | None = None
+    for context_distance in (None, *COLLAR_CONTEXT_RETRY_DISTANCES_M):
+        attempt_kwargs = dict(kwargs)
+        if context_distance is not None:
+            suffix = f"collar_context_retries/context_{int(context_distance)}m"
+            attempt_kwargs["local_patch_attempt_subdirectory"] = (
+                f"{base_subdirectory}/{suffix}" if base_subdirectory else suffix
+            )
+            attempt_kwargs["minimum_collar_context_m_override"] = float(context_distance)
+        try:
+            result = _materialize_local_patch_network_variant_once(**attempt_kwargs)
+        except (LocalPatchFallbackRequested, ValueError) as error:
+            last_error = error
+            attempts.append(
+                {
+                    "minimum_collar_context_m": 1000.0 if context_distance is None else float(context_distance),
+                    "status": "failed",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+            if not _retryable_collar_context_failure(error):
+                raise
+            continue
+        attempts.append(
+            {
+                "minimum_collar_context_m": 1000.0 if context_distance is None else float(context_distance),
+                "status": "selected",
+                "error_type": "",
+                "error": "",
+            }
+        )
+        relative_summary = (
+            Path(str(base_subdirectory)) / "collar_context_retry_summary.json"
+            if base_subdirectory
+            else Path("collar_context_retry_summary.json")
+        )
+        summary_path = Path(kwargs["output_dir"]) / "local_patch_attempt" / relative_summary
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        selected_distance = 1000.0 if context_distance is None else float(context_distance)
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "method": "bounded_minimum_collar_context_retry",
+                    "attempts": attempts,
+                    "selected_minimum_collar_context_m": selected_distance,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result.manifest.setdefault("local_patch", {})["collar_context_retry"] = {
+            "summary_path": str(summary_path.resolve()),
+            "selected_minimum_collar_context_m": selected_distance,
+            "attempts": attempts,
+        }
+        Path(result.output_paths["manifest"]).write_text(
+            json.dumps(result.manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return result
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("No collar-context attempt was executed.")
+
+
 def materialize_local_patch_network_variant(**kwargs: Any) -> NetworkVariantOutputs:
     """Run the selected domain, then progressively larger enclosing domains.
 
@@ -964,8 +1143,10 @@ def materialize_local_patch_network_variant(**kwargs: Any) -> NetworkVariantOutp
     cannot broaden the scientific collapse selection.
     """
     try:
-        return _materialize_local_patch_network_variant_once(**kwargs)
+        return _materialize_with_collar_context_retries(**kwargs)
     except (LocalPatchFallbackRequested, ValueError) as first_error:
+        if not _is_outer_context_retryable(first_error):
+            raise
         selected_ids = tuple(int(value) for value in (kwargs.get("unit_ids") or ()))
         if len(selected_ids) != 1:
             raise
@@ -985,10 +1166,9 @@ def materialize_local_patch_network_variant(**kwargs: Any) -> NetworkVariantOutp
                 "error": str(first_error),
             }
         ]
-        last_error: Exception = first_error
         for context_unit_id in candidates:
             try:
-                result = _materialize_local_patch_network_variant_once(
+                result = _materialize_with_collar_context_retries(
                     **kwargs,
                     computational_context_unit_id=int(context_unit_id),
                     local_patch_attempt_subdirectory=f"context_unit_{int(context_unit_id)}",
@@ -1002,7 +1182,6 @@ def materialize_local_patch_network_variant(**kwargs: Any) -> NetworkVariantOutp
                         "error": str(error),
                     }
                 )
-                last_error = error
                 continue
             attempts.append(
                 {
@@ -1013,20 +1192,11 @@ def materialize_local_patch_network_variant(**kwargs: Any) -> NetworkVariantOutp
                 }
             )
             output_dir = Path(kwargs["output_dir"])
-            summary_path = output_dir / "local_patch_attempt" / "outer_domain_retry_summary.json"
-            summary_path.parent.mkdir(parents=True, exist_ok=True)
-            summary_path.write_text(
-                json.dumps(
-                    {
-                        "method": "progressive_enclosing_unit_context_retry",
-                        "selected_unit_ids": list(selected_ids),
-                        "attempts": attempts,
-                        "selected_context_unit_id": int(context_unit_id),
-                    },
-                    indent=2,
-                    sort_keys=True,
-                ) + "\n",
-                encoding="utf-8",
+            summary_path = _write_outer_domain_retry_summary(
+                output_dir=output_dir,
+                selected_ids=selected_ids,
+                attempts=attempts,
+                selected_context_unit_id=int(context_unit_id),
             )
             result.manifest.setdefault("local_patch", {})["outer_domain_retry"] = {
                 "summary_path": str(summary_path.resolve()),
@@ -1039,7 +1209,13 @@ def materialize_local_patch_network_variant(**kwargs: Any) -> NetworkVariantOutp
                 encoding="utf-8",
             )
             return result
-        raise last_error
+        _write_outer_domain_retry_summary(
+            output_dir=kwargs["output_dir"],
+            selected_ids=selected_ids,
+            attempts=attempts,
+            selected_context_unit_id=None,
+        )
+        raise first_error
 
 
 __all__ = [

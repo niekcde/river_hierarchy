@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import geopandas as gpd
 import numpy as np
@@ -10,11 +12,97 @@ from rasterio.transform import from_origin
 from rasterio.windows import Window, transform as window_transform
 from shapely.geometry import LineString
 
+import network_variants.local_patch_execution as local_patch_execution
+
 from network_variants.local_patch_execution import (
     _copy_raster_with_local_edit,
+    _is_outer_context_retryable,
     _selected_units_from_hierarchy_products,
     _write_virtual_rasters_with_local_edit,
 )
+
+
+def test_outer_context_retry_is_limited_to_context_failures() -> None:
+    assert _is_outer_context_retryable(
+        ValueError("No safe local crop was found for the selected unit.")
+    )
+    assert _is_outer_context_retryable(
+        ValueError("No local link or node lies within 80 m of boundary node 4.")
+    )
+    assert _is_outer_context_retryable(
+        ValueError(
+            "Collar 12 has identical reference-centerline projections and no "
+            "safe outward continuation."
+        )
+    )
+    assert not _is_outer_context_retryable(
+        ValueError("A reversed strict parent connector exceeds the bounded correction distance.")
+    )
+    assert not _is_outer_context_retryable(
+        ValueError("Dissolving computational cut interfaces produced an invalid realized graph.")
+    )
+
+
+def test_collar_context_retry_is_bounded_and_recorded(tmp_path, monkeypatch) -> None:
+    calls: list[float | None] = []
+
+    def fake_materialize_once(**kwargs):
+        distance = kwargs.get("minimum_collar_context_m_override")
+        calls.append(distance)
+        if distance is None:
+            raise ValueError(
+                "No local link or node lies within 35.806 m of the downstream "
+                "anchored boundary node 113."
+            )
+        manifest_path = tmp_path / "summary" / "variant_manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text("{}\n", encoding="utf-8")
+        return SimpleNamespace(
+            manifest={},
+            output_paths={"manifest": str(manifest_path)},
+        )
+
+    monkeypatch.setattr(
+        local_patch_execution,
+        "_materialize_local_patch_network_variant_once",
+        fake_materialize_once,
+    )
+    result = local_patch_execution._materialize_with_collar_context_retries(
+        output_dir=tmp_path,
+    )
+
+    assert calls == [None, 1500.0]
+    retry = result.manifest["local_patch"]["collar_context_retry"]
+    assert retry["selected_minimum_collar_context_m"] == 1500.0
+    assert [row["status"] for row in retry["attempts"]] == ["failed", "selected"]
+    saved = json.loads(Path(result.output_paths["manifest"]).read_text())
+    assert saved["local_patch"]["collar_context_retry"] == retry
+
+
+def test_collar_context_retry_does_not_mask_topology_failure(tmp_path, monkeypatch) -> None:
+    calls = 0
+
+    def fake_materialize_once(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise ValueError(
+            "Final shared-anchored local graph is inconsistent with the raster edit."
+        )
+
+    monkeypatch.setattr(
+        local_patch_execution,
+        "_materialize_local_patch_network_variant_once",
+        fake_materialize_once,
+    )
+    try:
+        local_patch_execution._materialize_with_collar_context_retries(
+            output_dir=tmp_path,
+        )
+    except ValueError as error:
+        assert "inconsistent with the raster edit" in str(error)
+    else:
+        raise AssertionError("A topology failure must not enter the collar retry ladder.")
+    assert calls == 1
 
 
 def _write(path: Path, values: np.ndarray, transform) -> Path:

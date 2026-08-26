@@ -40,7 +40,7 @@ from hierarchy_level_definition.graph_building.directed_network_checks import (
 )
 
 
-LOCAL_PATCH_REALIZED_ASSEMBLY_VERSION = "topology-local-realized-assembly-v3"
+LOCAL_PATCH_REALIZED_ASSEMBLY_VERSION = "topology-local-realized-assembly-v4"
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,6 +485,7 @@ def assemble_local_patch_realized_graph(
     output_dir: str | Path,
     match_tolerance_m: float | None = None,
     unchanged_overlap_fraction: float = 0.95,
+    boundary_match_tolerance_pixels: float = 8.0,
 ) -> LocalPatchRealizedResult:
     """Splice the raw local graph at the closed computational-domain boundary.
 
@@ -501,10 +502,12 @@ def assemble_local_patch_realized_graph(
     parent_nodes = gpd.read_file(parent_nodes_path)
     if parent_links.crs is None or parent_nodes.crs is None:
         raise ValueError("Parent graph requires a CRS.")
+    if float(boundary_match_tolerance_pixels) < 8.0:
+        raise ValueError("boundary_match_tolerance_pixels must be at least 8.")
     with rasterio.open(variant_result.output_paths["local_collapsed_mask"]) as source:
         terminal_tolerance = float(
             max(abs(source.transform.a), abs(source.transform.e))
-        ) * 8.0
+        ) * float(boundary_match_tolerance_pixels)
     domain_source_id, domain_sink_id = _computational_domain_boundaries(
         contract,
         parent_links,
@@ -531,6 +534,8 @@ def assemble_local_patch_realized_graph(
 
     realized_links = gpd.read_file(merge_result.output_paths["merged_links"])
     realized_nodes = gpd.read_file(merge_result.output_paths["merged_nodes"])
+    splice_links = realized_links.copy()
+    splice_nodes = realized_nodes.copy()
     parent_order, parent_graph, parent_report = _infer_parent_node_order(
         parent_links,
         parent_nodes,
@@ -551,33 +556,79 @@ def assemble_local_patch_realized_graph(
         realized_links,
         match_tolerance=canonical_match_tolerance,
     )
-    realized_links, realized_nodes, canonical_direction_summary = (
-        _assign_variant_directions(
-            child_links=realized_links,
-            child_nodes=realized_nodes,
-            parent_links=parent_links,
-            parent_nodes=parent_nodes,
-            node_match=canonical_node_match,
-            link_match=canonical_link_match,
-        )
-    )
     source_id = int(parent_report.source_nodes[0])
     sink_id = int(parent_report.sink_nodes[0])
-    realized_links, realized_nodes = _refresh_topology(
-        realized_links,
-        realized_nodes,
+    splice_links, splice_nodes = _refresh_topology(
+        splice_links,
+        splice_nodes,
         source_id=source_id,
         sink_id=sink_id,
     )
+    splice_graph = build_directed_graph(
+        splice_links, splice_nodes, prefer_explicit_direction=True
+    )
+    splice_report = validate_single_inlet_single_outlet(splice_graph)
+    splice_is_dag = nx.is_directed_acyclic_graph(splice_graph)
+
+    canonical_direction_error: str | None = None
+    try:
+        realized_links, realized_nodes, canonical_direction_summary = (
+            _assign_variant_directions(
+                child_links=realized_links,
+                child_nodes=realized_nodes,
+                parent_links=parent_links,
+                parent_nodes=parent_nodes,
+                node_match=canonical_node_match,
+                link_match=canonical_link_match,
+            )
+        )
+        realized_links, realized_nodes = _refresh_topology(
+            realized_links,
+            realized_nodes,
+            source_id=source_id,
+            sink_id=sink_id,
+        )
+    except ValueError as error:
+        canonical_direction_error = str(error)
+        if not splice_report.is_valid or not splice_is_dag:
+            raise
+        realized_links = splice_links
+        realized_nodes = splice_nodes
+        canonical_direction_summary = {
+            "method": "preserved_valid_component_direction_after_canonical_error",
+            "canonical_direction_error": str(error),
+            "is_valid": True,
+        }
     realized_graph = build_directed_graph(
         realized_links,
         realized_nodes,
         prefer_explicit_direction=True,
     )
     realized_report = validate_single_inlet_single_outlet(realized_graph)
-    if not realized_report.is_valid or not nx.is_directed_acyclic_graph(realized_graph):
+    realized_is_dag = nx.is_directed_acyclic_graph(realized_graph)
+    if (
+        (not realized_report.is_valid or not realized_is_dag)
+        and splice_report.is_valid
+        and splice_is_dag
+    ):
+        canonical_direction_error = (
+            "Canonical parent-fragment direction produced invalid whole-graph "
+            f"topology: {list(realized_report.issues)}; is_dag={realized_is_dag}."
+        )
+        realized_links = splice_links
+        realized_nodes = splice_nodes
+        realized_graph = splice_graph
+        realized_report = splice_report
+        realized_is_dag = splice_is_dag
+        canonical_direction_summary = {
+            **dict(canonical_direction_summary),
+            "method": "preserved_valid_component_direction_after_fragment_conflict",
+            "canonical_direction_error": canonical_direction_error,
+            "is_valid": True,
+        }
+    if not realized_report.is_valid or not realized_is_dag:
         issues = list(realized_report.issues)
-        if not nx.is_directed_acyclic_graph(realized_graph):
+        if not realized_is_dag:
             issues.append("Realized graph is not a directed acyclic graph.")
         raise ValueError(
             "Dissolving computational cut interfaces produced an invalid realized "
@@ -630,8 +681,17 @@ def assemble_local_patch_realized_graph(
             "is_dag": True,
         },
         "canonical_direction_assignment": dict(canonical_direction_summary),
+        "precanonical_splice_direction_validation": {
+            **splice_report.to_dict(),
+            "is_dag": bool(splice_is_dag),
+        },
+        "canonical_direction_rejected": bool(canonical_direction_error),
+        "canonical_direction_rejection_reason": canonical_direction_error,
         "canonical_direction_match_tolerance_m": canonical_match_tolerance,
         "computational_boundary_match_tolerance_m": terminal_tolerance,
+        "computational_boundary_match_tolerance_pixels": float(
+            boundary_match_tolerance_pixels
+        ),
         "splice_summary": dict(merge_result.summary),
     }
     result = LocalPatchRealizedResult(
