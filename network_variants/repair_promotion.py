@@ -297,6 +297,8 @@ def _rewrite_tree(root: Path, replacements: Sequence[tuple[str, str]]) -> None:
     # bottom-up so a renamed directory never invalidates a pending child path.
     paths = sorted(root.rglob("*"), key=lambda path: len(path.parts), reverse=True)
     for path in paths:
+        if path.name.startswith("._"):
+            continue
         rebased_name = _replace_text(path.name, replacements)
         if rebased_name == path.name:
             continue
@@ -306,6 +308,13 @@ def _rewrite_tree(root: Path, replacements: Sequence[tuple[str, str]]) -> None:
                 f"Cannot rebase promoted artifact because the destination exists: {destination}"
             )
         path.rename(destination)
+    # Writing VRT/CSV metadata on some external volumes can recreate
+    # AppleDouble files after the first cleanup.
+    for path in sorted(root.rglob("._*"), key=lambda item: len(item.parts), reverse=True):
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
 
 
 def _validate_staged_outputs(staging: Path, target_state_dir: Path) -> None:
