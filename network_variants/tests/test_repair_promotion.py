@@ -115,6 +115,8 @@ def test_apply_promotion_rebases_state_and_registries_with_backup(tmp_path) -> N
     # Failed legacy states may have no authoritative equivalent-transition row.
     empty_equivalent = pd.read_csv(target / "equivalent_transition_registry.csv").iloc[0:0]
     empty_equivalent.to_csv(target / "equivalent_transition_registry.csv", index=False)
+    sidecar = repair / "states" / "S001_unit_7" / "variant" / "directed" / "._99__S001_unit_7_directed_links.gpkg"
+    sidecar.write_text("appledouble", encoding="utf-8")
     plan = build_promotion_plan(repair, target)
 
     backup = apply_promotion_plan(
@@ -132,6 +134,7 @@ def test_apply_promotion_rebases_state_and_registries_with_backup(tmp_path) -> N
     assert "S042_unit_7" in manifest["output_paths"]["directed_links"]
     assert Path(manifest["output_paths"]["directed_links"]).exists()
     assert not list(promoted.rglob("*S001_unit_7*"))
+    assert not list(promoted.rglob("._*"))
     state_registry = pd.read_csv(target / "state_registry.csv")
     child = state_registry.loc[state_registry["state_role"].eq("derived")].iloc[0]
     assert child["state_id"] == "S042_unit_7"

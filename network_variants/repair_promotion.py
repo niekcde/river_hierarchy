@@ -272,6 +272,16 @@ def _rebase_frame(frame: pd.DataFrame, replacements: Sequence[tuple[str, str]]) 
 
 
 def _rewrite_tree(root: Path, replacements: Sequence[tuple[str, str]]) -> None:
+    # External/macOS volumes can expose AppleDouble ``._*`` sidecars even when
+    # copytree ignore patterns were supplied.  They are not scientific
+    # artifacts and collide with their rebased counterparts, so remove them
+    # from the private staging tree before any rename.
+    sidecars = sorted(root.rglob("._*"), key=lambda path: len(path.parts), reverse=True)
+    for path in sidecars:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
             continue
