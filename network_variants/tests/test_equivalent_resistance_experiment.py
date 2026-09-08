@@ -446,6 +446,77 @@ def test_run_equivalent_resistance_experiment_recovers_component_from_unstable_n
     assert comparison["Lambda_matched"] > 0
 
 
+def test_selected_hydraulic_domain_replaces_isolated_member_aggregate(tmp_path: Path) -> None:
+    experiment_dir = tmp_path / "13_indep__anchored"
+    state_id = "S037_unit_48"
+    domain_dir = experiment_dir / "states" / state_id / "equivalent_resistance"
+    domain_dir.mkdir(parents=True)
+    pd.DataFrame(
+        [
+            {"domain_role": "parent", "id_link": 181, "id_us_node": 95, "id_ds_node": 120},
+            {"domain_role": "parent", "id_link": 185, "id_us_node": 128, "id_ds_node": 120},
+            {"domain_role": "child", "id_link": 900, "id_us_node": 112, "id_ds_node": 84},
+        ]
+    ).to_csv(domain_dir / "selected_hydraulic_domain_links.csv", index=False)
+    pd.DataFrame(
+        [
+            {
+                "transition_id": "T037",
+                "child_state_id": state_id,
+                "selected_domain_status": "complete",
+                "parent_solver_success": True,
+                "child_solver_success": True,
+                "selected_unit_ids": "48",
+                "hydraulic_domain_type": "containing_compound_context",
+                "parent_upstream_boundary_node": 112,
+                "parent_downstream_boundary_node": 84,
+                "child_upstream_boundary_node": 112,
+                "child_downstream_boundary_node": 84,
+                "parent_solver_method": "energy_sparse",
+                "child_solver_method": "energy_sparse",
+                "K_before": 4.934218e-7,
+                "K_after": 5.345743e-7,
+                "G_before": 1.0 / 4.934218e-7,
+                "G_after": 1.0 / 5.345743e-7,
+                "Q_unit_before": 1423.6,
+                "Q_unit_after": 1367.7,
+                "Lambda_K": 1.083402,
+                "Lambda_G": 0.923018,
+            }
+        ]
+    ).to_csv(experiment_dir / "equivalent_transition_registry.csv", index=False)
+
+    nominal = pd.DataFrame(
+        [{"state_id": state_id, "target_type": "unit", "target_id": 48, "nominal_upstream_node": 120, "nominal_downstream_node": 123, "K_eq_nominal_base": 9.0}]
+    )
+    child = pd.DataFrame(
+        [{"state_id": state_id, "child_object_id": f"{state_id}__obj_001", "child_link_ids": "175,176", "child_node_ids": "120,123", "K_variant_realized": float("nan"), "G_variant_realized": float("nan"), "Q_unit_variant": float("nan")}]
+    )
+    matched = pd.DataFrame(
+        [{"state_id": state_id, "child_object_id": f"{state_id}__obj_001", "matched_base_link_ids": "175,176", "matched_base_node_ids": "120,123", "K_eq_matched_base": float("nan"), "G_eq_matched_base": float("nan"), "Q_unit_matched_base": float("nan")}]
+    )
+    comparison = pd.DataFrame(
+        [{"state_id": state_id, "child_object_id": f"{state_id}__obj_001", "K_eq_matched_base": float("nan"), "K_variant_realized": float("nan"), "Lambda_matched": float("nan"), "Gamma_matched": float("nan"), "boundary_relation": "ambiguous"}]
+    )
+
+    child, matched, comparison, count = equivalent_resistance_experiment_module._apply_selected_hydraulic_domain_aggregates(
+        experiment_path=experiment_dir,
+        nominal_targets=nominal,
+        child_realized_objects=child,
+        matched_base_corridors=matched,
+        comparison=comparison,
+    )
+
+    assert count == 1
+    assert child.iloc[0]["child_link_ids"] == "900"
+    assert matched.iloc[0]["matched_base_link_ids"] == "181,185"
+    assert comparison.iloc[0]["K_eq_matched_base"] == pytest.approx(4.934218e-7)
+    assert comparison.iloc[0]["K_variant_realized"] == pytest.approx(5.345743e-7)
+    assert comparison.iloc[0]["Lambda_matched"] == pytest.approx(1.083402)
+    assert comparison.iloc[0]["boundary_relation"] == "selected_hydraulic_domain"
+    assert "residual_corridor_Lambda_matched_diagnostic" in comparison.columns
+
+
 def test_main_passes_equivalent_length_field_into_equivalent_resistance_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -30,7 +30,7 @@ from network_variants.width_review_gui import (
 from network_variants.width_routing_solver import prepare_hybrid_solver_links
 
 
-ROUTING_WIDTH_APPLICATION_VERSION = "routing-width-application-v1"
+ROUTING_WIDTH_APPLICATION_VERSION = "routing-width-application-v2"
 DEFAULT_FINAL_MODEL_DIR = Path(__file__).resolve().parent / "output" / "width_qc_final_model"
 DEFAULT_WORKFLOW_MANIFEST_PATH = DEFAULT_FINAL_MODEL_DIR / "width_qc_final_workflow_manifest_v1.json"
 DEFAULT_ENDPOINT_WINDOW = WindowSpecification(0.10, 250.0, 1000.0)
@@ -251,12 +251,16 @@ def apply_routing_width_model(
     workflow_manifest_path: str | Path = DEFAULT_WORKFLOW_MANIFEST_PATH,
     apply_known_base_exclusions: bool = True,
     evaluation_link_ids: Collection[int] | None = None,
+    excluded_evaluation_link_ids: Collection[int] | None = None,
+    exclusion_reason: str = "",
 ) -> tuple[gpd.GeoDataFrame, pd.DataFrame, dict[str, Any]]:
     """Classify and solve effective routing widths without changing measured families.
 
     When ``evaluation_link_ids`` is provided, only those links may receive a
     new model decision. Existing routing values on all other links are fixed
     context for the joint solver and their complete provenance is preserved.
+    ``excluded_evaluation_link_ids`` provides a caller-scoped eligibility guard:
+    those links retain their measured wet routing width.
     """
     raw_links = _measured_family_frame(enriched_links)
     raw_links, unit_membership_source = _ensure_current_unit_membership(raw_links, directed_nodes)
@@ -327,6 +331,7 @@ def apply_routing_width_model(
     features = _model_features(feature_links, link_width_samples, solver_links)
     features["width_model_evaluation_scope"] = features["id_link"].isin(evaluated_ids)
     features["width_model_excluded"] = False
+    features["width_model_exclusion_reason"] = ""
     if apply_known_base_exclusions:
         excluded_path = _resolved_artifact_path(
             workflow["files"]["excluded_cases"], fallback_dir=workflow_path.parent
@@ -340,6 +345,24 @@ def apply_routing_width_model(
             ).dropna().astype(int)
         )
         features["width_model_excluded"] = features["id_link"].isin(excluded_ids)
+        features.loc[features["width_model_excluded"], "width_model_exclusion_reason"] = (
+            "known_ambiguous_review_case"
+        )
+    explicitly_excluded_ids = {
+        int(link_id) for link_id in (excluded_evaluation_link_ids or [])
+    }
+    invalid_explicit_exclusions = explicitly_excluded_ids.difference(evaluated_ids)
+    if invalid_explicit_exclusions:
+        raise ValueError(
+            "Routing-width exclusions must be within the evaluation scope: "
+            f"{sorted(invalid_explicit_exclusions)}"
+        )
+    if explicitly_excluded_ids:
+        explicit_mask = features["id_link"].astype(int).isin(explicitly_excluded_ids)
+        features.loc[explicit_mask, "width_model_excluded"] = True
+        features.loc[explicit_mask, "width_model_exclusion_reason"] = str(
+            exclusion_reason or "caller_requested_exclusion"
+        )
 
     threshold = float(workflow["selected_threshold"])
     predicted_scope = (
@@ -404,6 +427,18 @@ def apply_routing_width_model(
     )
     audit["wid_adj_routing"] = audit["comparison_routing_width"]
     audit["width_correction_scale_factor"] = audit["comparison_scale_factor"]
+    explicit_exclusion_mask = audit["id_link"].astype(int).isin(explicitly_excluded_ids)
+    # The optimizer sees endpoint-window widths; an eligibility exclusion must
+    # explicitly restore the link-level measured wet width used by RAPID/EQ.
+    audit.loc[explicit_exclusion_mask, "wid_adj_routing"] = audit.loc[
+        explicit_exclusion_mask, "wid_adj_wet"
+    ]
+    audit.loc[explicit_exclusion_mask, "width_correction_scale_factor"] = 1.0
+    audit.loc[explicit_exclusion_mask, "comparison_routing_width"] = audit.loc[
+        explicit_exclusion_mask, "wid_adj_wet"
+    ]
+    audit.loc[explicit_exclusion_mask, "comparison_scale_factor"] = 1.0
+    audit.loc[explicit_exclusion_mask, "comparison_status"] = "excluded_retain_measured_wet"
     audit["width_correction_applied"] = audit["width_model_prediction"].eq(1) & ~np.isclose(
         audit["width_correction_scale_factor"], 1.0
     )
@@ -421,6 +456,7 @@ def apply_routing_width_model(
         ["retain_raw_flag", "correct_flag", "correct"],
         default="accept",
     )
+    audit.loc[explicit_exclusion_mask, "width_qc_decision"] = "retain_raw_closed_two_link_replacement"
     audit["width_qc_reason"] = np.select(
         [
             audit["width_model_excluded"],
@@ -430,7 +466,7 @@ def apply_routing_width_model(
             audit["width_model_prediction"].eq(1),
         ],
         [
-            "known_ambiguous_review_case",
+            audit["width_model_exclusion_reason"],
             "effective_width_inconsistent_with_measured_corridor",
             "outside_model_candidate_scope",
             "model_correction_outside_normal_scale_bounds",
@@ -511,6 +547,24 @@ def apply_routing_width_model(
         "example_id": str(example_id).zfill(2),
         "variant_id": str(variant_id),
         "measurement_source_field": "wid_adj_wet",
+        "trim_selection_version": (
+            str(raw_links["width_trim_selection_version"].dropna().iloc[0])
+            if "width_trim_selection_version" in raw_links.columns
+            and not raw_links["width_trim_selection_version"].dropna().empty
+            else "legacy_reconstructed"
+        ),
+        "native_trim_fallback_count": int(
+            raw_links.get("width_trim_method", pd.Series("", index=raw_links.index))
+            .astype(str)
+            .eq("native_rivgraph_fallback")
+            .sum()
+        ),
+        "no_valid_trim_core_count": int(
+            raw_links.get("width_trim_method", pd.Series("", index=raw_links.index))
+            .astype(str)
+            .eq("untrimmed_no_valid_core")
+            .sum()
+        ),
         "unit_membership_source": unit_membership_source,
         "model_version": str(bundle["model_version"]),
         "model_name": str(bundle["model_name"]),
@@ -531,6 +585,7 @@ def apply_routing_width_model(
         "excluded_count": int(
             (audit["width_model_evaluation_scope"] & audit["width_model_excluded"]).sum()
         ),
+        "explicitly_excluded_evaluation_link_count": int(explicit_exclusion_mask.sum()),
         "predicted_correction_count": int(
             audit.loc[audit["width_model_evaluation_scope"], "width_model_prediction"].sum()
         ),

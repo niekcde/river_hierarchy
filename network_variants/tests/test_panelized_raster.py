@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 from rasterio.transform import from_origin
-from shapely.geometry import LineString, box
+from shapely.geometry import LineString, Point, box
 
 import geopandas as gpd
 
@@ -60,6 +60,66 @@ def test_panelized_merge_passes_parent_fallback_only_to_direction_assignment(
 
     assert "fallback_directed_links_path" not in calls["build"]
     assert calls["direction"]["fallback_directed_links_path"] == parent
+
+
+def test_normalize_panelized_single_path_removes_only_serial_interface_nodes(
+    tmp_path: Path,
+) -> None:
+    core_dir = tmp_path / "core"
+    core_dir.mkdir()
+    crs = "EPSG:32611"
+    geometries = [
+        LineString([(0, 0), (3, 0)]),
+        LineString([(3, 0), (7, 0)]),
+        LineString([(7, 0), (10, 0)]),
+    ]
+    common = {
+        "global_link_id": [10, 11, 12],
+        "source_segments": ["P001:0:0", "P002:0:0", "P003:0:0"],
+        "id_node_a": [100, 101, 102],
+        "id_node_b": [101, 102, 103],
+        "id_nodes": ["100, 101", "101, 102", "102, 103"],
+        "direction_status": ["assigned", "assigned", "assigned"],
+    }
+    gpd.GeoDataFrame(common, geometry=geometries, crs=crs).to_file(
+        core_dir / "merged_links.gpkg", layer="merged_links", driver="GPKG"
+    )
+    gpd.GeoDataFrame(
+        {
+            **common,
+            "id_us_node": [100, 101, 102],
+            "id_ds_node": [101, 102, 103],
+        },
+        geometry=geometries,
+        crs=crs,
+    ).to_file(
+        core_dir / "merged_links_directed.gpkg",
+        layer="merged_links",
+        driver="GPKG",
+    )
+    gpd.GeoDataFrame(
+        {"id_node": [100, 101, 102, 103]},
+        geometry=[Point(0, 0), Point(3, 0), Point(7, 0), Point(10, 0)],
+        crs=crs,
+    ).to_file(core_dir / "merged_nodes.gpkg", layer="merged_nodes", driver="GPKG")
+
+    report = panelized_raster_module._normalize_panelized_single_path_artifacts(
+        core_dir=core_dir
+    )
+
+    directed = gpd.read_file(
+        core_dir / "merged_links_directed.gpkg", layer="merged_links"
+    )
+    undirected = gpd.read_file(core_dir / "merged_links.gpkg", layer="merged_links")
+    nodes = gpd.read_file(core_dir / "merged_nodes.gpkg", layer="merged_nodes")
+    assert report["input_link_count"] == 3
+    assert report["removed_internal_node_ids"] == [101, 102]
+    assert len(directed) == len(undirected) == 1
+    assert directed.loc[0, "id_us_node"] == 100
+    assert directed.loc[0, "id_ds_node"] == 103
+    assert directed.loc[0, "source_segments"] == "P001:0:0;P002:0:0;P003:0:0"
+    assert directed.geometry.iloc[0].equals(LineString([(0, 0), (3, 0), (7, 0), (10, 0)]))
+    assert set(nodes["id_node"].astype(int)) == {100, 103}
 
 
 def test_windowed_bank_labels_and_panel_edit(tmp_path: Path) -> None:
@@ -313,6 +373,110 @@ def test_segmented_width_patch_recomputes_only_split_links(
     assert summary["source_link_by_recomputed_link"] == {"0": 0, "2": 0}
 
 
+def test_segmented_width_patch_replaces_stale_preanchor_width_family(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Regenerated two-bank families must replace inherited pre-anchor fields."""
+    source_links = gpd.GeoDataFrame(
+        {"id_link": [0], "wid_adj_wet": [30.0], "wid_adj_total": [35.0]},
+        geometry=[LineString([(0, 0), (10, 0)])],
+        crs="EPSG:32611",
+    )
+    segmented_links = gpd.GeoDataFrame(
+        {"id_link": [0, 1], "wid_adj_wet": [float("nan"), float("nan")]},
+        geometry=[
+            LineString([(0, 0), (5, 0)]),
+            LineString([(5, 0), (10, 0)]),
+        ],
+        crs=source_links.crs,
+    )
+    source_samples = pd.DataFrame(
+        {
+            "id_link": [0, 0, 0],
+            "sample_index": [0, 1, 2],
+            "x": [0.0, 5.0, 10.0],
+            "y": [0.0, 0.0, 0.0],
+            "dt_width_global": [30.0, 30.0, 30.0],
+        }
+    )
+    origin_path = tmp_path / "origin.tif"
+    _write(origin_path, np.ones((12, 12), dtype="uint16"))
+
+    def fake_widths(links, samples, **kwargs):
+        enriched = links.copy()
+        enriched["wid_adj_wet"] = 44.0
+        enriched["wid_adj_total"] = 50.0
+        return enriched, samples.rename(columns={"width": "width_total"})
+
+    monkeypatch.setattr(
+        panelized_raster_module,
+        "compute_panelized_base_width_families",
+        fake_widths,
+    )
+    enriched, _, _ = compute_segmented_width_patch(
+        segmented_links=segmented_links,
+        source_links=source_links,
+        source_width_links=source_links,
+        source_width_samples=source_samples,
+        bank_labels_path=tmp_path / "unused_banks.tif",
+        origin_mask_path=origin_path,
+    )
+
+    assert "wid_adj_wet_x" not in enriched.columns
+    assert "wid_adj_wet_y" not in enriched.columns
+    assert enriched.set_index("id_link")["wid_adj_wet"].to_dict() == {0: 44.0, 1: 44.0}
+
+
+def test_segmented_width_patch_retains_canonical_family_for_reused_link(
+    tmp_path: Path,
+) -> None:
+    """A reuse-only post-anchor pass still publishes the measured wet width."""
+    source_links = gpd.GeoDataFrame(
+        {"id_link": [5], "wid_adj_wet": [31.0], "wid_adj_total": [36.0]},
+        geometry=[LineString([(0, 0), (10, 0)])],
+        crs="EPSG:32611",
+    )
+    segmented_links = gpd.GeoDataFrame(
+        {"id_link": [5]},
+        geometry=[LineString([(0, 0), (10, 0)])],
+        crs=source_links.crs,
+    )
+    samples = pd.DataFrame(
+        {
+            "id_link": [5, 5],
+            "sample_index": [0, 1],
+            "x": [0.0, 10.0],
+            "y": [0.0, 0.0],
+            "dt_width_global": [31.0, 31.0],
+        }
+    )
+    origin_path = tmp_path / "origin.tif"
+    _write(origin_path, np.ones((12, 12), dtype="uint16"))
+
+    enriched, _, summary = compute_segmented_width_patch(
+        segmented_links=segmented_links,
+        source_links=source_links,
+        source_width_links=source_links,
+        source_width_samples=samples,
+        bank_labels_path=tmp_path / "unused_banks.tif",
+        origin_mask_path=origin_path,
+    )
+
+    assert enriched.loc[0, "wid_adj_wet"] == 31.0
+    assert enriched.loc[0, "wid_adj_total"] == 36.0
+    assert summary["primary_source_link_by_reused_link"] == {"5": 5}
+
+
+def test_authoritative_width_family_selector_excludes_raw_and_routing_fields() -> None:
+    assert panelized_raster_module._is_authoritative_width_family_column("wid_adj_wet")
+    assert panelized_raster_module._is_authoritative_width_family_column("wid_med_total")
+    assert panelized_raster_module._is_authoritative_width_family_column("wid_pix_dry")
+    assert not panelized_raster_module._is_authoritative_width_family_column("wid_adj_orig")
+    assert not panelized_raster_module._is_authoritative_width_family_column("wid_med_orig")
+    assert not panelized_raster_module._is_authoritative_width_family_column("wid_adj_routing")
+
+
 def test_segmented_width_patch_reuses_unique_exact_secondary_link(
     tmp_path: Path,
     monkeypatch,
@@ -504,7 +668,64 @@ def test_virtual_state_mosaic_and_support_rasters_match_materialized_values(
     # The newly wetted pixel overlaps component 2, so the state-bank builder
     # correctly records that component as absorbed by the collapsed channel.
     assert removed == [2]
-    assert support["origin"]["overlay_path"].endswith("origin_mask_patch.tif")
+    assert support["origin"]["overlays"][0]["overlay_path"].endswith(
+        "origin_mask_patch_001.tif"
+    )
+
+
+def test_virtual_state_mosaic_keeps_disjoint_panel_patches_bounded(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "parent.tif"
+    panel_root = tmp_path / "panels"
+    _write(parent, np.zeros((20, 20), dtype="uint8"))
+    panel_specs = {
+        "P001": (from_origin(0, 20, 1, 1), (1, 1)),
+        "P002": (from_origin(16, 4, 1, 1), (2, 2)),
+    }
+    for panel_id, (transform, wet_index) in panel_specs.items():
+        (panel_root / panel_id).mkdir(parents=True)
+        values = np.zeros((4, 4), dtype="uint8")
+        values[wet_index] = 1
+        with rasterio.open(
+            panel_root / panel_id / "mask.tif",
+            "w",
+            driver="GTiff",
+            height=4,
+            width=4,
+            count=1,
+            dtype="uint8",
+            transform=transform,
+        ) as destination:
+            destination.write(values, 1)
+    plan = tmp_path / "plan.gpkg"
+    gpd.GeoDataFrame(
+        {"panel_id": ["P001", "P002"]},
+        geometry=[box(0, 16, 4, 20), box(16, 0, 20, 4)],
+        crs="EPSG:32611",
+    ).to_file(plan, layer="panel_cores", driver="GPKG")
+
+    materialized = write_panelized_state_mosaic(
+        parent_mask_path=parent,
+        panel_plan_path=plan,
+        state_panel_root=panel_root,
+        affected_panel_ids=["P001", "P002"],
+        output_mask_path=tmp_path / "materialized.tif",
+    )
+    virtual, publication = write_panelized_state_virtual_mosaic(
+        parent_mask_path=parent,
+        panel_plan_path=plan,
+        state_panel_root=panel_root,
+        affected_panel_ids=["P001", "P002"],
+        output_dir=tmp_path / "virtual",
+    )
+
+    assert len(publication["overlay_paths"]) == 2
+    for patch_path in publication["overlay_paths"]:
+        with rasterio.open(patch_path) as patch:
+            assert patch.shape == (4, 4)
+    with rasterio.open(materialized) as expected, rasterio.open(virtual) as actual:
+        assert np.array_equal(actual.read(1), expected.read(1))
 
 
 def test_merge_panel_two_bank_widths(tmp_path: Path) -> None:
@@ -513,8 +734,9 @@ def test_merge_panel_two_bank_widths(tmp_path: Path) -> None:
     gpd.GeoDataFrame({"global_link_id": [7], "source_segments": ["P001:3:0"]}, geometry=[line], crs="EPSG:32611").to_file(merged_path, layer="merged_links", driver="GPKG")
     gpd.GeoDataFrame({"segment_id": ["P001:3:0"], "panel_id": ["P001"], "source_link_id": [3]}, geometry=[line], crs="EPSG:32611").to_file(segments_path, layer="core_segments", driver="GPKG")
     sample_dir = tmp_path / "panel_widths" / "P001" / "widths"; sample_dir.mkdir(parents=True)
-    pd.DataFrame({"id_link": [3, 3, 3], "x": [0., 1., 2.], "y": [0., 0., 0.], "width_total": [10., 12., 14.], "width_wet": [10., 12., 14.], "width_dry": [0., 0., 0.]}).to_csv(sample_dir / "link_width_samples.csv", index=False)
+    pd.DataFrame({"id_link": [3, 3, 3], "x": [0., 1., 2.], "y": [0., 0., 0.], "width_total": [10., np.nan, 14.], "width_wet": [10., np.nan, 14.], "width_dry": [0., np.nan, 0.], "dt_width_global": [10., 12., 14.]}).to_csv(sample_dir / "link_width_samples.csv", index=False)
     result = merge_panel_two_bank_widths(merged_links_path=merged_path, core_segments_path=segments_path, panel_width_root=tmp_path / "panel_widths", output_dir=tmp_path / "merged_widths")
     output = gpd.read_file(result["links"])
     assert output.loc[0, "n_width_samples"] == 3
     assert output.loc[0, "wid_adj_total"] == 12.
+    assert output.loc[0, "wid_adj_wet"] == 12.

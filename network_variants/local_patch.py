@@ -33,7 +33,7 @@ DomainType = Literal[
     "selected_compound",
     "selected_group",
 ]
-SelectionType = Literal["unit", "compound_bubble", "group"]
+SelectionType = Literal["unit", "compound_bubble", "group", "island"]
 CollarRole = Literal["upstream", "downstream"]
 
 
@@ -203,7 +203,7 @@ class LocalPatchContract:
     def __post_init__(self) -> None:
         if not str(self.example_id).strip():
             raise ValueError("example_id must not be empty.")
-        if self.selection_type not in {"unit", "compound_bubble", "group"}:
+        if self.selection_type not in {"unit", "compound_bubble", "group", "island"}:
             raise ValueError(f"Unsupported selection_type: {self.selection_type!r}.")
         if self.domain_type not in {
             "closed_unit",

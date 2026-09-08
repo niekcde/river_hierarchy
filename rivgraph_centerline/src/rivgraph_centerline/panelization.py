@@ -122,13 +122,21 @@ def _core_owned_width_samples(
             xs, ys = rasterio.transform.xy(mask.transform, rows, cols, offset="center")
             pixel_size = max(abs(float(mask.transform.a)), abs(float(mask.transform.e)))
         coordinates = list(zip(map(float, xs), map(float, ys)))
+        ownership_tolerance = pixel_size * 0.75
+        # Restrict the relatively short source segment to this merged part
+        # once.  Testing every point against a very long merged reference
+        # line makes a normalized single-link reference section needlessly
+        # quadratic in its coordinate count.
+        owned_segment = segment.geometry.intersection(
+            merged_geometry.buffer(max(1e-7, pixel_size * 1e-6))
+        )
         selected = []
         for width, coordinate, index in zip(widths, coordinates, indices):
             point = Point(coordinate)
             sample_key = (panel, source_link_id, int(index))
             owned = (
-                point.distance(segment.geometry) <= pixel_size * 0.75
-                and point.distance(merged_geometry) <= pixel_size * 0.75
+                not owned_segment.is_empty
+                and point.distance(owned_segment) <= ownership_tolerance
                 and sample_key not in excluded_sample_keys
                 and sample_key not in selected_sample_keys
             )
@@ -137,19 +145,31 @@ def _core_owned_width_samples(
                 selected_sample_keys.add(sample_key)
         if not selected:
             continue
+        selected.sort(
+            key=lambda item: segment.geometry.project(Point(item[1]))
+        )
+        segment_start = Point(segment.geometry.coords[0])
+        segment_end = Point(segment.geometry.coords[-1])
+        start_projection = merged_geometry.project(segment_start)
+        end_projection = merged_geometry.project(segment_end)
+        if start_projection > end_projection:
+            selected.reverse()
         selected_widths = [float(item[0]) for item in selected]
         selected_coordinates = [item[1] for item in selected]
-        projections = [merged_geometry.project(Point(coordinate)) for coordinate in selected_coordinates]
-        if projections[0] > projections[-1]:
-            selected_widths.reverse()
-            selected_coordinates.reverse()
-            selected.reverse()
-            projections.reverse()
+        first_projection = merged_geometry.project(Point(selected_coordinates[0]))
+        last_projection = merged_geometry.project(Point(selected_coordinates[-1]))
         provenance = [
             {"panel_id": panel, "source_link_id": source_link_id, "source_segment_id": str(segment["segment_id"]), "source_pixel_index": int(item[2])}
             for item in selected
         ]
-        pieces.append((float(np.mean(projections)), selected_widths, selected_coordinates, provenance))
+        pieces.append(
+            (
+                float((first_projection + last_projection) / 2.0),
+                selected_widths,
+                selected_coordinates,
+                provenance,
+            )
+        )
     if not pieces:
         raise ValueError("No core-owned width samples were found for a merged link.")
     pieces.sort(key=lambda item: item[0])

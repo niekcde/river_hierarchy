@@ -123,6 +123,7 @@ def test_panelized_reference_section_builder_collapses_every_base_unit(
     assert calls[0]["panelized_mask_publication"] == "virtual_patch"
     assert calls[0]["selection_type"] == "reference_section_all_units"
     assert calls[0]["require_single_source_sink_path"] is True
+    assert calls[0]["compute_panel_width_products"] is True
     assert summary["construction_backend"] == "panelized"
     assert summary["unit_ids"] == [3, 7, 11]
 
@@ -1529,7 +1530,9 @@ def test_full_raster_base_source_reuses_complete_base_products_and_boundaries(
                 "exit_sides": "NS",
                 "code_version": "source-test-revision",
                 "n_complete_states": 1,
-                "n_failed_states": 0,
+                # Failed child states are independent of the copied S000_base
+                # contract and must not prevent compound-base reuse.
+                "n_failed_states": 2,
                 "stop_reason": "base_state_only",
                 "root_paths": {
                     "cleaned_mask": str(cleaned_mask.resolve()),
@@ -1584,11 +1587,13 @@ def test_full_raster_base_source_reuses_complete_base_products_and_boundaries(
     assert reuse["hydraulic_context_reused"] is True
     assert reuse["boundary_components_reused"] is True
     assert reuse["compatibility_validated"] is True
+    assert reuse["source_n_failed_states"] == 2
     reuse_audit = json.loads(Path(reuse["audit_manifest"]).read_text(encoding="utf-8"))
     assert reuse_audit["validation_passed"] is True
     assert reuse_audit["non_json_content_verified"] is True
     assert reuse_audit["non_json_content_mismatches"] == []
     assert reuse_audit["source_code_version"] == "source-test-revision"
+    assert reuse_audit["source_n_failed_states"] == 2
 
     copied_state = output_dir / "states" / "S000_base"
     copied_variant_manifest = json.loads(
@@ -2566,3 +2571,54 @@ def test_local_patch_child_runner_can_use_panelized_fallback(tmp_path: Path) -> 
     assert audit["execution_mode_requested"] == "local_patch"
     assert audit["execution_mode_used"] == "panelized"
     assert outputs.manifest["local_patch_fallback_audit"] == str(audit_path.resolve())
+
+
+def test_panelized_anchor_width_recovery_uses_recorded_realized_source() -> None:
+    """A post-anchor sampling failure must retain the realised panel measurement."""
+    enriched = gpd.GeoDataFrame(
+        {
+            "id_link": [10, 11],
+            "wid_adj_wet": [float("nan"), 25.0],
+            "wid_adj_total": [float("nan"), 30.0],
+            "wid_adj_dry": [float("nan"), 5.0],
+            "wet_fraction_adj": [float("nan"), 25.0 / 30.0],
+        },
+        geometry=[LineString([(0, 0), (1, 0)]), LineString([(1, 0), (2, 0)])],
+        crs="EPSG:3857",
+    )
+    realised = gpd.GeoDataFrame(
+        {
+            "id_link": [3, 4],
+            "wid_adj_wet": [40.0, 25.0],
+            "wid_adj_total": [50.0, 30.0],
+            "wid_adj_dry": [10.0, 5.0],
+            "wet_fraction_adj": [0.8, 25.0 / 30.0],
+        },
+        geometry=[LineString([(0, 0), (1, 0)]), LineString([(1, 0), (2, 0)])],
+        crs="EPSG:3857",
+    )
+    samples = pd.DataFrame(
+        {
+            "id_link": [10, 11],
+            "sample_index": [0, 0],
+            "width_total": [float("nan"), 30.0],
+            "width_wet": [float("nan"), 25.0],
+            "width_dry": [float("nan"), 5.0],
+        }
+    )
+
+    recovered, recovered_samples, summary = (
+        collapse_experiment_module._recover_invalid_segmented_width_families(
+            enriched_links=enriched,
+            link_width_samples=samples,
+            realized_width_links=realised,
+            segmented_width_summary={"source_link_by_recomputed_link": {"10": 3}},
+        )
+    )
+
+    row = recovered.set_index("id_link").loc[10]
+    assert row["wid_adj_wet"] == 40.0
+    assert row["wid_adj_total"] == 50.0
+    assert row["width_recovery_method"] == "realized_panel_source_family"
+    assert recovered_samples.loc[recovered_samples["id_link"].eq(10), "width_wet"].iloc[0] == 40.0
+    assert summary == {"applied_count": 1, "records": [{"child_id_link": 10, "source_id_link": 3}]}

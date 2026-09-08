@@ -44,6 +44,7 @@ from network_variants.width_product_inheritance import (
     WIDTH_INHERITANCE_FIELDS,
     inherit_unchanged_link_width_products,
 )
+from network_variants.width_samples import read_width_samples
 
 
 LOCAL_PATCH_PRODUCTS_VERSION = "topology-local-patch-products-v3"
@@ -320,6 +321,7 @@ def materialize_local_patch_width_length_products(
     width_runner: Callable[..., tuple[gpd.GeoDataFrame, pd.DataFrame]] = compute_width_families,
     routing_width_runner: Callable[..., tuple[gpd.GeoDataFrame, pd.DataFrame, dict[str, Any]]] | None = apply_routing_width_model,
     collapse_corridor_mode: str = "anchored",
+    exclude_closed_two_link_replacement: bool = False,
 ) -> LocalPatchProductResult:
     """Create complete Phase-6 width/length products for a merged local state."""
     if merge_result.status not in {
@@ -339,7 +341,7 @@ def materialize_local_patch_width_length_products(
     child_nodes = gpd.read_file(merge_result.output_paths[node_path_key])
     parent_links = gpd.read_file(parent_width_links_path).to_crs(child_links.crs)
     parent_nodes = gpd.read_file(parent_nodes_path).to_crs(child_nodes.crs)
-    parent_samples = pd.read_csv(parent_width_samples_path)
+    parent_samples = read_width_samples(parent_width_samples_path)
     # Phase 5 may carry sparse or stale width columns through the parent-shaped
     # merge schema.  Rebuild the width layer from exactly two authoritative
     # sources: parent inheritance and changed-link measurement.
@@ -401,6 +403,7 @@ def materialize_local_patch_width_length_products(
         collapsed_mask_path=variant_result.output_paths["local_collapsed_mask"],
         wet_reference_mask_path=variant_result.output_paths["local_base_mask"],
         origin_mask_path=variant_result.output_paths["local_origin_mask"],
+        rivgraph_distance_path=variant_result.output_paths.get("raw_rivgraph_distance"),
         bank_labels_path=bank_labels_path,
     )
     measured_set = set(int(value) for value in measured_ids)
@@ -442,6 +445,27 @@ def materialize_local_patch_width_length_products(
     routing_summary: dict[str, Any] = {"status": "not_run"}
     routing_paths: dict[str, str] = {}
     if routing_width_runner is not None:
+        excluded_routing_width_link_ids: list[int] = []
+        closed_replacement_audit = pd.DataFrame()
+        if exclude_closed_two_link_replacement and "lineage_type" in enriched.columns:
+            from network_variants.width_trim_selection import resolve_closed_replacement_exclusions
+
+            excluded_routing_width_link_ids, closed_replacement_audit = resolve_closed_replacement_exclusions(
+                enriched,
+                parent_links,
+                sorted(measured_set),
+            )
+            if not closed_replacement_audit.empty:
+                decision_columns = [
+                    column for column in closed_replacement_audit.columns
+                    if column != "id_link" and column not in enriched.columns
+                ]
+                enriched = enriched.merge(
+                    closed_replacement_audit[["id_link", *decision_columns]],
+                    on="id_link",
+                    how="left",
+                    validate="1:1",
+                )
         enriched, routing_audit, routing_summary = routing_width_runner(
             enriched,
             samples,
@@ -450,7 +474,34 @@ def materialize_local_patch_width_length_products(
             variant_id=str(variant_id),
             apply_known_base_exclusions=False,
             evaluation_link_ids=sorted(measured_set),
+            excluded_evaluation_link_ids=excluded_routing_width_link_ids,
+            exclusion_reason=(
+                "closed_two_link_replacement"
+                if excluded_routing_width_link_ids
+                else ""
+            ),
         )
+        from network_variants.width_trim_selection import build_parent_child_width_diagnostics
+
+        parent_child_diagnostics = build_parent_child_width_diagnostics(enriched, parent_links)
+        if not parent_child_diagnostics.empty:
+            diagnostic_columns = [
+                column for column in parent_child_diagnostics.columns
+                if column != "id_link" and column not in enriched.columns
+            ]
+            enriched = enriched.merge(
+                parent_child_diagnostics[["id_link", *diagnostic_columns]],
+                on="id_link",
+                how="left",
+                validate="1:1",
+            )
+            if not routing_audit.empty:
+                routing_audit = routing_audit.merge(
+                    parent_child_diagnostics,
+                    on="id_link",
+                    how="left",
+                    validate="1:1",
+                )
         routing_paths = write_routing_width_audit(
             routing_audit,
             routing_summary,

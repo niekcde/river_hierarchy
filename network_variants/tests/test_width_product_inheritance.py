@@ -25,6 +25,9 @@ def test_inherits_complete_width_product_and_samples_only_for_equal_geometry() -
                 "width_model_probability": 0.91,
                 "width_correction_applied": True,
                 "width_qc_reason": "model_correction",
+                "width_trim_method": "native_rivgraph_fallback",
+                "width_trim_start_sample_index": 0,
+                "width_trim_stop_sample_index_exclusive": 2,
                 "geometry": LineString([(0, 0), (1, 0)]),
             },
             {
@@ -69,6 +72,7 @@ def test_inherits_complete_width_product_and_samples_only_for_equal_geometry() -
             "sample_index": [0, 1, 0],
             "width_wet": [10.0, 12.0, 21.0],
             "variant_id": ["parent", "parent", "parent"],
+            "used_in_selected_width": [True, True, False],
         }
     )
     child_samples = pd.DataFrame(
@@ -93,6 +97,7 @@ def test_inherits_complete_width_product_and_samples_only_for_equal_geometry() -
     assert inherited["wid_adj_wet"] == 11.0
     assert inherited["wid_adj_routing"] == 9.5
     assert inherited["width_model_probability"] == 0.91
+    assert inherited["width_trim_method"] == "native_rivgraph_fallback"
     assert bool(inherited["width_correction_applied"])
     assert inherited["width_inheritance_status"] == "inherited_unchanged_1to1"
     assert inherited["width_inherited_from_parent_link_id"] == 10
@@ -107,6 +112,7 @@ def test_inherits_complete_width_product_and_samples_only_for_equal_geometry() -
     inherited_samples = samples.loc[samples["id_link"].eq(100)]
     assert inherited_samples["width_wet"].tolist() == [10.0, 12.0]
     assert inherited_samples["variant_id"].tolist() == ["parent", "parent"]
+    assert inherited_samples["used_in_selected_width"].tolist() == [True, True]
     assert samples.loc[samples["id_link"].eq(101), "width_wet"].tolist() == [31.0]
     assert summary["inherited_link_ids"] == [100]
     assert summary["rejected_candidate_reasons"] == {"geometry_changed": 1}

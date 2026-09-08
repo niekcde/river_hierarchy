@@ -32,6 +32,7 @@ from network_variants.variant_generation import (
     _match_child_nodes_to_parent_nodes,
     _normalize_width_boolean_fields,
     _repair_invalid_directionality,
+    _repair_global_progression_from_parent_reachability,
     _repair_unresolved_link_components,
     _resolve_link_by_progression,
     _resolve_link_lineage,
@@ -49,6 +50,64 @@ from network_variants.width_two_bank import (
     _select_local_controlling_pair,
     build_state_bank_labels,
 )
+
+
+def test_regional_parent_reachability_repairs_only_dominating_global_direction() -> None:
+    child_nodes = gpd.GeoDataFrame(
+        {
+            "id_node": [10, 20, 30, 40, 50],
+            "is_inlet": [True, False, False, False, False],
+            "is_outlet": [False, False, False, True, False],
+        },
+        geometry=[Point(0, 0), Point(2, 1), Point(2, -1), Point(4, 0), Point(1, 0)],
+        crs="EPSG:3857",
+    )
+    parent_links = gpd.GeoDataFrame(
+        {
+            "id_link": [101, 102, 103, 104],
+            "id_us_node": [1, 1, 2, 3],
+            "id_ds_node": [2, 3, 4, 4],
+        },
+        geometry=[LineString([(0, 0), (1, 1)])] * 4,
+        crs="EPSG:3857",
+    )
+    node_match = pd.DataFrame(
+        {
+            "child_id_node": [10, 20, 30, 40],
+            "matched_parent_node_id": [1, 2, 3, 4],
+            "match_within_tolerance": [True, True, True, True],
+        }
+    )
+    edge_nodes = {1: (10, 50), 2: (50, 20), 3: (20, 40), 4: (50, 30), 5: (30, 40)}
+    orientations = {1: (10, 50), 2: (50, 20), 3: (20, 40), 4: (30, 50), 5: (30, 40)}
+    incident = {node_id: [] for node_id in child_nodes["id_node"]}
+    for link_id, (node_a, node_b) in edge_nodes.items():
+        incident[node_a].append(link_id)
+        incident[node_b].append(link_id)
+
+    repaired, sources, audit = _repair_global_progression_from_parent_reachability(
+        orientation_by_link=orientations,
+        orientation_source={
+            1: "matched_parent_node_order",
+            2: "matched_parent_node_order",
+            3: "matched_parent_node_order",
+            4: "global_progression_rule",
+            5: "matched_parent_node_order",
+        },
+        edge_nodes=edge_nodes,
+        incident_links=incident,
+        child_nodes=child_nodes,
+        parent_links=parent_links,
+        node_match=node_match,
+        child_inlet_nodes={10},
+        child_outlet_nodes={40},
+        require_flag_match=False,
+    )
+
+    assert repaired[4] == (50, 30)
+    assert sources[4] == "regional_parent_reachability_rule"
+    assert [row["id_link"] for row in audit] == [4]
+    assert audit[0]["repaired_lost_parent_paths"] < audit[0]["current_lost_parent_paths"]
 
 
 def test_boundary_harmonic_orientation_enforces_cut_terminals_on_symmetric_graph() -> None:
@@ -433,7 +492,6 @@ def test_compute_width_families_base_channel_preserves_single_thread_width(tmp_p
         geometry="geometry",
         crs="EPSG:3857",
     )
-
     enriched, samples = compute_width_families(
         links,
         collapsed_mask_path=mask_path,
@@ -703,6 +761,10 @@ def test_apply_segmented_stub_width_inheritance_uses_clean_family_representative
     assert np.isclose(float(widths_by_link.loc[19, "wid_adj_total"]), float(widths_by_link.loc[44, "wid_adj_total"]))
     assert bool(metadata_by_link.loc[19, "family_width_inheritance_applied"]) is True
     assert int(metadata_by_link.loc[19, "family_width_inherited_from_link"]) == 44
+    assert (
+        widths_by_link.loc[19, "family_width_sample_provenance"]
+        == "measured_link_samples_retained__final_width_family_inherited_from_representative"
+    )
     assert bool(metadata_by_link.loc[21, "family_width_inheritance_applied"]) is False
     assert summary["applied_link_ids"] == [19]
 
@@ -1364,6 +1426,82 @@ def test_assign_variant_directions_preserves_canonical_parent_outlet() -> None:
     assert summary["sink_nodes"] == [12]
     assert summary["canonical_sink_nodes"] == [12]
     assert sorted(summary["topology_sink_nodes"]) == [12, 13]
+
+
+def test_touch_only_parent_match_does_not_reverse_changed_connector() -> None:
+    parent_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 0, "is_inlet": True, "is_outlet": False, "geometry": Point(0, 0)},
+            {"id_node": 1, "is_inlet": False, "is_outlet": True, "geometry": Point(10, 0)},
+            {"id_node": 2, "is_inlet": False, "is_outlet": False, "geometry": Point(20, 0)},
+        ],
+        crs="EPSG:3857",
+    )
+    child_nodes = gpd.GeoDataFrame(
+        [
+            {"id_node": 10, "is_inlet": True, "is_outlet": False, "geometry": Point(0, 0)},
+            {"id_node": 11, "is_inlet": False, "is_outlet": False, "geometry": Point(10, 0)},
+            {"id_node": 12, "is_inlet": False, "is_outlet": True, "geometry": Point(20, 0)},
+        ],
+        crs="EPSG:3857",
+    )
+    child_links = gpd.GeoDataFrame(
+        [
+            {"id_link": 20, "id_nodes": "10, 11", "geometry": LineString([(0, 0), (10, 0)])},
+            {"id_link": 21, "id_nodes": "11, 12", "geometry": LineString([(10, 0), (20, 0)])},
+        ],
+        crs="EPSG:3857",
+    )
+    child_links["is_inlet"] = [True, False]
+    child_links["is_outlet"] = [False, True]
+    child_links["type_io"] = ["inlet", "outlet"]
+    node_match = pd.DataFrame(
+        [
+            {"child_id_node": 10, "matched_parent_node_id": 0, "parent_node_order": 0, "match_within_tolerance": True},
+            {"child_id_node": 11, "matched_parent_node_id": 1, "parent_node_order": 1, "match_within_tolerance": True},
+            {"child_id_node": 12, "matched_parent_node_id": pd.NA, "parent_node_order": pd.NA, "match_within_tolerance": False},
+        ]
+    )
+    link_match = pd.DataFrame(
+        [
+            {
+                "child_id_link": 20,
+                "candidate_class": "core_overlap",
+                "child_overlap_length": 10.0,
+                "parent_id_us_node": 0,
+                "parent_id_ds_node": 1,
+            },
+            {
+                "child_id_link": 21,
+                "candidate_class": "touch_only",
+                "child_overlap_length": 1.0,
+                # This weak contact suggests the opposite direction and would
+                # create a false sink at node 11 if treated as lineage.
+                "parent_id_us_node": 2,
+                "parent_id_ds_node": 1,
+            },
+        ]
+    )
+
+    directed_links, _, summary = _assign_variant_directions(
+        child_links=child_links,
+        child_nodes=child_nodes,
+        parent_links=gpd.GeoDataFrame(
+            [
+                {"id_link": 0, "id_us_node": 0, "id_ds_node": 1, "geometry": LineString([(0, 0), (10, 0)])},
+                {"id_link": 1, "id_us_node": 2, "id_ds_node": 1, "geometry": LineString([(20, 0), (10, 0)])},
+            ],
+            crs="EPSG:3857",
+        ),
+        parent_nodes=parent_nodes,
+        node_match=node_match,
+        link_match=link_match,
+        canonicalize_parent_boundaries=False,
+    )
+
+    connector = directed_links.loc[directed_links["id_link"].eq(21)].iloc[0]
+    assert (int(connector.id_us_node), int(connector.id_ds_node)) == (11, 12)
+    assert summary["sink_nodes"] == [12]
 
 
 def test_segment_collapsed_links_to_anchor_nodes_splits_link_at_nominal_parent_nodes() -> None:

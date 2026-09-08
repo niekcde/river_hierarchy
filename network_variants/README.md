@@ -35,6 +35,36 @@ Still intentionally separate from this module:
 
 - running RAPID prep and RAPID routing themselves
 
+## Island-Only Preflight and Execution
+
+Island-only simplification is an additional sensitivity workflow. It first
+creates a small reviewed-input setup from a completed independent experiment;
+it does not replace independent or compound unit observations.
+
+Create the audited candidate setup (largest 8-connected water body and
+enclosed 8-connected dry components):
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  network_variants/run_prepare_island_setup.py \
+  /Volumes/PhD/river_hierarchy/network_variants/output/02_indep__anchored \
+  --print-candidates
+```
+
+This creates `island_only_setup_8connected/` with the candidate registry,
+candidate geometries, manifest, and exact island-equivalence registry. The
+command prints component counts, approved candidates, tiny exclusions,
+candidates requiring an anchor review, selected anchor units, and the number
+of aliases versus genuine island states. Use `--dry-run` to inspect candidate
+geometry without writing; equivalence requires the persisted reviewed setup.
+
+After reviewing the printed registry/geometries, run
+`run_island_experiment.py` with that setup. It consumes the frozen
+equivalence registry and only materializes the required island states. A fresh
+island output root uses no resume flag; `--resume-existing-experiment` is only
+for an interrupted root that already contains its frozen `setup/` and
+observation manifest.
+
 `network_variants` now writes state outputs in the layout consumed by the RAPID
 subproject, but the actual prep/run steps remain separate entry points under
 `RAPID/`.
@@ -633,6 +663,27 @@ the historical anchored CLI behavior, it does not first generate all realized
 children; only the requested anchored experiment is written (with the normal
 `__anchored` output suffix).
 
+The bounded crop and merge obey four additional invariants:
+
+- The first complete parent collar link outside the hydraulically closed
+  computational domain is retained. Its outer parent node is the normal raster
+  cut center. Only a collar shorter than 1,000 m is extended farther along the
+  reference continuation; 1,000 m is a minimum, not a fixed cut distance.
+- Collapse topology is validated against the independent-cycle rank of the
+  selected parent subgraph (`E - V + C`). The number of filled raster land
+  components is retained as edit provenance but is not the expected cycle
+  reduction for compound or nested selections.
+- Parent direction is inherited only from positive core-overlap lineage.
+  `touch_only` candidates establish adjacency but cannot reverse a genuinely
+  changed local connector. Changed connectors are oriented from the valid
+  local topology and surrounding parent DAG.
+- A larger enclosing-unit retry is attempted only for crop or context
+  insufficiency. Direction, anchoring, topology, cycle-rank, and hydraulic
+  failures retain their original domain. When an outer retry is appropriate,
+  `outer_domain_retry_summary.json` preserves the root error and every retry;
+  the final fallback points to that audit instead of replacing the scientific
+  failure with an enclosing-domain boundary message.
+
 ### Panelized base with local-patch children
 
 Large examples can combine the two execution modes in one command:
@@ -670,6 +721,17 @@ collapse and boundary-merge workflow. The reference section is one special
 local-patch backend because its footprint spans the network. The resulting
 width, slope, forcing, and BASED calculations are unchanged.
 
+Reference-section raster finalization also remains panel bounded. Each
+affected panel core is written as its own aligned mask patch and the patches
+are composed as a chained full-extent VRT. Origin-mask and bank-label support
+rasters use the same patch chain; absorbed bank-component IDs are still
+remapped over their complete global extent. No array spanning the rectangular
+union of all affected panels is allocated. Two-bank widths are evaluated per
+contributing panel (including reused panels that contribute to the final
+source-to-sink path), restricted to core-owned samples, and then merged in
+distance order onto the normalized reference link. Thus peak raster memory is
+bounded by a panel rather than by the full reference-section extent.
+
 The all-units reference product has a stricter graph contract than an ordinary
 variant: after every detected unit has been collapsed, **every link and node
 must belong to exactly one directed source-to-sink path**. Panel direction
@@ -681,6 +743,15 @@ disconnected fragments, additional sources/sinks, or unused links are rejected.
 The same invariant is checked again before a new or cached reference section is
 used for BASED. This strict rule does not apply to normal base and child
 networks, where genuine multi-channel units are expected.
+
+After that unique path has been proven, the panelized reference section is
+normalized to the same representation used by a full-raster reference section:
+one directed link between the scientific source and sink. Only artificial
+degree-two panel-interface nodes are removed. The ordered geometry and every
+core-owned panel width sample are retained and remapped to link `0`; the audit
+is written to
+`reference_section/variant/panelized_state/merged/core_boundary/single_path_normalization.json`.
+Ordinary panelized base and child networks are not normalized this way.
 
 When a panel merge group resolves into multiple final link parts, each part
 retains only the source panel segments with material linear overlap. Width
@@ -719,6 +790,11 @@ hierarchy settings, width settings, and equivalent-resistance configuration
 recorded by the source manifest must match the requested run. A missing or
 partial source is rejected before the destination experiment is reset; the
 workflow never mixes copied and recalculated base products.
+
+Failures among the source experiment's child states do not invalidate an
+otherwise complete `S000_base`, because none of those child artifacts are
+copied. Their count is retained as `source_n_failed_states` in both reuse
+manifests, so base reuse never conceals the independent experiment's status.
 
 Copying is transactional. Internal paths in the copied variant, hierarchy,
 hydraulic-context, boundary-component, reference-section, and solver-cache
@@ -778,6 +854,29 @@ Important interpretation:
 
 This avoids maintaining separate manual edits in both the parent network and a
 derived base-state product.
+
+The production width workflow now records one authoritative sample interval per
+link. A valid two-bank interior interval is preferred; when that interval is
+invalid, the native RivGraph/distance-transform endpoint trim is used when it
+defines a valid interior core with at least six contiguous samples (five raster
+sample intervals). Shorter fallback candidates are retained only in the audit;
+the existing complete-link width remains authoritative. The same recorded interval drives width-family
+summaries, review features, junction endpoint contexts, and routing. If neither
+interval is valid, the existing complete-link values are retained and the link
+is marked `untrimmed_no_valid_core` instead of silently inventing a trim.
+
+Before repairing existing experiment products, scan the proposed impact without
+writing into the experiment:
+
+```bash
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  network_variants/scan_width_trim_impact.py \
+  network_variants/output/46_indep__anchored \
+  --output /tmp/46_width_trim_impact.csv
+```
+
+Parent-versus-collapsed-child routing-width sums are published as diagnostic
+fields only. They never trigger trimming, width review, or a correction.
 
 After model validation, review the union of held-out manual/model disagreements
 and high-priority near-junction audit cases without changing the permanent
@@ -848,6 +947,15 @@ The solver additionally writes a single combined
 `width_routing_solver_rejected_corrections_v1.csv` for inspecting every
 predicted correction that was retained raw, including its rejected candidate
 width and complete junction accounting.
+
+For a newly synthesized `collapsed_many_to_one` link that replaces a
+hydraulically closed, simple two-link selected unit, the routing-width
+correction is deliberately not applied. The replacement retains its measured
+`wid_adj_wet` as `wid_adj_routing` (`width_qc_decision =
+retain_raw_closed_two_link_replacement`). This narrow guard prevents a
+child-only continuity adjustment from making a one-to-one collapse comparison
+inconsistent with its unadjusted parent links. It does not exempt neighbouring
+local-patch links or enclosing compound domains; the audit records the reason.
 
 ### Future Width-Review Automation
 
@@ -1005,6 +1113,15 @@ initializes internal heads from available node WSE and retries failed solves
 with every internal head initialized to `0.5`. Both attempts are recorded in
 `bubble_equivalent_metrics.csv`; if neither converges, provisional equivalent
 values and solved flows/heads are written as missing.
+
+For a compound bubble, “complete assembled edge set” also includes ordinary
+single-channel connector links between its detected member units. Those links
+do not belong to any bifurcation-confluence unit themselves, but omitting them
+can turn one hydraulically closed compound into an artificial multi-sink
+graph. The implementation therefore finds the latest common upstream node and
+earliest common downstream node of all member edges, then solves every edge in
+that closed directed interval. `n_closed_domain_connector_edges` and
+`closed_domain_connector_edge_ids` record the added connectors explicitly.
 
 ### Equivalent-resistance nonlinear solver
 
@@ -1235,13 +1352,40 @@ Two related workflows now exist:
    - `equivalent_resistance_comparison.csv`
    - `equivalent_resistance_manifest.json`
 
-The comparison workflow is important because the realized child corridor does
-not always share the same outer boundaries as the nominal base unit or bubble.
-The main physically consistent comparison field is therefore usually:
+The aggregate tables use the already-solved state-transition hydraulic domain
+as their authoritative comparison. For a hydraulically closed target this is
+the target itself; for a non-closed member it is the complete enclosing
+compound before and after the member collapse. The main physically consistent
+comparison field is:
 
 - `Lambda_matched = K_variant_realized / K_eq_matched_base`
 
-rather than the nominal-boundary comparison.
+rather than the nominal-boundary comparison. Values from the older isolated
+residual-corridor reconstruction are retained only in columns prefixed with
+`residual_corridor_` and suffixed with `_diagnostic`.
+
+### Staged width-product repair
+
+Existing experiments can adopt a newer trimming or routing-width algorithm
+without rerunning masks, RivGraph, direction assignment, or raster width
+sampling. The repair command always rebuilds `S000_base` first and then uses
+that repaired base as the inheritance source for the requested child states:
+
+```bash
+MPLCONFIGDIR=/tmp/mpl-width-repair \
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python -B \
+  network_variants/run_width_product_repair.py \
+  network_variants/output/<experiment> \
+  --output-root /tmp/width-product-repair \
+  --child-state-id <state-id>
+```
+
+Use `--include-all-children` instead of repeated `--child-state-id` arguments
+to stage a complete experiment. The source experiment is read-only: repaired
+files, old/new differences, per-state validation reports, hashes, and the
+top-level `width_product_repair_manifest.json` are written under the supplied
+output root. Promotion into production and equivalent-resistance recomputation
+are intentionally separate operations.
 
 ## Output Layout
 

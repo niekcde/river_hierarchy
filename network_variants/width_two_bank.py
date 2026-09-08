@@ -774,4 +774,10 @@ def compute_two_bank_width_families(
     sample_frame = pd.DataFrame.from_records(sample_records)
     enriched_lookup = summary_frame.copy()
     enriched = enriched.merge(enriched_lookup, on="id_link", how="left", validate="1:1")
+    from network_variants.width_trim_selection import apply_authoritative_width_trim_selection
+
+    enriched, sample_frame, _ = apply_authoritative_width_trim_selection(
+        enriched,
+        sample_frame,
+    )
     return enriched, sample_frame

@@ -50,6 +50,12 @@ from network_variants.hydraulic_context import (
     StateHydraulicContextOutputs,
     generate_state_hydraulic_context,
 )
+from network_variants.artifact_retention import (
+    ARTIFACT_PROFILES,
+    apply_successful_state_retention_best_effort,
+    validate_artifact_profile,
+)
+from network_variants.width_samples import read_width_samples
 from network_variants.equivalent_transition_domain import (
     build_matched_child_domain,
     load_parent_to_child_anchor_map,
@@ -64,6 +70,7 @@ from network_variants.variant_generation import (
     VariantDirectionValidationError,
     _apply_width_sample_flow_alignment,
     _apply_collapsed_selection_metadata,
+    _apply_segmented_stub_width_inheritance,
     _assign_variant_directions,
     _collapsed_selection_metadata,
     _component_footprint_geometry,
@@ -76,6 +83,7 @@ from network_variants.variant_generation import (
     _write_width_family_outputs,
     _write_state_bank_labels,
     compute_width_families,
+    derive_anchored_graph_from_realized,
     derive_anchored_variant_from_realized,
     generate_network_variant,
 )
@@ -89,6 +97,7 @@ from network_variants.width_product_inheritance import inherit_unchanged_link_wi
 from network_variants.panelized_raster import (
     compute_panelized_base_width_families,
     compute_panelized_child_width_patch,
+    compute_segmented_width_patch,
     materialize_panelized_child_state,
     write_panelized_virtual_support_rasters,
     write_state_bank_labels_windowed,
@@ -96,6 +105,7 @@ from network_variants.panelized_raster import (
 )
 from network_variants.local_patch_execution import (
     LocalPatchFallbackRequested,
+    _selected_units_from_hierarchy_products,
     materialize_local_patch_network_variant,
 )
 from rivgraph_centerline.workflow import run_rivgraph_for_run
@@ -277,6 +287,86 @@ def _variant_analysis_links_path(
     return Path(directed_links_path)
 
 
+def _recover_invalid_segmented_width_families(
+    *,
+    enriched_links: gpd.GeoDataFrame,
+    link_width_samples: pd.DataFrame,
+    realized_width_links: gpd.GeoDataFrame,
+    segmented_width_summary: Mapping[str, Any],
+) -> tuple[gpd.GeoDataFrame, pd.DataFrame, dict[str, Any]]:
+    """Recover an anchored segment only from its recorded realized source.
+
+    A panelized island edit can move a skeleton enough that the second,
+    post-anchor two-bank sample pass has no valid wet-width family, despite a
+    valid measured family having been produced for the realised panel graph.
+    Reusing that direct source family is preferable to inventing a value or
+    allowing an invalid width to reach routing. Every recovery is explicit in
+    the published links and summary.
+    """
+    result = enriched_links.copy()
+    samples = link_width_samples.copy()
+    if "wid_adj_wet" not in result.columns:
+        raise ValueError(
+            "Anchored panelized width recovery requires a wid_adj_wet column."
+        )
+    wet = pd.to_numeric(result["wid_adj_wet"], errors="coerce")
+    bad_ids = result.loc[wet.isna() | wet.le(0), "id_link"].astype(int).tolist()
+    if not bad_ids:
+        return result, samples, {"applied_count": 0, "records": []}
+
+    source_by_child: dict[int, int] = {}
+    for key in (
+        "source_link_by_recomputed_link",
+        "primary_source_link_by_reused_link",
+        "primary_partition_source_by_secondary_reused_link",
+    ):
+        source_by_child.update({
+            int(child): int(source)
+            for child, source in dict(segmented_width_summary.get(key, {}) or {}).items()
+        })
+    source = realized_width_links.copy()
+    source["id_link"] = pd.to_numeric(source["id_link"], errors="raise").astype(int)
+    source_index = source.set_index("id_link", drop=False)
+    family_columns = [
+        column for column in result.columns
+        if column in source.columns
+        and (column.startswith("wid_") or column in {"wet_fraction_adj", "dry_fraction_adj", "width_method"})
+    ]
+    records: list[dict[str, object]] = []
+    for child_id in bad_ids:
+        source_id = source_by_child.get(int(child_id))
+        if source_id is None or source_id not in source_index.index:
+            raise ValueError(
+                "Anchored panelized width recovery has no recorded realized source for "
+                f"invalid child link {child_id}."
+            )
+        source_row = source_index.loc[source_id]
+        source_wet = pd.to_numeric(pd.Series([source_row.get("wid_adj_wet")]), errors="coerce").iloc[0]
+        if not np.isfinite(source_wet) or float(source_wet) <= 0:
+            raise ValueError(
+                "Anchored panelized width recovery source has invalid wet width: "
+                f"child={child_id}, source={source_id}."
+            )
+        index = result.index[result["id_link"].astype(int).eq(int(child_id))]
+        for column in family_columns:
+            result.loc[index, column] = source_row[column]
+        result.loc[index, "width_recovery_method"] = "realized_panel_source_family"
+        result.loc[index, "width_recovery_source_link_id"] = int(source_id)
+        result.loc[index, "width_recovery_reason"] = "invalid_post_anchor_wet_width"
+        if not samples.empty and "id_link" in samples.columns:
+            sample_index = samples.index[pd.to_numeric(samples["id_link"], errors="coerce").eq(int(child_id))]
+            if len(sample_index):
+                total = pd.to_numeric(pd.Series([source_row.get("wid_adj_total")]), errors="coerce").iloc[0]
+                total = float(total) if np.isfinite(total) and total > 0 else float(source_wet)
+                samples.loc[sample_index, "width_total"] = total
+                samples.loc[sample_index, "width_wet"] = float(source_wet)
+                samples.loc[sample_index, "width_dry"] = max(total - float(source_wet), 0.0)
+                samples.loc[sample_index, "width_invalid"] = True
+                samples.loc[sample_index, "width_recovery_method"] = "realized_panel_source_family"
+        records.append({"child_id_link": int(child_id), "source_id_link": int(source_id)})
+    return result, samples, {"applied_count": len(records), "records": records}
+
+
 def _finalize_panelized_child_result(
     *,
     panelized_result: Mapping[str, Any],
@@ -304,6 +394,7 @@ def _finalize_panelized_child_result(
     sword_example_station_source_path: str | Path | None,
     sword_station_match_source_path: str | Path | None,
     sword_reach_buffer_steps: int,
+    exclude_closed_two_link_replacement: bool = False,
 ) -> NetworkVariantOutputs:
     """Finalize a panelized patch into the regular child-variant contract."""
     merged = panelized_result.get("merged", {})
@@ -330,9 +421,11 @@ def _finalize_panelized_child_result(
     virtual_support_manifest: dict[str, object] | None = None
     if mask_publication.get("mode") == "virtual_patch":
         collapsed_mask_path = collapsed_mask
-        overlay_path = mask_publication.get("overlay_path")
-        if not overlay_path:
-            raise ValueError("Panelized virtual mask publication is missing its overlay path.")
+        overlay_paths = list(mask_publication.get("overlay_paths") or [])
+        if not overlay_paths and mask_publication.get("overlay_path"):
+            overlay_paths = [mask_publication["overlay_path"]]
+        if not overlay_paths:
+            raise ValueError("Panelized virtual mask publication is missing its overlay paths.")
         (
             origin_mask_path,
             bank_labels_path,
@@ -340,7 +433,7 @@ def _finalize_panelized_child_result(
             virtual_support_manifest,
         ) = write_panelized_virtual_support_rasters(
             base_mask_path=parent_mask_path,
-            collapsed_patch_path=Path(str(overlay_path)),
+            collapsed_patch_paths=[Path(str(path)) for path in overlay_paths],
             boundary_component_labels_path=boundary_component_labels_path,
             output_dir=mask_dir,
         )
@@ -365,25 +458,61 @@ def _finalize_panelized_child_result(
     parent_nodes = _normalize_numeric_id_columns(gpd.read_file(parent_nodes_path))
     parent_variant_dir = parent_links_path.parent.parent
     parent_width_links = gpd.read_file(parent_variant_dir / "widths" / "links_with_width_families.gpkg")
-    parent_width_samples = pd.read_csv(parent_variant_dir / "widths" / "link_width_samples.csv")
+    parent_width_samples = read_width_samples(parent_variant_dir / "widths")
+    # Preserve the merged raw RivGraph samples as part of the regular variant
+    # handoff regardless of how the authoritative two-bank width products are
+    # produced below.  The panel-owned width branch uses its own merged sample
+    # table for scientific widths, but still publishes this raw compatibility
+    # artifact under variant/rivgraph.
     child_source_samples = pd.read_csv(str(merged["width_samples"]))
-    child_merged_links = gpd.read_file(
-        Path(str(merged["core_dir"])) / "merged_links.gpkg",
-        layer="merged_links",
-    )
-    parent_merged_links = gpd.read_file(parent_merged_links_path, layer="merged_links")
-    enriched_raw_links, link_width_samples, width_patch_summary = compute_panelized_child_width_patch(
-        child_links=raw_links,
-        child_source_samples=child_source_samples,
-        child_merged_links=child_merged_links,
-        parent_merged_links=parent_merged_links,
-        parent_width_links=parent_width_links,
-        parent_width_samples=parent_width_samples,
-        affected_panel_ids=list(panelized_result["panel_plan"]["affected"]),
-        bank_labels_path=bank_labels_path,
-        origin_mask_path=origin_mask_path,
-        bank_candidate_neighbors_max=bank_candidate_neighbors_max,
-    )
+    merged_width_products = panelized_result.get("merged_width_products")
+    if merged_width_products:
+        panel_width_links = gpd.read_file(str(merged_width_products["links"]))
+        if "global_link_id" not in panel_width_links.columns:
+            raise ValueError("Merged panel width links are missing global_link_id.")
+        panel_width_links = panel_width_links.rename(columns={"global_link_id": "id_link"})
+        panel_width_links["id_link"] = pd.to_numeric(
+            panel_width_links["id_link"], errors="raise"
+        ).astype(int)
+        if set(panel_width_links["id_link"]) != set(raw_links["id_link"].astype(int)):
+            raise ValueError("Merged panel width links do not match the published child links.")
+        enriched_raw_links = _merge_width_families_onto_links(raw_links, panel_width_links)
+        link_width_samples = pd.read_csv(str(merged_width_products["samples"]))
+        if "global_link_id" not in link_width_samples.columns:
+            raise ValueError("Merged panel width samples are missing global_link_id.")
+        link_width_samples = link_width_samples.drop(columns="id_link", errors="ignore").rename(
+            columns={"global_link_id": "id_link"}
+        )
+        link_width_samples["id_link"] = pd.to_numeric(
+            link_width_samples["id_link"], errors="raise"
+        ).astype(int)
+        width_patch_summary = {
+            "width_method": "panel_owned_two_bank_merge",
+            "n_width_links": int(len(panel_width_links)),
+            "n_width_samples": int(len(link_width_samples)),
+            "panel_width_products": {
+                key: str(Path(str(value)).resolve())
+                for key, value in merged_width_products.items()
+            },
+        }
+    else:
+        child_merged_links = gpd.read_file(
+            Path(str(merged["core_dir"])) / "merged_links.gpkg",
+            layer="merged_links",
+        )
+        parent_merged_links = gpd.read_file(parent_merged_links_path, layer="merged_links")
+        enriched_raw_links, link_width_samples, width_patch_summary = compute_panelized_child_width_patch(
+            child_links=raw_links,
+            child_source_samples=child_source_samples,
+            child_merged_links=child_merged_links,
+            parent_merged_links=parent_merged_links,
+            parent_width_links=parent_width_links,
+            parent_width_samples=parent_width_samples,
+            affected_panel_ids=list(panelized_result["panel_plan"]["affected"]),
+            bank_labels_path=bank_labels_path,
+            origin_mask_path=origin_mask_path,
+            bank_candidate_neighbors_max=bank_candidate_neighbors_max,
+        )
 
     with rasterio.open(collapsed_mask_path) as source:
         pixel_length = float(max(abs(source.transform.a), abs(source.transform.e)))
@@ -415,6 +544,51 @@ def _finalize_panelized_child_result(
         link_match=link_match,
         match_tolerance=match_tolerance,
     )
+    realized_directed_links = directed_links.copy()
+    realized_width_links = enriched_raw_links.copy()
+    realized_width_samples = link_width_samples.copy()
+    anchor_segmentation_summary: dict[str, Any] = {
+        "mode_applied": False,
+        "n_anchor_splits": 0,
+    }
+    if collapse_corridor_mode == "anchored":
+        unit_summary_path = parent_variant_dir.parent / "hierarchy" / "unit_summary.csv"
+        unit_membership_path = parent_variant_dir / "summary" / "unit_link_membership.csv"
+        missing_hierarchy_paths = [
+            str(path)
+            for path in (unit_summary_path, unit_membership_path)
+            if not path.exists()
+        ]
+        if missing_hierarchy_paths:
+            raise FileNotFoundError(
+                "Panelized scientific anchoring requires parent hierarchy products: "
+                + ", ".join(missing_hierarchy_paths)
+            )
+        units_by_id = _selected_units_from_hierarchy_products(
+            selected_unit_ids=unit_ids,
+            unit_summary=pd.read_csv(unit_summary_path),
+            unit_link_membership=pd.read_csv(unit_membership_path),
+            parent_links=parent_links,
+        )
+        anchored_graph = derive_anchored_graph_from_realized(
+            parent_links=parent_links,
+            parent_nodes=parent_nodes,
+            realized_links=directed_links,
+            realized_nodes=directed_nodes,
+            realized_node_match=node_match,
+            realized_link_match=link_match,
+            realized_link_lineage=link_lineage,
+            selected_unit_ids=unit_ids,
+            units_by_id=units_by_id,
+            match_tolerance=match_tolerance,
+        )
+        directed_links = anchored_graph.directed_links
+        directed_nodes = anchored_graph.directed_nodes
+        node_match = anchored_graph.node_match
+        link_match = anchored_graph.link_match
+        link_lineage = anchored_graph.link_lineage
+        direction_summary = anchored_graph.direction_summary
+        anchor_segmentation_summary = anchored_graph.anchor_segmentation_summary
     directed_nodes, node_sword_match, sword_match_summary = match_variant_nodes_to_sword(
         directed_nodes=directed_nodes,
         parent_nodes=parent_nodes,
@@ -458,7 +632,57 @@ def _finalize_panelized_child_result(
         ],
         errors="ignore",
     ).merge(link_lineage, on="id_link", how="left", validate="1:1")
-    directed_enriched_links = _merge_width_families_onto_links(directed_links, enriched_raw_links)
+    if collapse_corridor_mode == "anchored":
+        enriched_links, link_width_samples, segmented_width_summary = (
+            compute_segmented_width_patch(
+                segmented_links=directed_links,
+                source_links=realized_directed_links,
+                source_width_links=realized_width_links,
+                source_width_samples=realized_width_samples,
+                bank_labels_path=bank_labels_path,
+                origin_mask_path=origin_mask_path,
+                bank_candidate_neighbors_max=bank_candidate_neighbors_max,
+                secondary_source_links=parent_links,
+                secondary_source_width_links=parent_width_links,
+                secondary_source_width_samples=parent_width_samples,
+            )
+        )
+        (
+            enriched_links,
+            link_width_samples,
+            segmented_width_recovery_summary,
+        ) = _recover_invalid_segmented_width_families(
+            enriched_links=enriched_links,
+            link_width_samples=link_width_samples,
+            realized_width_links=realized_width_links,
+            segmented_width_summary=segmented_width_summary,
+        )
+        (
+            directed_links,
+            enriched_links,
+            segmented_stub_inheritance_summary,
+        ) = _apply_segmented_stub_width_inheritance(
+            directed_links=directed_links,
+            enriched_links=enriched_links,
+            link_width_samples=link_width_samples,
+        )
+        width_patch_summary = {
+            **width_patch_summary,
+            "anchored_segmented_width_patch": segmented_width_summary,
+            "anchored_segmented_width_recovery": segmented_width_recovery_summary,
+        }
+    else:
+        enriched_links = enriched_raw_links
+        segmented_stub_inheritance_summary = {
+            "applied_count": 0,
+            "applied_link_ids": [],
+            "records": [],
+        }
+        segmented_width_recovery_summary = {"applied_count": 0, "records": []}
+    directed_enriched_links = _merge_width_families_onto_links(
+        directed_links,
+        enriched_links,
+    )
     directed_enriched_links = _apply_width_sample_flow_alignment(
         directed_enriched_links,
         collapse_corridor_mode=collapse_corridor_mode,
@@ -472,6 +696,33 @@ def _finalize_panelized_child_result(
             link_lineage=link_lineage,
         )
     )
+    # A parent-product inheritance can legitimately replace a width family
+    # after the first recovery.  Guard the actual routing hand-off as well:
+    # routing must never see a non-positive wet width when a directly measured
+    # realised-panel source is available.
+    if collapse_corridor_mode == "anchored":
+        (
+            directed_enriched_links,
+            link_width_samples,
+            final_segmented_width_recovery_summary,
+        ) = _recover_invalid_segmented_width_families(
+            enriched_links=directed_enriched_links,
+            link_width_samples=link_width_samples,
+            realized_width_links=realized_width_links,
+            segmented_width_summary=segmented_width_summary,
+        )
+        if final_segmented_width_recovery_summary["applied_count"]:
+            segmented_width_recovery_summary = {
+                "applied_count": int(segmented_width_recovery_summary["applied_count"])
+                + int(final_segmented_width_recovery_summary["applied_count"]),
+                "records": [
+                    *segmented_width_recovery_summary["records"],
+                    *[
+                        {**record, "recovery_stage": "post_inheritance_routing_guard"}
+                        for record in final_segmented_width_recovery_summary["records"]
+                    ],
+                ],
+            }
     link_width_samples = _apply_collapsed_selection_metadata(
         link_width_samples,
         unit_ids=unit_ids,
@@ -483,6 +734,27 @@ def _finalize_panelized_child_result(
         directed_enriched_links["width_inheritance_status"].eq("changed_requires_evaluation"),
         "id_link",
     ].astype(int).tolist()
+    excluded_routing_width_link_ids = []
+    closed_replacement_audit = pd.DataFrame()
+    if exclude_closed_two_link_replacement:
+        from network_variants.width_trim_selection import resolve_closed_replacement_exclusions
+
+        excluded_routing_width_link_ids, closed_replacement_audit = resolve_closed_replacement_exclusions(
+            directed_enriched_links,
+            parent_width_links,
+            changed_width_link_ids,
+        )
+        if not closed_replacement_audit.empty:
+            decision_columns = [
+                column for column in closed_replacement_audit.columns
+                if column != "id_link" and column not in directed_enriched_links.columns
+            ]
+            directed_enriched_links = directed_enriched_links.merge(
+                closed_replacement_audit[["id_link", *decision_columns]],
+                on="id_link",
+                how="left",
+                validate="1:1",
+            )
     directed_enriched_links, routing_width_audit, routing_width_application = apply_routing_width_model(
         directed_enriched_links,
         link_width_samples,
@@ -491,7 +763,33 @@ def _finalize_panelized_child_result(
         variant_id=variant_id,
         apply_known_base_exclusions=False,
         evaluation_link_ids=changed_width_link_ids,
+        excluded_evaluation_link_ids=excluded_routing_width_link_ids,
+        exclusion_reason="closed_two_link_replacement",
     )
+    from network_variants.width_trim_selection import build_parent_child_width_diagnostics
+
+    parent_child_diagnostics = build_parent_child_width_diagnostics(
+        directed_enriched_links,
+        parent_width_links,
+    )
+    if not parent_child_diagnostics.empty:
+        diagnostic_columns = [
+            column for column in parent_child_diagnostics.columns
+            if column != "id_link" and column not in directed_enriched_links.columns
+        ]
+        directed_enriched_links = directed_enriched_links.merge(
+            parent_child_diagnostics[["id_link", *diagnostic_columns]],
+            on="id_link",
+            how="left",
+            validate="1:1",
+        )
+        if not routing_width_audit.empty:
+            routing_width_audit = routing_width_audit.merge(
+                parent_child_diagnostics,
+                on="id_link",
+                how="left",
+                validate="1:1",
+            )
     directed_enriched_links.loc[
         directed_enriched_links["id_link"].astype(int).isin(changed_width_link_ids),
         "width_inheritance_status",
@@ -610,6 +908,9 @@ def _finalize_panelized_child_result(
             "mask_publication": mask_publication,
             "virtual_support_rasters": virtual_support_manifest,
         },
+        "anchor_segmentation": anchor_segmentation_summary,
+        "segmented_stub_width_inheritance": segmented_stub_inheritance_summary,
+        "segmented_width_recovery": segmented_width_recovery_summary,
         "width_product_inheritance": width_product_inheritance,
         "routing_width_application": routing_width_application,
         "bank_label_summary": {
@@ -1163,6 +1464,14 @@ def _empty_equivalent_transition_frame() -> pd.DataFrame:
             "child_solver_cache_path",
             "parent_solver_initialization",
             "child_solver_initialization",
+            "parent_solver_strict_success",
+            "child_solver_strict_success",
+            "parent_solver_conditional_acceptance",
+            "child_solver_conditional_acceptance",
+            "parent_solver_acceptance_tier",
+            "child_solver_acceptance_tier",
+            "parent_candidate_K_relative_difference",
+            "child_candidate_K_relative_difference",
             "parent_primary_solver_success",
             "child_primary_solver_success",
             "parent_primary_residual_relative",
@@ -1382,6 +1691,30 @@ def _selected_hydraulic_domain_comparison(
         "child_solver_cache_path": child_solve.get("solver_cache_path", ""),
         "parent_solver_initialization": parent_solve.get("initialization_used", ""),
         "child_solver_initialization": child_solve.get("initialization_used", ""),
+        "parent_solver_strict_success": bool(
+            parent_solve.get("solver_strict_success", False)
+        ),
+        "child_solver_strict_success": bool(
+            child_solve.get("solver_strict_success", False)
+        ),
+        "parent_solver_conditional_acceptance": bool(
+            parent_solve.get("solver_conditional_acceptance", False)
+        ),
+        "child_solver_conditional_acceptance": bool(
+            child_solve.get("solver_conditional_acceptance", False)
+        ),
+        "parent_solver_acceptance_tier": parent_solve.get(
+            "solver_acceptance_tier", ""
+        ),
+        "child_solver_acceptance_tier": child_solve.get(
+            "solver_acceptance_tier", ""
+        ),
+        "parent_candidate_K_relative_difference": parent_solve.get(
+            "candidate_K_relative_difference", np.nan
+        ),
+        "child_candidate_K_relative_difference": child_solve.get(
+            "candidate_K_relative_difference", np.nan
+        ),
         "parent_primary_solver_success": bool(
             parent_solve.get("primary_solver_success", False)
         ),
@@ -2499,6 +2832,14 @@ def _write_base_reuse_audit(
         "source_stop_reason": (
             source_manifest.get("stop_reason") if source_manifest is not None else None
         ),
+        # Child-state failures do not invalidate a byte-verified S000_base.
+        # Preserve them as source provenance so a reused compound run cannot be
+        # mistaken for evidence that every independent child succeeded.
+        "source_n_failed_states": (
+            int(source_manifest.get("n_failed_states", 0) or 0)
+            if source_manifest is not None
+            else None
+        ),
         "source_file_count": int(len(source_inventory)),
         "destination_file_count_before_audit": int(len(destination_inventory)),
         "localized_manifest_count": int(len(localized_manifests)),
@@ -3082,11 +3423,16 @@ def _make_panelized_child_runner(
             wet_widths,
         )
         width = width.where(np.isfinite(width) & (width > 0), legacy_widths).fillna(0).max()
-        footprint = _component_footprint_geometry(
-            links,
-            link_ids,
-            preferred_width_field=str(kwargs.get("preferred_width_field", "wid_adj_routing")),
-            buffer_scale=float(kwargs.get("footprint_buffer_scale", 0.5)),
+        explicit_geometry = kwargs.get("collapse_geometry")
+        footprint = (
+            explicit_geometry
+            if explicit_geometry is not None
+            else _component_footprint_geometry(
+                links,
+                link_ids,
+                preferred_width_field=str(kwargs.get("preferred_width_field", "wid_adj_routing")),
+                buffer_scale=float(kwargs.get("footprint_buffer_scale", 0.5)),
+            )
         )
         if footprint.is_empty:
             raise ValueError("Selected unit links did not produce a valid collapse footprint.")
@@ -3103,6 +3449,7 @@ def _make_panelized_child_runner(
             state_root=state_root, panel_plan_path=panel_plan_path, panel_breaks_path=panel_breaks_path,
             boundary_match_plan_path=boundary_match_plan_path, boundary_component_labels_path=boundary_component_labels_path,
             footprint=footprint, halo_distance=max(float(width), 1.0), run_name=run_name,
+            explicit_geometry=explicit_geometry,
             exit_sides_by_panel=dict(exit_sides_by_panel), panel_runner=run_rivgraph_for_run,
             parent_directed_links_path=kwargs["reviewed_links_path"],
             materialize_full_mask=(
@@ -3112,6 +3459,9 @@ def _make_panelized_child_runner(
             all_touched=bool(kwargs.get("all_touched", True)),
             require_single_source_sink_path=bool(
                 kwargs.get("require_single_source_sink_path", False)
+            ),
+            compute_panel_width_products=bool(
+                kwargs.get("compute_panel_width_products", False)
             ),
         )
         return _finalize_panelized_child_result(
@@ -3140,6 +3490,9 @@ def _make_panelized_child_runner(
             sword_example_station_source_path=kwargs.get("sword_example_station_source_path"),
             sword_station_match_source_path=kwargs.get("sword_station_match_source_path"),
             sword_reach_buffer_steps=int(kwargs.get("sword_reach_buffer_steps", 2)),
+            exclude_closed_two_link_replacement=bool(
+                kwargs.get("exclude_closed_two_link_replacement", False)
+            ),
         )
     return runner
 
@@ -3206,6 +3559,7 @@ def _make_panelized_reference_section_builder(
             panelized_path_metrics=base_context.hierarchy_output_dir / "path_metrics.csv",
             panelized_mask_publication="virtual_patch",
             require_single_source_sink_path=True,
+            compute_panel_width_products=True,
         )
         return {
             "construction_backend": "panelized",
@@ -3917,7 +4271,10 @@ def _make_local_patch_child_runner(
                 stage = "execution"
                 code = type(exc).__name__
                 reason = str(exc)
-                source_audit = None
+                retry_summary = attempt_dir / "outer_domain_retry_summary.json"
+                source_audit = (
+                    str(retry_summary.resolve()) if retry_summary.exists() else None
+                )
             attempt_dir.mkdir(parents=True, exist_ok=True)
             fallback_audit = {
                 "schema_version": "local-patch-fallback-v2",
@@ -3970,6 +4327,9 @@ def _build_child_state(
     hydraulic_context_runner: Callable[..., StateHydraulicContextOutputs],
     hydraulic_context_kwargs: Mapping[str, Any] | None = None,
     defer_hierarchy: bool = False,
+    artifact_profile: str = "analysis",
+    compact_width_samples: bool = True,
+    drop_regenerable_raw: bool = False,
 ) -> ExperimentStateContext:
     state_started = time.perf_counter()
     stage_timings: dict[str, float | str] = {
@@ -3979,6 +4339,32 @@ def _build_child_state(
     _reset_state_dir(state_dir)
     variant_dir = state_dir / "variant"
     variant_call_kwargs = dict(variant_kwargs)
+    exclude_closed_two_link_replacement = False
+    if (
+        selection.selection_type == "unit"
+        and len(selection.selected_unit_ids) == 1
+        and parent_context.workflow is not None
+        and parent_context.analysis_links_path is not None
+        and parent_context.variant_output_dir is not None
+    ):
+        membership_path = (
+            Path(parent_context.variant_output_dir)
+            / "summary"
+            / "unit_link_membership.csv"
+        )
+        if membership_path.exists():
+            parent_domain = select_smallest_closed_parent_domain(
+                full_links=read_network(parent_context.analysis_links_path),
+                unit_summary=parent_context.workflow.unit_summary,
+                unit_link_membership=pd.read_csv(membership_path),
+                bubble_edge_resistance=parent_context.workflow.bubble_edge_resistance,
+                selected_unit_ids=selection.selected_unit_ids,
+            )
+            exclude_closed_two_link_replacement = bool(
+                parent_domain.domain_type == "closed_unit"
+                and parent_domain.selected_unit_is_closed
+                and len(parent_domain.links) == 2
+            )
     variant_call_kwargs.update(
         {
             "cleaned_mask_path": parent_context.cleaned_mask_path,
@@ -3993,6 +4379,7 @@ def _build_child_state(
             "selection_type": selection.selection_type,
             "compound_bubble_id": selection.compound_bubble_id,
             "bubble_root_unit_id": selection.bubble_root_unit_id,
+            "exclude_closed_two_link_replacement": exclude_closed_two_link_replacement,
         }
     )
     if selection.selection_type == "group":
@@ -4056,6 +4443,19 @@ def _build_child_state(
         parent_context=parent_context,
     )
     stage_timings["hydraulic_context_seconds"] = time.perf_counter() - hydraulic_started
+    retention_started = time.perf_counter()
+    retention = apply_successful_state_retention_best_effort(
+        state_dir,
+        profile=artifact_profile,
+        compact_width_samples=compact_width_samples,
+        drop_regenerable_raw=drop_regenerable_raw,
+    )
+    stage_timings["artifact_retention_seconds"] = time.perf_counter() - retention_started
+    stage_timings["artifact_profile"] = artifact_profile
+    stage_timings["artifact_retention_status"] = str(retention["status"])
+    stage_timings["local_patch_attempt_retention_action"] = str(
+        retention["local_patch_attempt"]["action"]
+    )
     stage_timings["state_total_seconds"] = time.perf_counter() - state_started
     (state_dir / "stage_timings.json").write_text(
         json.dumps(
@@ -4125,9 +4525,11 @@ def run_collapse_experiment(
     panelized_boundary_component_labels_path: str | Path | None = None,
     boundary_component_artifact_source_dir: str | Path | None = None,
     base_state_variant_source_dir: str | Path | None = None,
+    artifact_profile: str = "analysis",
     equivalent_forcing_table_runner: Callable[..., tuple[pd.DataFrame, dict[str, object]]] = prepare_forcing_table,
     equivalent_reference_kb_summary_runner: Callable[..., dict[str, Any]] = compute_reference_section_kb,
 ) -> CollapseExperimentOutputs:
+    artifact_profile = validate_artifact_profile(artifact_profile)
     execution_plan = resolve_execution_backend_plan(execution_mode)
     if execution_plan.base_backend == "panelized":
         base_state_variant_materializer = _materialize_panelized_base_state_variant
@@ -4247,10 +4649,6 @@ def run_collapse_experiment(
             mismatches.append(
                 "exit_sides: "
                 f"source={reused_base_manifest.get('exit_sides')!r} requested={exit_sides!r}"
-            )
-        if int(reused_base_manifest.get("n_failed_states", 0) or 0) != 0:
-            mismatches.append(
-                f"n_failed_states: source={reused_base_manifest.get('n_failed_states')!r} requested=0"
             )
         if int(reused_base_manifest.get("n_complete_states", 0) or 0) < 1:
             mismatches.append("source experiment has no completed base state")
@@ -4731,6 +5129,11 @@ def run_collapse_experiment(
                     else None
                 ),
                 "compatibility_validated": bool(base_reuse_compatibility_validated),
+                "source_n_failed_states": (
+                    int(reused_base_manifest.get("n_failed_states", 0) or 0)
+                    if reused_base_manifest is not None
+                    else None
+                ),
                 "variant_reused": base_state_variant_source_dir is not None,
                 "hierarchy_reused": reused_base_workflow is not None,
                 "hydraulic_context_reused": reused_base_workflow is not None,
@@ -4764,6 +5167,13 @@ def run_collapse_experiment(
                 ),
             },
             "options": {
+                "artifacts": {
+                    "profile": artifact_profile,
+                    "success_policy": (
+                        "retain_final_variant_and_compact_audits; "
+                        "remove_successful_local_patch_attempt_only_in_analysis"
+                    ),
+                },
                 "hierarchy": {
                     "defer_child_hierarchy": bool(defer_child_hierarchy),
                     "max_path_cutoff": max_path_cutoff,
@@ -4972,6 +5382,9 @@ def run_collapse_experiment(
                     hydraulic_context_runner=state_hydraulic_context_runner,
                     hydraulic_context_kwargs=state_hydraulic_context_kwargs,
                     defer_hierarchy=defer_child_hierarchy,
+                    artifact_profile=artifact_profile,
+                    compact_width_samples=mode in {"independent-units", "compound-bubbles"},
+                    drop_regenerable_raw=mode in {"independent-units", "compound-bubbles"},
                 )
             except VariantDirectionValidationError as exc:
                 error_text = _format_exception(exc)
@@ -5112,6 +5525,9 @@ def run_collapse_experiment(
                 hydraulic_context_runner=state_hydraulic_context_runner,
                 hydraulic_context_kwargs=state_hydraulic_context_kwargs,
                 defer_hierarchy=False,
+                artifact_profile=artifact_profile,
+                compact_width_samples=False,
+                drop_regenerable_raw=False,
             )
         except VariantDirectionValidationError as exc:
             error_text = _format_exception(exc)
@@ -5420,6 +5836,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--debug-hierarchy", action="store_true", help="Enable hierarchy/unit-detection debug output.")
     parser.add_argument(
+        "--artifact-profile",
+        choices=ARTIFACT_PROFILES,
+        default="analysis",
+        help=(
+            "Future-run artifact retention: analysis keeps final networks and compact audits; "
+            "reproducible/debug retain full local-patch attempt trees."
+        ),
+    )
+    parser.add_argument(
         "--preferred-width-field",
         default="wid_adj_routing",
         help="Preferred reviewed-link width field for collapse-footprint buffering.",
@@ -5599,6 +6024,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "equivalent_kb_width_percentile": args.equivalent_kb_width_percentile,
         "base_only": args.base_only,
         "defer_child_hierarchy": args.defer_child_hierarchy,
+        "artifact_profile": args.artifact_profile,
         "requested_unit_ids": args.requested_unit_ids,
         "requested_compound_bubble_ids": args.requested_compound_bubble_ids,
         "execution_mode": execution_plan.requested_modes,

@@ -199,6 +199,23 @@ def test_routing_application_preserves_measured_fields_and_adds_separate_routing
     assert "wid_adj_routing_raw" not in audit.columns
     assert set(audit["width_algorithm_version"]) == {application.ROUTING_WIDTH_APPLICATION_VERSION}
 
+    guarded_output, guarded_audit, guarded_summary = application.apply_routing_width_model(
+        links,
+        samples,
+        nodes,
+        example_id="99",
+        variant_id="S001_unit_1",
+        apply_known_base_exclusions=False,
+        excluded_evaluation_link_ids=[2],
+        exclusion_reason="closed_two_link_replacement",
+    )
+    guarded = guarded_output.set_index("id_link")
+    guarded_audit = guarded_audit.set_index("id_link")
+    assert guarded.loc[2, "wid_adj_routing"] == guarded.loc[2, "wid_adj_wet"]
+    assert guarded.loc[2, "width_qc_decision"] == "retain_raw_closed_two_link_replacement"
+    assert guarded_audit.loc[2, "width_qc_reason"] == "closed_two_link_replacement"
+    assert guarded_summary["explicitly_excluded_evaluation_link_count"] == 1
+
     paths = application.write_routing_width_audit(audit, summary, output_dir=tmp_path / "widths")
     manifest = json.loads(Path(paths["manifest"]).read_text(encoding="utf-8"))
     assert manifest["files"]["link_audit"] == application.ROUTING_AUDIT_FILENAME

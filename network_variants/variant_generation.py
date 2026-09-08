@@ -59,6 +59,7 @@ from network_variants.routing_width_application import (
     apply_routing_width_model,
     write_routing_width_audit,
 )
+from network_variants.width_samples import read_width_samples
 from network_variants.width_two_bank import build_state_bank_labels, compute_two_bank_width_families
 from network_variants.width_product_inheritance import inherit_unchanged_link_width_products
 
@@ -1461,12 +1462,18 @@ def _apply_segmented_stub_width_inheritance(
         "family_representative_bad_opposition_fraction": np.nan,
         "family_stub_to_representative_wet_ratio": np.nan,
         "family_stub_to_representative_total_ratio": np.nan,
+        "family_width_sample_provenance": "measured_link_samples_used_directly",
     }
     for column, default in metadata_defaults.items():
         if isinstance(default, pd.Series):
             adjusted_links[column] = default
         else:
             adjusted_links[column] = default
+    for column, default in metadata_defaults.items():
+        if isinstance(default, pd.Series):
+            adjusted_enriched[column] = default.reindex(adjusted_enriched.index)
+        else:
+            adjusted_enriched[column] = default
 
     if adjusted_links.empty or adjusted_enriched.empty or link_width_samples.empty:
         return adjusted_links, adjusted_enriched, {"applied_count": 0, "applied_link_ids": []}
@@ -1557,6 +1564,26 @@ def _apply_segmented_stub_width_inheritance(
         for column in SEGMENTED_STUB_WIDTH_INHERITANCE_FIELDS:
             if column in adjusted_enriched.columns and column in representative_enriched.index:
                 adjusted_enriched.loc[adjusted_enriched["id_link"].astype(int) == int(link_id), column] = representative_enriched[column]
+
+        enriched_stub_mask = adjusted_enriched["id_link"].astype(int) == int(link_id)
+        adjusted_enriched.loc[
+            enriched_stub_mask, "family_width_inheritance_candidate"
+        ] = True
+        adjusted_enriched.loc[
+            enriched_stub_mask, "family_width_inheritance_applied"
+        ] = True
+        adjusted_enriched.loc[
+            enriched_stub_mask, "family_representative_link_id"
+        ] = int(representative_link_id)
+        adjusted_enriched.loc[
+            enriched_stub_mask, "family_width_inherited_from_link"
+        ] = int(representative_link_id)
+        adjusted_enriched.loc[
+            enriched_stub_mask, "family_width_inheritance_reason"
+        ] = "inherited_from_segmented_family_representative"
+        adjusted_enriched.loc[
+            enriched_stub_mask, "family_width_sample_provenance"
+        ] = "measured_link_samples_retained__final_width_family_inherited_from_representative"
 
         adjusted_links.loc[stub_mask, "family_width_inheritance_applied"] = True
         adjusted_links.loc[stub_mask, "family_width_inherited_from_link"] = int(representative_link_id)
@@ -2352,9 +2379,12 @@ def _parent_interval_lengths(
         edge_lengths: list[float] = []
         for edge_key, attrs in parent_graph[int(upstream)][int(downstream)].items():
             _ = edge_key
-            value = attrs.get("len_adj")
+            # Anchor-interface placement must use the same physical-link
+            # length convention as the hierarchy and equivalent-resistance
+            # workflows. ``len_adj`` is only a legacy fallback.
+            value = attrs.get("len")
             if value is None or pd.isna(value):
-                value = attrs.get("len")
+                value = attrs.get("len_adj")
             if value is None or pd.isna(value):
                 geometry = attrs.get("geometry")
                 value = float(geometry.length) if geometry is not None else 0.0
@@ -4052,6 +4082,166 @@ def _resolve_single_remaining_link(
     return valid_candidates[0]
 
 
+def _repair_global_progression_from_parent_reachability(
+    *,
+    orientation_by_link: Mapping[int, tuple[int, int]],
+    orientation_source: Mapping[int, str],
+    edge_nodes: Mapping[int, tuple[int, int]],
+    incident_links: Mapping[int, Sequence[int]],
+    child_nodes: gpd.GeoDataFrame,
+    parent_links: gpd.GeoDataFrame,
+    node_match: pd.DataFrame,
+    child_inlet_nodes: set[int],
+    child_outlet_nodes: set[int],
+    require_flag_match: bool,
+) -> tuple[dict[int, tuple[int, int]], dict[int, str], list[dict[str, Any]]]:
+    """Repair weak global-progression directions from regional reachability.
+
+    Parent-link overlap is intentionally not used here: changed links can have
+    tiny, misleading overlaps with several parent links.  Instead, stable
+    one-to-one node matches define a local frontier around each weakly oriented
+    link.  A reversal is accepted only when it strictly reduces disagreement
+    with parent reachability without introducing a new disagreement, while the
+    complete child graph remains a valid DAG with the prescribed boundaries.
+    """
+
+    stable = node_match.copy()
+    if "match_within_tolerance" in stable.columns:
+        stable = stable.loc[stable["match_within_tolerance"].fillna(False)]
+    stable = stable.loc[stable["matched_parent_node_id"].notna()].copy()
+    if stable.empty:
+        return dict(orientation_by_link), dict(orientation_source), []
+    stable["child_id_node"] = pd.to_numeric(
+        stable["child_id_node"], errors="coerce"
+    ).astype("Int64")
+    stable["matched_parent_node_id"] = pd.to_numeric(
+        stable["matched_parent_node_id"], errors="coerce"
+    ).astype("Int64")
+    stable = stable.dropna(subset=["child_id_node", "matched_parent_node_id"])
+    stable = stable.loc[
+        ~stable["child_id_node"].duplicated(keep=False)
+        & ~stable["matched_parent_node_id"].duplicated(keep=False)
+    ]
+    child_to_parent = {
+        int(row.child_id_node): int(row.matched_parent_node_id)
+        for row in stable.itertuples(index=False)
+    }
+    if len(child_to_parent) < 2:
+        return dict(orientation_by_link), dict(orientation_source), []
+
+    parent_graph = nx.DiGraph()
+    for row in parent_links.itertuples(index=False):
+        if pd.isna(row.id_us_node) or pd.isna(row.id_ds_node):
+            continue
+        parent_graph.add_edge(int(row.id_us_node), int(row.id_ds_node))
+
+    repaired = {
+        int(link_id): tuple(map(int, endpoints))
+        for link_id, endpoints in orientation_by_link.items()
+    }
+    repaired_source = {
+        int(link_id): str(source) for link_id, source in orientation_source.items()
+    }
+    audit: list[dict[str, Any]] = []
+
+    def frontier_for(link_id: int) -> list[int]:
+        queue = list(edge_nodes[int(link_id)])
+        visited: set[int] = set()
+        frontier: set[int] = set()
+        while queue:
+            node_id = int(queue.pop())
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+            if node_id in child_to_parent:
+                frontier.add(node_id)
+                continue
+            for adjacent_link_id in incident_links.get(node_id, ()):
+                node_a, node_b = edge_nodes[int(adjacent_link_id)]
+                queue.append(int(node_b if int(node_a) == node_id else node_a))
+        return sorted(frontier)
+
+    def mismatch_counts(
+        graph: nx.DiGraph, frontier: Sequence[int]
+    ) -> tuple[int, int]:
+        lost = 0
+        extra = 0
+        for child_a in frontier:
+            for child_b in frontier:
+                if int(child_a) == int(child_b):
+                    continue
+                parent_a = child_to_parent[int(child_a)]
+                parent_b = child_to_parent[int(child_b)]
+                expected = (
+                    parent_a in parent_graph
+                    and parent_b in parent_graph
+                    and nx.has_path(parent_graph, parent_a, parent_b)
+                )
+                observed = nx.has_path(graph, int(child_a), int(child_b))
+                lost += int(expected and not observed)
+                extra += int(observed and not expected)
+        return int(lost), int(extra)
+
+    candidates = sorted(
+        int(link_id)
+        for link_id, source in repaired_source.items()
+        if source == "global_progression_rule"
+    )
+    for link_id in candidates:
+        frontier = frontier_for(link_id)
+        if len(frontier) < 2:
+            continue
+        current_graph = nx.DiGraph(
+            _build_oriented_child_graph(
+                child_nodes=child_nodes,
+                orientation_by_link=repaired,
+            )
+        )
+        current_lost, current_extra = mismatch_counts(current_graph, frontier)
+
+        upstream, downstream = repaired[link_id]
+        trial = dict(repaired)
+        trial[link_id] = (int(downstream), int(upstream))
+        trial_multigraph = _build_oriented_child_graph(
+            child_nodes=child_nodes,
+            orientation_by_link=trial,
+        )
+        trial_graph = nx.DiGraph(trial_multigraph)
+        trial_report = _validate_variant_direction_boundaries(
+            trial_multigraph,
+            child_inlet_nodes=child_inlet_nodes,
+            child_outlet_nodes=child_outlet_nodes,
+            require_flag_match=require_flag_match,
+        )
+        if not trial_report.is_valid or not nx.is_directed_acyclic_graph(trial_graph):
+            continue
+        trial_lost, trial_extra = mismatch_counts(trial_graph, frontier)
+        dominates = (
+            trial_lost <= current_lost
+            and trial_extra <= current_extra
+            and (trial_lost < current_lost or trial_extra < current_extra)
+        )
+        if not dominates:
+            continue
+        repaired = trial
+        repaired_source[link_id] = "regional_parent_reachability_rule"
+        audit.append(
+            {
+                "id_link": int(link_id),
+                "frontier_child_nodes": [int(value) for value in frontier],
+                "frontier_parent_nodes": [
+                    int(child_to_parent[value]) for value in frontier
+                ],
+                "current_lost_parent_paths": int(current_lost),
+                "current_extra_child_paths": int(current_extra),
+                "repaired_lost_parent_paths": int(trial_lost),
+                "repaired_extra_child_paths": int(trial_extra),
+            }
+        )
+
+    return repaired, repaired_source, audit
+
+
 def _assign_variant_directions(
     *,
     child_links: gpd.GeoDataFrame,
@@ -4116,29 +4306,38 @@ def _assign_variant_directions(
 
         if matches is not None and not matches.empty:
             core_matches = matches.loc[matches["candidate_class"] == "core_overlap"].copy()
+            # A touch-only candidate is adjacency evidence, not lineage.  It
+            # must never override the direction of a genuinely changed local
+            # connector merely because both geometries meet near one parent
+            # node.  Only a positive core-overlap match can transfer parent
+            # endpoint direction; otherwise local topology resolves the link.
             if not core_matches.empty:
-                matches = core_matches
-            score_start_end = 0.0
-            score_end_start = 0.0
-            for match_row in matches.itertuples(index=False):
-                weight = float(match_row.child_overlap_length)
-                parent_upstream = parent_node_geoms[int(match_row.parent_id_us_node)]
-                parent_downstream = parent_node_geoms[int(match_row.parent_id_ds_node)]
-                score_start_end += weight * (
-                    start_point.distance(parent_upstream) + end_point.distance(parent_downstream)
-                )
-                score_end_start += weight * (
-                    end_point.distance(parent_upstream) + start_point.distance(parent_downstream)
-                )
-            orientation_score_forward[link_id] = score_start_end
-            orientation_score_reverse[link_id] = score_end_start
-            if not math.isclose(score_start_end, score_end_start, rel_tol=1e-12, abs_tol=1e-9):
-                oriented_pair = (
-                    (start_node, end_node)
-                    if score_start_end < score_end_start
-                    else (end_node, start_node)
-                )
-                direction_method = "matched_parent_endpoints"
+                score_start_end = 0.0
+                score_end_start = 0.0
+                for match_row in core_matches.itertuples(index=False):
+                    weight = float(match_row.child_overlap_length)
+                    parent_upstream = parent_node_geoms[int(match_row.parent_id_us_node)]
+                    parent_downstream = parent_node_geoms[int(match_row.parent_id_ds_node)]
+                    score_start_end += weight * (
+                        start_point.distance(parent_upstream) + end_point.distance(parent_downstream)
+                    )
+                    score_end_start += weight * (
+                        end_point.distance(parent_upstream) + start_point.distance(parent_downstream)
+                    )
+                orientation_score_forward[link_id] = score_start_end
+                orientation_score_reverse[link_id] = score_end_start
+                if not math.isclose(
+                    score_start_end,
+                    score_end_start,
+                    rel_tol=1e-12,
+                    abs_tol=1e-9,
+                ):
+                    oriented_pair = (
+                        (start_node, end_node)
+                        if score_start_end < score_end_start
+                        else (end_node, start_node)
+                    )
+                    direction_method = "matched_parent_core_endpoints"
 
         if oriented_pair is None and node_a in parent_order_lookup and node_b in parent_order_lookup:
             order_a = parent_order_lookup[node_a]
@@ -4410,6 +4609,36 @@ def _assign_variant_directions(
             require_flag_match=require_child_boundary_flag_match,
         )
 
+    regional_reachability_repairs: list[dict[str, Any]] = []
+    if report.is_valid and nx.is_directed_acyclic_graph(nx.DiGraph(child_graph)):
+        (
+            orientation_by_link,
+            orientation_source,
+            regional_reachability_repairs,
+        ) = _repair_global_progression_from_parent_reachability(
+            orientation_by_link=orientation_by_link,
+            orientation_source=orientation_source,
+            edge_nodes=edge_nodes,
+            incident_links=incident_links,
+            child_nodes=child_nodes,
+            parent_links=parent_links,
+            node_match=node_match,
+            child_inlet_nodes=child_inlet_nodes,
+            child_outlet_nodes=child_outlet_nodes,
+            require_flag_match=require_child_boundary_flag_match,
+        )
+        if regional_reachability_repairs:
+            child_graph = _build_oriented_child_graph(
+                child_nodes=child_nodes,
+                orientation_by_link=orientation_by_link,
+            )
+            report = _validate_variant_direction_boundaries(
+                child_graph,
+                child_inlet_nodes=child_inlet_nodes,
+                child_outlet_nodes=child_outlet_nodes,
+                require_flag_match=require_child_boundary_flag_match,
+            )
+
     topology_source_nodes = sorted(int(node_id) for node_id in report.source_nodes)
     topology_sink_nodes = sorted(int(node_id) for node_id in report.sink_nodes)
     if canonicalize_parent_boundaries:
@@ -4542,6 +4771,10 @@ def _assign_variant_directions(
         "require_child_boundary_flag_match": bool(require_child_boundary_flag_match),
         "allow_boundary_potential_fallback": bool(allow_boundary_potential_fallback),
         "used_boundary_potential_fallback": bool(used_boundary_potential_fallback),
+        "n_regional_parent_reachability_repairs": int(
+            len(regional_reachability_repairs)
+        ),
+        "regional_parent_reachability_repairs": regional_reachability_repairs,
     }
     return directed_links, directed_nodes, summary
 
@@ -4641,6 +4874,7 @@ def generate_network_variant(
     max_path_cutoff: int = 100,
     max_paths: int = 5000,
     verbose_rivgraph: bool = False,
+    exclude_closed_two_link_replacement: bool = False,
 ) -> NetworkVariantOutputs:
     if collapse_corridor_mode not in COLLAPSE_CORRIDOR_MODES:
         raise ValueError(
@@ -4901,12 +5135,10 @@ def generate_network_variant(
         errors="ignore",
     ).merge(link_lineage, on="id_link", how="left", validate="1:1")
 
-    parent_width_samples_path = Path(reviewed_links_path).with_name("link_width_samples.csv")
-    parent_width_samples = (
-        pd.read_csv(parent_width_samples_path)
-        if parent_width_samples_path.exists()
-        else pd.DataFrame()
-    )
+    try:
+        parent_width_samples = read_width_samples(Path(reviewed_links_path).parent)
+    except FileNotFoundError:
+        parent_width_samples = pd.DataFrame()
     (
         directed_enriched_links,
         link_width_samples,
@@ -4952,6 +5184,27 @@ def generate_network_variant(
     )
     link_width_samples["example_id"] = example_id
     link_width_samples["variant_id"] = variant_id
+    excluded_routing_width_link_ids: list[int] = []
+    closed_replacement_audit = pd.DataFrame()
+    if exclude_closed_two_link_replacement:
+        from network_variants.width_trim_selection import resolve_closed_replacement_exclusions
+
+        excluded_routing_width_link_ids, closed_replacement_audit = resolve_closed_replacement_exclusions(
+            directed_enriched_links,
+            reviewed_links,
+            changed_width_link_ids,
+        )
+        if not closed_replacement_audit.empty:
+            decision_columns = [
+                column for column in closed_replacement_audit.columns
+                if column != "id_link" and column not in directed_enriched_links.columns
+            ]
+            directed_enriched_links = directed_enriched_links.merge(
+                closed_replacement_audit[["id_link", *decision_columns]],
+                on="id_link",
+                how="left",
+                validate="1:1",
+            )
     directed_enriched_links, routing_width_audit, routing_width_application = apply_routing_width_model(
         directed_enriched_links,
         link_width_samples,
@@ -4960,7 +5213,33 @@ def generate_network_variant(
         variant_id=variant_id,
         apply_known_base_exclusions=False,
         evaluation_link_ids=changed_width_link_ids,
+        excluded_evaluation_link_ids=excluded_routing_width_link_ids,
+        exclusion_reason="closed_two_link_replacement",
     )
+    from network_variants.width_trim_selection import build_parent_child_width_diagnostics
+
+    parent_child_diagnostics = build_parent_child_width_diagnostics(
+        directed_enriched_links,
+        reviewed_links,
+    )
+    if not parent_child_diagnostics.empty:
+        diagnostic_columns = [
+            column for column in parent_child_diagnostics.columns
+            if column != "id_link" and column not in directed_enriched_links.columns
+        ]
+        directed_enriched_links = directed_enriched_links.merge(
+            parent_child_diagnostics[["id_link", *diagnostic_columns]],
+            on="id_link",
+            how="left",
+            validate="1:1",
+        )
+        if not routing_width_audit.empty:
+            routing_width_audit = routing_width_audit.merge(
+                parent_child_diagnostics,
+                on="id_link",
+                how="left",
+                validate="1:1",
+            )
     directed_enriched_links.loc[
         directed_enriched_links["id_link"].astype(int).isin(changed_width_link_ids),
         "width_inheritance_status",
@@ -5370,12 +5649,10 @@ def derive_anchored_variant_from_realized(
 
     reviewed_links = gpd.read_file(reviewed_links_path)
     reviewed_nodes = gpd.read_file(reviewed_nodes_path)
-    parent_width_samples_path = Path(reviewed_links_path).with_name("link_width_samples.csv")
-    parent_width_samples = (
-        pd.read_csv(parent_width_samples_path)
-        if parent_width_samples_path.exists()
-        else None
-    )
+    try:
+        parent_width_samples = read_width_samples(Path(reviewed_links_path).parent)
+    except FileNotFoundError:
+        parent_width_samples = None
     with rasterio.open(collapsed_mask_path) as src:
         pixel_length = _pixel_length_from_transform(src.transform)
         collapsed_profile = src.profile.copy()

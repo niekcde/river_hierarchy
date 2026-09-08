@@ -1824,6 +1824,7 @@ def merge_local_patch_variant(
     upstream_boundary_node_ids: tuple[int, ...] | None = None,
     downstream_boundary_node_ids: tuple[int, ...] | None = None,
     merge_stage: str = "scientific_anchored",
+    expected_cycle_reduction_override: int | None = None,
 ) -> LocalPatchMergeResult:
     """Conservatively replace a prescribed contract domain in the parent graph.
 
@@ -2532,10 +2533,16 @@ def merge_local_patch_variant(
     parent_cycle_rank = _undirected_cycle_rank(parent_links)
     merged_cycle_rank = _undirected_cycle_rank(merged_links)
     observed_cycle_reduction = int(parent_cycle_rank - merged_cycle_rank)
-    expected_cycle_reduction = _expected_cycle_reduction(
-        variant_result,
-        parent_links=parent_links,
-        selected_link_ids=contract.selected_link_ids,
+    if expected_cycle_reduction_override is not None and int(expected_cycle_reduction_override) < 0:
+        raise ValueError("expected_cycle_reduction_override must be non-negative.")
+    expected_cycle_reduction = (
+        int(expected_cycle_reduction_override)
+        if expected_cycle_reduction_override is not None
+        else _expected_cycle_reduction(
+            variant_result,
+            parent_links=parent_links,
+            selected_link_ids=contract.selected_link_ids,
+        )
     )
     if (
         expected_cycle_reduction is not None
@@ -2639,6 +2646,11 @@ def merge_local_patch_variant(
                 int(expected_cycle_reduction)
                 if expected_cycle_reduction is not None
                 else None
+            ),
+            "expected_cycle_reduction_source": (
+                "explicit_override"
+                if expected_cycle_reduction_override is not None
+                else "selected_parent_subgraph"
             ),
             "passed": bool(
                 expected_cycle_reduction is None

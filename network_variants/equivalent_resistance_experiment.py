@@ -296,7 +296,10 @@ def _load_variant_links(
     *,
     directed_links_path: Path,
     variant_output_dir: Path,
+    analysis_links_path: Path | None = None,
 ) -> gpd.GeoDataFrame:
+    if analysis_links_path is not None and analysis_links_path.exists():
+        return _normalize_numeric_id_columns(gpd.read_file(analysis_links_path))
     widths_links_path = variant_output_dir / "widths" / "links_with_width_families.gpkg"
     width_families_csv_path = variant_output_dir / "widths" / "link_width_families.csv"
 
@@ -1295,16 +1298,22 @@ def _resolve_child_objects(
         if child_links_path is None or child_nodes_path is None or variant_output_dir is None:
             continue
 
-        lineage_path = variant_output_dir / "matching" / "link_lineage.csv"
-        node_match_path = variant_output_dir / "matching" / "node_match.csv"
-        if not lineage_path.exists():
-            continue
+        lineage_path = _optional_path(getattr(row, "link_lineage_path", None))
+        if lineage_path is None:
+            lineage_path = variant_output_dir / "matching" / "link_lineage.csv"
+        node_match_path = _optional_path(getattr(row, "node_match_path", None))
+        if node_match_path is None:
+            node_match_path = variant_output_dir / "matching" / "node_match.csv"
 
+        analysis_links_path = _optional_path(getattr(row, "analysis_links_path", None))
         child_links = _load_variant_links(
             directed_links_path=child_links_path,
             variant_output_dir=variant_output_dir,
+            analysis_links_path=analysis_links_path,
         )
         child_nodes = _normalize_numeric_id_columns(gpd.read_file(child_nodes_path))
+        if not lineage_path.exists():
+            continue
         lineage = _parse_lineage_lists(pd.read_csv(lineage_path))
         node_match = _parse_node_match(pd.read_csv(node_match_path)) if node_match_path.exists() else pd.DataFrame()
         target_parent_node_ids = _resolve_target_parent_node_ids(target)
@@ -1701,6 +1710,181 @@ def _build_comparison_frame(
     return pd.DataFrame.from_records(records).sort_values(["state_id", "child_object_id"], kind="mergesort").reset_index(drop=True)
 
 
+def _selected_domain_ids(domain: pd.DataFrame, role: str, column: str) -> list[int]:
+    if domain.empty or "domain_role" not in domain.columns or column not in domain.columns:
+        return []
+    values = pd.to_numeric(
+        domain.loc[domain["domain_role"].astype(str).eq(role), column],
+        errors="coerce",
+    )
+    return sorted(values.dropna().astype(int).unique().tolist())
+
+
+def _preserve_residual_corridor_diagnostics(
+    frame: pd.DataFrame,
+    columns: Sequence[str],
+) -> pd.DataFrame:
+    """Retain superseded isolated-corridor values as named diagnostics."""
+    result = frame.copy()
+    for column in columns:
+        if column in result.columns:
+            result[f"residual_corridor_{column}_diagnostic"] = result[column]
+    return result
+
+
+def _apply_selected_hydraulic_domain_aggregates(
+    *,
+    experiment_path: Path,
+    nominal_targets: pd.DataFrame,
+    child_realized_objects: pd.DataFrame,
+    matched_base_corridors: pd.DataFrame,
+    comparison: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, int]:
+    """Make the state-transition hydraulic domain authoritative in root tables."""
+    transition_path = experiment_path / "equivalent_transition_registry.csv"
+    if not transition_path.exists():
+        return child_realized_objects, matched_base_corridors, comparison, 0
+    transitions = pd.read_csv(transition_path)
+    required = {
+        "transition_id",
+        "child_state_id",
+        "selected_domain_status",
+        "parent_solver_success",
+        "child_solver_success",
+        "K_before",
+        "K_after",
+        "Lambda_K",
+    }
+    if transitions.empty or not required.issubset(transitions.columns):
+        return child_realized_objects, matched_base_corridors, comparison, 0
+    transitions = transitions.loc[
+        transitions["selected_domain_status"].astype(str).eq("complete")
+        & transitions["parent_solver_success"].fillna(False).astype(bool)
+        & transitions["child_solver_success"].fillna(False).astype(bool)
+    ].copy()
+    if transitions.empty:
+        return child_realized_objects, matched_base_corridors, comparison, 0
+
+    child = _preserve_residual_corridor_diagnostics(
+        child_realized_objects,
+        ("child_link_ids", "child_node_ids", "K_variant_realized", "G_variant_realized", "Q_unit_variant"),
+    )
+    matched = _preserve_residual_corridor_diagnostics(
+        matched_base_corridors,
+        ("matched_base_link_ids", "matched_base_node_ids", "K_eq_matched_base", "G_eq_matched_base", "Q_unit_matched_base"),
+    )
+    compared = _preserve_residual_corridor_diagnostics(
+        comparison,
+        ("K_eq_matched_base", "K_variant_realized", "Lambda_matched", "Gamma_matched", "boundary_relation"),
+    )
+    nominal_by_state = {
+        str(row.state_id): row for row in nominal_targets.itertuples(index=False)
+    }
+
+    def ensure_row(frame: pd.DataFrame, record: Mapping[str, Any]) -> tuple[pd.DataFrame, int]:
+        state_id = str(record["state_id"])
+        indices = frame.index[frame["state_id"].astype(str).eq(state_id)].tolist() if "state_id" in frame else []
+        if indices:
+            return frame, int(indices[0])
+        frame = pd.concat([frame, pd.DataFrame([dict(record)])], ignore_index=True, sort=False)
+        return frame, int(frame.index[-1])
+
+    applied = 0
+    for transition in transitions.itertuples(index=False):
+        state_id = str(transition.child_state_id)
+        domain_path = experiment_path / "states" / state_id / "equivalent_resistance" / "selected_hydraulic_domain_links.csv"
+        if not domain_path.exists():
+            continue
+        domain = pd.read_csv(domain_path)
+        parent_link_ids = _selected_domain_ids(domain, "parent", "id_link")
+        child_link_ids = _selected_domain_ids(domain, "child", "id_link")
+        parent_node_ids = sorted(set(_selected_domain_ids(domain, "parent", "id_us_node") + _selected_domain_ids(domain, "parent", "id_ds_node")))
+        child_node_ids = sorted(set(_selected_domain_ids(domain, "child", "id_us_node") + _selected_domain_ids(domain, "child", "id_ds_node")))
+        if not parent_link_ids or not child_link_ids:
+            continue
+
+        nominal = nominal_by_state.get(state_id)
+        target_type = getattr(nominal, "target_type", "") if nominal is not None else ""
+        target_id = getattr(nominal, "target_id", np.nan) if nominal is not None else np.nan
+        selected_unit_ids = getattr(transition, "selected_unit_ids", "")
+        child_object_id = f"{state_id}__selected_hydraulic_domain"
+        nominal_upstream = _optional_int(getattr(nominal, "nominal_upstream_node", pd.NA)) if nominal is not None else None
+        nominal_downstream = _optional_int(getattr(nominal, "nominal_downstream_node", pd.NA)) if nominal is not None else None
+        parent_upstream = _optional_int(getattr(transition, "parent_upstream_boundary_node", pd.NA))
+        parent_downstream = _optional_int(getattr(transition, "parent_downstream_boundary_node", pd.NA))
+        child_upstream = _optional_int(getattr(transition, "child_upstream_boundary_node", pd.NA))
+        child_downstream = _optional_int(getattr(transition, "child_downstream_boundary_node", pd.NA))
+        exact_nominal = nominal_upstream is not None and nominal_downstream is not None and parent_upstream == nominal_upstream and parent_downstream == nominal_downstream
+        boundary_relation = "exact_match" if exact_nominal else "selected_hydraulic_domain"
+
+        child_record = {
+            "state_id": state_id, "target_type": target_type, "target_id": target_id,
+            "selected_unit_ids": selected_unit_ids, "child_object_id": child_object_id,
+            "child_object_type": str(getattr(transition, "hydraulic_domain_type", "selected_hydraulic_domain")),
+            "child_link_ids": _serialize_int_list(child_link_ids), "child_node_ids": _serialize_int_list(child_node_ids),
+            "child_n_links": len(child_link_ids), "child_n_nodes": len(child_node_ids),
+            "child_upstream_node": child_upstream, "child_downstream_node": child_downstream,
+            "child_boundary_match_upstream_parent_node": parent_upstream,
+            "child_boundary_match_downstream_parent_node": parent_downstream,
+            "matched_parent_node_path": "", "matched_parent_link_ids": _serialize_int_list(parent_link_ids),
+            "boundaries_match_nominal_target": bool(exact_nominal), "boundary_relation": boundary_relation,
+            "K_variant_realized": getattr(transition, "K_after"), "G_variant_realized": getattr(transition, "G_after", np.nan),
+            "Q_unit_variant": getattr(transition, "Q_unit_after", np.nan), "solver_success_variant": True,
+            "solver_method_variant": str(getattr(transition, "child_solver_method", "")),
+            "solver_message_variant": "authoritative selected hydraulic-domain transition",
+            "solver_nfev_variant": getattr(transition, "child_solver_nfev", np.nan),
+            "residual_norm_variant": getattr(transition, "residual_norm_after", np.nan),
+            "residual_relative_variant": getattr(transition, "residual_relative_after", np.nan),
+            "comparison_scope": "selected_hydraulic_domain", "authoritative_transition_id": str(transition.transition_id),
+        }
+        child, child_index = ensure_row(child, child_record)
+        for key, value in child_record.items():
+            child.loc[child_index, key] = value
+
+        matched_record = {
+            "state_id": state_id, "child_object_id": child_object_id, "target_type": target_type, "target_id": target_id,
+            "matched_base_upstream_node": parent_upstream, "matched_base_downstream_node": parent_downstream,
+            "matched_base_link_ids": _serialize_int_list(parent_link_ids), "matched_base_node_ids": _serialize_int_list(parent_node_ids),
+            "matched_base_node_path": "", "matched_base_n_links": len(parent_link_ids), "matched_base_n_nodes": len(parent_node_ids),
+            "K_eq_matched_base": getattr(transition, "K_before"), "G_eq_matched_base": getattr(transition, "G_before", np.nan),
+            "Q_unit_matched_base": getattr(transition, "Q_unit_before", np.nan), "solver_success_matched": True,
+            "solver_method_matched": str(getattr(transition, "parent_solver_method", "")),
+            "solver_message_matched": "authoritative selected hydraulic-domain transition",
+            "solver_nfev_matched": getattr(transition, "parent_solver_nfev", np.nan),
+            "residual_norm_matched": getattr(transition, "residual_norm_before", np.nan),
+            "residual_relative_matched": getattr(transition, "residual_relative_before", np.nan),
+            "boundaries_match_nominal_target": bool(exact_nominal), "boundary_relation": boundary_relation,
+            "comparison_scope": "selected_hydraulic_domain", "authoritative_transition_id": str(transition.transition_id),
+        }
+        matched, matched_index = ensure_row(matched, matched_record)
+        for key, value in matched_record.items():
+            matched.loc[matched_index, key] = value
+
+        compared_record = {
+            "state_id": state_id, "child_object_id": child_object_id, "target_type": target_type, "target_id": target_id,
+            "K_eq_nominal_base": getattr(nominal, "K_eq_nominal_base", np.nan) if nominal is not None else np.nan,
+            "K_eq_matched_base": getattr(transition, "K_before"), "K_variant_realized": getattr(transition, "K_after"),
+            "Lambda_nominal": np.nan, "Lambda_matched": getattr(transition, "Lambda_K"), "Gamma_nominal": np.nan,
+            "Gamma_matched": getattr(transition, "Lambda_G", np.nan), "boundaries_match_nominal_target": bool(exact_nominal),
+            "boundary_relation": boundary_relation, "comparison_valid_for_nominal": False,
+            "comparison_valid_for_matched": True, "comparison_scope": "selected_hydraulic_domain",
+            "hydraulic_domain_type": str(getattr(transition, "hydraulic_domain_type", "")),
+            "authoritative_transition_id": str(transition.transition_id),
+        }
+        compared, compared_index = ensure_row(compared, compared_record)
+        for key, value in compared_record.items():
+            compared.loc[compared_index, key] = value
+        applied += 1
+
+    sort_columns = ["state_id", "child_object_id"]
+    return (
+        child.sort_values(sort_columns, kind="mergesort").reset_index(drop=True),
+        matched.sort_values(sort_columns, kind="mergesort").reset_index(drop=True),
+        compared.sort_values(sort_columns, kind="mergesort").reset_index(drop=True),
+        applied,
+    )
+
+
 def write_equivalent_resistance_outputs(
     output_dir: str | Path,
     *,
@@ -1790,6 +1974,15 @@ def run_equivalent_resistance_experiment(
         child_realized_objects=child_realized_objects,
         matched_base_corridors=matched_base_corridors,
     )
+    child_realized_objects, matched_base_corridors, comparison, n_authoritative_transition_aggregates = (
+        _apply_selected_hydraulic_domain_aggregates(
+            experiment_path=experiment_path,
+            nominal_targets=base_nominal_targets,
+            child_realized_objects=child_realized_objects,
+            matched_base_corridors=matched_base_corridors,
+            comparison=comparison,
+        )
+    )
 
     output_path = (
         Path(output_dir).expanduser().resolve()
@@ -1811,6 +2004,7 @@ def run_equivalent_resistance_experiment(
         "n_comparisons": int(len(comparison)),
         "n_valid_matched_comparisons": int(comparison["comparison_valid_for_matched"].fillna(False).astype(bool).sum()) if not comparison.empty else 0,
         "n_valid_nominal_comparisons": int(comparison["comparison_valid_for_nominal"].fillna(False).astype(bool).sum()) if not comparison.empty else 0,
+        "n_authoritative_transition_aggregates": int(n_authoritative_transition_aggregates),
     }
     write_equivalent_resistance_outputs(
         output_path,

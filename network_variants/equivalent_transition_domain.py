@@ -11,6 +11,7 @@ import pandas as pd
 
 from hierarchy_level_definition.metrics import BubbleEquivalentResistanceConfig
 from hierarchy_level_definition.metrics.bubble_equivalent_metrics import (
+    _select_stable_solver_attempt,
     prepare_bubble_resistance_edges,
 )
 from hierarchy_level_definition.metrics.equivalent_resistance import (
@@ -409,9 +410,27 @@ def solve_hydraulic_domain(
     if primary_success:
         primary.update(
             {
+                "solver_strict_success": True,
+                "solver_conditional_acceptance": False,
+                "solver_acceptance_tier": "strict",
+                "candidate_K_relative_difference": np.nan,
+                "conditional_residual_relative_tolerance": float(
+                    config.conditional_residual_relative_tolerance
+                ),
+                "extended_residual_relative_allowance": float(
+                    config.extended_residual_relative_allowance
+                ),
+                "conditional_K_relative_tolerance": float(
+                    config.conditional_k_relative_tolerance
+                ),
+                "primary_K_eq": float(primary.get("K_eq", np.nan)),
+                "neutral_fallback_K_eq": np.nan,
                 "initialization_used": "available_node_heads",
                 "primary_solver_success": True,
                 "primary_residual_relative": primary_residual,
+                "neutral_fallback_attempted": False,
+                "neutral_fallback_solver_success": pd.NA,
+                "neutral_fallback_residual_relative": np.nan,
             }
         )
         return primary, resolved_kb
@@ -439,14 +458,41 @@ def solve_hydraulic_domain(
         solver_cache_dir=config.solver_cache_dir,
     )
     fallback = dict(fallback)
-    fallback.update(
+    selected, selected_initialization = _select_stable_solver_attempt(
+        primary,
+        fallback,
+        config=config,
+    )
+    selected.update(
         {
-            "initialization_used": "neutral_internal_heads_fallback",
+            "initialization_used": selected_initialization,
             "primary_solver_success": False,
             "primary_residual_relative": primary_residual,
+            "neutral_fallback_attempted": True,
+            "neutral_fallback_solver_success": bool(
+                fallback.get("solver_success", False)
+            ),
+            "neutral_fallback_residual_relative": fallback.get(
+                "residual_relative", np.nan
+            ),
         }
     )
-    return fallback, fallback_kb.to_dict()
+    if not bool(selected.get("solver_success", False)):
+        for field in ("K_eq", "G_eq", "Q_unit"):
+            selected[field] = np.nan
+        if isinstance(selected.get("edge_flows"), pd.DataFrame):
+            edge_flows = selected["edge_flows"].copy()
+            for column in ("q_unit", "dh"):
+                if column in edge_flows.columns:
+                    edge_flows[column] = np.nan
+            selected["edge_flows"] = edge_flows
+        if isinstance(selected.get("node_heads"), pd.DataFrame):
+            node_heads = selected["node_heads"].copy()
+            for column in ("head_norm", "continuity_residual"):
+                if column in node_heads.columns:
+                    node_heads[column] = np.nan
+            selected["node_heads"] = node_heads
+    return selected, fallback_kb.to_dict()
 
 
 def read_network(path: str | Path) -> gpd.GeoDataFrame:

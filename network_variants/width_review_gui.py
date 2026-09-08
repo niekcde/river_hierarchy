@@ -44,6 +44,7 @@ from network_variants.width_review_fingerprint import (
     upgrade_review_fingerprints,
     validate_review_fingerprints,
 )
+from network_variants.width_samples import read_width_samples
 
 
 RIVGRAPH_WIDTH_TRIM_MULTIPLIER = 1.1
@@ -155,12 +156,19 @@ def compute_sample_qc_frame(samples: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
             ),
         )
 
-    ordered = (
-        samples.sort_values(["id_link", "sample_index"], kind="mergesort")
-        .groupby("id_link", group_keys=False)
-        .apply(_mark_trimmed_sample_rows)
-        .reset_index(drop=True)
-    )
+    if "used_in_selected_width" in samples.columns:
+        ordered = samples.sort_values(["id_link", "sample_index"], kind="mergesort").copy()
+        ordered["used_in_trimmed_width"] = (
+            ordered["used_in_selected_width"].fillna(False).astype(bool)
+        )
+        ordered = ordered.reset_index(drop=True)
+    else:
+        ordered = (
+            samples.sort_values(["id_link", "sample_index"], kind="mergesort")
+            .groupby("id_link", group_keys=False)
+            .apply(_mark_trimmed_sample_rows)
+            .reset_index(drop=True)
+        )
     mean_frame = (
         ordered.groupby("id_link", as_index=False)
         .agg(qc_mean_opposition_cos=("qc_opposition_cos", "mean"))
@@ -1283,7 +1291,7 @@ def load_review_context(
     len_over_width_threshold: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, gpd.GeoDataFrame, dict[int, int]]:
     families = pd.read_csv(paths.link_width_families_path)
-    samples = pd.read_csv(paths.link_width_samples_path)
+    samples = read_width_samples(paths.link_width_samples_path)
     marked_samples, sample_qc = compute_sample_qc_frame(samples)
     resolved_width_field = width_field if width_field in families.columns else "wid_adj"
     candidate_frame = build_candidate_frame(

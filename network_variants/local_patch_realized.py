@@ -486,6 +486,7 @@ def assemble_local_patch_realized_graph(
     match_tolerance_m: float | None = None,
     unchanged_overlap_fraction: float = 0.95,
     boundary_match_tolerance_pixels: float = 8.0,
+    expected_cycle_reduction_override: int | None = None,
 ) -> LocalPatchRealizedResult:
     """Splice the raw local graph at the closed computational-domain boundary.
 
@@ -530,6 +531,7 @@ def assemble_local_patch_realized_graph(
         downstream_boundary_node_ids=downstream_ids,
         merge_stage="local_realized",
         boundary_match_tolerance_m=terminal_tolerance,
+        expected_cycle_reduction_override=expected_cycle_reduction_override,
     )
 
     realized_links = gpd.read_file(merge_result.output_paths["merged_links"])

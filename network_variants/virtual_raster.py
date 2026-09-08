@@ -94,10 +94,11 @@ def _source_element(
     dtype: str,
     destination_window: Window,
     value_overrides: dict[int, int] | None = None,
+    source_nodata: int | float | None = None,
 ) -> None:
     source = ET.SubElement(
         band,
-        "ComplexSource" if value_overrides else "SimpleSource",
+        "ComplexSource" if value_overrides or source_nodata is not None else "SimpleSource",
     )
     filename = ET.SubElement(source, "SourceFilename", relativeToVRT="0")
     filename.text = str(path.resolve())
@@ -125,6 +126,8 @@ def _source_element(
         xSize=str(int(destination_window.width)),
         ySize=str(int(destination_window.height)),
     )
+    if source_nodata is not None:
+        ET.SubElement(source, "NODATA").text = format(float(source_nodata), ".17g")
     if value_overrides:
         dtype_info = np.iinfo(np.dtype(dtype))
         control_points: dict[float, float] = {
@@ -204,6 +207,7 @@ def write_overlay_vrt(
             height=overlay.height,
             dtype=overlay.dtypes[0],
             destination_window=window,
+            source_nodata=overlay.nodata,
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(root).write(output_path, encoding="utf-8", xml_declaration=True)

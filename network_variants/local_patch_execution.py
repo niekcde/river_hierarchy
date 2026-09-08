@@ -45,6 +45,7 @@ from network_variants.local_patch_variant import (
     materialize_local_patch_variant,
 )
 from network_variants.virtual_raster import write_overlay_vrt
+from network_variants.width_samples import resolve_width_samples_path
 from network_variants.variant_generation import (
     NetworkVariantOutputs,
     _apply_collapsed_selection_metadata,
@@ -444,6 +445,10 @@ def _materialize_local_patch_network_variant_once(
     local_patch_attempt_subdirectory: str | None = None,
     exclude_closed_two_link_replacement: bool = False,
     minimum_collar_context_m_override: float | None = None,
+    collapse_geometry: object | None = None,
+    collapse_component_id: str | None = None,
+    collapse_source_unit_ids: Sequence[int] | None = None,
+    expected_cycle_reduction_override: int | None = None,
     **_: Any,
 ) -> NetworkVariantOutputs:
     """Build one canonical child state using the validated local-patch phases."""
@@ -482,7 +487,7 @@ def _materialize_local_patch_network_variant_once(
     membership_path = parent_variant_dir / "summary" / "unit_link_membership.csv"
     unit_summary_path = hierarchy_dir / "unit_summary.csv"
     bubble_path = hierarchy_dir / "bubble_edge_resistance.csv"
-    parent_samples_path = parent_variant_dir / "widths" / "link_width_samples.csv"
+    parent_samples_dir = parent_variant_dir / "widths"
     if local_patch_reference_centerline_path is not None:
         reference_centerline = Path(local_patch_reference_centerline_path).resolve()
         if not reference_centerline.exists():
@@ -493,10 +498,11 @@ def _materialize_local_patch_network_variant_once(
         reference_centerline = _one_path(
             parent_variant_dir / "rivgraph", "*centerline.gpkg", label="reference centerline"
         )
-    required = (membership_path, unit_summary_path, bubble_path, parent_samples_path)
+    required = (membership_path, unit_summary_path, bubble_path)
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         raise FileNotFoundError("Local-patch parent artifacts are missing: " + ", ".join(missing))
+    parent_samples_path = resolve_width_samples_path(parent_samples_dir)
 
     parent_links = gpd.read_file(reviewed_links_path)
     parent_nodes = gpd.read_file(reviewed_nodes_path)
@@ -610,6 +616,13 @@ def _materialize_local_patch_network_variant_once(
                 local_exit_sides_override=(
                     None if attempt_index == 0 else candidate_exit_sides
                 ),
+                collapse_geometry=collapse_geometry,
+                collapse_component_id=collapse_component_id,
+                collapse_source_unit_ids=(
+                    tuple(int(value) for value in collapse_source_unit_ids)
+                    if collapse_source_unit_ids is not None
+                    else None
+                ),
             )
             candidate_realized = assemble_local_patch_realized_graph(
                 contract=contract,
@@ -626,6 +639,7 @@ def _materialize_local_patch_network_variant_once(
                     if minimum_collar_context_m_override is not None
                     else 8.0
                 ),
+                expected_cycle_reduction_override=expected_cycle_reduction_override,
             )
             with rasterio.open(candidate_variant.output_paths["local_collapsed_mask"]) as source:
                 anchoring_match_tolerance = float(
@@ -696,10 +710,16 @@ def _materialize_local_patch_network_variant_once(
     parent_cycle_rank = _undirected_cycle_rank(parent_links)
     anchored_cycle_rank = _undirected_cycle_rank(final_anchored_links)
     observed_cycle_reduction = int(parent_cycle_rank - anchored_cycle_rank)
-    expected_cycle_reduction = _expected_cycle_reduction(
-        raw_variant,
-        parent_links=parent_links,
-        selected_link_ids=contract.selected_link_ids,
+    if expected_cycle_reduction_override is not None and int(expected_cycle_reduction_override) < 0:
+        raise ValueError("expected_cycle_reduction_override must be non-negative.")
+    expected_cycle_reduction = (
+        int(expected_cycle_reduction_override)
+        if expected_cycle_reduction_override is not None
+        else _expected_cycle_reduction(
+            raw_variant,
+            parent_links=parent_links,
+            selected_link_ids=contract.selected_link_ids,
+        )
     )
     final_collapse_topology_validation = {
         "method": "final_shared_anchored_selected_parent_cycle_rank_reduction",
@@ -710,6 +730,11 @@ def _materialize_local_patch_network_variant_once(
             int(expected_cycle_reduction)
             if expected_cycle_reduction is not None
             else None
+        ),
+        "expected_cycle_reduction_source": (
+            "explicit_override"
+            if expected_cycle_reduction_override is not None
+            else "selected_parent_subgraph"
         ),
         "passed": bool(
             expected_cycle_reduction is None
@@ -881,6 +906,19 @@ def _materialize_local_patch_network_variant_once(
         "selection_type": selection_type,
         "compound_bubble_id": compound_bubble_id,
         "selected_unit_ids": list(selected_ids),
+        "explicit_collapse_geometry": {
+            "enabled": bool(collapse_geometry is not None),
+            "component_id": (
+                str(collapse_component_id)
+                if collapse_geometry is not None and collapse_component_id is not None
+                else None
+            ),
+            "source_unit_ids": (
+                [int(value) for value in collapse_source_unit_ids]
+                if collapse_geometry is not None and collapse_source_unit_ids is not None
+                else None
+            ),
+        },
         "collapse_corridor_mode": collapse_corridor_mode,
         "execution_mode_requested": "local_patch",
         "execution_mode_used": "local_patch",

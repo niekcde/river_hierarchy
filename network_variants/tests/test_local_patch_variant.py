@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import rasterio
 from rasterio.transform import from_origin
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, Polygon
 
 from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import (
     StructuralUnit,
@@ -20,6 +20,7 @@ from network_variants.local_patch import (
 )
 from network_variants.local_patch_raster import build_local_patch_base_raster
 from network_variants.local_patch_variant import (
+    _apply_explicit_collapse_geometry_to_mask,
     _local_rivgraph_run_name,
     _normalize_rivgraph_geometries_to_skeleton,
     derive_local_exit_side_candidates,
@@ -88,6 +89,33 @@ def test_raw_geometries_use_skeleton_shape_not_outer_local_mask(tmp_path) -> Non
     assert normalized_links.iloc[0].geometry.length < 3.0
     assert normalized_nodes.loc[1].geometry.equals(Point(0.5, 99.5))
     assert normalized_nodes.loc[2].geometry.equals(Point(1.5, 98.5))
+
+
+def test_explicit_island_geometry_is_the_only_local_raster_edit(tmp_path) -> None:
+    base = np.zeros((10, 10), dtype=np.uint8)
+    base[4:6, :] = 1
+    mask_path = _write_raster(tmp_path / "base.tif", base, "uint8")
+    geometry = Polygon([(2, 93), (4, 93), (4, 96), (2, 96)])
+
+    collapsed, origin, summary, components, edits = (
+        _apply_explicit_collapse_geometry_to_mask(
+            mask_path,
+            geometry=geometry,
+            component_id="island_56_013",
+            source_unit_ids=(12,),
+            all_touched=True,
+            allow_noop=False,
+        )
+    )
+
+    added = (collapsed > 0) & ~(base > 0)
+    assert summary["collapse_geometry_mode"] == "frozen_explicit_geometry"
+    assert summary["explicit_component_id"] == "island_56_013"
+    assert int(added.sum()) == int(summary["pixels_added"])
+    assert int((origin == 101).sum()) == int(added.sum())
+    assert components.iloc[0]["component_id"] == "island_56_013"
+    assert components.iloc[0]["unit_ids"] == "12"
+    assert set(edits["action"]) == {"add"}
 
 
 def _inputs(tmp_path: Path):

@@ -20,6 +20,7 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import rasterio
+from rasterio.features import rasterize
 from shapely.geometry import LineString, Point
 
 from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import (
@@ -31,7 +32,10 @@ from network_variants.variant_generation import (
     _apply_collapse_components_to_mask,
     _componentize_units,
     _run_rivgraph,
+    _vectorize_mask,
     _write_mask,
+    WIDTH_SCOPE_BASE_LABEL,
+    WIDTH_SCOPE_COMPONENT_LABEL_START,
 )
 from hierarchy_level_definition.graph_building.directed_network_checks import (
     parse_id_nodes,
@@ -467,6 +471,97 @@ class LocalPatchVariantResult:
         }
 
 
+def _apply_explicit_collapse_geometry_to_mask(
+    parent_mask_path: str | Path,
+    *,
+    geometry: object,
+    component_id: str,
+    source_unit_ids: tuple[int, ...],
+    all_touched: bool,
+    allow_noop: bool,
+) -> tuple[np.ndarray, np.ndarray, Mapping[str, Any], pd.DataFrame, gpd.GeoDataFrame]:
+    """Apply one frozen island geometry without regenerating a unit footprint.
+
+    The anchor unit defines the computational domain and final segmentation,
+    whereas this geometry alone defines the morphology-first raster edit.
+    """
+    with rasterio.open(parent_mask_path) as source:
+        parent_mask = source.read(1) > 0
+        transform = source.transform
+        crs = source.crs
+        pixel_area = abs(float(transform.a) * float(transform.e))
+    candidate = rasterize(
+        [(geometry, 1)],
+        out_shape=parent_mask.shape,
+        transform=transform,
+        fill=0,
+        all_touched=all_touched,
+        dtype="uint8",
+    ).astype(bool)
+    added = candidate & ~parent_mask
+    if not np.any(added) and not allow_noop:
+        raise ValueError("The explicit island geometry adds no dry pixels in the local crop.")
+    scope_label = int(WIDTH_SCOPE_COMPONENT_LABEL_START)
+    origin = np.where(parent_mask, WIDTH_SCOPE_BASE_LABEL, 0).astype(np.uint16)
+    origin[added] = scope_label
+    collapsed = (parent_mask | added).astype(np.uint8)
+    unit_ids_text = ",".join(str(int(value)) for value in source_unit_ids)
+    added_pixels = int(added.sum())
+    scope_pixels = int((parent_mask | added).sum())
+    component_frame = pd.DataFrame.from_records(
+        [{
+            "component_id": str(component_id),
+            "origin_label": scope_label,
+            "width_scope_label": scope_label,
+            "unit_ids": unit_ids_text,
+            "link_ids": "",
+            "node_ids": "",
+            "compound_bubble_ids": "",
+            "n_units": int(len(source_unit_ids)),
+            "n_links": 0,
+            "n_nodes": 0,
+            "footprint_area": float(getattr(geometry, "area", 0.0)),
+            "origin_scope_pixels": scope_pixels,
+            "origin_scope_area": float(scope_pixels * pixel_area),
+            "width_scope_pixels": scope_pixels,
+            "width_scope_area": float(scope_pixels * pixel_area),
+            "added_pixels": added_pixels,
+            "added_area": float(added_pixels * pixel_area),
+            "candidate_added_pixels": added_pixels,
+            "rejected_neighbour_pixels": 0,
+            "rejected_neighbour_area": 0.0,
+            "component_ownership_audit": json.dumps(
+                {"method": "frozen_explicit_island_geometry", "accepted": True},
+                sort_keys=True,
+            ),
+        }]
+    )
+    records: list[dict[str, Any]] = []
+    for edit_geometry in _vectorize_mask(added, transform):
+        records.append({
+            "component_id": str(component_id),
+            "geometry_role": "edit",
+            "action": "add",
+            "width_scope_label": scope_label,
+            "unit_ids": unit_ids_text,
+            "geometry": edit_geometry,
+        })
+    edits = gpd.GeoDataFrame(records, geometry="geometry", crs=crs)
+    summary = {
+        "base_water_pixels": int(parent_mask.sum()),
+        "collapsed_water_pixels": int(collapsed.sum()),
+        "pixels_added": added_pixels,
+        "pixels_removed": 0,
+        "changed_pixels": added_pixels,
+        "pixel_area": float(pixel_area),
+        "width_scope_labels": [int(WIDTH_SCOPE_BASE_LABEL), scope_label],
+        "origin_labels": [int(WIDTH_SCOPE_BASE_LABEL), scope_label],
+        "collapse_geometry_mode": "frozen_explicit_geometry",
+        "explicit_component_id": str(component_id),
+    }
+    return collapsed, origin, summary, component_frame, edits
+
+
 def materialize_local_patch_variant(
     *,
     contract: LocalPatchContract,
@@ -484,6 +579,9 @@ def materialize_local_patch_variant(
     max_path_cutoff: int = 100,
     max_paths: int = 5000,
     local_exit_sides_override: str | None = None,
+    collapse_geometry: object | None = None,
+    collapse_component_id: str | None = None,
+    collapse_source_unit_ids: tuple[int, ...] | None = None,
     network_analyzer: Callable[..., tuple[Any, list[Any], Any]] = analyze_network,
     rivgraph_runner: Callable[..., Mapping[str, Path | None]] = _run_rivgraph,
 ) -> LocalPatchVariantResult:
@@ -523,25 +621,44 @@ def materialize_local_patch_variant(
     )
     if missing_units:
         raise ValueError(f"Selected units are missing from the reviewed graph: {missing_units}.")
-    components = _componentize_units(contract.selected_unit_ids, units_by_id)
     reviewed_links = gpd.read_file(reviewed_links_path)
 
     local_base_mask_path = Path(raster_result.output_paths["local_base_mask"])
-    (
-        collapsed_mask,
-        origin_mask,
-        collapse_summary,
-        collapse_components,
-        edit_geometries,
-    ) = _apply_collapse_components_to_mask(
-        local_base_mask_path,
-        components,
-        reviewed_links,
-        preferred_width_field=preferred_width_field,
-        buffer_scale=footprint_buffer_scale,
-        all_touched=all_touched,
-        allow_noop=allow_noop,
-    )
+    if collapse_geometry is None:
+        components = _componentize_units(contract.selected_unit_ids, units_by_id)
+        (
+            collapsed_mask,
+            origin_mask,
+            collapse_summary,
+            collapse_components,
+            edit_geometries,
+        ) = _apply_collapse_components_to_mask(
+            local_base_mask_path,
+            components,
+            reviewed_links,
+            preferred_width_field=preferred_width_field,
+            buffer_scale=footprint_buffer_scale,
+            all_touched=all_touched,
+            allow_noop=allow_noop,
+        )
+    else:
+        (
+            collapsed_mask,
+            origin_mask,
+            collapse_summary,
+            collapse_components,
+            edit_geometries,
+        ) = _apply_explicit_collapse_geometry_to_mask(
+            local_base_mask_path,
+            geometry=collapse_geometry,
+            component_id=str(collapse_component_id or "explicit_geometry"),
+            source_unit_ids=tuple(
+                int(value)
+                for value in (collapse_source_unit_ids or contract.selected_unit_ids)
+            ),
+            all_touched=all_touched,
+            allow_noop=allow_noop,
+        )
 
     barrier_path = Path(raster_result.output_paths["main_bank_cut_barrier"])
     with rasterio.open(local_base_mask_path) as source:

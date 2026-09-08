@@ -89,6 +89,12 @@ def _distance(x: float, y: float, point: tuple[float, float]) -> float:
 
 
 def _prepare_samples(samples: pd.DataFrame) -> pd.DataFrame:
+    if "used_in_selected_width" in samples.columns:
+        prepared = samples.copy()
+        prepared["used_in_trimmed_width"] = (
+            prepared["used_in_selected_width"].fillna(False).astype(bool)
+        )
+        return prepared
     if "used_in_trimmed_width" in samples.columns:
         return samples.copy()
     marked, _ = compute_sample_qc_frame(samples)
@@ -191,6 +197,7 @@ def calculate_endpoint_widths(
                         "endpoint_windows_nonoverlapping": False,
                         "sample_order_orientation": "unavailable",
                         "sample_orientation_score_margin": np.nan,
+                        "width_trim_method": getattr(link, "width_trim_method", "legacy_reconstructed"),
                     }
                 )
             continue
@@ -255,6 +262,7 @@ def calculate_endpoint_widths(
                     "endpoint_windows_nonoverlapping": bool(sampled_length >= us_gap + ds_gap + 2 * window_length),
                     "sample_order_orientation": "sample_index_us_to_ds" if sample_order_forward else "sample_index_ds_to_us",
                     "sample_orientation_score_margin": orientation_margin,
+                    "width_trim_method": getattr(link, "width_trim_method", "legacy_reconstructed"),
                 }
             )
     return pd.DataFrame(rows)

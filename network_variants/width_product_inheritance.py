@@ -47,6 +47,18 @@ MEASURED_WIDTH_FIELDS = (
     "qc_mean_opposition_cos_trimmed",
     "qc_min_opposition_cos",
     "width_method",
+    "width_trim_selection_version",
+    "width_trim_method",
+    "width_trim_valid_core",
+    "width_trim_fallback_reason",
+    "width_trim_start_sample_index",
+    "width_trim_stop_sample_index_exclusive",
+    "width_trim_sample_count",
+    "width_trim_native_candidate_start",
+    "width_trim_native_candidate_stop_exclusive",
+    "width_trim_native_candidate_sample_count",
+    "wid_adj_total_two_bank_original",
+    "wid_adj_wet_two_bank_original",
 )
 
 # These fields record the reviewed/model decision and the effective value used
@@ -141,10 +153,20 @@ def _geometries_are_unchanged(child_geometry: object, parent_geometry: object) -
         return False
 
 
-def _missing_value_for(series: pd.Series) -> object:
-    if pd.api.types.is_numeric_dtype(series.dtype):
-        return np.nan
-    return None
+def _assign_values_without_dtype_coercion_warning(
+    series: pd.Series,
+    mask: pd.Series,
+    values: object,
+) -> pd.Series:
+    """Assign nullable values without relying on deprecated dtype coercion."""
+
+    # Older products store several audit flags as NumPy ``bool``. Changed
+    # links need those fields cleared before reevaluation, but that dtype
+    # cannot represent a missing value. An object buffer preserves the exact
+    # scalar values and ``infer_objects`` recovers numeric dtypes when safe.
+    result = series.astype(object).copy()
+    result.loc[mask] = values
+    return result.infer_objects(copy=False)
 
 
 def inherit_unchanged_link_width_products(
@@ -219,7 +241,17 @@ def inherit_unchanged_link_width_products(
     # an earlier merge happened to carry that column forward.
     for field in routing_fields_present:
         if field in result_links.columns:
-            result_links.loc[~inherited_mask, field] = _missing_value_for(result_links[field])
+            missing_value = (
+                np.nan
+                if pd.api.types.is_numeric_dtype(result_links[field].dtype)
+                and not pd.api.types.is_bool_dtype(result_links[field].dtype)
+                else None
+            )
+            result_links[field] = _assign_values_without_dtype_coercion_warning(
+                result_links[field],
+                ~inherited_mask,
+                missing_value,
+            )
 
     for field in inherited_fields:
         values_by_parent = parent_by_id[field].to_dict()
@@ -229,7 +261,11 @@ def inherit_unchanged_link_width_products(
         if field not in result_links.columns:
             result_links[field] = inherited_values
         elif inherited_mask.any():
-            result_links.loc[inherited_mask, field] = inherited_values.loc[inherited_mask].to_numpy()
+            result_links[field] = _assign_values_without_dtype_coercion_warning(
+                result_links[field],
+                inherited_mask,
+                inherited_values.loc[inherited_mask].to_numpy(),
+            )
 
     result_links["width_inheritance_status"] = np.where(
         inherited_mask,
