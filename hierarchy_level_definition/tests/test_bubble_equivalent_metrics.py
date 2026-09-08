@@ -45,6 +45,55 @@ def _parallel_unit(*, unit_id: int, edge_ids: list[int], upstream: int, downstre
     )
 
 
+def test_compound_bubble_domain_includes_nonunit_connectors() -> None:
+    first = StructuralUnit(
+        unit_id=1,
+        bifurcation=0,
+        confluence=2,
+        n_paths=2,
+        unit_class="compound",
+        min_path_length=1.0,
+        max_path_length=2.0,
+        paths=[],
+        node_set={0, 1, 2},
+        edge_set={(0, 1, 1), (1, 2, 2)},
+        children=[],
+        parents=[],
+    )
+    second = StructuralUnit(
+        unit_id=2,
+        bifurcation=0,
+        confluence=4,
+        n_paths=2,
+        unit_class="compound",
+        min_path_length=1.0,
+        max_path_length=3.0,
+        paths=[],
+        node_set={0, 1, 3, 4},
+        edge_set={(0, 1, 1), (1, 3, 3), (3, 4, 4)},
+        children=[],
+        parents=[],
+    )
+    prepared = pd.DataFrame(
+        [
+            {"edge_id": 1, "u": 0, "v": 1},
+            {"edge_id": 2, "u": 1, "v": 2},
+            {"edge_id": 3, "u": 1, "v": 3},
+            {"edge_id": 4, "u": 3, "v": 4},
+            # Ordinary single-channel continuation: not owned by either unit.
+            {"edge_id": 5, "u": 2, "v": 4},
+        ]
+    )
+
+    keys, connector_ids = bubble_metrics_module._complete_compound_bubble_edge_keys(
+        prepared,
+        [first, second],
+    )
+
+    assert (2, 4, 5) in keys
+    assert connector_ids == [5]
+
+
 def _fake_solve_result(*, success: bool, residual: float, k_eq: float) -> dict:
     return {
         "n_nodes": 3,
@@ -142,6 +191,94 @@ def test_hierarchy_bubble_solver_masks_provisional_values_when_both_attempts_fai
     assert pd.isna(solved["G_eq"])
     assert pd.isna(solved["Q_unit"])
     assert solved["edge_flows"][["q_unit", "dh"]].isna().all().all()
+
+
+def test_hierarchy_bubble_solver_conditionally_accepts_stable_near_convergence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results = [
+        _fake_solve_result(success=False, residual=0.008, k_eq=100.0),
+        _fake_solve_result(success=False, residual=0.006, k_eq=101.0),
+    ]
+    monkeypatch.setattr(
+        bubble_metrics_module,
+        "solve_bubble_equivalent_K",
+        lambda *args, **kwargs: results.pop(0),
+    )
+
+    solved = bubble_metrics_module._solve_with_neutral_head_fallback(
+        bubble_nodes=pd.DataFrame({"node_id": [1, 2, 3]}),
+        bubble_edges=pd.DataFrame(
+            {"edge_id": [1, 2], "u": [1, 2], "v": [2, 3], "K_e": [2.0, 2.0]}
+        ),
+        upstream_node=1,
+        downstream_node=3,
+        config=BubbleEquivalentResistanceConfig(),
+    )
+
+    assert solved["solver_success"] is True
+    assert solved["solver_strict_success"] is False
+    assert solved["solver_conditional_acceptance"] is True
+    assert solved["solver_acceptance_tier"] == "conditional_stable"
+    assert solved["K_eq"] == pytest.approx(101.0)
+    assert solved["candidate_K_relative_difference"] == pytest.approx(1.0 / 101.0)
+
+
+def test_hierarchy_bubble_solver_rejects_near_convergence_when_k_is_unstable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results = [
+        _fake_solve_result(success=False, residual=0.008, k_eq=100.0),
+        _fake_solve_result(success=False, residual=0.006, k_eq=110.0),
+    ]
+    monkeypatch.setattr(
+        bubble_metrics_module,
+        "solve_bubble_equivalent_K",
+        lambda *args, **kwargs: results.pop(0),
+    )
+
+    solved = bubble_metrics_module._solve_with_neutral_head_fallback(
+        bubble_nodes=pd.DataFrame({"node_id": [1, 2, 3]}),
+        bubble_edges=pd.DataFrame(
+            {"edge_id": [1, 2], "u": [1, 2], "v": [2, 3], "K_e": [2.0, 2.0]}
+        ),
+        upstream_node=1,
+        downstream_node=3,
+        config=BubbleEquivalentResistanceConfig(),
+    )
+
+    assert solved["solver_success"] is False
+    assert solved["solver_acceptance_tier"] == "rejected"
+    assert pd.isna(solved["K_eq"])
+
+
+def test_hierarchy_bubble_solver_keeps_primary_when_neutral_attempt_is_worse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results = [
+        _fake_solve_result(success=False, residual=0.006, k_eq=100.0),
+        _fake_solve_result(success=False, residual=0.008, k_eq=101.0),
+    ]
+    monkeypatch.setattr(
+        bubble_metrics_module,
+        "solve_bubble_equivalent_K",
+        lambda *args, **kwargs: results.pop(0),
+    )
+
+    solved = bubble_metrics_module._solve_with_neutral_head_fallback(
+        bubble_nodes=pd.DataFrame({"node_id": [1, 2, 3]}),
+        bubble_edges=pd.DataFrame(
+            {"edge_id": [1, 2], "u": [1, 2], "v": [2, 3], "K_e": [2.0, 2.0]}
+        ),
+        upstream_node=1,
+        downstream_node=3,
+        config=BubbleEquivalentResistanceConfig(),
+    )
+
+    assert solved["solver_success"] is True
+    assert solved["solver_initialization"] == "available_node_heads"
+    assert solved["K_eq"] == pytest.approx(100.0)
+    assert solved["residual_relative"] == pytest.approx(0.006)
 
 
 def test_compute_bubble_equivalent_metrics_from_units_reduces_standalone_parallel_unit() -> None:
@@ -332,6 +469,7 @@ def test_write_unit_workflow_outputs_writes_equivalent_resistance_files(tmp_path
 
 
 def test_resolve_length_field_candidates_prioritizes_requested_field() -> None:
+    assert LENGTH_FIELD_CANDIDATES[0] == "len"
     assert resolve_length_field_candidates(None) == LENGTH_FIELD_CANDIDATES
     assert resolve_length_field_candidates("len") == ("len", "len_adj", "link_length_m")
     with pytest.raises(ValueError, match="Unsupported equivalent-resistance length field"):

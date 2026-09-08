@@ -30,7 +30,9 @@ WIDTH_FIELD_CANDIDATES = (
     "wid",
     "wid_med",
 )
-LENGTH_FIELD_CANDIDATES = ("len_adj", "len", "link_length_m")
+# Prefer the physical centreline length. ``len_adj`` is retained solely as a
+# compatibility fallback for legacy products that lack ``len``.
+LENGTH_FIELD_CANDIDATES = ("len", "len_adj", "link_length_m")
 KB_FIELD_CANDIDATES = ("k_b", "kb", "rapid_kb_value")
 MANNING_N_FIELD_CANDIDATES = ("n", "manning_n", "rapid_n_manning")
 CHEZY_CZ_FIELD_CANDIDATES = ("C_z", "Cz", "chezy_cz")
@@ -70,6 +72,9 @@ class BubbleEquivalentResistanceConfig:
     solver_backend: str = "dense_legacy"
     sparse_min_internal_nodes: int = 64
     solver_cache_dir: str | None = None
+    conditional_residual_relative_tolerance: float = 0.01
+    extended_residual_relative_allowance: float = 0.015
+    conditional_k_relative_tolerance: float = 0.02
 
 
 def _resolve_first_present(columns: Sequence[str], candidates: Sequence[str]) -> str | None:
@@ -304,6 +309,8 @@ def _empty_bubble_summary_frame() -> pd.DataFrame:
             "assembled_boundaries_differ_from_root",
             "n_member_units",
             "member_unit_ids",
+            "n_closed_domain_connector_edges",
+            "closed_domain_connector_edge_ids",
             "n_nodes",
             "n_edges",
             "solver_success",
@@ -332,6 +339,15 @@ def _empty_bubble_summary_frame() -> pd.DataFrame:
             "solver_message",
             "solver_nfev",
             "solver_initialization",
+            "solver_strict_success",
+            "solver_conditional_acceptance",
+            "solver_acceptance_tier",
+            "candidate_K_relative_difference",
+            "conditional_residual_relative_tolerance",
+            "extended_residual_relative_allowance",
+            "conditional_K_relative_tolerance",
+            "primary_K_eq",
+            "neutral_fallback_K_eq",
             "primary_solver_success",
             "primary_solver_nfev",
             "primary_residual_relative",
@@ -444,6 +460,191 @@ def _validated_assembled_bubble_terminals(
     return source_node, sink_node
 
 
+def _complete_compound_bubble_edge_keys(
+    prepared_edges: pd.DataFrame,
+    members: Sequence[StructuralUnit],
+) -> tuple[list[tuple[int, int, int]], list[int]]:
+    """Return the smallest closed directed domain containing all member edges.
+
+    Edge-overlap components can be connected through ordinary single-channel
+    links that are not members of any detected structural unit. Omitting those
+    connectors makes a scientifically closed compound appear to have several
+    sinks. Singleton bubbles already carry their complete unit edge set and do
+    not require domain expansion.
+    """
+    selected_keys = {
+        (int(u), int(v), int(key))
+        for unit in members
+        for u, v, key in unit.edge_set
+    }
+    if len(members) <= 1 or not selected_keys:
+        return sorted(selected_keys), []
+
+    graph = nx.DiGraph()
+    graph.add_edges_from(
+        (int(row.u), int(row.v)) for row in prepared_edges.itertuples(index=False)
+    )
+    if not nx.is_directed_acyclic_graph(graph):
+        raise ValueError("Complete compound-bubble domain requires a directed acyclic graph.")
+
+    selected_nodes = {node for u, v, _ in selected_keys for node in (u, v)}
+    common_ancestors = set(graph.nodes)
+    common_descendants = set(graph.nodes)
+    for node_id in selected_nodes:
+        common_ancestors.intersection_update(nx.ancestors(graph, node_id) | {node_id})
+        common_descendants.intersection_update(nx.descendants(graph, node_id) | {node_id})
+    if not common_ancestors or not common_descendants:
+        raise ValueError("Compound-bubble member edges have no common closed hydraulic domain.")
+
+    node_order = {int(node): index for index, node in enumerate(nx.topological_sort(graph))}
+    source_node = max(common_ancestors, key=lambda node: node_order[int(node)])
+    sink_node = min(common_descendants, key=lambda node: node_order[int(node)])
+    if any(
+        int(node) != int(source_node)
+        and not nx.has_path(graph, int(node), int(source_node))
+        for node in common_ancestors
+    ):
+        raise ValueError("Compound-bubble domain has no unique latest common upstream boundary.")
+    if any(
+        int(node) != int(sink_node)
+        and not nx.has_path(graph, int(sink_node), int(node))
+        for node in common_descendants
+    ):
+        raise ValueError("Compound-bubble domain has no unique earliest common downstream boundary.")
+
+    between_nodes = (
+        (set(nx.descendants(graph, source_node)) | {source_node})
+        & (set(nx.ancestors(graph, sink_node)) | {sink_node})
+    )
+    domain = prepared_edges.loc[
+        prepared_edges["u"].astype(int).isin(between_nodes)
+        & prepared_edges["v"].astype(int).isin(between_nodes)
+    ]
+    domain_keys = {
+        (int(row.u), int(row.v), int(row.edge_id))
+        for row in domain.itertuples(index=False)
+    }
+    missing_selected = sorted(selected_keys.difference(domain_keys))
+    if missing_selected:
+        raise ValueError(
+            "Closed compound-bubble domain omitted selected member edges: "
+            f"{missing_selected[:10]}."
+        )
+    connector_ids = sorted(key for _, _, key in domain_keys.difference(selected_keys))
+    return sorted(domain_keys), connector_ids
+
+
+def _select_stable_solver_attempt(
+    primary: Mapping[str, Any],
+    fallback: Mapping[str, Any],
+    *,
+    config: BubbleEquivalentResistanceConfig,
+) -> tuple[dict[str, Any], str]:
+    """Select the best numerical attempt and audit conditional acceptance.
+
+    The nonlinear solver's native success criterion remains the strict result.
+    A near-converged result is accepted only when both initializations produce
+    a stable equivalent K.  This prevents a small residual alone from admitting
+    a numerically ambiguous hydraulic reduction.
+    """
+
+    primary = dict(primary)
+    fallback = dict(fallback)
+    primary_success = bool(primary.get("solver_success", False))
+    fallback_success = bool(fallback.get("solver_success", False))
+    primary_residual = float(primary.get("residual_relative", np.nan))
+    fallback_residual = float(fallback.get("residual_relative", np.nan))
+
+    if fallback_success and not primary_success:
+        selected = fallback
+        selected_label = "neutral_internal_heads_fallback"
+    elif primary_success and not fallback_success:
+        selected = primary
+        selected_label = "available_node_heads"
+    elif np.isfinite(fallback_residual) and (
+        not np.isfinite(primary_residual) or fallback_residual < primary_residual
+    ):
+        selected = fallback
+        selected_label = "neutral_internal_heads_fallback"
+    else:
+        selected = primary
+        selected_label = "available_node_heads"
+
+    primary_k = float(primary.get("K_eq", np.nan))
+    fallback_k = float(fallback.get("K_eq", np.nan))
+    if (
+        np.isfinite(primary_k)
+        and np.isfinite(fallback_k)
+        and primary_k > 0.0
+        and fallback_k > 0.0
+    ):
+        k_relative_difference = abs(primary_k - fallback_k) / max(
+            abs(primary_k), abs(fallback_k)
+        )
+    else:
+        k_relative_difference = np.nan
+
+    strict_success = bool(selected.get("solver_success", False))
+    selected_residual = float(selected.get("residual_relative", np.nan))
+    stable_k = bool(
+        np.isfinite(k_relative_difference)
+        and k_relative_difference <= config.conditional_k_relative_tolerance
+    )
+    conditional_success = bool(
+        not strict_success
+        and stable_k
+        and np.isfinite(selected_residual)
+        and selected_residual
+        <= config.extended_residual_relative_allowance
+    )
+    if strict_success:
+        acceptance_tier = "strict"
+    elif conditional_success and (
+        selected_residual <= config.conditional_residual_relative_tolerance
+    ):
+        acceptance_tier = "conditional_stable"
+    elif conditional_success:
+        acceptance_tier = "extended_conditional_stable"
+    else:
+        acceptance_tier = "rejected"
+
+    selected["solver_success"] = bool(strict_success or conditional_success)
+    selected.update(
+        {
+            "solver_strict_success": strict_success,
+            "solver_conditional_acceptance": conditional_success,
+            "solver_acceptance_tier": acceptance_tier,
+            "candidate_K_relative_difference": float(k_relative_difference),
+            "conditional_residual_relative_tolerance": float(
+                config.conditional_residual_relative_tolerance
+            ),
+            "extended_residual_relative_allowance": float(
+                config.extended_residual_relative_allowance
+            ),
+            "conditional_K_relative_tolerance": float(
+                config.conditional_k_relative_tolerance
+            ),
+            "primary_K_eq": primary_k,
+            "neutral_fallback_K_eq": fallback_k,
+        }
+    )
+    return selected, selected_label
+
+
+def _mask_failed_solver_values(selected: dict[str, Any]) -> None:
+    selected["K_eq"] = np.nan
+    selected["G_eq"] = np.nan
+    selected["Q_unit"] = np.nan
+    edge_flows = selected["edge_flows"].copy()
+    edge_flows[["q_unit", "dh"]] = np.nan
+    selected["edge_flows"] = edge_flows
+    node_heads = selected["node_heads"].copy()
+    for column in ("head_norm", "continuity_residual"):
+        if column in node_heads.columns:
+            node_heads[column] = np.nan
+    selected["node_heads"] = node_heads
+
+
 def _solve_with_neutral_head_fallback(
     *,
     bubble_nodes: pd.DataFrame,
@@ -477,6 +678,21 @@ def _solve_with_neutral_head_fallback(
     if primary_success:
         primary.update(
             {
+                "solver_strict_success": True,
+                "solver_conditional_acceptance": False,
+                "solver_acceptance_tier": "strict",
+                "candidate_K_relative_difference": np.nan,
+                "conditional_residual_relative_tolerance": float(
+                    config.conditional_residual_relative_tolerance
+                ),
+                "extended_residual_relative_allowance": float(
+                    config.extended_residual_relative_allowance
+                ),
+                "conditional_K_relative_tolerance": float(
+                    config.conditional_k_relative_tolerance
+                ),
+                "primary_K_eq": float(primary.get("K_eq", np.nan)),
+                "neutral_fallback_K_eq": np.nan,
                 "solver_initialization": primary_initialization,
                 "primary_solver_success": True,
                 "primary_solver_nfev": primary_nfev,
@@ -509,14 +725,12 @@ def _solve_with_neutral_head_fallback(
     fallback_success = bool(fallback["solver_success"])
     fallback_residual = float(fallback["residual_relative"])
     fallback_nfev = int(fallback["solver_nfev"])
-    if fallback_success or (
-        np.isfinite(fallback_residual)
-        and (not np.isfinite(primary_residual) or fallback_residual <= primary_residual)
-    ):
-        selected = fallback
-        selected_initialization = "neutral_internal_heads_fallback"
-    else:
-        selected = primary
+    selected, selected_initialization = _select_stable_solver_attempt(
+        primary,
+        fallback,
+        config=config,
+    )
+    if selected_initialization == "available_node_heads":
         selected_initialization = primary_initialization
     selected.update(
         {
@@ -531,17 +745,7 @@ def _solve_with_neutral_head_fallback(
         }
     )
     if not bool(selected["solver_success"]):
-        selected["K_eq"] = np.nan
-        selected["G_eq"] = np.nan
-        selected["Q_unit"] = np.nan
-        edge_flows = selected["edge_flows"].copy()
-        edge_flows[["q_unit", "dh"]] = np.nan
-        selected["edge_flows"] = edge_flows
-        node_heads = selected["node_heads"].copy()
-        for column in ("head_norm", "continuity_residual"):
-            if column in node_heads.columns:
-                node_heads[column] = np.nan
-        selected["node_heads"] = node_heads
+        _mask_failed_solver_values(selected)
         selected["solver_message"] = (
             f"Primary solve failed ({primary.get('solver_message', '')}); "
             f"neutral fallback failed ({fallback.get('solver_message', '')})."
@@ -581,7 +785,10 @@ def compute_bubble_equivalent_metrics_from_units(
     node_rows: list[pd.DataFrame] = []
 
     for bubble_id, members, root_unit in bubble_specs:
-        bubble_edge_keys = sorted({(int(u), int(v), int(key)) for unit in members for u, v, key in unit.edge_set})
+        bubble_edge_keys, connector_edge_ids = _complete_compound_bubble_edge_keys(
+            prepared_edges,
+            members,
+        )
         missing_keys = [key for key in bubble_edge_keys if key not in edge_lookup.index]
         if missing_keys:
             raise ValueError(
@@ -641,6 +848,10 @@ def compute_bubble_equivalent_metrics_from_units(
                 ),
                 "n_member_units": int(len(members)),
                 "member_unit_ids": ",".join(str(unit.unit_id) for unit in members),
+                "n_closed_domain_connector_edges": int(len(connector_edge_ids)),
+                "closed_domain_connector_edge_ids": ",".join(
+                    str(edge_id) for edge_id in connector_edge_ids
+                ),
                 "n_nodes": int(solve_result["n_nodes"]),
                 "n_edges": int(solve_result["n_edges"]),
                 "solver_success": bool(solve_result["solver_success"]),
@@ -689,6 +900,25 @@ def compute_bubble_equivalent_metrics_from_units(
                 "solver_message": solve_result["solver_message"],
                 "solver_nfev": int(solve_result["solver_nfev"]),
                 "solver_initialization": solve_result["solver_initialization"],
+                "solver_strict_success": solve_result["solver_strict_success"],
+                "solver_conditional_acceptance": solve_result[
+                    "solver_conditional_acceptance"
+                ],
+                "solver_acceptance_tier": solve_result["solver_acceptance_tier"],
+                "candidate_K_relative_difference": solve_result[
+                    "candidate_K_relative_difference"
+                ],
+                "conditional_residual_relative_tolerance": solve_result[
+                    "conditional_residual_relative_tolerance"
+                ],
+                "extended_residual_relative_allowance": solve_result[
+                    "extended_residual_relative_allowance"
+                ],
+                "conditional_K_relative_tolerance": solve_result[
+                    "conditional_K_relative_tolerance"
+                ],
+                "primary_K_eq": solve_result["primary_K_eq"],
+                "neutral_fallback_K_eq": solve_result["neutral_fallback_K_eq"],
                 "primary_solver_success": solve_result["primary_solver_success"],
                 "primary_solver_nfev": solve_result["primary_solver_nfev"],
                 "primary_residual_relative": solve_result["primary_residual_relative"],

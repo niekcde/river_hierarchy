@@ -7,6 +7,7 @@ import pytest
 
 from hierarchy_level_definition.metrics.unit_metrics import (
     compute_unit_metrics_from_units,
+    edge_length_from_attrs,
     normalized_entropy,
     weighted_harmonic_mean_width,
 )
@@ -63,6 +64,10 @@ def _make_unit(
 def test_weighted_harmonic_mean_width() -> None:
     result = weighted_harmonic_mean_width([100.0, 100.0], [50.0, 100.0])
     assert result == pytest.approx(200.0 / (100.0 / 50.0 + 100.0 / 100.0))
+
+
+def test_physical_len_takes_precedence_over_legacy_len_adj() -> None:
+    assert edge_length_from_attrs({"len": 200.0, "len_adj": 75.0}) == 200.0
 
 
 def test_unit_equivalent_width_and_length() -> None:

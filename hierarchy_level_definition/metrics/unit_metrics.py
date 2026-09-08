@@ -27,7 +27,10 @@ from hierarchy_level_definition.unit_detection.bifurcation_confluence_units impo
 )
 
 
-LENGTH_COLUMNS = ("len_adj", "len")
+# ``len`` is the physical centreline length used by the routing and active
+# equivalent-resistance workflows. ``len_adj`` remains a legacy RivGraph
+# diagnostic, not the preferred scientific path length.
+LENGTH_COLUMNS = ("len", "len_adj")
 REPRESENTATIVE_WIDTH_COLUMNS = (
     "wid_adj_routing",
     "wid_adj_wet",

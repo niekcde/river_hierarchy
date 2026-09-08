@@ -132,7 +132,9 @@ def parse_id_nodes(value: Any) -> tuple[int, int]:
 
 
 def edge_length_from_attrs(attrs: dict[str, Any]) -> float:
-    for key in ("len_adj", "len"):
+    # Keep structural path lengths on the same physical-length convention as
+    # hierarchy metrics, equivalent resistance, and routing.
+    for key in ("len", "len_adj"):
         value = attrs.get(key)
         if value is not None and not pd.isna(value):
             return float(value)
