@@ -21,6 +21,13 @@ def build_parser() -> argparse.ArgumentParser:
         description="Prepare RAPID inputs for every state in a network_variants experiment."
     )
     parser.add_argument("experiment_dir", help="Path to the network_variants experiment directory.")
+    parser.add_argument(
+        "--work-root",
+        help=(
+            "Optional disposable workspace for regenerable RAPID prep files. "
+            "Final run products and failure diagnostics remain in each state directory."
+        ),
+    )
     parser.add_argument("--forcing-path", help="CSV or parquet file with time/discharge forcing.")
     parser.add_argument("--forcing-station-key", help="Explicit station_key to extract from a multi-station forcing source.")
     parser.add_argument("--station-key-column", default="station_key", help="Station-key column in the forcing file.")
@@ -142,6 +149,7 @@ def main(argv: list[str] | None = None) -> int:
             include_base_state=not args.exclude_base_state,
             strict_sword=not args.allow_missing_sword,
         ),
+        work_root=args.work_root,
     )
     print(f"Wrote RAPID prep outputs to {Path(args.experiment_dir).expanduser().resolve()}")
     print(f"Prepared states: {int(prep_registry['status'].eq('prepared').sum()) if not prep_registry.empty else 0}")

@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import ast
 import csv
+import errno
+import gzip
+import hashlib
 import json
-from dataclasses import asdict
+import os
+import shutil
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -17,10 +23,113 @@ from scipy.sparse import csc_matrix, diags, identity
 from scipy.sparse.linalg import factorized, splu
 
 from .hydrograph import HydrographMetricConfig, write_hydrograph_outputs
+from .parquet_compat import parquet_safe_metadata_frame
 
 
 DEFAULT_QOUT_NAME = "Qout_rapid_framework.nc"
 LEGACY_QOUT_BASENAME = "Qout_MS_b82_20150101_20240531_GLDASv21_ens_dtR10800"
+
+
+@dataclass(frozen=True, slots=True)
+class RapidResultStorageConfig:
+    """Retention policy for completed prepared RAPID states.
+
+    Compact mode preserves a gzip-compressed Qout, a Parquet reach/subreach
+    mapping, hydrograph products, and a manifest. It can then remove the
+    regenerable prep directory only after all result products are published.
+    """
+
+    compact_qout: bool = False
+    retain_prepared_inputs: bool = True
+    write_mapping_parquet: bool = False
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _publish_compact_result(
+    *,
+    prep_dir: Path,
+    run_dir: Path,
+    qout_path: Path,
+    storage: RapidResultStorageConfig,
+) -> dict[str, object]:
+    result: dict[str, object] = {"qout_nc": str(qout_path), "compact_qout": False}
+    if storage.write_mapping_parquet:
+        source = prep_dir / "rapid_link_attributes.csv"
+        if not source.exists():
+            raise FileNotFoundError(f"RAPID link mapping was not found: {source}")
+        mapping = parquet_safe_metadata_frame(pd.read_csv(source, low_memory=False))
+        mapping_path = run_dir / "rapid_link_mapping.parquet"
+        mapping.to_parquet(mapping_path, index=False, compression="zstd")
+        result["rapid_link_mapping_parquet"] = str(mapping_path)
+        result["rapid_link_mapping_sha256"] = _sha256(mapping_path)
+    if not storage.retain_prepared_inputs:
+        reach_geometry = prep_dir / "rapid_reach_attributes.gpkg"
+        if not reach_geometry.exists():
+            raise FileNotFoundError(
+                "RAPID reach geometry was not found; it is required for downstream "
+                f"reach-wave analysis before removing prep: {reach_geometry}"
+            )
+        retained_geometry = run_dir / reach_geometry.name
+        # The normal experiment work root is on the same volume as its run
+        # output.  Move rather than copy the large reach geometry in that case:
+        # copying temporarily doubles its footprint precisely when the storage
+        # policy is trying to reclaim space. ``replace`` also repairs a partial
+        # destination left by an interrupted publication.
+        try:
+            os.replace(reach_geometry, retained_geometry)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            # A caller may deliberately place disposable prep on another
+            # volume. Preserve the existing cross-device behavior in that rare
+            # case, while keeping the zero-extra-space same-volume path above.
+            shutil.copy2(reach_geometry, retained_geometry)
+        result["rapid_reach_attributes_gpkg"] = str(retained_geometry)
+        result["rapid_reach_attributes_sha256"] = _sha256(retained_geometry)
+    if storage.compact_qout:
+        compressed = qout_path.with_suffix(qout_path.suffix + ".gz")
+        with qout_path.open("rb") as source, gzip.open(compressed, "wb", compresslevel=6) as target:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+        result["qout_nc"] = str(compressed)
+        result["qout_uncompressed_bytes"] = int(qout_path.stat().st_size)
+        result["qout_compressed_bytes"] = int(compressed.stat().st_size)
+        result["compact_qout"] = True
+        qout_path.unlink()
+    return result
+
+
+def _write_failure_bundle(
+    *,
+    prep_dir: Path,
+    run_dir: Path,
+    error: Exception,
+    failure_dir: Path | None = None,
+) -> Path:
+    failure_dir = failure_dir or (prep_dir.parent / "failures")
+    failure_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": "rapid-run-failure-v1",
+        "generated_at": datetime.now(UTC).isoformat(),
+        "prep_dir": str(prep_dir),
+        "run_dir": str(run_dir),
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "prep_manifest_sha256": _sha256(prep_dir / "rapid_prep_manifest.json")
+        if (prep_dir / "rapid_prep_manifest.json").exists() else None,
+    }
+    signature = hashlib.sha256(
+        f"{payload['error_type']}::{payload['error']}".encode("utf-8")
+    ).hexdigest()[:16]
+    path = failure_dir / f"rapid_run_failure_{signature}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return path
 
 
 def con_vec(con_csv: str | Path) -> tuple[list[int], list[list[int]], list[list[float]], list[int]]:
@@ -260,19 +369,25 @@ def run_prepared_experiment(
     *,
     only_prepared: bool = True,
     hydrograph_config: HydrographMetricConfig | None = None,
+    storage_config: RapidResultStorageConfig | None = None,
 ) -> pd.DataFrame:
     experiment_path = Path(experiment_dir).expanduser().resolve()
     registry_path = experiment_path / "rapid_prep_registry.csv"
     if not registry_path.exists():
         raise FileNotFoundError(f"RAPID prep registry was not found: {registry_path}")
     registry = pd.read_csv(registry_path)
+    storage = storage_config or RapidResultStorageConfig()
     run_rows: list[dict[str, object]] = []
     for row in registry.itertuples(index=False):
         status = getattr(row, "status", "")
         if only_prepared and status != "prepared":
             continue
         prep_dir = Path(getattr(row, "rapid_prep_dir")).expanduser().resolve()
-        run_dir = prep_dir.parent / "run"
+        registered_run_dir = getattr(row, "rapid_run_dir", "")
+        if registered_run_dir is None or pd.isna(registered_run_dir) or not str(registered_run_dir).strip():
+            run_dir = prep_dir.parent / "run"
+        else:
+            run_dir = Path(str(registered_run_dir)).expanduser().resolve()
         run_dir.mkdir(parents=True, exist_ok=True)
         qout_path = run_dir / DEFAULT_QOUT_NAME
         try:
@@ -302,8 +417,23 @@ def run_prepared_experiment(
                         "hydrograph_metrics_json": "",
                     }
                 )
+            published = _publish_compact_result(
+                prep_dir=prep_dir, run_dir=run_dir, qout_path=output, storage=storage
+            )
+            run_row.update(published)
+            if not storage.retain_prepared_inputs:
+                shutil.rmtree(prep_dir)
+                run_row["rapid_prep_retained"] = False
+            else:
+                run_row["rapid_prep_retained"] = True
             run_rows.append(run_row)
         except Exception as exc:  # pragma: no cover
+            failure_bundle = _write_failure_bundle(
+                prep_dir=prep_dir,
+                run_dir=run_dir,
+                error=exc,
+                failure_dir=run_dir.parent / "failures",
+            )
             run_rows.append(
                 {
                     "state_id": getattr(row, "state_id"),
@@ -317,6 +447,7 @@ def run_prepared_experiment(
                     "outlet_hydrograph_csv": "",
                     "hydrograph_metrics_csv": "",
                     "hydrograph_metrics_json": "",
+                    "failure_bundle": str(failure_bundle),
                 }
             )
     run_registry = pd.DataFrame(run_rows)
@@ -337,6 +468,7 @@ def run_prepared_experiment(
                     if hydrograph_config is not None
                     else None
                 ),
+                "storage_config": asdict(storage),
             },
             indent=2,
         )
@@ -411,6 +543,7 @@ def run_rapid(
 __all__ = [
     "DEFAULT_QOUT_NAME",
     "LEGACY_QOUT_BASENAME",
+    "RapidResultStorageConfig",
     "HydrographMetricConfig",
     "bas_vec",
     "ccc_mat",

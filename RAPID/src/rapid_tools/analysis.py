@@ -497,6 +497,34 @@ def build_experiment_analysis_frame(
             delta = delta / SECONDS_PER_HOUR
         run_registry[delta_column] = delta
 
+    # `*_seconds` is a state-local simulation coordinate: spin-up length can
+    # differ slightly among states.  Absolute outlet-peak translation must
+    # therefore be compared on the shared UTC forcing clock, not by directly
+    # subtracting those local coordinates.
+    if "peak_time_utc" in run_registry.columns:
+        base_peak_time_utc = pd.to_datetime(base_row.get("peak_time_utc"), utc=True, errors="coerce")
+        peak_time_utc = pd.to_datetime(run_registry["peak_time_utc"], utc=True, errors="coerce")
+        if pd.notna(base_peak_time_utc):
+            utc_peak_shift_hours = (peak_time_utc - base_peak_time_utc).dt.total_seconds() / SECONDS_PER_HOUR
+            run_registry["peak_time_shift_hours"] = utc_peak_shift_hours
+            # Retain the established alias, but make it physically valid.
+            run_registry["delta_peak_time_hours"] = utc_peak_shift_hours
+
+    # Peak magnitude is distinct from timing: a state may retain the same
+    # lag-to-inflow peak while its outlet peak is slightly attenuated or
+    # amplified. Express the change relative to the base outlet peak so it is
+    # comparable across examples.
+    if "peak_discharge_cms" in run_registry.columns:
+        base_peak_discharge = pd.to_numeric(base_row.get("peak_discharge_cms"), errors="coerce")
+        if pd.notna(base_peak_discharge) and float(base_peak_discharge) != 0.0:
+            run_registry["peak_magnitude_pct_change_vs_base"] = (
+                pd.to_numeric(run_registry["peak_discharge_cms"], errors="coerce")
+                / float(base_peak_discharge)
+                - 1.0
+            ) * 100.0
+        else:
+            run_registry["peak_magnitude_pct_change_vs_base"] = float("nan")
+
     if "lag_to_inflow_peak_seconds" in run_registry.columns:
         base_lag_seconds = pd.to_numeric(base_row.get("lag_to_inflow_peak_seconds"), errors="coerce")
         baseline = float(base_lag_seconds) if pd.notna(base_lag_seconds) else float("nan")
@@ -719,7 +747,7 @@ def plot_hydrograph_overlay(
     return fig
 
 
-def _resolve_reach_attributes_gpkg(prep_dir: Path) -> Path:
+def _resolve_reach_attributes_gpkg(prep_dir: Path, run_dir: Path | None = None) -> Path:
     manifest = _load_json_if_exists(prep_dir / "rapid_prep_manifest.json")
     if manifest is not None:
         paths = manifest.get("paths", {})
@@ -731,18 +759,28 @@ def _resolve_reach_attributes_gpkg(prep_dir: Path) -> Path:
     fallback = prep_dir / "rapid_reach_attributes.gpkg"
     if fallback.exists():
         return fallback
+    if run_dir is not None:
+        retained = run_dir / "rapid_reach_attributes.gpkg"
+        if retained.exists():
+            return retained
     raise FileNotFoundError(
-        "RAPID reach geometry export was not found. Re-run RAPID prep with the updated code so "
-        "'rapid_reach_attributes.gpkg' is written."
+        "RAPID reach geometry export was not found. Re-run RAPID prep, or retain the compact "
+        "run-level 'rapid_reach_attributes.gpkg' before removing prep."
     )
 
 
-def load_reach_wave_stack(prep_dir: str | Path, qout_nc: str | Path) -> ReachWaveStack:
+def load_reach_wave_stack(
+    prep_dir: str | Path,
+    qout_nc: str | Path,
+    *,
+    run_dir: str | Path | None = None,
+) -> ReachWaveStack:
     import geopandas as gpd
 
     prep_path = _as_path(prep_dir)
     qout_path = _as_path(qout_nc)
-    reaches = gpd.read_file(_resolve_reach_attributes_gpkg(prep_path))
+    resolved_run_dir = _as_path(run_dir) if run_dir is not None else None
+    reaches = gpd.read_file(_resolve_reach_attributes_gpkg(prep_path, resolved_run_dir))
     reaches["reach_id"] = pd.to_numeric(reaches["reach_id"], errors="coerce").astype(int)
     river_ids, time_seconds, qout = _load_qout(qout_path)
     reach_index = reaches.set_index("reach_id", drop=False)
@@ -830,12 +868,14 @@ def _load_wave_state(experiment_dir: str | Path, state_id: str) -> _LoadedWaveSt
         return fallback if fallback.exists() else registered
 
     prep_dir = resolve_state_artifact("rapid_prep_dir", "rapid", "prep")
+    run_dir = resolve_state_artifact("rapid_run_dir", "rapid", "run")
     qout_path = resolve_state_artifact("qout_nc", "rapid", "run", "Qout_rapid_framework.nc")
     hydro_path = resolve_state_artifact("outlet_hydrograph_csv", "rapid", "run", "outlet_hydrograph.csv")
     run_row["rapid_prep_dir"] = str(prep_dir)
+    run_row["rapid_run_dir"] = str(run_dir)
     run_row["qout_nc"] = str(qout_path)
     run_row["outlet_hydrograph_csv"] = str(hydro_path)
-    wave_stack = load_reach_wave_stack(prep_dir, qout_path)
+    wave_stack = load_reach_wave_stack(prep_dir, qout_path, run_dir=run_dir)
     outlet_hydro = pd.read_csv(hydro_path)
     if "time_utc" in outlet_hydro.columns:
         outlet_hydro["time_utc"] = pd.to_datetime(outlet_hydro["time_utc"], utc=True, errors="coerce")

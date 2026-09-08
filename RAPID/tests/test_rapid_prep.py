@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import gzip
+import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,9 +20,10 @@ SRC = ROOT / "RAPID" / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from rapid_tools.engine import run_prepared_experiment, write_qout_netcdf
+from rapid_tools.engine import RapidResultStorageConfig, run_prepared_experiment, write_qout_netcdf
 from rapid_tools.forcing import ForcingConfig
-from rapid_tools.hydrograph import HydrographMetricConfig, _integrate_trapezoid, summarize_outlet_hydrograph
+from rapid_tools.hydrograph import HydrographMetricConfig, _integrate_trapezoid, _load_qout, summarize_outlet_hydrograph
+from rapid_tools.analysis import load_reach_wave_stack
 from rapid_tools.k_values import (
     KValueConfig,
     apply_stability_effective_length_cap,
@@ -29,6 +32,7 @@ from rapid_tools.k_values import (
     find_nearby_compatible_forcing_and_routing_dt,
     select_coordinated_routing_timesteps,
 )
+import rapid_tools.prep as rapid_prep_module
 from rapid_tools.prep import RapidPrepConfig, build_rapid_graph, compute_reach_ratios, create_conn_file, prepare_experiment
 from rapid_tools.reference_section import (
     _build_reference_section_variant,
@@ -58,12 +62,13 @@ def _write_single_path_graph(links_path: Path, nodes_path: Path) -> None:
 def _write_state(
     tmp_path: Path,
     *,
+    experiment_name: str = "experiment",
     link_id: int = 11,
     link_length: float = 1000.0,
     width_samples_wet: list[float] | None = None,
     write_hydraulic_context: bool = True,
 ) -> Path:
-    experiment_dir = tmp_path / "experiment"
+    experiment_dir = tmp_path / experiment_name
     state_dir = experiment_dir / "states" / "S001_unit_1"
     variant_dir = state_dir / "variant"
     hierarchy_dir = state_dir / "hierarchy"
@@ -1047,6 +1052,86 @@ def test_run_prepared_experiment_writes_qout(tmp_path: Path) -> None:
     assert hydrograph_metrics.loc[0, "event_end_source"] == "auto_outlet_series_end_fallback"
 
 
+def test_run_prepared_experiment_can_publish_compact_results_and_drop_prep(tmp_path: Path) -> None:
+    experiment_dir = _write_state(tmp_path)
+    work_root = tmp_path / "rapid-work"
+    prep_registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=experiment_dir / "forcing.csv",
+        prep_config=RapidPrepConfig(),
+        work_root=work_root,
+    )
+    prep_row = prep_registry.iloc[0]
+    assert Path(prep_row["rapid_prep_dir"]).is_relative_to(work_root)
+    assert Path(prep_row["rapid_run_dir"]).is_relative_to(experiment_dir)
+    run_registry = run_prepared_experiment(
+        experiment_dir,
+        storage_config=RapidResultStorageConfig(
+            compact_qout=True,
+            retain_prepared_inputs=False,
+            write_mapping_parquet=True,
+        ),
+    )
+
+    row = run_registry.iloc[0]
+    assert row["status"] == "ran"
+    assert str(row["qout_nc"]).endswith(".nc.gz")
+    assert Path(row["qout_nc"]).exists()
+    assert Path(row["rapid_run_dir"]).is_relative_to(experiment_dir)
+    assert Path(row["rapid_link_mapping_parquet"]).exists()
+    assert Path(row["rapid_reach_attributes_gpkg"]).exists()
+    assert not Path(row["rapid_prep_dir"]).exists()
+    wave_stack = load_reach_wave_stack(
+        row["rapid_prep_dir"], row["qout_nc"], run_dir=row["rapid_run_dir"]
+    )
+    assert len(wave_stack.reaches) == 1
+
+
+def test_compact_publication_moves_reach_geometry_on_the_same_volume(tmp_path: Path) -> None:
+    """Avoid a temporary second large GeoPackage before disposable prep is removed."""
+    from rapid_tools.engine import _publish_compact_result
+
+    prep = tmp_path / "prep"
+    run = tmp_path / "run"
+    prep.mkdir()
+    run.mkdir()
+    reach_geometry = prep / "rapid_reach_attributes.gpkg"
+    reach_geometry.write_bytes(b"complete geometry")
+    # Simulate the partial destination produced by a disk-full interrupted copy.
+    retained = run / reach_geometry.name
+    retained.write_bytes(b"partial")
+    qout = run / "Qout.nc"
+    qout.write_bytes(b"qout")
+
+    result = _publish_compact_result(
+        prep_dir=prep,
+        run_dir=run,
+        qout_path=qout,
+        storage=RapidResultStorageConfig(retain_prepared_inputs=False),
+    )
+
+    assert not reach_geometry.exists()
+    assert retained.read_bytes() == b"complete geometry"
+    assert Path(result["rapid_reach_attributes_gpkg"]) == retained
+
+
+def test_hydrograph_loader_reads_compressed_qout(tmp_path: Path) -> None:
+    raw_qout = tmp_path / "qout.nc"
+    river_ids = np.array([1, 2], dtype=np.int64)
+    time_seconds = np.array([0.0, 300.0], dtype=np.float64)
+    expected_qout = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
+    write_qout_netcdf(raw_qout, river_ids, time_seconds, expected_qout)
+    compressed_qout = raw_qout.with_suffix(".nc.gz")
+    with raw_qout.open("rb") as source, gzip.open(compressed_qout, "wb") as target:
+        shutil.copyfileobj(source, target)
+
+    loaded_ids, loaded_time, loaded_qout = _load_qout(compressed_qout)
+
+    np.testing.assert_array_equal(loaded_ids, river_ids)
+    np.testing.assert_allclose(loaded_time, time_seconds)
+    np.testing.assert_allclose(loaded_qout, expected_qout)
+
+
 def test_compute_k_values_exports_kb_provenance() -> None:
     frame = pd.DataFrame(
         {
@@ -1462,6 +1547,95 @@ def test_select_coordinated_routing_timesteps_keeps_disjoint_states_close() -> N
     assert plan["states"]["S000_base"]["routing_dt_seconds"] == 740
     assert plan["states"]["S021_unit_15"]["routing_dt_seconds"] == 800
     assert plan["states"]["CB001_bubble_5"]["routing_dt_seconds"] == 710
+
+
+def test_timestep_coordination_discovers_independent_compound_sibling(tmp_path: Path) -> None:
+    independent = tmp_path / "13_indep__anchored"
+    compound = tmp_path / "13_compound_bubbles__anchored"
+    independent.mkdir()
+    compound.mkdir()
+    (independent / "state_registry.csv").write_text("state_id,state_dir\n", encoding="utf-8")
+    (compound / "state_registry.csv").write_text("state_id,state_dir\n", encoding="utf-8")
+
+    assert rapid_prep_module._sibling_experiment_for_timestep_coordination(independent) == compound.resolve()
+    assert rapid_prep_module._sibling_experiment_for_timestep_coordination(compound) == independent.resolve()
+
+
+def test_coordinated_sibling_prepass_uses_and_cleans_isolated_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    independent = _write_state(
+        tmp_path / "independent",
+        experiment_name="13_indep__anchored",
+    )
+    compound = _write_state(
+        tmp_path / "compound",
+        experiment_name="13_compound_bubbles__anchored",
+    )
+    work_root = tmp_path / "rapid-work"
+    monkeypatch.setattr(
+        rapid_prep_module,
+        "_sibling_experiment_for_timestep_coordination",
+        lambda experiment_path: independent if experiment_path == compound.resolve() else None,
+    )
+
+    registry = prepare_experiment(
+        compound,
+        forcing_path=compound / "forcing.csv",
+        prep_config=RapidPrepConfig(preferred_routing_dt_seconds=60),
+        work_root=work_root,
+    )
+
+    assert registry.loc[0, "status"] == "prepared"
+    assert (work_root / compound.name / "S001_unit_1" / "prep").exists()
+    assert not (work_root / independent.name).exists()
+    assert not list((work_root / "_coordination_prepass").glob("*"))
+
+    manifest = json.loads((compound / "rapid_prep_manifest.json").read_text())
+    assert manifest["sibling_timestep_prepass_status"] == "removed_after_successful_timestep_selection"
+
+
+def test_failed_coordinated_sibling_prepass_is_retained_for_diagnosis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    independent = _write_state(
+        tmp_path / "independent",
+        experiment_name="13_indep__anchored",
+    )
+    compound = _write_state(
+        tmp_path / "compound",
+        experiment_name="13_compound_bubbles__anchored",
+    )
+    work_root = tmp_path / "rapid-work"
+    monkeypatch.setattr(
+        rapid_prep_module,
+        "_sibling_experiment_for_timestep_coordination",
+        lambda experiment_path: independent if experiment_path == compound.resolve() else None,
+    )
+    original_prepare_state = rapid_prep_module.prepare_state
+
+    def fail_only_sibling(context, *args, **kwargs):
+        if independent.name in str(context.rapid_prep_dir):
+            raise ValueError("synthetic sibling prepass failure")
+        return original_prepare_state(context, *args, **kwargs)
+
+    monkeypatch.setattr(rapid_prep_module, "prepare_state", fail_only_sibling)
+
+    registry = prepare_experiment(
+        compound,
+        forcing_path=compound / "forcing.csv",
+        prep_config=RapidPrepConfig(preferred_routing_dt_seconds=60),
+        work_root=work_root,
+    )
+
+    assert registry.loc[0, "status"] == "failed"
+    retained = list((work_root / "_coordination_prepass").glob("*/coordination_prepass_manifest.json"))
+    assert len(retained) == 1
+    failure = json.loads(retained[0].read_text())
+    assert failure["status"] == "retained_timestep_selection_failure"
+    assert "synthetic sibling prepass failure" in failure["error"]
 
 
 def test_integrate_trapezoid_falls_back_to_trapz(monkeypatch) -> None:

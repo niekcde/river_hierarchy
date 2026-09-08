@@ -12,7 +12,7 @@ if str(SRC) not in sys.path:
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from rapid_tools.engine import run_prepared_experiment
+from rapid_tools.engine import RapidResultStorageConfig, run_prepared_experiment
 from rapid_tools.hydrograph import HydrographMetricConfig
 
 
@@ -25,6 +25,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-failed-prep",
         action="store_true",
         help="Attempt to run states even if the prep registry did not mark them as prepared.",
+    )
+    parser.add_argument(
+        "--compact-qout",
+        action="store_true",
+        help="Gzip Qout after successful hydrograph export, retaining the compressed .nc.gz result.",
+    )
+    parser.add_argument(
+        "--write-mapping-parquet",
+        action="store_true",
+        help="Write a compact Parquet copy of the RAPID reach/subreach mapping in each final run directory.",
+    )
+    parser.add_argument(
+        "--drop-prepared-inputs",
+        action="store_true",
+        help=(
+            "Remove a state's regenerable prep directory only after RAPID, hydrograph, and requested "
+            "compact outputs publish successfully. Failed preparation remains available for diagnosis."
+        ),
     )
     parser.add_argument(
         "--event-start-mode",
@@ -150,6 +168,11 @@ def main(argv: list[str] | None = None) -> int:
             event_start_buffer_hours=args.event_start_buffer_hours,
             event_end_time=args.event_end_time,
             event_end_buffer_hours=args.event_end_buffer_hours,
+        ),
+        storage_config=RapidResultStorageConfig(
+            compact_qout=args.compact_qout,
+            retain_prepared_inputs=not args.drop_prepared_inputs,
+            write_mapping_parquet=args.write_mapping_parquet,
         ),
     )
     print(f"Wrote RAPID run outputs to {Path(args.experiment_dir).expanduser().resolve()}")

@@ -190,11 +190,13 @@ Important behavior:
 - resampling densifies the series; it does not create new hydrologic
   information beyond the source observations
 - when `--preferred-routing-dt-seconds` is supplied, prep first builds the K
-  values and Muskingum stability interval for every state. It then selects one
-  stable multiple-of-five timestep for the whole experiment when the intervals
-  overlap. If they do not overlap, it projects one common central target into
-  each interval so that the state-specific values remain as close as stability
-  permits
+  values and Muskingum stability interval for every state. When the matching
+  sibling experiment exists, the prepass automatically covers both the
+  independent-unit and compound-bubble experiments. It then selects one stable
+  multiple-of-five timestep for all states when the intervals overlap. If they
+  do not overlap, it projects one common central target into each interval so
+  that the state-specific values—and therefore the two experiment modes—remain
+  as close as stability permits
 - in that coordinated mode, each state's forcing interval is automatically set
   equal to its selected routing interval. This provides exact clock alignment;
   `--forcing-resample-seconds` remains recorded as the requested input setting
@@ -484,20 +486,47 @@ The geometry context helper also exposes cleaner x-axis aliases:
 - `lambda_matched`
 - `k_ratio_to_matched_base`
 
-The width-fraction metric is now a bounded upstream-share metric on the base
+Its `plot_category` is a hydraulic/run-scope label, with mutually exclusive
+definitions:
+
+- `compound indep`: an independent run whose selected unit contains nested
+  structure, but is not being represented by an enclosing compound domain;
+- `compound unit compound`: a dedicated compound-bubble run;
+- `single simple`: a closed simple unit outside a compound, on the main
+  single-centerline branch;
+- `part of compound unit`: a non-closed compound member evaluated in its
+  complete enclosing compound domain; that member can itself be simple or
+  compound;
+- `nested unit`: a hydraulically closed unit inside a compound, off the main
+  single-centerline branch.
+
+The width/exposure metric is a bounded upstream-share metric on the base
 directed graph rather than a direct width ratio. Plotting code:
 
 - finds the first clean upstream mandatory edge using a dominator-based helper
 - propagates width-based split shares downstream through the base DAG
 - sums the shares that first enter the matched target corridor
 
+The main plotting predictor uses the exposure factor in
+`length_fraction * (-log10(Lambda_matched)) * width_fraction`. The factor is
+aligned to the domain used to calculate `Lambda_matched`:
+
+- a `closed_compound_unit` or `containing_compound_context` is the complete
+  hydraulically closed compound between its outer terminals, so its exposure
+  is `1.0`; its matched Lambda already describes that entire compound;
+- a `closed_unit` nested inside a larger compound retains its routed
+  base-network width share, because its Lambda describes only that subdomain.
+
 For debugging and notebook diagnostics the geometry frame keeps:
 
 - `width_fraction_of_total_raw`
 - `width_fraction_of_total`
+- `exposure_fraction_source`
 - `upstream_reference_link_id`
 
-`width_fraction_of_total` is the capped plotting value. The raw share should
+`width_fraction_of_total_raw` is the uncapped routed-share diagnostic.
+`width_fraction_of_total` is the capped, domain-aligned plotting exposure and
+its source is recorded in `exposure_fraction_source`. The raw share should
 already be bounded in `[0, 1]` apart from floating-point noise.
 
 Notebook code can discover the currently supported plotting metric names

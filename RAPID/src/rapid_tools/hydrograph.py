@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import gzip
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import pandas as pd
@@ -41,7 +44,14 @@ def _integrate_trapezoid(y: np.ndarray, x: np.ndarray) -> float:
 
 
 def _load_qout(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    with netcdf_file(path, "r", mmap=False) as ds:
+    resolved_path = Path(path).expanduser().resolve()
+    if resolved_path.suffix.lower() == ".gz":
+        with TemporaryDirectory(prefix="rapid-qout-") as temporary_dir:
+            temporary_path = Path(temporary_dir) / resolved_path.with_suffix("").name
+            with gzip.open(resolved_path, "rb") as source, temporary_path.open("wb") as target:
+                shutil.copyfileobj(source, target, length=1024 * 1024)
+            return _load_qout(temporary_path)
+    with netcdf_file(resolved_path, "r", mmap=False) as ds:
         river_ids = np.array(ds.variables["rivid"].data, dtype=np.int64).copy()
         time_seconds = np.array(ds.variables["time"].data, dtype=np.float64).copy()
         qout = np.array(ds.variables["Qout"].data, dtype=np.float64).copy()

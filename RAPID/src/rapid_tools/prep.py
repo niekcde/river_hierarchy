@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
 import warnings
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import geopandas as gpd
 import networkx as nx
@@ -36,6 +38,93 @@ from .k_values import (
 from .registry import RapidStateContext, iter_preparable_states, load_state_registry
 
 SECONDS_PER_HOUR = 3600.0
+
+
+def _sibling_experiment_for_timestep_coordination(experiment_path: Path) -> Path | None:
+    """Return the matching independent/compound experiment when available."""
+    name = experiment_path.name
+    replacements = (
+        ("_indep__", "_compound_bubbles__"),
+        ("_compound_bubbles__", "_indep__"),
+    )
+    for source, target in replacements:
+        if source not in name:
+            continue
+        sibling = experiment_path.with_name(name.replace(source, target, 1))
+        if (sibling / "state_registry.csv").exists():
+            return sibling.resolve()
+    return None
+
+
+def _with_work_root(
+    context: RapidStateContext,
+    *,
+    work_root: Path | None,
+    experiment_name: str,
+) -> RapidStateContext:
+    """Redirect only regenerable RAPID preparation files to ``work_root``.
+
+    State outputs, including the final run directory and failure diagnostics,
+    remain in the experiment tree. This lets a caller use a fast disposable
+    volume for the large intermediate prep products without changing any
+    provenance paths for the state itself.
+    """
+    if work_root is None:
+        return context
+    return replace(
+        context,
+        rapid_prep_dir=(work_root / experiment_name / context.state_id / "prep").resolve(),
+    )
+
+
+def _coordination_prepass_root(
+    *,
+    experiment_path: Path,
+    sibling_path: Path,
+    work_root: Path | None,
+) -> Path:
+    """Create an isolated workspace for a sibling timestep-selection prepass.
+
+    A coordinated timestep needs K bounds from both experiments, but that
+    prepass must never recreate the sibling experiment's real RAPID prep
+    directories after its successful run has removed them.
+    """
+    parent = (
+        work_root / "_coordination_prepass"
+        if work_root is not None
+        else experiment_path / "rapid_coordination_prepass"
+    )
+    token = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + f"_{uuid4().hex[:8]}"
+    root = parent / f"{experiment_path.name}__with__{sibling_path.name}__{token}"
+    root.mkdir(parents=True, exist_ok=False)
+    return root.resolve()
+
+
+def _write_coordination_prepass_manifest(
+    prepass_root: Path,
+    *,
+    experiment_path: Path,
+    sibling_path: Path,
+    status: str,
+    error: str | None,
+) -> Path:
+    """Record why an otherwise-disposable coordination prepass was retained."""
+    path = prepass_root / "coordination_prepass_manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "rapid-coordination-prepass-v1",
+                "generated_at": datetime.now(UTC).isoformat(),
+                "experiment_dir": str(experiment_path),
+                "sibling_experiment_dir": str(sibling_path),
+                "status": status,
+                "error": error,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,10 +394,18 @@ def split_links_into_subreaches(
 
 
 def _resolve_link_width_samples_path(link_widths_path: Path) -> Path | None:
-    candidate = link_widths_path.parent / "link_width_samples.csv"
-    if candidate.exists():
-        return candidate
+    for name in ("link_width_samples.parquet", "link_width_samples.csv"):
+        candidate = link_widths_path.parent / name
+        if candidate.exists():
+            return candidate
     return None
+
+
+def _read_link_width_samples(path: Path) -> pd.DataFrame:
+    """Read either the compact future Parquet product or legacy CSV samples."""
+    if path.suffix.lower() == ".parquet":
+        return pd.read_parquet(path)
+    return pd.read_csv(path)
 
 
 def apply_subreach_widths_from_samples(
@@ -322,7 +419,7 @@ def apply_subreach_widths_from_samples(
     if not link_width_samples_path.exists():
         raise FileNotFoundError(f"Subreach width samples were not found: {link_width_samples_path}")
 
-    samples = pd.read_csv(link_width_samples_path)
+    samples = _read_link_width_samples(link_width_samples_path)
     if sample_field not in samples.columns:
         raise ValueError(
             f"Subreach width samples do not contain '{sample_field}'. "
@@ -968,7 +1065,8 @@ def prepare_state(
     if prep_config.vary_width_by_subreach:
         if subreach_width_samples_path is None:
             raise FileNotFoundError(
-                f"Subreach-width adjustment was requested, but link_width_samples.csv was not found beside {context.link_widths_path}."
+                "Subreach-width adjustment was requested, but no link_width_samples.parquet "
+                f"or legacy CSV was found beside {context.link_widths_path}."
             )
         rapid_links = apply_subreach_widths_from_samples(
             rapid_links,
@@ -1161,6 +1259,8 @@ def prepare_state(
     manifest = {
         "state_id": context.state_id,
         "state_role": context.state_role,
+        "state_dir": str(context.state_dir),
+        "rapid_run_dir": str(context.rapid_run_dir),
         "prep_config": asdict(prep_config),
         "forcing_config": asdict(resolved_forcing_config) if forcing_path is not None else None,
         "forcing_metadata": resolved_forcing_metadata,
@@ -1253,7 +1353,9 @@ def prepare_state(
     return {
         "state_id": context.state_id,
         "state_role": context.state_role,
+        "state_dir": str(context.state_dir),
         "rapid_prep_dir": str(context.rapid_prep_dir),
+        "rapid_run_dir": str(context.rapid_run_dir),
         "rapid_prep_manifest": str(manifest_path),
         "conn_csv": str(conn_path),
         "riv_csv": str(riv_path),
@@ -1327,6 +1429,7 @@ def prepare_experiment(
     forcing_path: str | Path | None = None,
     forcing_config: ForcingConfig | None = None,
     prep_config: RapidPrepConfig | None = None,
+    work_root: str | Path | None = None,
 ) -> pd.DataFrame:
     experiment_path = Path(experiment_dir).expanduser().resolve()
     registry = load_state_registry(experiment_path)
@@ -1334,6 +1437,9 @@ def prepare_experiment(
     prep_config = prep_config or RapidPrepConfig()
     forcing_config = forcing_config or ForcingConfig()
     resolved_prep_config = prep_config
+    resolved_work_root = (
+        Path(work_root).expanduser().resolve() if work_root is not None else None
+    )
 
     reference_kb_summary: dict[str, object] | None = None
     reference_kb_summary_source: str | None = None
@@ -1353,12 +1459,17 @@ def prepare_experiment(
     except Exception as exc:  # pragma: no cover
         experiment_prepass_error = str(exc)
 
-    contexts = list(
-        iter_preparable_states(
+    contexts = [
+        _with_work_root(
+            context,
+            work_root=resolved_work_root,
+            experiment_name=experiment_path.name,
+        )
+        for context in iter_preparable_states(
             registry,
             include_base_state=prep_config.include_base_state,
         )
-    )
+    ]
     network_prepass: dict[str, dict[str, object]] = {}
     state_bounds: dict[str, tuple[float, float]] = {}
 
@@ -1405,15 +1516,102 @@ def prepare_experiment(
         forcing_path is not None
         and resolved_prep_config.preferred_routing_dt_seconds is not None
     )
-    if coordinated_timestep_enabled and state_bounds:
+    coordination_bounds = {
+        f"{experiment_path.name}::{state_id}": bounds
+        for state_id, bounds in state_bounds.items()
+    }
+    coordinated_experiment_dirs = [str(experiment_path)]
+    sibling_prepass_error: str | None = None
+    sibling_prepass_root: Path | None = None
+    sibling_prepass_status = "not_required"
+    sibling_path = (
+        _sibling_experiment_for_timestep_coordination(experiment_path)
+        if coordinated_timestep_enabled
+        else None
+    )
+    if sibling_path is not None:
+        coordinated_experiment_dirs.append(str(sibling_path))
         try:
-            timestep_plan = select_coordinated_routing_timesteps(
-                state_bounds,
-                preferred_routing_dt_seconds=resolved_prep_config.preferred_routing_dt_seconds,
-                multiple_seconds=5,
+            sibling_prepass_root = _coordination_prepass_root(
+                experiment_path=experiment_path,
+                sibling_path=sibling_path,
+                work_root=resolved_work_root,
             )
+            sibling_prepass_status = "prepared_for_timestep_selection"
+            sibling_registry = load_state_registry(sibling_path)
+            sibling_reference_kb_summary = reference_kb_summary
+            if str(resolved_prep_config.kb_mode or "fixed") == "based_reference_section":
+                sibling_reference_kb_summary, _ = _load_stored_reference_kb_summary(sibling_path)
+            for sibling_context in iter_preparable_states(
+                sibling_registry,
+                include_base_state=False,
+            ):
+                sibling_context = _with_work_root(
+                    sibling_context,
+                    work_root=sibling_prepass_root,
+                    experiment_name=sibling_path.name,
+                )
+                sibling_result = prepare_state(
+                    sibling_context,
+                    forcing_path=None,
+                    forcing_config=forcing_config,
+                    prep_config=resolved_prep_config,
+                    reference_kb_summary=sibling_reference_kb_summary,
+                )
+                if sibling_result.get("status") != "prepared":
+                    raise ValueError(
+                        f"Sibling state {sibling_context.state_id} could not be prepared for joint timestep "
+                        f"selection: {sibling_result.get('error', 'unknown prepass error')}"
+                    )
+                coordination_bounds[f"{sibling_path.name}::{sibling_context.state_id}"] = (
+                    float(sibling_result["stability_length_cap_dt_min_after_seconds"]),
+                    float(sibling_result["stability_length_cap_dt_max_after_seconds"]),
+                )
         except Exception as exc:  # pragma: no cover
-            timestep_plan_error = str(exc)
+            sibling_prepass_error = str(exc)
+
+    if coordinated_timestep_enabled and coordination_bounds:
+        if sibling_path is not None and sibling_prepass_error is not None:
+            timestep_plan_error = (
+                "Joint independent/compound timestep prepass failed: "
+                f"{sibling_prepass_error}"
+            )
+        else:
+            try:
+                timestep_plan = select_coordinated_routing_timesteps(
+                    coordination_bounds,
+                    preferred_routing_dt_seconds=resolved_prep_config.preferred_routing_dt_seconds,
+                    multiple_seconds=5,
+                )
+                timestep_plan["coordinated_experiment_dirs"] = coordinated_experiment_dirs
+                timestep_plan["sibling_prepass_error"] = sibling_prepass_error
+            except Exception as exc:  # pragma: no cover
+                timestep_plan_error = str(exc)
+
+    if sibling_prepass_root is not None:
+        retention_error = sibling_prepass_error or timestep_plan_error
+        if retention_error is None and timestep_plan is not None:
+            try:
+                shutil.rmtree(sibling_prepass_root)
+                sibling_prepass_status = "removed_after_successful_timestep_selection"
+            except Exception as exc:  # pragma: no cover - filesystem-specific cleanup failure
+                sibling_prepass_status = "retained_cleanup_failure"
+                _write_coordination_prepass_manifest(
+                    sibling_prepass_root,
+                    experiment_path=experiment_path,
+                    sibling_path=sibling_path,
+                    status=sibling_prepass_status,
+                    error=str(exc),
+                )
+        else:
+            sibling_prepass_status = "retained_timestep_selection_failure"
+            _write_coordination_prepass_manifest(
+                sibling_prepass_root,
+                experiment_path=experiment_path,
+                sibling_path=sibling_path,
+                status=sibling_prepass_status,
+                error=retention_error or "Timestep plan was not created.",
+            )
 
     for context in contexts:
         prepass_result = network_prepass[context.state_id]
@@ -1456,7 +1654,10 @@ def prepare_experiment(
             )
             continue
 
-        state_selection = dict(timestep_plan["states"][context.state_id])
+        state_selection_key = f"{experiment_path.name}::{context.state_id}"
+        state_selection = dict(timestep_plan["states"][state_selection_key])
+        state_selection["coordination_key"] = state_selection_key
+        state_selection["coordinated_experiment_dirs"] = coordinated_experiment_dirs
         selected_dt = int(state_selection["routing_dt_seconds"])
         state_forcing_config = replace(
             forcing_config,
@@ -1497,6 +1698,7 @@ def prepare_experiment(
         json.dumps(
             {
                 "experiment_dir": str(experiment_path),
+                "work_root": str(resolved_work_root) if resolved_work_root is not None else None,
                 "forcing_path": str(Path(forcing_path).expanduser().resolve()) if forcing_path is not None else None,
                 "forcing_config": asdict(forcing_config) if forcing_config is not None else None,
                 "prep_config": asdict(resolved_prep_config),
@@ -1508,6 +1710,10 @@ def prepare_experiment(
                 "timestep_plan": timestep_plan,
                 "timestep_plan_error": timestep_plan_error,
                 "coordinated_timestep_enabled": bool(coordinated_timestep_enabled),
+                "coordinated_experiment_dirs": coordinated_experiment_dirs,
+                "sibling_timestep_prepass_error": sibling_prepass_error,
+                "sibling_timestep_prepass_workspace": str(sibling_prepass_root) if sibling_prepass_root is not None else None,
+                "sibling_timestep_prepass_status": sibling_prepass_status,
                 "states_total": int(len(prep_registry)),
                 "states_prepared": int(prep_registry["status"].eq("prepared").sum()) if not prep_registry.empty else 0,
                 "states_failed": int(prep_registry["status"].eq("failed").sum()) if not prep_registry.empty else 0,

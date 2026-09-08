@@ -18,8 +18,9 @@ SECONDS_PER_HOUR = 3600.0
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[3] / "network_variants" / "output"
 
 CATEGORY_COLOR_MAP = {
-    "single unit": "#1f77b4",
-    "compound unit": "#d62728",
+    "single simple": "#1f77b4",
+    "compound indep": "#9467bd",
+    "compound unit compound": "#d62728",
     "nested unit": "#2ca02c",
     "part of compound unit": "#ff7f0e",
 }
@@ -28,6 +29,7 @@ TIMING_Y_METRIC_LABELS = {
     "centroid50_shift_hours": "Centroid shift above 50% peak [hours]",
     "centroid75_shift_hours": "Centroid shift above 75% peak [hours]",
     "peak_time_shift_hours": "Peak-time shift [hours]",
+    "peak_magnitude_pct_change_vs_base": "Peak magnitude change vs base [%]",
     "rise95_time_shift_hours": "Rise-95 timing shift [hours]",
     "plateau995_center_shift_hours": "99.5% peak-plateau center shift [hours]",
     "peak_window_center95_shift_hours": "95% peak-window center shift [hours]",
@@ -57,18 +59,18 @@ GEOMETRY_X_METRIC_LABELS = {
     "len_fraction": "Selected length fraction",
     "child_parent_len_frac": "Child length / matched parent length",
     "child_length_fraction": "Child length / matched parent length",
-    "width_fraction_of_total": "Upstream width-share routed into target object",
-    "width_fraction": "Upstream width-share routed into target object",
+    "width_fraction_of_total": "Domain-aligned discharge exposure factor",
+    "width_fraction": "Domain-aligned discharge exposure factor",
     "Lambda_matched": "Lambda_K (selected hydraulic domain)",
     "lambda_matched": "Lambda_K (selected hydraulic domain)",
     "neg_log10_lambda": "-log10(Lambda_K, selected hydraulic domain)",
     "log_lambda": "-log10(Lambda_K, selected hydraulic domain)",
     "length_weighted_log_lambda": "Selected-domain length fraction * (-log10(Lambda_K))",
     "len_fraction_weighted_log_lambda": "Selected-domain length fraction * (-log10(Lambda_K))",
-    "width_weighted_log_lambda": "Selected-domain length fraction * (-log10(Lambda_K)) * width_fraction",
-    "len_fraction_width_weighted_log_lambda": "Selected-domain length fraction * (-log10(Lambda_K)) * width_fraction",
+    "width_weighted_log_lambda": "Selected-domain length fraction * (-log10(Lambda_K)) * exposure factor",
+    "len_fraction_width_weighted_log_lambda": "Selected-domain length fraction * (-log10(Lambda_K)) * exposure factor",
     "child_parent_weighted_log_lambda": "(child_len / matched_parent_len) * (-log10(Lambda_matched))",
-    "child_parent_width_weighted_log_lambda": "(child_len / matched_parent_len) * (-log10(Lambda_matched)) * width_fraction",
+    "child_parent_width_weighted_log_lambda": "(child_len / matched_parent_len) * (-log10(Lambda_matched)) * exposure factor",
     "Lambda_matched_diagnostic": "Lambda_matched (deprecated residual-corridor diagnostic)",
     "k_ratio_to_matched_base": "K_after / K_before (selected hydraulic domain)",
 }
@@ -389,15 +391,32 @@ def _load_selected_hydraulic_domain_frame(exp_dir: Path, state_ids: Sequence[str
 
 
 def _classify_plot_category(row: pd.Series) -> str:
+    """Assign mutually exclusive categories from run and hydraulic-domain scope."""
+    def _flag(value: object) -> bool:
+        return bool(value) if pd.notna(value) else False
+
+    mode = str(row.get("mode", "")).strip()
+    domain_type = str(row.get("hydraulic_domain_type", "")).strip()
+    in_compound = _flag(row.get("in_compound_bubble", False))
+
+    # A compound-bubble run is the complete compound object itself.
     if row.get("target_type") == "compound_bubble":
-        return "compound unit"
-    if bool(row.get("is_compound", False)):
-        return "compound unit"
-    if pd.notna(row.get("compound_unit_id")):
+        return "compound unit compound"
+    # This non-closed member is evaluated in the enclosing compound domain.
+    # It can itself be simple or compound; its membership is the defining fact.
+    if domain_type == "containing_compound_context":
         return "part of compound unit"
-    if str(row.get("unit_class", "")) == "compound_or_nested_complex":
+    # This is an independently collapsed compound unit containing nested
+    # structure, rather than a member represented by an enclosing compound.
+    if mode == "indep" and _flag(row.get("is_compound", False)):
+        return "compound indep"
+    # A closed unit inside a compound is a nested side-domain, even though it
+    # can have a simple local bifurcation/confluence topology.
+    if domain_type == "closed_unit" and in_compound:
         return "nested unit"
-    return "single unit"
+    # Remaining closed units are simple objects on the main single-centerline
+    # branch (or standalone equivalents outside a compound).
+    return "single simple"
 
 
 def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.DataFrame:
@@ -471,6 +490,11 @@ def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.Dat
         warnings.warn(f"Skipping {exp_dir.name}: selected hydraulic-domain transition results are unavailable.", stacklevel=2)
         return pd.DataFrame()
 
+    residual_lambda_column = (
+        "residual_corridor_Lambda_matched_diagnostic"
+        if "residual_corridor_Lambda_matched_diagnostic" in comp.columns
+        else "Lambda_matched"
+    )
     summary = pd.DataFrame(rows).merge(
         comp[
             [
@@ -478,7 +502,7 @@ def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.Dat
                 "child_object_id",
                 "target_type",
                 "target_id",
-                "Lambda_matched",
+                residual_lambda_column,
                 "K_eq_matched_base",
                 "K_variant_realized",
                 "boundary_relation",
@@ -488,7 +512,7 @@ def _build_experiment_frame(example_id: str, mode: str, exp_dir: Path) -> pd.Dat
         on="state_id",
         how="left",
     )
-    summary = summary.rename(columns={"Lambda_matched": "Lambda_matched_diagnostic"})
+    summary = summary.rename(columns={residual_lambda_column: "Lambda_matched_diagnostic"})
     transition_columns = [
         "state_id", "Lambda_K", "K_before", "K_after", "percent_change_K",
         "hydraulic_domain_type", "parent_domain_n_links", "child_domain_n_links",
@@ -748,10 +772,24 @@ def _build_base_context(exp_dir: Path) -> dict[str, Any]:
         "network_us_dist_out_m",
         "network_ds_dist_out_m",
     }
-    base_rapid = pd.read_csv(
-        exp_dir / "states" / "S000_base" / "rapid" / "prep" / "rapid_link_attributes.csv",
-        usecols=lambda column: column in distance_columns,
-    )
+    # New compact outputs retain this mapping under rapid/run as parquet after
+    # removing the larger rapid/prep directory.  Prefer the legacy CSV when
+    # available so historical experiments remain byte-for-byte compatible.
+    base_state_dir = exp_dir / "states" / "S000_base" / "rapid"
+    legacy_link_attributes = base_state_dir / "prep" / "rapid_link_attributes.csv"
+    retained_link_mapping = base_state_dir / "run" / "rapid_link_mapping.parquet"
+    if legacy_link_attributes.is_file():
+        base_rapid = pd.read_csv(
+            legacy_link_attributes,
+            usecols=lambda column: column in distance_columns,
+        )
+    elif retained_link_mapping.is_file():
+        base_rapid = pd.read_parquet(retained_link_mapping, columns=sorted(distance_columns))
+    else:
+        raise FileNotFoundError(
+            "Base RAPID link mapping was not found. Expected either "
+            f"{legacy_link_attributes} or {retained_link_mapping}."
+        )
     missing_distance_columns = distance_columns.difference(base_rapid.columns)
     if missing_distance_columns:
         raise ValueError(
@@ -891,6 +929,21 @@ def _width_fraction_of_total(row: pd.Series, ctx: dict[str, Any]) -> float:
     return float(share) if np.isfinite(share) else float("nan")
 
 
+def _exposure_fraction(row: pd.Series, *, raw_width_share: float) -> tuple[float, str]:
+    """Return the discharge-exposure factor matched to the EQ domain.
+
+    A selected-domain Lambda for a complete compound represents the entire
+    closed compound between its outer terminals. Its exposure is therefore one,
+    irrespective of an internal width split. A closed unit nested inside a
+    larger compound is different: its Lambda describes only that subdomain, so
+    the routed base-network width share remains the appropriate exposure.
+    """
+    domain_type = str(row.get("hydraulic_domain_type", "")).strip()
+    if domain_type in {"closed_compound_unit", "containing_compound_context"}:
+        return 1.0, "complete_closed_compound"
+    return float(raw_width_share), "nested_or_unit_width_share"
+
+
 def build_geometry_context_frame(
     plot_df: pd.DataFrame,
     *,
@@ -912,6 +965,8 @@ def build_geometry_context_frame(
     matched_dist_frac: list[float] = []
     child_lens: list[float] = []
     width_fracs: list[float] = []
+    exposure_fracs: list[float] = []
+    exposure_sources: list[str] = []
     upstream_reference_link_ids: list[float] = []
 
     for row in geom_df.itertuples(index=False):
@@ -943,6 +998,9 @@ def build_geometry_context_frame(
         child_lens.append(_child_length(exp_dir, row.state_id, row.child_link_ids))
         share, upstream_link_id = _compute_target_base_share(row_series, ctx)
         width_fracs.append(share)
+        exposure, exposure_source = _exposure_fraction(row_series, raw_width_share=share)
+        exposure_fracs.append(exposure)
+        exposure_sources.append(exposure_source)
         upstream_reference_link_ids.append(float(upstream_link_id) if upstream_link_id is not None else float("nan"))
 
     geom_df["matched_base_len"] = matched_lens
@@ -953,7 +1011,8 @@ def build_geometry_context_frame(
     geom_df["child_parent_len_frac"] = geom_df["child_len"] / geom_df["matched_base_len"]
     geom_df["upstream_reference_link_id"] = upstream_reference_link_ids
     geom_df["width_fraction_of_total_raw"] = width_fracs
-    geom_df["width_fraction_of_total"] = pd.to_numeric(geom_df["width_fraction_of_total_raw"], errors="coerce").clip(upper=1.0)
+    geom_df["exposure_fraction_source"] = exposure_sources
+    geom_df["width_fraction_of_total"] = pd.to_numeric(pd.Series(exposure_fracs, index=geom_df.index), errors="coerce").clip(upper=1.0)
     geom_df["child_parent_weighted_log_lambda"] = geom_df["child_parent_len_frac"] * geom_df["neg_log10_lambda"]
     geom_df["child_parent_width_weighted_log_lambda"] = (
         geom_df["child_parent_len_frac"]

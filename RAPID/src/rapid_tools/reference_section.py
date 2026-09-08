@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .slope import SlopeConfig, compute_section_slope_reference
+from network_variants.width_samples import read_width_samples
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -249,9 +250,7 @@ def _load_width_summary(
                     "statistic": "direct_single_link" if len(widths) == 1 else "median_multi_link",
                 }
 
-    if not link_width_samples_path.exists():
-        raise FileNotFoundError(f"Reference-section width samples were not found: {link_width_samples_path}")
-    samples = pd.read_csv(link_width_samples_path)
+    samples = read_width_samples(link_width_samples_path)
     if width_sample_field not in samples.columns:
         raise ValueError(
             f"Reference-section width inputs do not contain '{width_sample_field}'. "
