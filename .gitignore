@@ -26,3 +26,8 @@ RAPID/notebooks/conceptual_channel_splitting_celerity.png
 RAPID/notebooks/conceptual_ebi_celerity.pdf
 RAPID/notebooks/conceptual_ebi_celerity.png
 RAPID/notebooks/link_*_bank_targets*.png
+
+# Generated classification runs, exported plots, and local review data
+/RAPID/classification/results/
+/RAPID/notebooks/newplot_2.png
+/network_variants/island_topology_review_registry.csv
