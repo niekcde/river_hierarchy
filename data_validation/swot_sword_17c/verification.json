@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "files_accounted_for": 17963,
+  "examples_accounted_for": 17,
+  "unique_nodes": 19247,
+  "independent_full_granule_read": "SWOT_L2_HR_RiverSP_Node_035_050_AR_20250701T091202_20250701T091637_PID0_01.parquet",
+  "independent_numpy_medians": 100,
+  "coverage_identities": "passed",
+  "duplicate_join_check": "passed",
+  "all_example_reaches_present_in_sword": true
+}

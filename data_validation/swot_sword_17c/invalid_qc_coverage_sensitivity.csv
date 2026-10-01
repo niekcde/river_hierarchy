@@ -1,0 +1,2 @@
+node_id,reach_id,x,y,dist_out,wse_obs_p50,n_obs,region,sword_p50,swot_rows_before_filter,swot_p50,swot_observations,first_observation,last_observation,swot_p50_valid_qc,sword_valid,swot_valid,coverage_category,swot_minus_sword_m,swot_p50_one_row_per_observation,dedup_minus_primary_m
+44250000060371,44250000061,105.81301143997666,14.147623500494596,771172.9809924614,,,AS,,25,87.10237,1,2025-07-02T19:46:52Z,2025-07-02T19:46:52Z,,False,True,swot_only,,87.10237,0.0

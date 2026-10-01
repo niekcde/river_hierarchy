@@ -1,0 +1,126 @@
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+W20260925 08:07:32.230645 0x16bcf7000 cpu_info.cc:242] IOError: sysctlbyname failed for 'hw.l1dcachesize'. Detail: [errno 1] Operation not permitted
+W20260925 08:07:32.231360 0x16bcf7000 cpu_info.cc:242] IOError: sysctlbyname failed for 'hw.l2cachesize'. Detail: [errno 1] Operation not permitted
+W20260925 08:07:32.231686 0x16bcf7000 cpu_info.cc:242] IOError: sysctlbyname failed for 'hw.l3cachesize'. Detail: [errno 1] Operation not permitted
+W20260925 08:07:32.232027 0x16bcf7000 cpu_info.cc:242] IOError: sysctlbyname failed for 'hw.optional.neon'. Detail: [errno 1] Operation not permitted
+SWORD: 19,247 nodes; 17 examples; SWOT: 17,963 files
+500/17963 files; 22,157 target rows; 4s
+1000/17963 files; 83,930 target rows; 7s
+1500/17963 files; 119,856 target rows; 9s
+2000/17963 files; 140,660 target rows; 11s
+2500/17963 files; 167,702 target rows; 14s
+3000/17963 files; 189,219 target rows; 16s
+3500/17963 files; 224,007 target rows; 18s
+4000/17963 files; 247,412 target rows; 20s
+4500/17963 files; 271,078 target rows; 22s
+5000/17963 files; 290,939 target rows; 24s
+5500/17963 files; 309,850 target rows; 26s
+6000/17963 files; 334,796 target rows; 29s
+6500/17963 files; 361,636 target rows; 32s
+7000/17963 files; 387,792 target rows; 34s
+7500/17963 files; 414,400 target rows; 36s
+8000/17963 files; 449,276 target rows; 38s
+8500/17963 files; 469,794 target rows; 40s
+9000/17963 files; 503,526 target rows; 42s
+9500/17963 files; 530,849 target rows; 44s
+10000/17963 files; 556,631 target rows; 47s
+10500/17963 files; 582,302 target rows; 49s
+11000/17963 files; 606,930 target rows; 51s
+11500/17963 files; 637,928 target rows; 53s
+12000/17963 files; 666,414 target rows; 55s
+12500/17963 files; 693,968 target rows; 57s
+13000/17963 files; 719,406 target rows; 59s
+13500/17963 files; 757,209 target rows; 61s
+14000/17963 files; 782,713 target rows; 63s
+14500/17963 files; 812,089 target rows; 65s
+15000/17963 files; 843,556 target rows; 67s
+15500/17963 files; 870,216 target rows; 69s
+16000/17963 files; 902,533 target rows; 72s
+16500/17963 files; 927,766 target rows; 74s
+17000/17963 files; 959,669 target rows; 75s
+17500/17963 files; 988,305 target rows; 77s
+{
+  "sword_sources": [
+    {
+      "path": "/Volumes/PhD/SWORD/v17c/sword_AS_v17c_nodes.parquet",
+      "size_bytes": 1269036023,
+      "mtime_ns": 1777274190000000000
+    },
+    {
+      "path": "/Volumes/PhD/SWORD/v17c/sword_NA_v17c_nodes.parquet",
+      "size_bytes": 471470954,
+      "mtime_ns": 1777274190000000000
+    },
+    {
+      "path": "/Volumes/PhD/SWORD/v17c/sword_SA_v17c_nodes.parquet",
+      "size_bytes": 620931361,
+      "mtime_ns": 1777274190000000000
+    }
+  ],
+  "example_source": "/Users/6256481/Code/river-hierarchy/SWORD_gauge_match/outputs/hierarchy_example_reach_summary.csv",
+  "example_source_sha256": "b4908a0e3a55dbd467c495571dbb6fa47f289cb763a35564a0031cc9491acb63",
+  "filter_source": "/Users/6256481/Code/river-morphology-atlas/open_SWOT_files.py",
+  "filter_source_sha256": "2b418278b90b63b7aa18df84e22234120b29dbdd5cb6993547bc0ba1ad316bcf",
+  "filter": "wse_sm_u <= 1 AND dark_frac <= 0.5 AND ABS(xtrk_dist) BETWEEN 10000 AND 60000 AND wse_sm > 0",
+  "sword_field": "wse_obs_p50",
+  "swot_field": "wse_sm",
+  "scope": "All nodes on saved example reaches, including endpoint reaches; no optional reach buffer or spatial crop; no WSE filling.",
+  "files_scanned": 17963,
+  "file_errors": 0,
+  "total_archive_rows": 564049068,
+  "target_rows": 1010146,
+  "filtered_rows": 473247,
+  "invalid_qc_rows_passing_repository_filter": 16,
+  "strict_qc_coverage_changed_nodes": 1,
+  "duplicate_observation_rows": 34456,
+  "nodes_p50_changed_by_dedup": 10219,
+  "swot_extra_nodes": 0,
+  "swot_extra_valid_nodes": 0,
+  "first_filtered_observation": "2023-07-28T11:26:56Z",
+  "last_filtered_observation": "2025-11-12T06:44:35Z",
+  "all_examples": {
+    "sword_nodes": 19247,
+    "sword_valid": 18342,
+    "swot_valid": 18185,
+    "sword_missing": 905,
+    "swot_missing": 1062,
+    "recovered_by_swot": 25,
+    "sword_only": 182,
+    "neither": 880,
+    "net_gain": -157,
+    "median_swot_minus_sword_m": -0.08533000000001323,
+    "median_absolute_difference_m": 0.23682499999999962
+  },
+  "generated_examples": {
+    "sword_nodes": 17871,
+    "sword_valid": 17003,
+    "swot_valid": 16864,
+    "sword_missing": 868,
+    "swot_missing": 1007,
+    "recovered_by_swot": 25,
+    "sword_only": 164,
+    "neither": 843,
+    "net_gain": -139,
+    "median_swot_minus_sword_m": -0.06774499999994532,
+    "median_absolute_difference_m": 0.2210450000000037
+  },
+  "elapsed_seconds": 81.55730414390564
+}
+ example_id  generated_network  sword_nodes  sword_valid  swot_valid  sword_missing  swot_missing  recovered_by_swot  sword_only  neither  net_gain  median_swot_minus_sword_m  median_absolute_difference_m
+          2               True          623          623         621              0             2                  0           2        0        -2                   0.149170                      0.149170
+          3               True          320          223         217             97           103                  0           6       97        -6                  -0.216620                      0.217120
+          5               True          916          916         915              0             1                  0           1        0        -1                  -0.313350                      0.315330
+         10              False         1376         1339        1321             37            55                  0          18       37       -18                  -0.934495                      0.944310
+         11               True          325          325         319              0             6                  0           6        0        -6                   2.505450                      2.505450
+         13               True         1448         1381        1376             67            72                  0           5       67        -5                   1.170837                      1.173977
+         15               True          519          519         513              0             6                  0           6        0        -6                  -0.888776                      0.893723
+         21               True          949          926         861             23            88                  0          65       23       -65                   2.519680                      2.520014
+         22               True         1720         1346        1326            374           394                  8          28      366       -20                   2.651865                      2.665710
+         37               True          492          492         492              0             0                  0           0        0         0                  -0.054922                      0.059182
+         41               True         2543         2542        2543              1             0                  1           0        0         1                  -0.271985                      0.271985
+         45               True         1032         1032        1032              0             0                  0           0        0         0                  -0.145290                      0.164807
+         46               True         3902         3785        3757            117           145                  8          36      109       -28                  -0.122790                      0.130685
+         48               True          491          491         491              0             0                  0           0        0         0                  -0.020110                      0.076520
+         54               True          814          689         687            125           127                  6           8      119        -2                   0.003765                      0.038955
+         55               True         1300         1238        1239             62            61                  2           1       60         1                  -0.014330                      0.036795
+         56               True          477          475         475              2             2                  0           0        2         0                  -0.086110                      0.094200

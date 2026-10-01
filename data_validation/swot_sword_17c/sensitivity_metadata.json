@@ -1,0 +1,11 @@
+{
+  "duplicated_groups": 30994,
+  "duplicate_groups_with_different_wse": 5962,
+  "median_absolute_p50_change_m": 0.004345000000000709,
+  "maximum_absolute_p50_change_m": 4.1028,
+  "primary": "all file rows, matching existing repository aggregation",
+  "sensitivity": "first file in sorted filename order for each node/reach/cycle/pass/time; diagnostic only, not a preferred product-version selection",
+  "invalid_qc_coverage_changed_node_ids": [
+    44250000060371
+  ]
+}

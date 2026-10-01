@@ -1,0 +1,67 @@
+{
+  "sword_sources": [
+    {
+      "path": "/Volumes/PhD/SWORD/v17c/sword_AS_v17c_nodes.parquet",
+      "size_bytes": 1269036023,
+      "mtime_ns": 1777274190000000000
+    },
+    {
+      "path": "/Volumes/PhD/SWORD/v17c/sword_NA_v17c_nodes.parquet",
+      "size_bytes": 471470954,
+      "mtime_ns": 1777274190000000000
+    },
+    {
+      "path": "/Volumes/PhD/SWORD/v17c/sword_SA_v17c_nodes.parquet",
+      "size_bytes": 620931361,
+      "mtime_ns": 1777274190000000000
+    }
+  ],
+  "example_source": "/Users/6256481/Code/river-hierarchy/SWORD_gauge_match/outputs/hierarchy_example_reach_summary.csv",
+  "example_source_sha256": "b4908a0e3a55dbd467c495571dbb6fa47f289cb763a35564a0031cc9491acb63",
+  "filter_source": "/Users/6256481/Code/river-morphology-atlas/open_SWOT_files.py",
+  "filter_source_sha256": "2b418278b90b63b7aa18df84e22234120b29dbdd5cb6993547bc0ba1ad316bcf",
+  "filter": "wse_sm_u <= 1 AND dark_frac <= 0.5 AND ABS(xtrk_dist) BETWEEN 10000 AND 60000 AND wse_sm > 0",
+  "sword_field": "wse_obs_p50",
+  "swot_field": "wse_sm",
+  "scope": "All nodes on saved example reaches, including endpoint reaches; no optional reach buffer or spatial crop; no WSE filling.",
+  "files_scanned": 17963,
+  "file_errors": 0,
+  "total_archive_rows": 564049068,
+  "target_rows": 1010146,
+  "filtered_rows": 473247,
+  "invalid_qc_rows_passing_repository_filter": 16,
+  "strict_qc_coverage_changed_nodes": 1,
+  "duplicate_observation_rows": 34456,
+  "nodes_p50_changed_by_dedup": 10219,
+  "swot_extra_nodes": 0,
+  "swot_extra_valid_nodes": 0,
+  "first_filtered_observation": "2023-07-28T11:26:56Z",
+  "last_filtered_observation": "2025-11-12T06:44:35Z",
+  "all_examples": {
+    "sword_nodes": 19247,
+    "sword_valid": 18342,
+    "swot_valid": 18185,
+    "sword_missing": 905,
+    "swot_missing": 1062,
+    "recovered_by_swot": 25,
+    "sword_only": 182,
+    "neither": 880,
+    "net_gain": -157,
+    "median_swot_minus_sword_m": -0.08533000000001323,
+    "median_absolute_difference_m": 0.23682499999999962
+  },
+  "generated_examples": {
+    "sword_nodes": 17871,
+    "sword_valid": 17003,
+    "swot_valid": 16864,
+    "sword_missing": 868,
+    "swot_missing": 1007,
+    "recovered_by_swot": 25,
+    "sword_only": 164,
+    "neither": 843,
+    "net_gain": -139,
+    "median_swot_minus_sword_m": -0.06774499999994532,
+    "median_absolute_difference_m": 0.2210450000000037
+  },
+  "elapsed_seconds": 81.55730414390564
+}
