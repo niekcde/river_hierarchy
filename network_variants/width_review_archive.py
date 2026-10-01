@@ -368,6 +368,145 @@ def archive_base_width_review(
     }
 
 
+def recover_base_width_review_archive(
+    variant_output_dir: str | Path,
+    *,
+    source_links_path: str | Path,
+    source_nodes_path: str | Path,
+    cleaned_mask_path: str | Path,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Reconstruct a lost run-level archive from a completed base variant.
+
+    Older experiments retain their reviewed candidate labels in the completed
+    base width product even when a later storage cleanup removed the separate
+    ``width_review`` folder.  This recovery is deliberately conservative: it
+    accepts only a complete good/bad classification already marked as having
+    come from a permanent archive, and records the exact base product from
+    which the archive was recovered.
+    """
+    variant = Path(variant_output_dir).expanduser().resolve()
+    families_path = variant / "widths" / "links_with_width_families.gpkg"
+    if not families_path.exists():
+        raise FileNotFoundError(f"Completed base width product does not exist: {families_path}")
+    source_links = Path(source_links_path).expanduser().resolve()
+    source_nodes = Path(source_nodes_path).expanduser().resolve()
+    cleaned_mask = Path(cleaned_mask_path).expanduser().resolve()
+    for label, path in {
+        "source links": source_links,
+        "source nodes": source_nodes,
+        "cleaned mask": cleaned_mask,
+    }.items():
+        if not path.exists():
+            raise FileNotFoundError(f"Required {label} does not exist: {path}")
+
+    families = gpd.read_file(families_path)
+    required = {"id_link", "manual_width_review_candidate", "manual_width_review_decision"}
+    missing = sorted(required.difference(families.columns))
+    if missing:
+        raise ValueError(f"Base width product cannot recover review labels; missing={missing}")
+    if "manual_width_review_source" in families.columns:
+        sources = families.loc[
+            families["manual_width_review_candidate"].fillna(False).astype(bool),
+            "manual_width_review_source",
+        ].astype("string").dropna().unique().tolist()
+        if sources != ["permanent_archive"]:
+            raise ValueError(
+                "Base width product has no unambiguous permanent-review provenance: "
+                f"sources={sources}"
+            )
+    candidates = families.loc[
+        families["manual_width_review_candidate"].fillna(False).astype(bool),
+        ["id_link", "manual_width_review_decision"],
+    ].copy()
+    candidates["id_link"] = pd.to_numeric(candidates["id_link"], errors="raise").astype(int)
+    candidates["review_decision"] = (
+        candidates.pop("manual_width_review_decision").astype("string").str.strip().str.lower()
+    )
+    if candidates.empty or candidates["id_link"].duplicated().any():
+        raise ValueError("Recovered review candidates must be non-empty with unique link IDs.")
+    invalid = candidates.loc[~candidates["review_decision"].isin(["good", "bad"]), "id_link"].tolist()
+    if invalid:
+        raise ValueError(f"Recovered review decisions are incomplete/invalid for links: {invalid}")
+
+    archive_dir = review_archive_dir(source_links)
+    paths = _archive_paths(archive_dir)
+    existing = [path for path in paths.values() if path.exists()]
+    if existing and not overwrite:
+        raise FileExistsError(
+            "A width-review archive already exists; recovery refuses to replace it: "
+            + ", ".join(str(path) for path in existing)
+        )
+    if existing and overwrite:
+        version_existing_review_archive(archive_dir)
+
+    source_frame = gpd.read_file(source_links)
+    targets = _build_review_targets(candidates, source_frame, require_complete=True)
+    example_id = normalize_example_id(families.iloc[0].get("example_id", source_links.stem.split("_")[0]))
+    summary = {
+        "schema_version": "base-width-review-recovery-v1",
+        "recovered_at": datetime.now(timezone.utc).isoformat(),
+        "recovery_source_variant": str(variant),
+        "recovery_source_width_product": str(families_path),
+        "recovery_source_width_product_sha256": _sha256(families_path),
+        "decision_count": int(len(candidates)),
+        "rationale": (
+            "Recovered from completed base product retaining permanent-archive review provenance; "
+            "numeric reviewed width targets are retained only as historical audit fields."
+        ),
+    }
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_csv(candidates.sort_values("id_link", kind="mergesort"), paths["decisions"])
+    _atomic_write_json(summary, paths["summary"])
+    _atomic_copy(source_links, paths["links_snapshot"])
+    _atomic_write_csv(targets, paths["targets"])
+    counts = candidates["review_decision"].value_counts().to_dict()
+    manifest = {
+        "schema_version": ARCHIVE_SCHEMA_VERSION,
+        "example_id": example_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": {
+            "recovered_from_variant": str(variant),
+            "recovered_from_width_product": str(families_path),
+            "reviewed_links": str(source_links),
+            "reviewed_nodes": str(source_nodes),
+            "cleaned_mask": str(cleaned_mask),
+        },
+        "recovery": summary,
+        "files": {key: path.name for key, path in paths.items() if key != "manifest"},
+        "counts": {
+            "review_rows": int(len(candidates)),
+            "good": int(counts.get("good", 0)),
+            "bad": int(counts.get("bad", 0)),
+            "source_links": int(len(source_frame)),
+        },
+        "review_completion_status": "complete",
+        "archive_file_sha256": {
+            key: _sha256(path) for key, path in paths.items() if key != "manifest"
+        },
+        "review_status": "recovered_unfingerprinted",
+    }
+    _atomic_write_json(manifest, paths["manifest"])
+    # Import locally to avoid a module-level archive/fingerprint cycle.
+    from network_variants.width_review_fingerprint import upgrade_review_fingerprints
+
+    upgrade_review_fingerprints(
+        archive_dir,
+        mask_path=cleaned_mask,
+        links_path=source_links,
+        nodes_path=source_nodes,
+    )
+    return {
+        "example_id": example_id,
+        "archive_dir": str(archive_dir),
+        "manifest": str(paths["manifest"]),
+        "recovered_review_rows": int(len(candidates)),
+        "good": int(counts.get("good", 0)),
+        "bad": int(counts.get("bad", 0)),
+        "source_width_product_sha256": _sha256(families_path),
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Copy completed base-width reviews into durable per-example archives."

@@ -14,13 +14,16 @@ from network_variants.width_review_archive import archive_base_width_review
 from network_variants.width_review_fingerprint import (
     CORRUPT_STATUS,
     CURRENT_STATUS,
+    DIRECTION_ONLY_CURRENT_STATUS,
     INCOMPLETE_REVIEW_STATUS,
     STALE_LINK_IDS_STATUS,
     STALE_MASK_STATUS,
     STALE_TOPOLOGY_STATUS,
     STALE_WIDTH_METHOD_STATUS,
     upgrade_review_fingerprints,
+    validate_direction_only_review_continuity,
     validate_review_fingerprints,
+    write_direction_only_review_continuity,
 )
 
 
@@ -177,6 +180,41 @@ def test_direction_or_topology_change_marks_review_stale(tmp_path: Path) -> None
     )
 
     assert result["status"] == STALE_TOPOLOGY_STATUS
+
+
+def test_explicit_whole_network_direction_continuity_is_accepted(tmp_path: Path) -> None:
+    archive, mask, links_path, nodes_path, _ = _review_fixture(tmp_path)
+    links = gpd.read_file(links_path)
+    links[["id_us_node", "id_ds_node"]] = links[["id_ds_node", "id_us_node"]]
+    # Reverse coordinate order as a direction-aware raw writer may do.  The
+    # correction is valid because the geometric line remains equal.
+    links.geometry = links.geometry.map(lambda geometry: LineString(list(geometry.coords)[::-1]))
+    nodes = gpd.read_file(nodes_path)
+    nodes["is_inlet"], nodes["is_outlet"] = nodes["is_outlet"], nodes["is_inlet"]
+    corrected_links = tmp_path / "corrected_links.gpkg"
+    corrected_nodes = tmp_path / "corrected_nodes.gpkg"
+    _write_gpkg(links, corrected_links)
+    _write_gpkg(nodes, corrected_nodes)
+
+    record = write_direction_only_review_continuity(
+        archive,
+        mask_path=mask,
+        links_path=corrected_links,
+        nodes_path=corrected_nodes,
+        prior_exit_sides="SW",
+        corrected_exit_sides="WS",
+        output_path=tmp_path / "continuity.json",
+    )
+    result = validate_direction_only_review_continuity(
+        archive,
+        continuity_path=record["continuity_path"],
+        mask_path=mask,
+        links_path=corrected_links,
+        nodes_path=corrected_nodes,
+    )
+
+    assert result["status"] == DIRECTION_ONLY_CURRENT_STATUS
+    assert result["direction_continuity_audit"]["reversed_link_ids"] == [1, 2]
 
 
 def test_width_method_change_marks_review_stale(tmp_path: Path) -> None:

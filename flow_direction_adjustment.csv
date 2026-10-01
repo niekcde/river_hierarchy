@@ -1,0 +1,8 @@
+example_id,adjustment_scope,link_id,current_exit_sides,corrected_exit_sides,status,reason
+13,whole_network,,SW,WS,confirmed,"Directed source-to-sink WSE gradient was reversed; swap ordered RivGraph inlet/outlet sides."
+13,link,94,,,confirmed,"Post-RivGraph whole-network correction: reverse retained interior direction 64->63 to 63->64; required to restore the WS DAG."
+13,link,97,,,confirmed,"Post-RivGraph whole-network correction: reverse retained interior direction 65->64 to 64->65; required to restore the WS DAG."
+13,link,146,,,confirmed,"Post-RivGraph whole-network correction: reverse retained interior direction 96->99 to 99->96; completes the verified whole-network WS reversal."
+15,link,130,,,confirmed,"Manual link-direction correction: reverse link 130 (83->88 to 88->83)."
+45,whole_network,,NS,SN,confirmed,"Directed source-to-sink WSE gradient was reversed; swap ordered RivGraph inlet/outlet sides."
+48,whole_network,,WN,NW,confirmed,"Directed source-to-sink WSE gradient was reversed; swap ordered RivGraph inlet/outlet sides."

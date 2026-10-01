@@ -1,0 +1,30 @@
+[
+  {
+    "example_id": "15",
+    "n_links_reversed": 1,
+    "reversed_link_ids": [
+      130
+    ],
+    "links_path": "rivgraph_centerline/outputs/runs/15/rivgraph/15_links.gpkg",
+    "links_source_path": "rivgraph_centerline/outputs/runs/15/rivgraph/15_links.gpkg",
+    "old_backup_mode": "overwrite",
+    "nodes_path": "rivgraph_centerline/outputs/runs/15/rivgraph/15_nodes.gpkg",
+    "links_backup_path": "rivgraph_centerline/outputs/runs/15/rivgraph/15_links_old.gpkg",
+    "manual_link_csv_path": "rivgraph_centerline/outputs/runs/15/rivgraph/manual_link_directions.csv",
+    "manual_link_csv_backup_path": "rivgraph_centerline/outputs/runs/15/rivgraph/manual_link_directions_old.csv",
+    "validation_output_dir": "hierarchy_level_definition/graph_building/outputs_direction130/15",
+    "validation_is_valid": true,
+    "validation_issues": [],
+    "reversal_details": [
+      {
+        "link_id": 130,
+        "old_us_node": 83,
+        "old_ds_node": 88,
+        "new_us_node": 88,
+        "new_ds_node": 83,
+        "old_id_nodes": "83, 88",
+        "new_id_nodes": "88, 83"
+      }
+    ]
+  }
+]

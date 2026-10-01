@@ -333,6 +333,13 @@ def write_review_outputs(
     links: gpd.GeoDataFrame,
     manual_link_frame: pd.DataFrame,
 ) -> None:
+    # GeoPackages copied from a differently named trial can retain an internal
+    # layer name that does not match their filename. GeoPandas otherwise adds
+    # a second layer when writing here, while ordinary readers open the stale
+    # first layer. The caller has already made an explicit recoverable backup;
+    # replace the working container so it has exactly one canonical layer.
+    if paths.links_path.suffix.lower() == ".gpkg":
+        paths.links_path.unlink(missing_ok=True)
     links.to_file(paths.links_path, driver="GPKG")
     manual_link_frame.to_csv(paths.manual_link_csv_path, index=False)
 

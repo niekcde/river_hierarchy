@@ -18,6 +18,8 @@ from network_variants.width_review_archive import (
 from network_variants.width_review_fingerprint import (
     CORRUPT_STATUS,
     CURRENT_STATUS,
+    DIRECTION_ONLY_CURRENT_STATUS,
+    validate_direction_only_review_continuity,
     validate_review_fingerprints,
 )
 
@@ -238,6 +240,7 @@ def attach_permanent_base_review_provenance(
     reviewed_links_path: str | Path,
     reviewed_nodes_path: str | Path,
     cleaned_mask_path: str | Path,
+    direction_review_continuity_path: str | Path | None = None,
 ) -> tuple[gpd.GeoDataFrame, dict[str, Any]]:
     """Attach durable human labels without applying historical numeric targets."""
     if "id_link" not in enriched_links.columns:
@@ -257,6 +260,14 @@ def attach_permanent_base_review_provenance(
     reviewed_links = Path(reviewed_links_path).expanduser().resolve()
     archive_dir = review_archive_dir(reviewed_links)
     manifest_path = archive_dir / ARCHIVE_MANIFEST_NAME
+    # A direction-continuity record is opt-in and lives beside the immutable
+    # review archive. Ordinary runs have no such file and therefore retain the
+    # normal strict freshness behaviour.
+    resolved_continuity_path = (
+        Path(direction_review_continuity_path).expanduser().resolve()
+        if direction_review_continuity_path is not None
+        else archive_dir / "direction_only_continuity.json"
+    )
     common_summary = {
         "application_version": BASE_REVIEW_PROVENANCE_VERSION,
         "archive_dir": str(archive_dir),
@@ -282,13 +293,21 @@ def attach_permanent_base_review_provenance(
         links_path=reviewed_links,
         nodes_path=reviewed_nodes_path,
     )
+    if resolved_continuity_path.exists() and validation.get("status") != CURRENT_STATUS:
+        validation = validate_direction_only_review_continuity(
+            archive_dir,
+            continuity_path=resolved_continuity_path,
+            mask_path=cleaned_mask_path,
+            links_path=reviewed_links,
+            nodes_path=reviewed_nodes_path,
+        )
     status = str(validation.get("status"))
     if status == CORRUPT_STATUS:
         raise ValueError(
             f"Permanent width-review archive is corrupt and cannot be used: {archive_dir}; "
             f"issues={validation.get('issues', [])}"
         )
-    if status != CURRENT_STATUS:
+    if status not in {CURRENT_STATUS, DIRECTION_ONLY_CURRENT_STATUS}:
         return result, {
             **common_summary,
             "status": "skipped_stale_or_incomplete",
@@ -350,7 +369,11 @@ def attach_permanent_base_review_provenance(
     counts = decisions["review_decision"].value_counts().to_dict()
     return result, {
         **common_summary,
-        "status": "attached",
+        "status": (
+            "attached_direction_only_continuity"
+            if status == DIRECTION_ONLY_CURRENT_STATUS
+            else "attached"
+        ),
         "review_status": status,
         "review_completion_status": completion_status,
         "legacy_completion_status_assumed": "review_completion_status" not in manifest,
@@ -361,4 +384,10 @@ def attach_permanent_base_review_provenance(
         "reviewed_candidate_count": int(len(decisions)),
         "good_count": int(counts.get("good", 0)),
         "bad_count": int(counts.get("bad", 0)),
+        "direction_review_continuity_path": (
+            str(resolved_continuity_path)
+            if resolved_continuity_path.exists()
+            else None
+        ),
+        "direction_continuity_audit": validation.get("direction_continuity_audit"),
     }
