@@ -1087,6 +1087,34 @@ def test_run_prepared_experiment_can_publish_compact_results_and_drop_prep(tmp_p
     assert len(wave_stack.reaches) == 1
 
 
+def test_run_prepared_experiment_recovers_compact_result_after_prep_cleanup(tmp_path: Path) -> None:
+    """A restart must recognise publication when the disposable prep is gone."""
+    experiment_dir = _write_state(tmp_path)
+    work_root = tmp_path / "rapid-work"
+    prep_registry = prepare_experiment(
+        experiment_dir,
+        forcing_path=experiment_dir / "forcing.csv",
+        prep_config=RapidPrepConfig(),
+        work_root=work_root,
+    )
+    storage = RapidResultStorageConfig(
+        compact_qout=True,
+        retain_prepared_inputs=False,
+        write_mapping_parquet=True,
+    )
+    first = run_prepared_experiment(experiment_dir, storage_config=storage)
+    prep_dir = Path(prep_registry.loc[0, "rapid_prep_dir"])
+    assert first.loc[0, "status"] == "ran"
+    assert not prep_dir.exists()
+
+    recovered = run_prepared_experiment(experiment_dir, storage_config=storage)
+    row = recovered.iloc[0]
+    assert row["status"] == "ran"
+    assert bool(row["recovered_existing_published_result"])
+    assert not bool(row["rapid_prep_retained"])
+    assert Path(row["qout_nc"]).exists()
+
+
 def test_compact_publication_moves_reach_geometry_on_the_same_volume(tmp_path: Path) -> None:
     """Avoid a temporary second large GeoPackage before disposable prep is removed."""
     from rapid_tools.engine import _publish_compact_result

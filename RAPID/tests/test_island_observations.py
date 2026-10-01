@@ -188,6 +188,75 @@ def test_prepare_island_observations_inherits_source_unit_timestep_pair(
     assert calls[0][1]["timestep_selection"]["selection_mode"] == "inherited_base_source_unit_timestep"
 
 
+def test_prepare_island_observations_accepts_documented_timestep_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A narrow-but-stable island may use an explicit recorded clock."""
+    forcing = tmp_path / "forcing.parquet"
+    forcing.touch()
+    base = tmp_path / "base_experiment"
+    base.mkdir()
+    (base / "rapid_prep_manifest.json").write_text(json.dumps({
+        "forcing_path": str(forcing),
+        "forcing_config": {"resample_seconds": 1180},
+        "prep_config": {"kb_mode": "fixed", "preferred_routing_dt_seconds": 1180},
+        "reference_kb_summary": {},
+        "timestep_plan": {"selected_unique_routing_dt_seconds": [1180]},
+    }))
+    state = tmp_path / "island_state"
+    state.mkdir()
+    products = []
+    for name in ("links.gpkg", "nodes.gpkg", "widths.gpkg"):
+        product = state / name
+        product.touch()
+        products.append(product)
+    hydraulic = state / "hydraulic"
+    hydraulic.mkdir()
+    analysis_path = tmp_path / "island_analysis_manifest.csv"
+    pd.DataFrame([{
+        "island_id": "island_narrow_clock",
+        "analysis_backend": "island_full_raster",
+        "analysis_state_dir": str(state),
+        "analysis_directed_links_path": str(products[0]),
+        "analysis_directed_nodes_path": str(products[1]),
+        "analysis_routing_width_links_path": str(products[2]),
+    }]).to_csv(analysis_path, index=False)
+    hydraulic_path = tmp_path / "island_hydraulic_context_registry.csv"
+    pd.DataFrame([{
+        "island_id": "island_narrow_clock",
+        "hydraulic_context_dir": str(hydraulic),
+    }]).to_csv(hydraulic_path, index=False)
+    calls = []
+
+    def fake_prepare(context, **kwargs):
+        calls.append(kwargs)
+        return {"state_id": context.state_id, "status": "prepared"}
+
+    monkeypatch.setattr("rapid_tools.island_observations.prepare_state", fake_prepare)
+    prepare_island_observations(
+        analysis_path,
+        hydraulic_context_registry_path=hydraulic_path,
+        base_experiment_dir=base,
+        island_ids=["island_narrow_clock"],
+        island_forcing_routing_dt_seconds={"island_narrow_clock": 920},
+    )
+
+    assert calls[0]["planned_routing_dt_seconds"] == 920
+    assert calls[0]["forcing_config"].resample_seconds == 920
+    assert calls[0]["prep_config"].preferred_routing_dt_seconds == 920
+    assert calls[0]["timestep_selection"]["selection_mode"] == (
+        "explicit_island_forcing_routing_timestep_override"
+    )
+    assert calls[0]["timestep_selection"]["island_forcing_routing_dt_override_seconds"] == 920
+    registry = pd.read_csv(tmp_path / "island_rapid_prep_registry.csv")
+    row = registry.iloc[0]
+    assert row["island_timestep_selection_mode"] == (
+        "explicit_island_forcing_routing_timestep_override"
+    )
+    assert row["island_forcing_routing_dt_override_seconds"] == 920
+
+
 def test_targeted_island_preparation_preserves_non_target_registry_records(
     tmp_path: Path,
     monkeypatch,
@@ -257,6 +326,73 @@ def test_targeted_island_preparation_preserves_non_target_registry_records(
     assert result[["island_id", "status"]].to_dict("records") == [
         {"island_id": "retry_me", "status": "prepared"},
         {"island_id": "already_an_alias", "status": "referenced_existing_independent_state"},
+    ]
+
+
+def test_targeted_island_preparation_recovers_from_empty_registry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A full-disk interruption must not prevent a storage-bounded restart."""
+    forcing = tmp_path / "forcing.parquet"
+    forcing.touch()
+    base = tmp_path / "base_experiment"
+    base.mkdir()
+    (base / "rapid_prep_manifest.json").write_text(json.dumps({
+        "forcing_path": str(forcing),
+        "forcing_config": {"resample_seconds": 300},
+        "prep_config": {"kb_mode": "fixed", "preferred_routing_dt_seconds": 300},
+        "reference_kb_summary": {},
+        "timestep_plan": {"selected_unique_routing_dt_seconds": [300]},
+    }))
+    state = tmp_path / "island_state"
+    state.mkdir()
+    products = []
+    for name in ("links.gpkg", "nodes.gpkg", "widths.gpkg"):
+        product = state / name
+        product.touch()
+        products.append(product)
+    hydraulic = state / "hydraulic"
+    hydraulic.mkdir()
+    analysis_path = tmp_path / "island_analysis_manifest.csv"
+    pd.DataFrame([
+        {
+            "island_id": "retry_after_disk_full",
+            "analysis_backend": "island_local_patch",
+            "analysis_state_dir": str(state),
+            "analysis_directed_links_path": str(products[0]),
+            "analysis_directed_nodes_path": str(products[1]),
+            "analysis_routing_width_links_path": str(products[2]),
+        },
+        {
+            "island_id": "alias_survives_recovery",
+            "analysis_backend": "independent_unit_alias",
+            "analysis_state_dir": str(state),
+            "canonical_state_dir": str(state),
+        },
+    ]).to_csv(analysis_path, index=False)
+    hydraulic_path = tmp_path / "island_hydraulic_context_registry.csv"
+    pd.DataFrame([
+        {"island_id": "retry_after_disk_full", "hydraulic_context_dir": str(hydraulic)},
+        {"island_id": "alias_survives_recovery", "hydraulic_context_dir": str(hydraulic)},
+    ]).to_csv(hydraulic_path, index=False)
+    # This is the exact artifact left by a failed CSV write after preparation.
+    (tmp_path / "island_rapid_prep_registry.csv").write_bytes(b"")
+
+    monkeypatch.setattr(
+        "rapid_tools.island_observations.prepare_state",
+        lambda context, **kwargs: {"state_id": context.state_id, "status": "prepared"},
+    )
+    result = prepare_island_observations(
+        analysis_path,
+        hydraulic_context_registry_path=hydraulic_path,
+        base_experiment_dir=base,
+        island_ids=["retry_after_disk_full"],
+    )
+
+    assert result[["island_id", "status"]].to_dict("records") == [
+        {"island_id": "retry_after_disk_full", "status": "prepared"},
+        {"island_id": "alias_survives_recovery", "status": "referenced_existing_independent_state"},
     ]
 
 

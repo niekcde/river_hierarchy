@@ -249,6 +249,63 @@ def _island_context(row: pd.Series, hydraulic_row: pd.Series, *, work_root: Path
     )
 
 
+def _conceptual_island_prep_records(
+    analysis: pd.DataFrame,
+    hydraulic: pd.DataFrame,
+    *,
+    base_dir: Path,
+) -> list[dict[str, object]]:
+    """Create provenance-only records for aliases and strict exclusions.
+
+    Targeted preparation is also used by the storage-bounded streaming runner.
+    It must therefore be able to bootstrap a complete conceptual registry even
+    when a preceding all-at-once attempt left a zero-byte registry behind.
+    """
+    records: list[dict[str, object]] = []
+    for _, row in analysis.iterrows():
+        island_id = _text(row.get("island_id"))
+        backend = _text(row.get("analysis_backend"))
+        strict_status = _text(row.get("strict_analysis_status"))
+        if strict_status == "exclude_pruning_or_mask_topology_exception":
+            records.append({
+                "island_id": island_id,
+                "execution_backend": backend,
+                "status": "excluded_topology_review",
+                "analysis_state_dir": _text(row.get("analysis_state_dir")),
+                "rapid_prep_dir": "",
+                "rapid_run_dir": "",
+                "source_state_dir": _text(row.get("canonical_state_dir")),
+                "source_unit_id": row.get("source_unit_id"),
+                "anchor_bifurcation": row.get("anchor_bifurcation"),
+                "anchor_confluence": row.get("anchor_confluence"),
+                "hydraulic_context_output_dir": "",
+                "config_source_experiment": str(base_dir),
+            })
+            continue
+        if backend != "independent_unit_alias":
+            continue
+        if island_id not in hydraulic.index:
+            raise ValueError(f"Island hydraulic-context registry has no row for {island_id}.")
+        hydraulic_row = hydraulic.loc[island_id]
+        if isinstance(hydraulic_row, pd.DataFrame):
+            raise ValueError(f"Island hydraulic-context registry has duplicate rows for {island_id}.")
+        records.append({
+            "island_id": island_id,
+            "execution_backend": backend,
+            "status": "referenced_existing_independent_state",
+            "analysis_state_dir": _text(row.get("analysis_state_dir")),
+            "rapid_prep_dir": "",
+            "rapid_run_dir": "",
+            "source_state_dir": _text(row.get("canonical_state_dir")),
+            "source_unit_id": row.get("source_unit_id"),
+            "anchor_bifurcation": row.get("anchor_bifurcation"),
+            "anchor_confluence": row.get("anchor_confluence"),
+            "hydraulic_context_output_dir": _text(hydraulic_row.get("hydraulic_context_dir")),
+            "config_source_experiment": str(base_dir),
+        })
+    return records
+
+
 def prepare_island_observations(
     analysis_manifest_path: str | Path,
     *,
@@ -256,6 +313,7 @@ def prepare_island_observations(
     base_experiment_dir: str | Path,
     work_root: str | Path | None = None,
     island_ids: Collection[str] | None = None,
+    island_forcing_routing_dt_seconds: Mapping[str, int] | None = None,
 ) -> pd.DataFrame:
     """Prepare only genuine island states and register alias references.
 
@@ -266,6 +324,7 @@ def prepare_island_observations(
     analysis_path = Path(analysis_manifest_path).expanduser().resolve()
     hydraulic_path = Path(hydraulic_context_registry_path).expanduser().resolve()
     analysis = pd.read_csv(analysis_path, low_memory=False)
+    full_analysis = analysis.copy()
     hydraulic = pd.read_csv(hydraulic_path, low_memory=False).set_index("island_id")
     required = {"island_id", "analysis_backend", "analysis_state_dir"}
     missing = sorted(required - set(analysis.columns))
@@ -276,7 +335,8 @@ def prepare_island_observations(
 
     # A targeted retry is intentionally limited to genuine island states. The
     # aliases and topology-review exclusions are conceptual observations, not
-    # new RAPID preparations; their existing registry records remain intact.
+    # new RAPID preparations; they are reconstituted below from the full
+    # manifest so this also works after a partial, zero-byte registry write.
     requested_island_ids = {_text(value) for value in (island_ids or []) if _text(value)}
     if requested_island_ids:
         available_ids = set(analysis["island_id"].map(_text))
@@ -297,6 +357,29 @@ def prepare_island_observations(
                 f"these are aliases or exclusions: {sorted(non_genuine)}"
             )
         analysis = requested_rows.copy()
+
+    explicit_timestep_overrides: dict[str, int] = {}
+    for raw_island_id, raw_dt in (island_forcing_routing_dt_seconds or {}).items():
+        island_id = _text(raw_island_id)
+        try:
+            dt_seconds = int(raw_dt)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Island forcing/routing timestep override for {island_id!r} is not an integer: {raw_dt!r}"
+            ) from exc
+        if not island_id or dt_seconds <= 0:
+            raise ValueError(
+                "Island forcing/routing timestep overrides require a non-empty island ID "
+                "and a positive integer number of seconds."
+            )
+        explicit_timestep_overrides[island_id] = dt_seconds
+    available_island_ids = set(analysis["island_id"].map(_text))
+    unknown_overrides = sorted(set(explicit_timestep_overrides) - available_island_ids)
+    if unknown_overrides:
+        raise ValueError(
+            "Island forcing/routing timestep overrides are not in the selected preparation set: "
+            f"{unknown_overrides}"
+        )
 
     (
         base_dir,
@@ -363,14 +446,29 @@ def prepare_island_observations(
         context = _island_context(row, hydraulic_row, work_root=resolved_work_root)
         source_unit_id = _selected_unit_id(row.get("source_unit_id"))
         inherited_timestep = source_unit_timestep_plan.get(source_unit_id)
-        source_preferred_dt = (
+        explicit_timestep = explicit_timestep_overrides.get(island_id)
+        source_preferred_dt = explicit_timestep or (
             int(inherited_timestep["routing_dt_seconds"])
             if inherited_timestep is not None
             else fallback_planned_dt
         )
         state_forcing_config = forcing_config
         state_prep_config = prep_config
-        if inherited_timestep is not None:
+        if explicit_timestep is not None:
+            # This is a documented numerical-clock exception, not a hydraulic
+            # recalibration: retain the inherited hydraulic/K configuration,
+            # but require the named state to use the explicitly approved clock.
+            state_forcing_config = replace(
+                forcing_config,
+                resample_seconds=int(explicit_timestep),
+                resample_minutes=None,
+            )
+            state_prep_config = replace(
+                prep_config,
+                preferred_routing_dt_seconds=int(explicit_timestep),
+                forcing_dt_search_max_offset_seconds=0,
+            )
+        elif inherited_timestep is not None:
             state_forcing_config = replace(
                 forcing_config,
                 resample_seconds=int(inherited_timestep["forcing_dt_seconds"]),
@@ -385,7 +483,28 @@ def prepare_island_observations(
                 prep_config,
                 preferred_routing_dt_seconds=int(inherited_timestep["routing_dt_seconds"]),
             )
-        planned_dt = None if inherited_timestep is not None else fallback_planned_dt
+        planned_dt = (
+            int(explicit_timestep)
+            if explicit_timestep is not None
+            else (None if inherited_timestep is not None else fallback_planned_dt)
+        )
+        timestep_selection = {
+            "selection_mode": (
+                "explicit_island_forcing_routing_timestep_override"
+                if explicit_timestep is not None
+                else "inherited_base_source_unit_timestep"
+                if inherited_timestep is not None
+                else "inherited_base_fallback_timestep"
+            ),
+            "base_experiment_dir": str(base_dir),
+            "preferred_routing_dt_seconds": source_preferred_dt,
+            "planned_routing_dt_seconds": planned_dt,
+            "forcing_dt_seconds": int(state_forcing_config.resample_seconds)
+            if state_forcing_config.resample_seconds is not None else None,
+            "source_unit_id": source_unit_id,
+            "source_unit_timestep": inherited_timestep,
+            "island_forcing_routing_dt_override_seconds": explicit_timestep,
+        }
         try:
             result = prepare_state(
                 context,
@@ -394,20 +513,7 @@ def prepare_island_observations(
                 prep_config=state_prep_config,
                 reference_kb_summary=reference_kb_summary,
                 planned_routing_dt_seconds=planned_dt,
-                timestep_selection={
-                    "selection_mode": (
-                        "inherited_base_source_unit_timestep"
-                        if inherited_timestep is not None
-                        else "inherited_base_fallback_timestep"
-                    ),
-                    "base_experiment_dir": str(base_dir),
-                    "preferred_routing_dt_seconds": source_preferred_dt,
-                    "planned_routing_dt_seconds": planned_dt,
-                    "forcing_dt_seconds": int(state_forcing_config.resample_seconds)
-                    if state_forcing_config.resample_seconds is not None else None,
-                    "source_unit_id": source_unit_id,
-                    "source_unit_timestep": inherited_timestep,
-                },
+                timestep_selection=timestep_selection,
             )
             result.update({
                 "island_id": island_id,
@@ -417,6 +523,12 @@ def prepare_island_observations(
                 "anchor_bifurcation": row.get("anchor_bifurcation"),
                 "anchor_confluence": row.get("anchor_confluence"),
                 "config_source_experiment": str(base_dir),
+                # Keep clock-exception provenance after compact storage removes
+                # the regenerable per-state preparation manifest.
+                "island_timestep_selection_mode": timestep_selection["selection_mode"],
+                "island_forcing_routing_dt_override_seconds": explicit_timestep,
+                "source_unit_timestep": json.dumps(inherited_timestep, sort_keys=True)
+                if inherited_timestep is not None else "",
             })
         except Exception as exc:  # preserve an actionable state-level record
             result = {
@@ -440,15 +552,33 @@ def prepare_island_observations(
     output_root = analysis_path.parent
     registry = pd.DataFrame(records)
     registry_path = output_root / "island_rapid_prep_registry.csv"
-    if requested_island_ids and registry_path.exists():
-        previous = pd.read_csv(registry_path, low_memory=False)
-        if "island_id" not in previous.columns:
+    if requested_island_ids:
+        # An interrupted all-at-once preparation can leave an empty registry;
+        # treat that as no usable prior state rather than blocking recovery.
+        previous = pd.DataFrame()
+        if registry_path.exists() and registry_path.stat().st_size > 0:
+            try:
+                previous = pd.read_csv(registry_path, low_memory=False)
+            except pd.errors.EmptyDataError:
+                previous = pd.DataFrame()
+        if not previous.empty and "island_id" not in previous.columns:
             raise ValueError(f"Existing island RAPID prep registry has no island_id column: {registry_path}")
-        previous = previous.loc[~previous["island_id"].map(_text).isin(requested_island_ids)]
-        registry = pd.concat([previous, registry], ignore_index=True, sort=False)
+        conceptual_records = _conceptual_island_prep_records(
+            full_analysis, hydraulic, base_dir=base_dir
+        )
+        conceptual_ids = {_text(record["island_id"]) for record in conceptual_records}
+        if not previous.empty:
+            previous = previous.loc[
+                ~previous["island_id"].map(_text).isin(requested_island_ids | conceptual_ids)
+            ]
+        registry = pd.concat(
+            [previous, registry, pd.DataFrame(conceptual_records)],
+            ignore_index=True,
+            sort=False,
+        )
         # Restore conceptual-manifest ordering so a targeted retry does not
         # produce a misleading registry order.
-        full_order = pd.read_csv(analysis_path, low_memory=False)["island_id"].map(_text).tolist()
+        full_order = full_analysis["island_id"].map(_text).tolist()
         order = {island_id: index for index, island_id in enumerate(full_order)}
         registry = (
             registry.assign(_manifest_order=registry["island_id"].map(_text).map(order))
@@ -511,7 +641,12 @@ def run_prepared_island_observations(
             records.append({"island_id": island_id, "status": "excluded_topology_review"})
             continue
         if status != "prepared":
-            records.append({"island_id": island_id, "status": "not_run", "prep_status": status})
+            records.append({
+                "island_id": island_id,
+                "status": "not_run",
+                "prep_status": status,
+                "error": _text(row.get("error")),
+            })
             continue
         prep_dir = Path(_text(row.get("rapid_prep_dir"))).expanduser().resolve()
         run_dir = Path(_text(row.get("rapid_run_dir"))).expanduser().resolve()
@@ -707,3 +842,115 @@ def compare_island_to_independent_hydrographs(
         encoding="utf-8",
     )
     return result
+
+
+def stream_island_observations(
+    analysis_manifest_path: str | Path,
+    *,
+    hydraulic_context_registry_path: str | Path,
+    base_experiment_dir: str | Path,
+    work_root: str | Path,
+    island_ids: Collection[str] | None = None,
+    island_forcing_routing_dt_seconds: Mapping[str, int] | None = None,
+    storage_config: RapidResultStorageConfig | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Prepare and route genuine island states one at a time.
+
+    Preparation inputs are the large, disposable part of an island RAPID run.
+    This adapter bounds peak workspace use to one state: prepare one island,
+    publish its compact result, remove its prep inputs, and only then advance
+    to the next.  It is restart-safe because each targeted preparation retains
+    the complete conceptual alias/exclusion registry.
+    """
+    analysis_path = Path(analysis_manifest_path).expanduser().resolve()
+    analysis = pd.read_csv(analysis_path, low_memory=False)
+    genuine = analysis.loc[
+        ~analysis["analysis_backend"].map(_text).eq("independent_unit_alias")
+        & ~analysis.get("strict_analysis_status", pd.Series("", index=analysis.index)).map(_text).eq(
+            "exclude_pruning_or_mask_topology_exception"
+        )
+    ].copy()
+    available = genuine["island_id"].map(_text).tolist()
+    requested = [_text(value) for value in (island_ids or available) if _text(value)]
+    unknown = sorted(set(requested) - set(available))
+    if unknown:
+        raise ValueError(
+            "Streaming island RAPID accepts only genuine, non-excluded island IDs; "
+            f"unknown or conceptual IDs: {unknown}"
+        )
+    # Preserve manifest order and ignore accidental repeated CLI arguments.
+    requested_set = set(requested)
+    ordered_ids = [island_id for island_id in available if island_id in requested_set]
+    overrides = dict(island_forcing_routing_dt_seconds or {})
+    unknown_overrides = sorted(set(overrides) - set(ordered_ids))
+    if unknown_overrides:
+        raise ValueError(
+            "Streaming island timestep overrides must refer to a selected island: "
+            f"{unknown_overrides}"
+        )
+
+    storage = storage_config or RapidResultStorageConfig(
+        compact_qout=True,
+        retain_prepared_inputs=False,
+        write_mapping_parquet=True,
+    )
+    iteration_records: list[dict[str, object]] = []
+    prep_registry_path = analysis_path.parent / "island_rapid_prep_registry.csv"
+    for index, island_id in enumerate(ordered_ids, start=1):
+        registry = prepare_island_observations(
+            analysis_path,
+            hydraulic_context_registry_path=hydraulic_context_registry_path,
+            base_experiment_dir=base_experiment_dir,
+            work_root=work_root,
+            island_ids=[island_id],
+            island_forcing_routing_dt_seconds={island_id: overrides[island_id]}
+            if island_id in overrides else None,
+        )
+        prep_row = registry.loc[registry["island_id"].map(_text).eq(island_id)].iloc[0]
+        run_registry = run_prepared_island_observations(
+            prep_registry_path,
+            storage_config=storage,
+        )
+        run_row = run_registry.loc[run_registry["island_id"].map(_text).eq(island_id)].iloc[0]
+        iteration_records.append({
+            "sequence": index,
+            "island_id": island_id,
+            "prep_status": _text(prep_row.get("status")),
+            "run_status": _text(run_row.get("status")),
+            "error": _text(run_row.get("error")) or _text(prep_row.get("error")),
+        })
+
+    comparison = compare_island_to_independent_hydrographs(
+        analysis_path,
+        base_experiment_dir=base_experiment_dir,
+    )
+    final_prep = pd.read_csv(prep_registry_path, low_memory=False)
+    final_run = pd.read_csv(analysis_path.parent / "island_rapid_run_registry.csv", low_memory=False)
+    iteration = pd.DataFrame(iteration_records)
+    iteration.to_csv(analysis_path.parent / "island_rapid_stream_execution.csv", index=False)
+    (analysis_path.parent / "island_rapid_stream_manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "island-rapid-stream-v1",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "analysis_manifest": str(analysis_path),
+                "hydraulic_context_registry": str(Path(hydraulic_context_registry_path).expanduser().resolve()),
+                "base_experiment_dir": str(Path(base_experiment_dir).expanduser().resolve()),
+                "work_root": str(Path(work_root).expanduser().resolve()),
+                "island_ids": ordered_ids,
+                "island_forcing_routing_dt_seconds": overrides,
+                "storage_config": asdict(storage),
+                "n_streamed": len(ordered_ids),
+                "n_prepared": int(final_prep["status"].eq("prepared").sum()),
+                "n_prep_failed": int(final_prep["status"].eq("failed").sum()),
+                "n_ran": int(final_run["status"].eq("ran").sum()),
+                "n_run_failed": int(final_run["status"].eq("failed").sum()),
+                "n_compared": int(comparison["comparison_status"].eq("compared_island_vs_independent_unit").sum()),
+                "n_comparison_failed": int(comparison["comparison_status"].eq("comparison_failed").sum()),
+            },
+            indent=2,
+            sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    return final_prep, final_run, comparison

@@ -52,6 +52,98 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _nonempty_file(path: Path) -> bool:
+    """Whether a durable RAPID artifact is present and non-empty."""
+    return path.is_file() and path.stat().st_size > 0
+
+
+def _remove_disposable_prep(prep_dir: Path) -> None:
+    """Remove regenerable preparation safely on filesystems with delete races.
+
+    External APFS volumes can report a child as already removed while
+    ``shutil.rmtree`` is walking the directory (notably alongside ``._``
+    metadata files).  A completed run must not become a failed run merely
+    because that final, disposable cleanup sees such a race.
+    """
+    if not prep_dir.exists():
+        return
+
+    def ignore_already_missing(_function: object, _path: str, excinfo: object) -> None:
+        error = excinfo if isinstance(excinfo, BaseException) else excinfo[1]  # type: ignore[index]
+        if isinstance(error, FileNotFoundError):
+            return
+        raise error
+
+    shutil.rmtree(prep_dir, onexc=ignore_already_missing)
+    if prep_dir.exists():
+        raise OSError(f"Disposable RAPID prep directory was not fully removed: {prep_dir}")
+
+
+def _recover_published_result(
+    *,
+    state_id: str,
+    prep_dir: Path,
+    run_dir: Path,
+    storage: RapidResultStorageConfig,
+) -> dict[str, object] | None:
+    """Recover a complete result bundle after a cleanup-interrupted restart.
+
+    Compact publication intentionally removes preparation inputs.  On a
+    subsequent invocation, their absence is therefore expected when all final
+    products already exist; rerouting would be wasteful and could overwrite a
+    valid result.  Require every artifact promised by the selected storage
+    policy before treating that result as complete.
+    """
+    # A present preparation directory means this invocation deliberately
+    # rebuilt inputs (for example after an upstream hydraulic-context refresh).
+    # Never recover the previous run in that case: it was produced from an
+    # older prep bundle and must be replaced by routing the current one.
+    if prep_dir.exists():
+        return None
+
+    qout_gz = run_dir / f"{DEFAULT_QOUT_NAME}.gz"
+    qout_nc = run_dir / DEFAULT_QOUT_NAME
+    qout = qout_gz if _nonempty_file(qout_gz) else qout_nc
+    if not _nonempty_file(qout):
+        return None
+    if storage.compact_qout and qout != qout_gz:
+        return None
+
+    outlet = run_dir / "outlet_hydrograph.csv"
+    metrics_csv = run_dir / "hydrograph_metrics.csv"
+    metrics_json = run_dir / "hydrograph_metrics.json"
+    if not all(_nonempty_file(path) for path in (outlet, metrics_csv, metrics_json)):
+        return None
+
+    record: dict[str, object] = {
+        "state_id": state_id,
+        "rapid_prep_dir": str(prep_dir),
+        "rapid_run_dir": str(run_dir),
+        "qout_nc": str(qout),
+        "status": "ran",
+        "hydrograph_status": "computed",
+        "outlet_hydrograph_csv": str(outlet),
+        "hydrograph_metrics_csv": str(metrics_csv),
+        "hydrograph_metrics_json": str(metrics_json),
+        "recovered_existing_published_result": True,
+        "rapid_prep_retained": prep_dir.exists(),
+        "compact_qout": qout == qout_gz,
+    }
+    if storage.write_mapping_parquet:
+        mapping = run_dir / "rapid_link_mapping.parquet"
+        if not _nonempty_file(mapping):
+            return None
+        record["rapid_link_mapping_parquet"] = str(mapping)
+        record["rapid_link_mapping_sha256"] = _sha256(mapping)
+    if not storage.retain_prepared_inputs:
+        geometry = run_dir / "rapid_reach_attributes.gpkg"
+        if not _nonempty_file(geometry):
+            return None
+        record["rapid_reach_attributes_gpkg"] = str(geometry)
+        record["rapid_reach_attributes_sha256"] = _sha256(geometry)
+    return record
+
+
 def _publish_compact_result(
     *,
     prep_dir: Path,
@@ -389,6 +481,18 @@ def run_prepared_experiment(
         else:
             run_dir = Path(str(registered_run_dir)).expanduser().resolve()
         run_dir.mkdir(parents=True, exist_ok=True)
+        recovered = _recover_published_result(
+            state_id=str(getattr(row, "state_id")),
+            prep_dir=prep_dir,
+            run_dir=run_dir,
+            storage=storage,
+        )
+        if recovered is not None:
+            if not storage.retain_prepared_inputs and prep_dir.exists():
+                _remove_disposable_prep(prep_dir)
+                recovered["rapid_prep_retained"] = False
+            run_rows.append(recovered)
+            continue
         qout_path = run_dir / DEFAULT_QOUT_NAME
         try:
             output = run_prepared_state(prep_dir, output_path=qout_path)
@@ -422,7 +526,7 @@ def run_prepared_experiment(
             )
             run_row.update(published)
             if not storage.retain_prepared_inputs:
-                shutil.rmtree(prep_dir)
+                _remove_disposable_prep(prep_dir)
                 run_row["rapid_prep_retained"] = False
             else:
                 run_row["rapid_prep_retained"] = True
