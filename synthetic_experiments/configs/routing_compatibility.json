@@ -1,0 +1,23 @@
+{
+  "b65756cf37febf45fabf3b87": {
+    "routing_source": "ccdf1a7762ed0b2518ffb1ea",
+    "routing_provenance": {
+      "files": {
+        "synthetic_experiments.routing": "fb5ca721850043b024fb877d95328d52c36525cced1e85e08e767e3e5cef1646",
+        "rapid_tools.engine": "2c08308344ad540cff60856b2790deb3d1696b25891b8645f061860a9f9acad2",
+        "rapid_tools.prep": "9ced7cb1df5de05efdda60b4ad914f547bf53617d4496b2f3ce6ad4189aaf306",
+        "rapid_tools.k_values": "585320ff321729a072bca6e2cf7cb179642d0cdd4bdabd7361cd9ad87cc268ed"
+      },
+      "digest_source": "def digest(value):\n    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()[:24]\n",
+      "versions": {
+        "numpy": "1.26.4",
+        "scipy": "1.13.1",
+        "pandas": "2.2.3",
+        "networkx": "3.2.1",
+        "geopandas": "1.1.3",
+        "shapely": "2.1.2"
+      }
+    },
+    "evidence": "Captured before the main-island extension; the complete current source fingerprint exactly matched the baseline, extremes and full_grid manifests."
+  }
+}

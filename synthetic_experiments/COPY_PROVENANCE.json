@@ -1,0 +1,20 @@
+[
+  {
+    "source": "synthetic_runs/src/synthetic_runs/core/network.py",
+    "destination": "synthetic_experiments/src/synthetic_experiments/core/network.py",
+    "source_sha256": "05f3b579c9d7639484d22ae9e804a82873f84c78ab07dda2090dd95962166818",
+    "adaptations": "Plot hover length uses physical length_m when assigned, falling back to downstream span."
+  },
+  {
+    "source": "synthetic_runs/src/synthetic_runs/core/helpers.py",
+    "destination": "synthetic_experiments/src/synthetic_experiments/core/helpers.py",
+    "source_sha256": "34903012b7962253aca1dd42686d1244fa41caa06dcaf385b035819dff9c730c",
+    "adaptations": "Package import renamed where applicable; otherwise copied unchanged."
+  },
+  {
+    "source": "synthetic_runs/src/synthetic_runs/analysis/plotting.py",
+    "destination": "synthetic_experiments/src/synthetic_experiments/plotting.py",
+    "source_sha256": "df448989594b96f94b1a76606dffc2da3b46f3d78c0e6cd6c8fa7e0580ed41fd",
+    "adaptations": "Imports new package; plot extents use Params directly so a centerline without a corridor recipe can be plotted."
+  }
+]

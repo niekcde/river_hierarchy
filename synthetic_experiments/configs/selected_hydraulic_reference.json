@@ -1,0 +1,18 @@
+{
+  "decision_reference": "HYD-2026-09-30-SELECTED-ALPHA065",
+  "decision_date": "2026-09-30",
+  "scope": "synthetic experiments",
+  "depth_alpha": 0.65,
+  "depth_rule": "D_i = D_ref * (W_i / W_ref)^depth_alpha",
+  "kb_rule": "kb_i = kb_ref * (W_i / W_ref)^(1 - depth_alpha)",
+  "reference_method": "BASED at the existing single-centerline reference width, slope and peak discharge; reference shared across parent and child states",
+  "n_manning": 0.035,
+  "x": 0.1,
+  "target_length_m": 200,
+  "effective_length_floor_m": 200,
+  "allocation": "unchanged width-based allocation",
+  "resistance": "existing Chezy equation evaluated with local kb",
+  "reason": "User selected 0.65 after the literature-motivated scaling test and full synthetic feasibility scan; it retains margin below the approximately 0.6699015 integer-timestep boundary. This exponent is a modelling choice, not a measured or calibrated optimum.",
+  "real_case_decision": "deferred until new runs using updated slopes",
+  "existing_results": "Original factorial and extension hydrographs retain their saved settings; selecting this reference does not relabel or reroute those outputs."
+}

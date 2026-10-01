@@ -1,0 +1,15 @@
+{
+  "name": "embedded_width_length_extension",
+  "unit_reference_network_length_m": 20000,
+  "fixed_outer_unit_span_m": 10000,
+  "total_width_m": 500,
+  "reference_slope": 0.0001,
+  "inner_fraction": 0.5,
+  "internal_location": "central",
+  "outer_a_fraction": [0.05, 0.1, 0.2, 0.5, 0.8, 0.9, 0.95],
+  "length_multiplier": [1, 1.25, 1.5, 2, 3],
+  "network_extent_m": [20000, 100000, 400000, 800000],
+  "embedding": "equal straight upstream and downstream extensions; unit geometry and reference slope fixed",
+  "pilot": "all 0.05/0.95 shares x 1/3 multipliers x 20/800 km extents, plus 0.8 x 1 x 20 km anchor",
+  "note": "Separate 140-configuration extension; do not combine with original seven-factor ANOVA. Branch A is the lengthened simple branch; nested and crossover retain their existing family-specific targets."
+}

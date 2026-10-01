@@ -1,0 +1,41 @@
+{
+  "grid": {
+    "total_width_m": [
+      500
+    ],
+    "reference_slope": [
+      0.0001
+    ],
+    "outer_a_fraction": [
+      0.8
+    ],
+    "inner_fraction": [
+      0.5
+    ],
+    "length_multiplier": [
+      1.0
+    ],
+    "total_length_m": [
+      20000
+    ],
+    "internal_location": [
+      "central"
+    ]
+  },
+  "routing": {
+    "target_length_m": 200,
+    "effective_length_floor_m": 200,
+    "kb": 20,
+    "x": 0.1,
+    "n_manning": 0.35,
+    "min_celerity_mps": 0.05,
+    "max_celerity_mps": 2.524,
+    "chezy_cz": 22,
+    "baseflow_cms": 100,
+    "peak_cms": 1000,
+    "rise_hours": 12,
+    "fall_hours": 24,
+    "window_travel_multiplier": 3,
+    "minimum_buffer_hours": 48
+  }
+}

@@ -1,5 +1,10 @@
 # Synthetic Runs
 
+> Preserved legacy workflow. New controlled synthetic collapse experiments live
+> in [`../synthetic_experiments/`](../synthetic_experiments/README.md). Existing
+> code and paths here remain intact for reproducibility; new implementation work
+> belongs in the separate package.
+
 This subproject is being reorganized from the legacy synthetic-network code
 copied from the old `river_hierarchy` repository.
 

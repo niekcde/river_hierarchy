@@ -1,0 +1,9 @@
+{
+  "reference": "SYN-2026-09-30-SELECTED-RERUN",
+  "results_root": "synthetic_experiments/outputs/hydraulic_alpha065_20260930",
+  "depth_alpha": 0.65,
+  "n_manning": 0.035,
+  "reference_depth": "BASED per configuration",
+  "status": "complete",
+  "real_case_decision": "deferred pending new runs using updated slopes"
+}
