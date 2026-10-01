@@ -229,6 +229,15 @@ def test_full_raster_adapter_runs_only_reruns_and_reuses_completed_output(
         "example_id": "56",
         "match_tolerance": 1.0,
     }
+    # AppleDouble metadata on an external macOS volume must not prevent the
+    # full-raster fallback from consuming its otherwise clean local fallback.
+    local_fallback = (
+        output / "island_reruns" / "island_56_002" / "local_patch"
+        / "fallback_to_full_raster.json"
+    )
+    local_fallback.parent.mkdir(parents=True, exist_ok=True)
+    local_fallback.write_text("{}", encoding="utf-8")
+    (local_fallback.parent.parent / "._local_patch").write_text("metadata", encoding="utf-8")
     report = island_module.run_island_full_raster_observations(
         output / "island_observation_manifest.csv", **kwargs
     )

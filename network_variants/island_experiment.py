@@ -989,6 +989,8 @@ def generate_island_hydraulic_contexts(
     base_node_context_path: str | Path,
     slope_config: object | None = None,
     output_dir: str | Path | None = None,
+    refresh_existing: bool = False,
+    backup_existing_dir: str | Path | None = None,
 ) -> pd.DataFrame:
     """Generate hydraulic context only for non-aliased island observations.
 
@@ -1016,6 +1018,7 @@ def generate_island_hydraulic_contexts(
     if not base_link.exists() or not base_node.exists():
         raise FileNotFoundError("Island hydraulic context requires complete base link/node context products.")
 
+    backup_root = Path(backup_existing_dir).resolve() if backup_existing_dir is not None else None
     records: list[dict[str, object]] = []
     for row in analysis.itertuples(index=False):
         island_id = str(row.island_id)
@@ -1061,6 +1064,9 @@ def generate_island_hydraulic_contexts(
 
         context_dir = state_dir / "hydraulic_context"
         manifest_file = context_dir / HYDRAULIC_CONTEXT_MANIFEST
+        refreshed_existing = False
+        backup_dir = ""
+        backup_files: list[str] = []
         if manifest_file.exists():
             existing = _load_json_file(manifest_file)
             paths = dict(existing.get("output_paths", {}))
@@ -1068,17 +1074,34 @@ def generate_island_hydraulic_contexts(
                 existing.get("input_paths", {}).get("directed_links") == str(Path(row.analysis_routing_width_links_path).resolve())
                 and all(paths.get(key) and Path(paths[key]).exists() for key in ("link_hydraulic_context", "node_hydraulic_context"))
             ):
-                records.append({
-                    "island_id": island_id,
-                    "hydraulic_context_action": "reused_completed_island_context",
-                    "hydraulic_context_status": "ready_island_context",
-                    "hydraulic_context_dir": str(context_dir),
-                    "link_hydraulic_context_path": str(paths["link_hydraulic_context"]),
-                    "node_hydraulic_context_path": str(paths["node_hydraulic_context"]),
-                    "hydraulic_context_manifest_path": str(manifest_file),
-                })
-                continue
-            raise FileExistsError(f"Island hydraulic-context directory contains a non-matching result: {context_dir}")
+                if not refresh_existing:
+                    records.append({
+                        "island_id": island_id,
+                        "hydraulic_context_action": "reused_completed_island_context",
+                        "hydraulic_context_status": "ready_island_context",
+                        "hydraulic_context_dir": str(context_dir),
+                        "link_hydraulic_context_path": str(paths["link_hydraulic_context"]),
+                        "node_hydraulic_context_path": str(paths["node_hydraulic_context"]),
+                        "hydraulic_context_manifest_path": str(manifest_file),
+                        "backup_dir": "",
+                        "backup_files": "",
+                    })
+                    continue
+            elif not refresh_existing:
+                raise FileExistsError(f"Island hydraulic-context directory contains a non-matching result: {context_dir}")
+            refreshed_existing = True
+            if backup_root is not None:
+                destination = backup_root / island_id
+                for source in (
+                    context_dir / "link_hydraulic_context.csv",
+                    context_dir / "node_hydraulic_context.csv",
+                    manifest_file,
+                ):
+                    if source.exists():
+                        destination.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source, destination / source.name)
+                        backup_files.append(source.name)
+                backup_dir = str(destination) if backup_files else ""
 
         outputs = generate_state_hydraulic_context(
             directed_links_path=row.analysis_routing_width_links_path,
@@ -1099,12 +1122,16 @@ def generate_island_hydraulic_contexts(
         )
         records.append({
             "island_id": island_id,
-            "hydraulic_context_action": "generated_island_context",
+            "hydraulic_context_action": (
+                "refreshed_island_context" if refreshed_existing else "generated_island_context"
+            ),
             "hydraulic_context_status": "ready_island_context",
             "hydraulic_context_dir": str(outputs.output_dir),
             "link_hydraulic_context_path": str(outputs.link_context_path),
             "node_hydraulic_context_path": str(outputs.node_context_path),
             "hydraulic_context_manifest_path": str(outputs.manifest_path),
+            "backup_dir": backup_dir,
+            "backup_files": ",".join(backup_files),
         })
 
     registry = pd.DataFrame.from_records(records).sort_values("island_id", kind="mergesort").reset_index(drop=True)
@@ -1121,6 +1148,9 @@ def generate_island_hydraulic_contexts(
             "n_observations": int(len(registry)),
             "n_alias_references": int(registry["hydraulic_context_action"].eq("reference_existing_independent_state").sum()),
             "n_generated_island_contexts": int(registry["hydraulic_context_action"].eq("generated_island_context").sum()),
+            "n_refreshed_island_contexts": int(registry["hydraulic_context_action"].eq("refreshed_island_context").sum()),
+            "refresh_existing": bool(refresh_existing),
+            "backup_existing_dir": str(backup_root) if backup_root is not None else "",
             "n_excluded_topology_review": int(registry["hydraulic_context_action"].eq("excluded_topology_review").sum()),
             "registry_csv": str(registry_path),
         }, indent=2) + "\n",
@@ -1677,9 +1707,10 @@ def run_island_full_raster_observations(
             continue
         if run_dir.exists() and any(run_dir.iterdir()):
             local_fallback = run_dir / "local_patch" / "fallback_to_full_raster.json"
+            run_entries = _non_metadata_directory_entries(run_dir)
             allowed_direct_local_fallback = (
                 local_fallback.exists()
-                and {item.name for item in run_dir.iterdir()} == {"local_patch"}
+                and run_entries == {"local_patch"}
             )
             # A direction-stage failure can leave raw mask/RivGraph products
             # under variant/ before a canonical island manifest exists. They
@@ -1688,7 +1719,7 @@ def run_island_full_raster_observations(
             retryable_interrupted_full_run = (
                 local_fallback.exists()
                 and not run_manifest_path.exists()
-                and {item.name for item in run_dir.iterdir()} == {"local_patch", "variant"}
+                and run_entries == {"local_patch", "variant"}
             )
             if retryable_interrupted_full_run:
                 retry_audit = run_dir / "local_patch" / "full_raster_retry_cleanup.json"
@@ -1978,14 +2009,15 @@ def run_island_panelized_observations(
             continue
         fallback = run_dir / "local_patch" / "fallback_to_panelized.json"
         if run_dir.exists() and any(run_dir.iterdir()):
+            run_entries = _non_metadata_directory_entries(run_dir)
             direct_fallback_only = (
                 fallback.exists()
-                and {item.name for item in run_dir.iterdir()} == {"local_patch"}
+                and run_entries == {"local_patch"}
             )
             retryable_incomplete_panelized_run = (
                 fallback.exists()
                 and not run_manifest_path.exists()
-                and {item.name for item in run_dir.iterdir()} == {"local_patch", "variant"}
+                and run_entries == {"local_patch", "variant"}
             )
             if retryable_incomplete_panelized_run:
                 retry_audit = run_dir / "local_patch" / "panelized_retry_cleanup.json"
