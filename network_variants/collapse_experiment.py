@@ -4526,6 +4526,7 @@ def run_collapse_experiment(
     boundary_component_artifact_source_dir: str | Path | None = None,
     base_state_variant_source_dir: str | Path | None = None,
     artifact_profile: str = "analysis",
+    preserve_regenerable_raw_for_reuse: bool = False,
     equivalent_forcing_table_runner: Callable[..., tuple[pd.DataFrame, dict[str, object]]] = prepare_forcing_table,
     equivalent_reference_kb_summary_runner: Callable[..., dict[str, Any]] = compute_reference_section_kb,
 ) -> CollapseExperimentOutputs:
@@ -5384,7 +5385,13 @@ def run_collapse_experiment(
                     defer_hierarchy=defer_child_hierarchy,
                     artifact_profile=artifact_profile,
                     compact_width_samples=mode in {"independent-units", "compound-bubbles"},
-                    drop_regenerable_raw=mode in {"independent-units", "compound-bubbles"},
+                    # A paired realized->anchored run derives its child network
+                    # from the realized mask and RivGraph products. Retention
+                    # cannot remove those source artifacts before anchoring.
+                    drop_regenerable_raw=(
+                        mode in {"independent-units", "compound-bubbles"}
+                        and not preserve_regenerable_raw_for_reuse
+                    ),
                 )
             except VariantDirectionValidationError as exc:
                 error_text = _format_exception(exc)
@@ -6083,6 +6090,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         experiment_id = args.experiment_id
         output_dir = args.output_dir
         current_run_kwargs = dict(run_kwargs)
+        if collapse_corridor_mode == "realized" and persist_realized_and_anchored:
+            # The immediately following anchored pass consumes every realized
+            # child mask/RivGraph bundle. Keep that source set despite the
+            # analysis profile; the anchored output remains compact.
+            current_run_kwargs["preserve_regenerable_raw_for_reuse"] = True
         if suffix_mode_outputs:
             experiment_id = _suffix_experiment_id_for_collapse_mode(
                 experiment_id or _default_experiment_id(args.cleaned_mask, args.mode),

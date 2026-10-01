@@ -5581,6 +5581,12 @@ def derive_anchored_variant_from_realized(
 
     collapsed_mask_path = output_paths.get("collapsed_mask")
     if collapsed_mask_path is None or not collapsed_mask_path.exists():
+        source_collapsed_mask = source_manifest.get("output_paths", {}).get("collapsed_mask")
+        if source_collapsed_mask:
+            copied_mask = output_path / "mask" / Path(str(source_collapsed_mask)).name
+            if copied_mask.exists():
+                collapsed_mask_path = copied_mask
+    if collapsed_mask_path is None or not collapsed_mask_path.exists():
         raise FileNotFoundError("Could not resolve copied collapsed mask path for anchored derivation.")
     if wet_reference_mask_path is None:
         source_wet_reference = source_manifest.get("source_paths", {}).get("wet_reference_mask")
@@ -5631,6 +5637,10 @@ def derive_anchored_variant_from_realized(
     realized_directed_links = directed_links.copy()
     realized_width_links_path = output_paths.get("links_with_width_families")
     realized_width_samples_path = output_paths.get("link_width_samples")
+    if realized_width_samples_path is None or not realized_width_samples_path.exists():
+        compact_width_samples_path = width_dir / "link_width_samples.parquet"
+        if compact_width_samples_path.exists():
+            realized_width_samples_path = compact_width_samples_path
     if realized_width_links_path is None or not realized_width_links_path.exists():
         raise FileNotFoundError(
             "Anchored derivation requires the realized links-with-width-families product."
@@ -5640,7 +5650,10 @@ def derive_anchored_variant_from_realized(
             "Anchored derivation requires the realized link-width samples."
         )
     realized_width_links = gpd.read_file(realized_width_links_path)
-    realized_width_samples = pd.read_csv(realized_width_samples_path)
+    if realized_width_samples_path.suffix.lower() == ".parquet":
+        realized_width_samples = pd.read_parquet(realized_width_samples_path)
+    else:
+        realized_width_samples = pd.read_csv(realized_width_samples_path)
     node_match = pd.read_csv(node_match_path)
     link_match = pd.read_csv(link_match_path)
     link_lineage = pd.read_csv(link_lineage_path)

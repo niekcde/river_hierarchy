@@ -1329,6 +1329,8 @@ def test_main_runs_both_collapse_corridor_modes_with_suffixed_outputs(
     assert [call["experiment_id"] for call in calls] == ["demo__realized", "demo__anchored"]
     assert [Path(call["output_dir"]).name for call in calls] == ["demo_output__realized", "demo_output__anchored"]
     assert "variant_runner" not in calls[0]
+    assert calls[0]["preserve_regenerable_raw_for_reuse"] is True
+    assert "preserve_regenerable_raw_for_reuse" not in calls[1]
     assert callable(calls[1]["variant_runner"])
     assert Path(calls[1]["boundary_component_artifact_source_dir"]) == (
         tmp_path / "demo_output__realized" / "boundary_components"
