@@ -20,12 +20,13 @@ import pandas as pd
 from sklearn.base import clone
 from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import ElasticNet, Ridge
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeRegressor
 
 from train_rapid_impact_classifier import Config, PRIMARY_Y_METRIC, load_and_filter
+from rapid_tools.response_diagnostics import response_scores
 
 
 MODEL_VERSION = "rapid-response-grid-v1"
@@ -218,7 +219,7 @@ def evaluate(frame: pd.DataFrame, target: str) -> tuple[pd.DataFrame, pd.DataFra
                 "n_features": len(features),
                 "mae_pct_points": mean_absolute_error(y, prediction),
                 "rmse_pct_points": mean_squared_error(y, prediction) ** 0.5,
-                "r2": r2_score(y, prediction),
+                **response_scores(y, prediction),
             })
             prediction_frames.append(pd.DataFrame({
                 "target": target, "model": model_name, "features": " + ".join(features), "example_id": groups,

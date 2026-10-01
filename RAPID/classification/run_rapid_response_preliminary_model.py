@@ -20,12 +20,13 @@ import numpy as np
 import pandas as pd
 from sklearn.base import clone
 from sklearn.linear_model import Ridge
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from search_rapid_response_predictors import add_topology_features, verify_domain_aligned_exposure
 from train_rapid_impact_classifier import Config, PRIMARY_Y_METRIC, load_and_filter
+from rapid_tools.response_diagnostics import response_scores
 
 
 MODEL_VERSION = "rapid-response-preliminary-ridge-v1"
@@ -140,7 +141,7 @@ def main() -> None:
                 "n_features": len(FEATURES),
                 "mae_pct_points": mean_absolute_error(predictions["observed_lag_shift_pct"], predictions["predicted_lag_shift_pct"]),
                 "rmse_pct_points": mean_squared_error(predictions["observed_lag_shift_pct"], predictions["predicted_lag_shift_pct"]) ** 0.5,
-                "r2": r2_score(predictions["observed_lag_shift_pct"], predictions["predicted_lag_shift_pct"]),
+                **response_scores(predictions["observed_lag_shift_pct"], predictions["predicted_lag_shift_pct"]),
             }
         ]
     )
@@ -164,6 +165,10 @@ def main() -> None:
         f"Usable cohort: {len(frame)} states across {frame['example_id'].nunique()} examples.\n\n"
         f"Leave-one-example-out CV: MAE = {summary.mae_pct_points:.4f} percentage points; "
         f"RMSE = {summary.rmse_pct_points:.4f}; R² = {summary.r2:.4f}.\n\n"
+        f"Signed-log1p R² (scale = 1 percentage point) = {summary.r2_signed_log1p:.4f}. "
+        f"Log10-magnitude R² = {summary.r2_log10_magnitude:.4f} on {int(summary.n_log_magnitude)} nonzero pairs; "
+        f"linear R² on those same pairs = {summary.r2_linear_log_subset:.4f}. "
+        f"Sign accuracy (including zeros) = {summary.sign_accuracy:.4f}.\n\n"
         f"The domain-aligned exposure check passed; see `exposure_metric_audit.csv`.\n"
     )
     (results_dir / "config.json").write_text(json.dumps({"model": MODEL_NAME, "features": FEATURES, "target": PRIMARY_Y_METRIC, "requested_example_ids": requested_ids, "included_example_ids": usable_ids, "skipped_examples": skipped_examples, "data_audit": audit}, indent=2) + "\n")

@@ -8,6 +8,9 @@ now serves two workflows:
 - `network_variants/`, which prepares and runs RAPID per state for directed,
   width-enriched experiment outputs
 
+See [current response metric definitions](CURRENT_RESPONSE_METRICS.md) for the
+three evaluation metrics and the distinction from historical spread analyses.
+
 ## Scope
 
 - shared RAPID routing engine

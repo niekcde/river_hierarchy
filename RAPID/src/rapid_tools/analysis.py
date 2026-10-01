@@ -535,6 +535,13 @@ def build_experiment_analysis_frame(
         run_registry["lag_to_inflow_peak_pct_shift_vs_base"] = (
             run_registry["lag_to_inflow_peak_relative_to_base"] * 100.0
         )
+        # Apparent peak-propagation speed at the same reference distance.
+        # D cancels in (D/tau_variant)/(D/tau_base); nonpositive lags are invalid.
+        lag_seconds = pd.to_numeric(run_registry["lag_to_inflow_peak_seconds"], errors="coerce")
+        run_registry["peak_speed_pct_change_vs_base"] = (
+            100.0 * (baseline / lag_seconds.where(np.isfinite(lag_seconds) & lag_seconds.gt(0)) - 1.0)
+            if np.isfinite(baseline) and baseline > 0 else np.nan
+        )
         run_registry["lag_to_inflow_peak_hour_shift_vs_base"] = (
             run_registry["lag_to_inflow_peak_relative_to_base"] * (baseline / SECONDS_PER_HOUR)
         )
