@@ -1,0 +1,18 @@
+{
+  "examples": [
+    "03",
+    "21",
+    "55",
+    "56"
+  ],
+  "n_candidates": 282,
+  "n_selected": 79,
+  "script_sha256": "588d71f6016c203a30a6f652c40b134491732c84fdeb822cef5522a425471d31",
+  "selection": "16 independent and up to 4 compound states per example; farthest-point rank geometry; S000_base parents only",
+  "slope": "parent boundary rapid_wse_for_slope drop / shortest parent-domain path length",
+  "shape_reference": "max(initial input, final input); sensitivity +5% and +10% parent peak excess",
+  "event": "first input change through each complete outlet record; positive excess; trapezoidal moments",
+  "validation": "leave one whole network out; standardized raw features; Ridge alpha=10; no tuning",
+  "excluded_scope": "additional island reruns; non-base transitions; incomplete domains or missing predictors",
+  "caveat": "exploratory four-network pilot; thresholded event shape is not an independent physical baseflow separation"
+}
