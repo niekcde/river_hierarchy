@@ -223,3 +223,9 @@ anchor comparisons are checked and excluded from extension scores, leaving
 - [SYN-2026-09-30-SELECTED-RERUN](notes/2026-09-30_selected_hydraulic_rerun.md): selected setup, rerun coverage, matched changes, checks, and limits.
 
 - [SYN-2026-09-29 checkpoint](notes/2026-09-29_synthetic_checkpoint.md): what is ready, why sensitivity/prediction is paused, outstanding checks, and the restart of hydraulic applicability.
+
+## Interpretation checkpoint — 5 October 2026
+
+Reference **HYDROGRAPH-MEAN-SPREAD-2026-10-05**. Synthetic forcing isolates topology/geometry effects under a shared upstream event. Real runs likewise omit observed tributary/lateral input hydrographs, so transfer and gauge agreement are conditional on that simplification. Missing lateral inputs can contribute to disagreement but do not explain it uniquely. See the [current descriptive audit](../RAPID/validation/hydrograph_mean_spread_20261005/README.md).
+
+Discharge standard deviation is being considered as a smoothing descriptor, with an initial example-37 check. It is not yet an adopted response variable. Comparisons require common windows and a fixed forcing; different event lengths and padded plateaus can change SD independently of collapse. Proposed event shortening and Excel review fields remain unimplemented.

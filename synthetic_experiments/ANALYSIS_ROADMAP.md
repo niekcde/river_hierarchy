@@ -1,5 +1,9 @@
 # Synthetic results: current analysis structure
 
+**Real-case comparison, 5 October 2026:** [Deduplicated four-response benchmark](../RAPID/validation/deduplicated_response_benchmark_20261005/README.md). Distinct island operations are retained; matched original-grid transfer remains weak. This test does not include the wider embedding extension in training.
+
+**Review index, 5 October 2026:** [Completed investigations, findings and remaining real-case checks](notes/2026-10-05_review_inventory.md). Includes the distinction between strong original-grid interpolation and poor wider-extension transfer.
+
 **Update, 30 September 2026:** [Selected hydraulic rerun](notes/2026-09-30_selected_hydraulic_rerun.md) refreshes the full grid, extension and current notebooks at alpha=.65 / n=.035. Real-case validation remains deferred.
 
 **Earlier decision record, 29 September 2026:** [SYN-2026-09-29 checkpoint](notes/2026-09-29_synthetic_checkpoint.md). Sensitivity/predictor exploration is paused pending additional real-case comparison; hydraulic applicability is the active workstream.
