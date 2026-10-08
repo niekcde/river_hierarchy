@@ -1,0 +1,127 @@
+from pathlib import Path
+import pandas as pd,numpy as np,json,hashlib,shutil
+from scipy.stats import spearmanr
+R=Path('/Users/6256481/Code/river-hierarchy');O=R/'RAPID/validation/cunge_parent_child_20261005'
+d=pd.read_csv(O/'refined_pairs.csv',dtype={'example':str});assert len(d)==1920
+selection=pd.read_csv(O/'selected_pairs.csv',dtype={'example_id':str});assert len(selection)==64
+keys=['example','state','profile','forcing','dt_s']
+coarse=pd.read_csv(O/'main_pairs.csv',dtype={'example':str});g=d.merge(coarse,on=keys,suffixes=('_fine','_coarse'))
+clock=d[d.dt_s==30].merge(d[d.dt_s==15],on=[k for k in keys if k!='dt_s'],suffixes=('_30','_15'))
+tilt=pd.read_csv(O/'tiltcheck_pairs.csv',dtype={'example':str});j=d.merge(tilt,on=keys,suffixes=('_20','_30'))
+checks=dict(selected_pairs=64,rivers=16,selected_states_including_bases=80,preferred_hydrographs=2400,preferred_pair_comparisons=1920,
+ reporting_grid_max_pair_peak_difference_seconds=float(3600*(g.delta_peak_h_fine-g.delta_peak_h_coarse).abs().max()),
+ clock_max_pair_peak_difference_seconds=float(3600*(clock.delta_peak_h_30-clock.delta_peak_h_15).abs().max()),
+ wrap_max_pair_peak_difference_seconds=float(3600*(j.delta_peak_h_20-j.delta_peak_h_30).abs().max()),
+ frequency_screen_minimum_outlet_cms=float(d.min_outlet.min()),maximum_initial_error_fraction=float(d.initial_error.max()))
+# Independent causal native-step checks on every resolved reversal in the saved event and sharper pulse.
+npairs=[];nmetrics=[]
+for tag,forcing in [('native','saved_event'),('native_pulse','pulse_12h')]:
+ frames=[pd.read_csv(p,dtype={'example':str}) for p in (O/tag).glob('*/metrics.csv')]
+ native=pd.concat(frames,ignore_index=True);nmetrics.append(native)
+ for (ex,profile),z in native.groupby(['example','profile']):
+  p=z[z.state.eq('S000_base')].iloc[0]
+  for c in z[~z.state.eq('S000_base')].itertuples():
+   npairs.append(dict(example=ex,state=c.state,profile=profile,forcing=forcing,native_delta_peak_h=c.peak_time_h-p.peak_time_h,native_minimum_all_segment_flow=min(c.minimum_all_segment_flow,p.minimum_all_segment_flow),negative_segment_steps=c.negative_segment_steps+p.negative_segment_steps))
+nat=pd.DataFrame(npairs).merge(d[d.dt_s==30],on=['example','state','profile','forcing'],validate='one_to_one')
+nat['peak_contrast_error_seconds']=3600*(nat.native_delta_peak_h-nat.delta_peak_h)
+nat.to_csv(O/'native_validation.csv',index=False)
+nm=pd.concat(nmetrics);nm.to_csv(O/'native_state_metrics.csv',index=False)
+checks.update(native_state_runs=len(nm),native_pair_comparisons=len(nat),native_max_pair_peak_error_seconds=float(nat.peak_contrast_error_seconds.abs().max()),native_negative_segment_steps=int(nm.negative_segment_steps.sum()),native_minimum_segment_flow_cms=float(nm.minimum_all_segment_flow.min()))
+# Method contrasts, including near-zero and material-effect classifications.
+comparisons=[];associations=[];rank_rows=[]
+for forcing,z in d[d.dt_s==30].groupby('forcing'):
+ base=z[z.profile.eq('fixed_0.1')].set_index(['example','state'])
+ for profile,w in z.groupby('profile'):
+  associations.append(dict(forcing=forcing,profile=profile,spearman_omega_peak_shift=spearmanr(w.omega,w.delta_peak_h).statistic))
+  if profile=='fixed_0.1':continue
+  w=w.set_index(['example','state']).loc[base.index]
+  for ix,a in base.iterrows():
+   b=w.loc[ix];tol=1/60
+   cls='same_direction' if a.delta_peak_h*b.delta_peak_h>0 else 'sign_change'
+   if min(abs(a.delta_peak_h),abs(b.delta_peak_h))<=tol:cls='near_zero_in_at_least_one'
+   elif a.delta_peak_h*b.delta_peak_h<0:cls='resolved_reversal'
+   comparisons.append(dict(example=ix[0],state=ix[1],forcing=forcing,alternative=profile,baseline_peak_shift_h=a.delta_peak_h,alternative_peak_shift_h=b.delta_peak_h,contrast_change_h=b.delta_peak_h-a.delta_peak_h,classification=cls,baseline_lag_change_pct=a.lag_change_pct,alternative_lag_change_pct=b.lag_change_pct,peak_excess_effect_change_pp=b.peak_excess_change_pct-a.peak_excess_change_pct,omega=a.omega))
+  for ex,zz in base.groupby(level='example'):
+   ww=w.loc[zz.index];rank_rows.append(dict(example=ex,forcing=forcing,profile=profile,n=len(zz),spearman=spearmanr(zz.delta_peak_h,ww.delta_peak_h).statistic))
+comp=pd.DataFrame(comparisons);comp.to_csv(O/'method_contrasts.csv',index=False)
+pd.DataFrame(associations).to_csv(O/'omega_associations.csv',index=False);pd.DataFrame(rank_rows).to_csv(O/'within_river_ranks.csv',index=False)
+reversals=comp[(comp.forcing=='saved_event')&(comp.alternative=='cunge_reference')&comp.classification.eq('resolved_reversal')]
+assert len(reversals)==8
+reversals.to_csv(O/'saved_event_reversals.csv',index=False)
+for forcing in ['saved_event','pulse_12h']:
+ req=set(map(tuple,comp[(comp.forcing==forcing)&(comp.alternative=='cunge_reference')&comp.classification.eq('resolved_reversal')][['example','state']].values))
+ got=set(map(tuple,nat[(nat.forcing==forcing)&(nat.profile=='cunge_reference')][['example','state']].values))
+ assert req<=got
+# Keep the full-pulse centroid contrast separate from peak timing.
+a=d[(d.dt_s==30)&d.profile.eq('fixed_0.1')&(d.forcing=='pulse_48h')].set_index(['example','state'])
+b=d[(d.dt_s==30)&d.profile.eq('cunge_reference')&(d.forcing=='pulse_48h')].set_index(['example','state'])
+checks['maximum_centroid_contrast_change_seconds']=float(3600*(a.centroid_shift_h-b.centroid_shift_h).abs().max())
+# Hash all input geometries and unchanged model source; preserve temporary analysis instructions as artifacts.
+sha=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+old=json.loads((R/'RAPID/validation/cunge_sensitivity_pilot_20261005/provenance.json').read_text())['model_code_hashes_unchanged']
+changes=[p for p,v in old.items() if sha(p)!=v];checks['production_source_changes_since_pilot']=changes;assert not changes
+sources=[]
+for p in sorted((O/'refined').glob('*/grid.json')):
+ for name,path,fp in json.loads(p.read_text())['sources']:sources.append(dict(state=name,fingerprint=fp,path=path,sha256=sha(path)))
+(O/'verification.json').write_text(json.dumps(checks,indent=2))
+(O/'provenance.json').write_text(json.dumps(dict(input_sources=sources,model_source_hashes=old,selection_source_sha256=json.loads((O/'design.json').read_text())['source_sha256'],note='No production source, configuration, or run output edited; all new outputs isolated here.'),indent=2))
+execution=O/'execution_records';execution.mkdir(exist_ok=True)
+for name in ['cunge_pairs_select','cunge_pairs_run','cunge_pairs_analyze','cunge_pairs_native','cunge_pairs_native_pulse','cunge_pairs_finalize','cunge_sensitivity_pilot']:
+ path=Path('/private/tmp')/(name+'.py');shutil.copyfile(path,execution/(name+'.py.txt'))
+# Figures.
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+fig,axes=plt.subplots(1,3,figsize=(14,4.8),constrained_layout=True)
+for ax,forcing,title in zip(axes,['saved_event','pulse_48h','pulse_12h'],['Saved event forcing','48-hour rise / recession','12-hour rise / recession']):
+ z=comp[(comp.forcing==forcing)&(comp.alternative=='cunge_reference')];rev=z.classification.eq('resolved_reversal')
+ ax.scatter(z.baseline_peak_shift_h,z.alternative_peak_shift_h,c=np.where(rev,'#c2410c','#2563eb'),s=32,alpha=.8,edgecolors='white',linewidths=.4)
+ ax.set_xscale('symlog',linthresh=1/60);ax.set_yscale('symlog',linthresh=1/60)
+ lim=max(z.baseline_peak_shift_h.abs().max(),z.alternative_peak_shift_h.abs().max())*1.3;ax.plot([-lim,lim],[-lim,lim],c='.6',ls='--',lw=1);ax.axhline(0,c='.8',lw=.7);ax.axvline(0,c='.8',lw=.7);ax.set_xlim(-lim,lim);ax.set_ylim(-lim,lim)
+ ax.set(title=title,xlabel='Parent–child peak shift with X = 0.1 (hours)',ylabel='Peak shift with Cunge-derived X (hours)');ax.grid(alpha=.15)
+ ax.text(.03,.97,f'{int(rev.sum())} resolved direction reversals / 64',transform=ax.transAxes,va='top',fontsize=9)
+fig.suptitle('Parent–child timing is not uniformly robust to Cunge-derived X\nOrange: opposite signs, each exceeding one minute · symmetric log axes · purposive stress sample')
+fig.savefig(O/'peak_relationships.png',dpi=170);plt.close(fig)
+# Highlight one reversal across controlled and saved forcing; show peak markers explicitly.
+ex='41';state='S130_unit_126';sel=selection[(selection.example_id==ex)&(selection.state_id==state)].iloc[0]
+grid=json.loads((O/'refined'/ex/'grid.json').read_text());basefp=next(v[2] for v in grid['sources'] if v[0]=='S000_base')
+fig,axes=plt.subplots(2,2,figsize=(11,7),constrained_layout=True)
+for i,forcing in enumerate(['saved_event','pulse_48h']):
+ for j,profile in enumerate(['fixed_0.1','cunge_reference']):
+  pa=pd.read_parquet(O/'refined'/ex/f'{basefp}_{profile}_dt30.parquet');ch=pd.read_parquet(O/'refined'/ex/f'{sel.fingerprint}_{profile}_dt30.parquet')
+  yp=pa[forcing+'_outlet'].to_numpy();yc=ch[forcing+'_outlet'].to_numpy();t=pa.time_seconds.to_numpy()/3600;peak=t[yp.argmax()];offset=min(yp[0],yc[0]);norm=yp.max()-offset
+  ax=axes[i,j];ax.plot(t-peak,(yp-offset)/norm,label='Parent',c='#2563eb');ax.plot(t-peak,(yc-offset)/norm,label='Child',c='#d97706');ax.scatter([0,t[yc.argmax()]-peak],[(yp.max()-offset)/norm,(yc.max()-offset)/norm],c=['#2563eb','#d97706'],s=25,zorder=3)
+  value=d[(d.example==ex)&(d.state==state)&(d.profile==profile)&(d.forcing==forcing)&(d.dt_s==30)].iloc[0].delta_peak_h
+  ax.set(xlim=(-12,12),ylim=(.91,1.012),xlabel='Hours relative to parent peak',ylabel='Normalized discharge above initial level',title=f'{forcing} · {profile}\nChild minus parent peak: {value:+.2f} h');ax.grid(alpha=.2);ax.legend(fontsize=8)
+fig.suptitle('Example 41 / S130_unit_126: the direction reversal persists for a single smooth pulse')
+fig.savefig(O/'example_41_reversal.png',dpi=170);plt.close(fig)
+# Plain-text report avoids modifying repository documentation or notebooks.
+summary=pd.read_csv(O/'refined_agreement.csv')
+lines=['PARENT–CHILD ROBUSTNESS TO MUSKINGUM X — 5 OCTOBER 2026','',
+'Finding: the selected parent–child peak-timing relationships are robust to changing a uniform X from 0.1 to 0 or 0.3, but not uniformly robust to Cunge-derived X. Keep the accepted baseline; explicitly report this structural sensitivity. This is not independent hydraulic validation.','',
+'DESIGN','64 canonical pairs (four per river) from the complete 2,214-pair inventory; all 16 rivers, 80 unique routed states including parents. Selection was frozen before new-X outcomes: extremes of existing signed timing response, near-zero response, and added family/category coverage weighted by affected length. It is a purposive stress sample, not a random prevalence estimate.',
+'Five parameterizations: fixed X=0, 0.1, 0.3; unclipped Cunge X at stored reference discharge; unclipped Cunge X at the midpoint of saved-event initial and peak inflow. Each state uses its own production width-based steady flow allocation. Reference choices are held fixed across forcing tests; no discharge-dependent X updates.',
+'Three forcings: the saved inlet event (linearly interpolated); controlled sinusoidal-squared pulses with 48-hour or 12-hour rise and equally long recession. Controlled baseflow=0.1 Qref, peak=Qref. K, geometry, segmentation, caps and branch-splitting rules retained. This tests X only, not a hydraulically reconciled full Muskingum–Cunge model.',
+'Exact discrete linear transfer of the existing recurrence evaluated by exponentially tilted Fourier inversion. Primary report grid 300 seconds, routing clocks 30 and 15 seconds; complete coarse 600-second check. The preserved external-input convention is (C1+C2) on the first inlet cell. Independent causal native-step calculations use 60-second steps and audit every segment at every step.',
+'Preferred grid: 2,400 state hydrographs and 1,920 paired results. Primary peak times use local quadratic interpolation of the global maximum. Lag percentages use the parent lag under the same parameterization. All 64 primary pairs retained for every condition.','',
+'PRIMARY AGREEMENT (64 pairs each; a resolved reversal requires both shifts >1 minute in magnitude)',
+summary[(summary.dt_s==30)&summary.metric.eq('delta_peak_h')][['forcing','profile','spearman','median_abs_difference','p90_abs_difference','max_abs_difference','resolved_both','resolved_sign_flips']].to_string(index=False),
+'Absolute differences in the table are HOURS of change in the child-minus-parent timing contrast, not whole-network arrival-time changes.',
+'All eight saved-event reversals also exceed a five-minute magnitude threshold under both methods. Six exceed fifteen minutes under both. Their native-step calculations independently confirm the signs.',
+'', 'SAVED-EVENT REVERSALS',reversals[['example','state','baseline_peak_shift_h','alternative_peak_shift_h','contrast_change_h']].to_string(index=False),
+'', 'METRIC-SPECIFIC FINDINGS',
+'Full-pulse centroid contrasts are invariant here to numerical precision. These are analytic moments over the entire linear response, not truncated-event centroids. The same inlet contribution cancels within these selected pairs; internal mean travel time is controlled by K. Do not substitute this metric retroactively for the study’s peak-lag endpoint.',
+'Peak and duration/width effects can change. For the 12-hour pulse, Cunge-reference versus fixed-X parent–child peak-excess effects have Spearman rho approximately 0.55 and maximum difference approximately 29 percentage points. Full-response RMS width is highly tail-sensitive; large changes are not equivalent to comparable changes in event duration.',
+'Duration uses departure/return thresholds of 1% of inlet excess, common across the pair. Some Cunge tails do not settle within the reporting window (8 unavailable duration comparisons for the sharper-pulse Cunge-reference condition and 4 for the saved-event condition); those durations remain censored, never treated as zero. Peak results retain all 64 pairs.',
+'The descriptive omega–peak-shift rank association retains its broad negative sign (saved event: approximately -0.66 at fixed X and -0.56 with Cunge-reference), but individual predictions/signs are not preserved. No model was retrained, and these selected-sample associations are not population prediction scores.',
+'', 'NUMERICAL VERIFICATION',json.dumps(checks,indent=2),
+'Changing damping from 20 to 30 was checked on all selected states in networks 11, 37, 41 and 46. Independent native checks include all eight saved-event resolved reversals, plus low-sensitivity and extreme-X controls, and every resolved reversal for the sharper pulse. No negative native segment flows occurred in those targeted checks. The broader Fourier screen checks outlet flows, not every internal segment. This is empirical positivity for tested forcings, not a universal positivity proof.',
+'Analytic DC gain is unity by the recurrence and network flow-split closure, so full-response volume is conserved. Long Cunge tails prevent claiming that every finite output window captures all volume. No negative-flow clipping or X clipping was used.',
+'', 'INTERPRETATION',
+'The initial three-parent pilot understated the risk for pairwise conclusions. A small absolute whole-network hydrograph change can be large relative to a simplification effect. The current baseline remains a valid explicitly specified routing experiment, but the results do not support a blanket claim that peak-lag direction or magnitude is insensitive to diffusion parameterization.',
+'Interpret as numerical/structural sensitivity, not evidence that Cunge-derived X is physically correct. Allocated Q and prescribed depth/celerity are not necessarily one consistent Manning state; large negative X and slope sensitivity remain physical-interpretation limitations. Observations or a suitable hydraulic benchmark are needed to select the more accurate formulation.',
+'Selected sample deliberately includes extremes and is not representative enough to infer the percentage of all 2,214 pairs that would reverse. All production code hashes match the preceding pilot; no production parameters or results were changed.',
+'', 'ARTIFACTS',
+'design.json; selected_pairs.csv; refined_pairs.csv; method_contrasts.csv; refined_agreement.csv; saved_event_reversals.csv; native_validation.csv; verification.json; omega_associations.csv; within_river_ranks.csv; provenance.json. Figures: peak_relationships.png and example_41_reversal.png. Complete hydrographs in refined/. Temporary analysis scripts are preserved as non-executable text in execution_records/.']
+(O/'REPORT.txt').write_text('\n'.join(lines))
+print(json.dumps(checks,indent=2));print(reversals[['example','state','baseline_peak_shift_h','alternative_peak_shift_h']].to_string(index=False))

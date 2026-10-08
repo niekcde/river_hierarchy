@@ -1,0 +1,31 @@
+from pathlib import Path
+import json,hashlib,shutil
+import numpy as np,pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+R=Path('/Users/6256481/Code/river-hierarchy');O=R/'RAPID/validation/cunge_physical_assessment_20261005'
+cal=pd.read_csv(O/'calibration_two_time_comparison.csv',dtype={'example':str});assert len(cal)==48 and cal.groupby('profile').size().eq(16).all()
+old=pd.read_csv(R/'RAPID/outputs/travel_time_calibration_refined/refined_candidates.csv',dtype={'example':str}).set_index('example')
+raw=pd.concat([pd.read_csv(p,dtype={'example':str}) for folder in ['calibration','calibration_remaining'] for p in (O/folder).glob('*/best.csv')]);raw.to_csv(O/'rapid_inlet_calibration_partial.csv',index=False)
+base=raw[raw.profile=='fixed_0.1'];assert len(base)==16
+summary=[]
+for label,g in [('current_rapid_fixed',base),*list(cal.groupby('profile'))]:
+ fit=g[g.within_sampling];summary.append(dict(profile=label,n_cases=len(g),fits=int(g.within_sampling.sum()),fits_in_comparison_band=int(g.common_band_within_sampling.sum()),fitted_n_min=fit.n.min(),fitted_n_max=fit.n.max(),half_clock_max_shift_s=g.half_clock_lag_change_seconds.abs().max(),tail_unsettled_best=int((~g.get('tail_settled',pd.Series(True,index=g.index)).fillna(True).astype(bool)).sum())))
+pd.DataFrame(summary).to_csv(O/'calibration_summary.csv',index=False)
+print(pd.DataFrame(summary).to_string(index=False))
+# Compare n spreads on exactly the rivers that both formulations fit.
+matched=[]
+for profile in ['cunge_event_midpoint','cunge_stored_reference']:
+ g=cal[(cal.profile==profile)&cal.within_sampling];ids=g.example.tolist();b=base[base.example.isin(ids)]
+ matched.append(dict(profile=profile,n=len(g),baseline_n_min=b.n.min(),baseline_n_max=b.n.max(),cunge_n_min=g.n.min(),cunge_n_max=g.n.max(),baseline_range=b.n.max()-b.n.min(),cunge_range=g.n.max()-g.n.min(),baseline_ratio=b.n.max()/b.n.min(),cunge_ratio=g.n.max()/g.n.min()))
+pd.DataFrame(matched).to_csv(O/'calibration_matched_ranges.csv',index=False);print(pd.DataFrame(matched).to_string(index=False))
+fig,ax=plt.subplots(figsize=(9,7),layout='constrained');ids=old.index.tolist();yy=np.arange(len(ids));ax.axvspan(.025,.06,color='#dfe9dc',alpha=.8,label='Notebook comparison band')
+for label,g,color,offset in [('Current RAPID, X = 0.1',base,'#333333',-.22),('Cunge, event midpoint',cal[cal.profile=='cunge_event_midpoint'],'#1678b5',0),('Cunge, stored reference',cal[cal.profile=='cunge_stored_reference'],'#d17a00',.22)]:
+ g=g.set_index('example').loc[ids];ok=g.within_sampling.to_numpy();ax.scatter(g.n[ok],yy[ok]+offset,color=color,s=35,label=label);ax.scatter(g.n[~ok],yy[~ok]+offset,color=color,s=60,marker='x')
+ax.set(yticks=yy,yticklabels=ids,xlabel="Fitted Manning n (crosses: target not fitted)",ylabel='River example',xlim=(.008,.103),title='Calibration with the standard upstream boundary for Cunge\nSame events, geometry, depths, celerity caps and timing targets');ax.invert_yaxis();ax.legend(loc='lower right',fontsize=9);fig.savefig(O/'calibration_comparison.png',dpi=170);plt.close(fig)
+workbook=R/'RAPID/reviews/hydrograph_match_review.xlsx';sha=hashlib.sha256(workbook.read_bytes()).hexdigest();assert sha==json.loads((R/'RAPID/outputs/travel_time_calibration_refined/refinement_manifest.json').read_text())['workbook_sha256']
+verification=dict(workbook_sha256=sha,reviewed_workbook_matches_notebook_cache=True,completed_standard_boundary_cases=len(cal),standard_boundary_best_fits_all_tails_settled=bool(cal.tail_settled.all()),standard_boundary_max_half_clock_shift_seconds=float(cal.half_clock_lag_change_seconds.abs().max()),baseline_rapid_reproduction_max_seconds=float(base.baseline_reproduction_error_h.abs().max()*3600),production_source_edited=False,scope='Fixed reference Cunge X and unchanged hydraulic geometry/depth; not a full variable-parameter Muskingum-Cunge implementation.',discarded_or_partial='Native RAPID inlet broad-grid searches had extreme decay tails; incomplete 15/22/46 native profiles are excluded from full-cohort calibration conclusions. Partial caches preserved. Standard upstream boundary comparison is complete.')
+(O/'verification.json').write_text(json.dumps(verification,indent=2))
+for name in ['cunge_assess_calibration_v2.py','cunge_calibrate_boundary.py','cunge_calibrate_dense11.py','cunge_inlet_ablation.py','cunge_boundary_pair_check.py','cunge_finalize_assessment.py']:
+ shutil.copyfile(Path('/private/tmp')/name,O/'execution_records'/(name+'.txt'))

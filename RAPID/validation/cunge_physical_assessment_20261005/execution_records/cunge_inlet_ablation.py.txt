@@ -1,0 +1,16 @@
+import sys,inspect,json
+import numpy as np,pandas as pd
+sys.path.insert(0,'/private/tmp');import cunge_assess_calibration_v2 as c
+code=inspect.getsource(c.route).replace('def route(', 'def standard_route(').replace('(a[i]+b[i],0.) if node==s[\'root\'] and seg==0 else (a[i],b[i])','(a[i],b[i])');exec(code,c.__dict__)
+rows=[]
+for ex in ['11','15','41']:
+ r=c.old.loc[ex];w=c.schedule.loc[ex];wave=pd.read_parquet(r.hydrograph_path);times=pd.to_datetime(wave.time_utc,utc=True);event=wave.loc[(times>=pd.Timestamp(w.first_sample))&(times<=pd.Timestamp(w.last_sample)),'q_inflow_cms'].to_numpy();src=c.previous.SOURCES[ex];f=pd.read_parquet(src['frame']);ref=json.loads(c.Path(src['policy_manifest']).read_text())['reference_kb_summary']['reference_discharge_cms'];s=c.previous.setup(f,ref,(event[0]+event.max())/2);step=float(r.forcing_step_s);dt=float(r.routing_dt_s);nsub=round(step/dt)
+ for n in np.unique([r.n_manning,{'11':.1,'15':.01,'41':.01921875}[ex]]):
+  speed=np.clip(f.rapid_celerity_mps_raw.to_numpy()*.035/n,.05,5);k=f.rapid_effective_length_m.to_numpy()/speed;x=.5*(1-ref*s['shares']/(f.width*f.slope*f.rapid_effective_length_m*speed)).to_numpy();ss=dict(s);ss['f']=f.copy();ss['f']['rapid_k']=k
+  mu,var=c.previous.moments(ss,x,dt)
+  inlet_extra=sum(s['ratios'][i]*(-k[i]*x[i]-dt/2) for i in s['edges'][s['root']])
+  flow=np.r_[event,np.full(int(np.ceil(120*86400/step)),event[-1])]
+  for name,fn in [('rapid_external',c.route),('two_time_boundary',c.standard_route)]:
+   q,mn,gain=fn(s,k,x,flow,nsub,dt);pi=int(q.argmax());lag=(pi-int(event.argmax()))*step/3600
+   rows.append(dict(example=ex,n=n,boundary=name,lag_h=lag,error_h=lag-r.observed_lag_h,peak_cms=q.max(),min_all_segments=mn,peak_at_boundary=pi in [0,len(q)-1],rapid_inlet_added_mean_h=inlet_extra/3600,rapid_mean_h=mu/3600))
+   pd.DataFrame(rows).to_csv(c.O/'inlet_ablation.csv',index=False);print(rows[-1],flush=True)

@@ -1,0 +1,38 @@
+from pathlib import Path
+import sys,json
+import numpy as np,pandas as pd,networkx as nx
+from scipy.signal import lfilter
+from concurrent.futures import ProcessPoolExecutor
+sys.path.insert(0,'/private/tmp')
+import cunge_pairs_run as exp
+R,O,S=exp.R,exp.O,exp.S
+# Reuse the independently verified native-step recurrence from the preceding pilot.
+code=Path('/private/tmp/cunge_sensitivity_pilot.py').read_text();exec(code[code.index('def route('):code.index('\nrows=[];verifyrows=')])
+d=pd.read_csv(O/'main_pairs.csv',dtype={'example':str});z=d[(d.forcing=='saved_event')&(d.dt_s==30)];a=z[z.profile=='fixed_0.1'].set_index(['example','state']);b=z[z.profile=='cunge_reference'].set_index(['example','state']);flip=(a.delta_peak_h*b.delta_peak_h<0)&(a.delta_peak_h.abs()>1/60)&(b.delta_peak_h.abs()>1/60)
+chosen={ex:list(g.index.get_level_values('state')) for ex,g in a[flip].groupby(level='example')}
+# Extra numerical stress (11) and low-sensitivity control (48).
+for ex in ['11','48']:
+ chosen[ex]=[exp.SEL[exp.SEL.example_id.eq(ex)].sort_values('interpolated_peak_shift_hours').iloc[0].state_id]
+(O/'native_selection.json').write_text(json.dumps(chosen,indent=2))
+
+def run_native(ex):
+ dest=O/'native'/ex;dest.mkdir(parents=True,exist_ok=True)
+ grid=json.loads((O/'main'/ex/'grid.json').read_text());src=exp.SOURCES[ex]
+ ref=grid['reference_cms'];qmid=grid['midpoint_cms'];h=pd.read_csv(src['hydrograph']);st=h.time_seconds.to_numpy()-grid['actual_start_offset_seconds'];sq=h.q_inflow_cms.to_numpy()
+ dt=60.;end=grid['analyzed_days']*86400;t=np.arange(0,end+dt,dt)
+ forcing=np.interp(t,st,sq);base=forcing[0]
+ wanted=[v for v in grid['sources'] if v[0]=='S000_base' or v[0] in chosen[ex]]
+ rows=[]
+ for name,path,fp in wanted:
+  f=pd.read_parquet(path);s=exp.setup(f,ref,qmid)
+  for profile in ['fixed_0.1','cunge_reference']:
+   q,mn,neg,_=route(f,s['xs'][profile],dt,forcing,base)
+   mu,var=exp.moments(s,s['xs'][profile],dt)
+   metrics=exp.metrics(t,q,forcing,base,sq[-1],'saved_event',mu,var,0)
+   rows.append(dict(example=ex,state=name,profile=profile,dt_s=dt,forcing='saved_event',minimum_all_segment_flow=mn,negative_segment_steps=neg,**metrics))
+   take=5;pd.DataFrame(dict(time_seconds=t[::take],outlet=q[::take])).to_parquet(dest/f'{fp}_{profile}.parquet',index=False)
+   print('NATIVE',ex,name,profile,'min',mn,'negative',neg,flush=True)
+  pd.DataFrame(rows).to_csv(dest/'metrics.csv',index=False)
+ return ex
+if __name__=='__main__':
+ with ProcessPoolExecutor(max_workers=2) as pool:list(pool.map(run_native,chosen))

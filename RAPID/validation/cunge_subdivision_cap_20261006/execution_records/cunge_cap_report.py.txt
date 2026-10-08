@@ -1,0 +1,76 @@
+import sys,json,hashlib,shutil
+from pathlib import Path
+import numpy as np,pandas as pd
+sys.path.insert(0,'/private/tmp');import cunge_factor_test as f
+c=f.c;O=c.O;OLD=c.OLD
+def main():
+ metrics=pd.read_csv(O/'metrics.csv',dtype={'example':str});summary=pd.read_csv(O/'pair_summary.csv');iso=pd.read_csv(O/'edge975_sensitivity.csv')
+ native=pd.concat([pd.read_csv(p,dtype={'example':str}) for p in O.glob('native_*.csv')]);assert len(native)==8*13*2*2
+ native.to_csv(O/'native_verification.csv',index=False)
+ zz=native[native.dt_s==15].merge(metrics,on=['example','state','profile','forcing','dt_s']);zz['peak_error_s']=3600*(zz.peak_h-zz.peak_time_h);zz.to_csv(O/'native_vs_frequency.csv',index=False)
+ halves=native[native.dt_s==15].merge(native[native.dt_s==7.5],on=['example','state','profile','forcing'],suffixes=('','_half'));halves['peak_change_s']=3600*(halves.peak_h-halves.peak_h_half)
+ audits=[];sources=[];momerr=0.;gainerr=0.
+ for gridpath in sorted((O/'factors').glob('*/grid.json')):
+  g=json.loads(gridpath.read_text())
+  for state,path,fp in g['sources']:
+   src=Path(path);sources.append(dict(example=g['example'],state=state,fingerprint=fp,frame=path,sha256=hashlib.sha256(src.read_bytes()).hexdigest()));s=f.setup(pd.read_parquet(path),g['reference_cms'],g['midpoint_cms']);base=c.t.moments(s,s['xs']['physical_200'],15)
+   for label in [f'cap_{i}' for i in c.CAPS]+[f'factor_{i}' for i in f.FACTORS]+['adaptive_nonpositive_x','physical_200','unsegmented_actual']:
+    x=s['xs'][label];k,N,dx,_=s['variants'][id(x)];den=15+2*k*(1-x);a=(15-2*k*x)/den;b=(15+2*k*x)/den;d=(2*k*(1-x)-15)/den;assert np.isfinite(a+b+d).all() and (d>=0).all() and (d<1).all();gainerr=max(gainerr,float(np.max(abs(((a+b)/(1-d))**N-1))));mom=c.t.moments(s,x,15);momerr=max(momerr,max(abs(np.array(mom)-base)/np.maximum(1,np.array(base))))
+    audits.append(dict(example=g['example'],state=state,profile=label,segments=int(N.sum()),max_x=float(x.max()),negative_current_inflow_coefficients=int((a<0).sum()),min_previous_outflow_coefficient=float(d.min()),max_previous_outflow_coefficient=float(d.max()),minimum_dt_upper_s=float((2*k*(1-x)).min())))
+ audit=pd.DataFrame(audits);audit.to_csv(O/'coefficient_audit.csv',index=False);(O/'sources.json').write_text(json.dumps(sources,indent=2))
+ verification=dict(states=80,parent_child_pairs=64,new_network_grid_rules=13,forcings_per_network=3,native_runs=len(native),isolated_link_runs=len(iso),max_native_vs_frequency_peak_error_s=float(zz.peak_error_s.abs().max()),max_native_time_halving_peak_change_s=float(halves.peak_change_s.abs().max()),max_nominal_moment_relative_difference=momerr,max_edge_zero_frequency_gain_error=gainerr,minimum_network_dt_upper_s=float(audit.minimum_dt_upper_s.min()),minimum_native_total_discharge_cms=float(native.minimum_all_segments.min()),scope='Constant reference Q, c and hydraulic geometry, n=.035; selected population only; standard two-time upstream boundary; no production code changed.')
+ (O/'verification.json').write_text(json.dumps(verification,indent=2))
+ native_summary=native.groupby('profile').agg(min_total_q=('minimum_all_segments','min'),worst_pulse12_internal_dip_pct=('minimum_excess_fraction',lambda x:-100*x.min()));native_summary.to_csv(O/'native_summary.csv')
+ rootcounts=audit[audit.state=='S000_base'].groupby('profile').segments.sum()
+ pairtable=summary[summary.profile.isin(['unsegmented_actual','cap_2','cap_3','cap_8','cap_16','cap_32','factor_2','factor_3','factor_4','adaptive_nonpositive_x'])]
+ isotable=iso[(iso.dt_s==15)&iso.forcing.isin(['pulse_12h','pulse_48h','pulse_1h'])&iso.N.isin([1,2,3,8,16,32,33,49,92,98,371])]
+ txt='''CUNGE SUBDIVISION SENSITIVITY — 2026-10-06
+
+Question: can the conservative dx <= Ld subdivision rule be relaxed while preserving acceptable routing?
+
+DEFINITIONS AND INTERPRETATION
+Ld = Q_reference / (B S c), dx=L/N, K=dx/c, X=0.5*(1-Ld/dx).
+Rule A (previous conservative rule): N=max(1,ceil(L/Ld)).
+Rule B (cap): N=min(M,max(1,ceil(L/Ld))), M=2,3,4,8,16,32.
+Rule C (hydraulic scale multiplier): N=max(1,ceil(L/(alpha*Ld))), alpha=2,3,4,6,8,12,16.
+Written literally, max(2,L/Ld) would not reduce 98 sections on the longest link; both plausible relaxations were tested.
+Rule C implies X <= (1-1/alpha)/2. It indirectly restricts X through the grid but does not overwrite X. Directly clipping X at fixed dx would change the nominal diffusion coefficient c*dx*(0.5-X). Every rule here preserves Q/(2 B S), total actual length, nominal travel time and nominal variance.
+
+DESIGN
+16 parents and their 64 previously selected children, using the anchored hydraulic frames. Within each state, all hydraulics, celerity, Manning n=.035, reference discharges, topology and split fractions held fixed across grids. Q values are the previously frozen state reference allocations; this is not a new reference-allocation or calibration experiment.
+Three network forcings: saved event, and sin-squared positive pulses with 12 h / 48 h rise and equal fall durations. dt=15 s; frequency-domain evaluation every 150 s. Both inlet time levels used in the standard Muskingum recurrence, without lateral inflow.
+13 new grid rules * 80 states * 3 forcings = 3120 state-hydrograph evaluations, plus existing reference grids.
+Native recurrence checked on four selected stress pairs (examples 15,37,48,54), all 13 rules, saved event and 12 h pulse, dt=15 and 7.5 s: 416 runs. These checks include every numerical subsection, not only the network outlet.
+Isolated-link experiment: only child 37 / CB001_bubble_3 / edge975 varied, with identical inlet hydrograph taken from the conservative grid. Outlet at anchored node648, upstream node20. Actual L=74274.651476 m, c=3.358991644 m/s, Ld=763.935673892 m. Counts include 1 through16 plus selected values up to743. Saved event and positive 1,12,48 h rise pulses and a step, at both time steps. The 1 h pulse and step are stress tests, not an assertion that observed floods rise this quickly.
+
+STABILITY VERSUS POSITIVITY VERSUS ACCURACY
+At these parameters N=1 is already bounded. Therefore there is no largest finite alpha that can be selected merely from boundedness.
+For O_t=a I_t+b I_(t-1)+d O_(t-1), the impulse weights are h0=a and hj=(b+d*a)*d^(j-1), j>=1. b+d*a=4*K*dt/[dt+2*K*(1-X)]^2 >0. With 0<=d<1, a>=0 ensures positivity for arbitrary nonnegative forcing, even when b<0.
+For Cunge this sufficient positive-response condition is dx <= Ld+c*dt, with dt <= (dx+Ld)/c retained for d>=0. At dt15 this link needs ceil(L/(Ld+c*15))=92 sections; alpha<=1+c*15/Ld=1.065954 is the continuous conservative bound before integer rounding. At dt7.5 it needs95. The dt-independent X<=0 rule needs98.
+Fewer sections can work for smooth hydrographs, but that is a forcing-dependent accuracy decision. No universal positive-response guarantee follows from cap2/cap3 or alpha2/alpha3.
+
+RESULTS: 64 PAIRS
+Reference is a physical 200 m grid with exact total edge lengths and no floor. Peak-contrast errors are differences in (child peak time minus parent peak time), not individual travel-time errors. Resolved reversals require both contrast magnitudes to exceed1 minute. All new rules preserve the resolved contrast signs for these three forcings. Many effects are small, but the worst cases materially affect peak timing. The 100 m reference check had maximum saved-event pair difference1.63 seconds from200 m.
+'''
+ txt+=pairtable.to_string(index=False)+'\n\nISOLATED 74 KM LINK\n'+isotable.to_string(index=False)
+ txt+='''\nAll isolated errors refer to the 743-section numerical reference, not observed truth. Dip is percent of allocated imposed pulse amplitude, not percent total discharge. The 12 h pulse has baseline10% and excess90% of Q_reference; small dips in that test do not imply negative total flow. The 1 h pulse can produce negative total flow for very low counts. Saved-event dip fields are intentionally blank: that input itself drops below its initial flow, so crossing that baseline is not an unphysical-dip test.
+The link-only saved-event peak can jump between nearly equal maxima and is not the same metric as the full network outlet peak. Use the network-pair table for parent-child conclusions. Nominal mean and variance agree between grid rules; high-order waveform errors and oscillations can still differ.
+
+NATIVE CHECKS, INCLUDING INTERNAL SUBSECTIONS
+'''+native_summary.to_string()+'\n\nTOTAL NUMERICAL SECTIONS ACROSS 16 BASE NETWORKS\n'+rootcounts.to_string()+'\n\nVERIFICATION\n'+json.dumps(verification,indent=2)
+ txt+='''\n\nRECOMMENDATION
+Do not treat98 as a necessary stability count. Two or three sections do not provide adequate protection across the tested forcings; nor does a single relaxed hydraulic multiplier guarantee accuracy across the networks.
+For a general positive-response requirement, use N=max(1,ceil(L/(Ld+c*dt))) together with the d>=0 guard, or retain the slightly more conservative dt-independent Ld rule. Recheck after changing dt or hydraulic/calibration parameters.
+For fewer sections, define acceptable pulse undershoot, waveform error and parent-child peak-contrast error, then choose the coarsest grid that passes those checks under the fastest relevant forcing. Keep unchanged anchored exterior links on the same grid in parent and child comparisons. This is an empirical tolerance policy, not a new universal stability theorem.
+For the specific 74 km link,16 sections greatly reduce the12 h dip; 32 reduces it to roughly0.0001% but does not eliminate artifacts for all sharper forcing. Across64 pairs cap32 limits the tested saved-event contrast differences to6.06 minutes. A tighter required timing tolerance must refine affected reaches further; even the original Ld rule has that6.06-minute worst case.
+
+Literature context: Ponce and Theurer, Accuracy Criteria in Diffusion Routing (1982), https://ponce.sdsu.edu/accuracy_criteria_in_diffusion_routing.html distinguishes bounded routing from accuracy, including negative outflow artifacts on coarse grids. The quantitative conclusions above come from the archived experiments, not that paper.
+
+Artifacts: sensitivity.png; edge975_sensitivity.csv; metrics.csv; pairs.csv; pair_changes.csv; pair_summary.csv; coefficient_audit.csv; native_verification.csv; native_vs_frequency.csv; verification.json; sources.json; caps/ and factors/ waveforms and source manifests. Scripts and their helper dependencies are archived in execution_records/. Production code and notebooks were not changed by this experiment.
+'''
+ (O/'REPORT.txt').write_text(txt)
+ dest=O/'execution_records';dest.mkdir(exist_ok=True)
+ for name in ['cunge_cap_test','cunge_cap_native','cunge_factor_test','cunge_factor_native','cunge_cap_summarize','cunge_cap_report','cunge_pairs_run','cunge_segmentation_test','cunge_segmentation_adaptive','cunge_segmentation_native']:
+  shutil.copyfile(Path('/private/tmp')/(name+'.py'),dest/(name+'.py.txt'))
+ print(json.dumps(verification,indent=2));print(native_summary.to_string());print(rootcounts.to_string())
+if __name__=='__main__':main()

@@ -1,0 +1,159 @@
+CUNGE SUBDIVISION SENSITIVITY — 2026-10-06
+
+Question: can the conservative dx <= Ld subdivision rule be relaxed while preserving acceptable routing?
+
+DEFINITIONS AND INTERPRETATION
+Ld = Q_reference / (B S c), dx=L/N, K=dx/c, X=0.5*(1-Ld/dx).
+Rule A (previous conservative rule): N=max(1,ceil(L/Ld)).
+Rule B (cap): N=min(M,max(1,ceil(L/Ld))), M=2,3,4,8,16,32.
+Rule C (hydraulic scale multiplier): N=max(1,ceil(L/(alpha*Ld))), alpha=2,3,4,6,8,12,16.
+Written literally, max(2,L/Ld) would not reduce 98 sections on the longest link; both plausible relaxations were tested.
+Rule C implies X <= (1-1/alpha)/2. It indirectly restricts X through the grid but does not overwrite X. Directly clipping X at fixed dx would change the nominal diffusion coefficient c*dx*(0.5-X). Every rule here preserves Q/(2 B S), total actual length, nominal travel time and nominal variance.
+
+DESIGN
+16 parents and their 64 previously selected children, using the anchored hydraulic frames. Within each state, all hydraulics, celerity, Manning n=.035, reference discharges, topology and split fractions held fixed across grids. Q values are the previously frozen state reference allocations; this is not a new reference-allocation or calibration experiment.
+Three network forcings: saved event, and sin-squared positive pulses with 12 h / 48 h rise and equal fall durations. dt=15 s; frequency-domain evaluation every 150 s. Both inlet time levels used in the standard Muskingum recurrence, without lateral inflow.
+13 new grid rules * 80 states * 3 forcings = 3120 state-hydrograph evaluations, plus existing reference grids.
+Native recurrence checked on four selected stress pairs (examples 15,37,48,54), all 13 rules, saved event and 12 h pulse, dt=15 and 7.5 s: 416 runs. These checks include every numerical subsection, not only the network outlet.
+Isolated-link experiment: only child 37 / CB001_bubble_3 / edge975 varied, with identical inlet hydrograph taken from the conservative grid. Outlet at anchored node648, upstream node20. Actual L=74274.651476 m, c=3.358991644 m/s, Ld=763.935673892 m. Counts include 1 through16 plus selected values up to743. Saved event and positive 1,12,48 h rise pulses and a step, at both time steps. The 1 h pulse and step are stress tests, not an assertion that observed floods rise this quickly.
+
+STABILITY VERSUS POSITIVITY VERSUS ACCURACY
+At these parameters N=1 is already bounded. Therefore there is no largest finite alpha that can be selected merely from boundedness.
+For O_t=a I_t+b I_(t-1)+d O_(t-1), the impulse weights are h0=a and hj=(b+d*a)*d^(j-1), j>=1. b+d*a=4*K*dt/[dt+2*K*(1-X)]^2 >0. With 0<=d<1, a>=0 ensures positivity for arbitrary nonnegative forcing, even when b<0.
+For Cunge this sufficient positive-response condition is dx <= Ld+c*dt, with dt <= (dx+Ld)/c retained for d>=0. At dt15 this link needs ceil(L/(Ld+c*15))=92 sections; alpha<=1+c*15/Ld=1.065954 is the continuous conservative bound before integer rounding. At dt7.5 it needs95. The dt-independent X<=0 rule needs98.
+Fewer sections can work for smooth hydrographs, but that is a forcing-dependent accuracy decision. No universal positive-response guarantee follows from cap2/cap3 or alpha2/alpha3.
+
+RESULTS: 64 PAIRS
+Reference is a physical 200 m grid with exact total edge lengths and no floor. Peak-contrast errors are differences in (child peak time minus parent peak time), not individual travel-time errors. Resolved reversals require both contrast magnitudes to exceed1 minute. All new rules preserve the resolved contrast signs for these three forcings. Many effects are small, but the worst cases materially affect peak timing. The 100 m reference check had maximum saved-event pair difference1.63 seconds from200 m.
+    forcing                profile  n  median_abs_change_min  max_abs_change_min  pairs_over_5min  pairs_over_1min  resolved_flips  max_amplitude_contrast_change_pp
+  pulse_12h adaptive_nonpositive_x 64               0.007124            0.795253                0                0               0                          0.118230
+  pulse_12h                 cap_16 64               0.007123            0.795253                0                0               0                          0.116597
+  pulse_12h                  cap_2 64               0.006992           19.715981                3                3               0                          0.573924
+  pulse_12h                  cap_3 64               0.006943            9.195128                2                3               0                          0.257982
+  pulse_12h                 cap_32 64               0.007124            0.795253                0                0               0                          0.117845
+  pulse_12h                  cap_8 64               0.007109            1.008188                0                1               0                          0.112138
+  pulse_12h               factor_2 64               0.008425            3.104598                0                3               0                          0.188045
+  pulse_12h               factor_3 64               0.007888            5.054685                1                3               0                          0.285168
+  pulse_12h               factor_4 64               0.007619            9.228968                1                4               0                          0.284893
+  pulse_12h     unsegmented_actual 64               0.011535           58.753418                3                6               0                          1.749946
+  pulse_48h adaptive_nonpositive_x 64               0.002414            0.496582                0                0               0                          0.011648
+  pulse_48h                 cap_16 64               0.002414            0.496582                0                0               0                          0.011648
+  pulse_48h                  cap_2 64               0.002508            1.800805                0                2               0                          0.011648
+  pulse_48h                  cap_3 64               0.002486            0.706234                0                0               0                          0.011648
+  pulse_48h                 cap_32 64               0.002414            0.496582                0                0               0                          0.011648
+  pulse_48h                  cap_8 64               0.002288            0.496582                0                0               0                          0.011648
+  pulse_48h               factor_2 64               0.002603            0.497193                0                0               0                          0.011196
+  pulse_48h               factor_3 64               0.002795            0.465489                0                0               0                          0.011196
+  pulse_48h               factor_4 64               0.002795            0.706294                0                0               0                          0.011196
+  pulse_48h     unsegmented_actual 64               0.002795            7.535508                1                3               0                          0.016845
+saved_event adaptive_nonpositive_x 64               0.012403            6.059921                1                2               0                          0.019679
+saved_event                 cap_16 64               0.013956           14.232185                2                3               0                          0.019679
+saved_event                  cap_2 64               0.026228          111.166248                2                4               0                          0.188131
+saved_event                  cap_3 64               0.025500           73.498706                2                4               0                          0.139908
+saved_event                 cap_32 64               0.012403            6.059921                1                3               0                          0.019679
+saved_event                  cap_8 64               0.016441           29.725993                2                3               0                          0.113352
+saved_event               factor_2 64               0.029269           14.375085                2                3               0                          0.054423
+saved_event               factor_3 64               0.034112           14.375085                2                4               0                          0.054423
+saved_event               factor_4 64               0.037446           14.371647                3                4               0                          0.054359
+saved_event     unsegmented_actual 64               0.047629          194.030099                4                8               0                          0.425800
+
+ISOLATED 74 KM LINK
+  forcing  dt_s   N         x  outlet_dip_pct  internal_dip_pct  peak_time_error_min  peak_excess_error_pct  max_shape_error_pct  negative_total_q  reference_N
+pulse_12h  15.0   1  0.494857    7.363146e+00      7.363146e+00           -57.150570           8.654595e-02            12.045400             False          743
+pulse_12h  15.0   2  0.489715    3.236574e+00      3.236574e+00           -18.061562           8.499117e-02             4.101764             False          743
+pulse_12h  15.0   3  0.484572    1.750044e+00      1.750044e+00            -8.453189           4.320388e-02             1.904201             False          743
+pulse_12h  15.0   8  0.458859    2.388727e-01      2.388727e-01            -1.232669           6.496012e-03             0.351652             False          743
+pulse_12h  15.0  16  0.417718    2.191108e-02      2.191108e-02            -0.309458           1.640593e-03             0.095835             False          743
+pulse_12h  15.0  32  0.335436    8.922485e-05      1.183017e-04            -0.077345           4.151495e-04             0.024561             False          743
+pulse_12h  15.0  33  0.330293    5.792560e-05      8.477715e-05            -0.072721           3.904952e-04             0.023104             False          743
+pulse_12h  15.0  49  0.248011    3.682775e-09      5.874301e-07            -0.032911           1.773584e-04             0.010498             False          743
+pulse_12h  15.0  92  0.026877    0.000000e+00     -0.000000e+00            -0.009234           4.986792e-05             0.002952             False          743
+pulse_12h  15.0  98 -0.003979    2.360266e-15      2.360266e-15            -0.008121           4.386100e-05             0.002597             False          743
+pulse_12h  15.0 371 -1.407920    0.000000e+00     -0.000000e+00            -0.000433           2.339752e-06             0.000139             False          743
+pulse_48h  15.0   1  0.494857    5.765366e-01      5.765366e-01            -4.846256           1.611782e-03             0.577947             False          743
+pulse_48h  15.0   2  0.489715    2.160598e-01      2.160598e-01            -1.233331           4.150612e-04             0.220221             False          743
+pulse_48h  15.0   3  0.484572    1.129297e-01      1.129297e-01            -0.549980           1.857152e-04             0.118968             False          743
+pulse_48h  15.0   8  0.458859    1.504771e-02      1.504771e-02            -0.077512           2.654691e-05             0.022737             False          743
+pulse_48h  15.0  16  0.417718    1.374792e-03      1.374792e-03            -0.019377           6.641644e-06             0.006214             False          743
+pulse_48h  15.0  32  0.335436    5.585255e-06      7.401527e-06            -0.004838           1.631017e-06             0.001597             False          743
+pulse_48h  15.0  33  0.330293    3.625739e-06      5.303466e-06            -0.004549           1.531193e-06             0.001502             False          743
+pulse_48h  15.0  49  0.248011    2.299182e-10      3.671958e-08            -0.002058           6.801474e-07             0.000683             False          743
+pulse_48h  15.0  92  0.026877    0.000000e+00     -0.000000e+00            -0.000577           1.908449e-07             0.000192             False          743
+pulse_48h  15.0  98 -0.003979    2.360266e-15      2.360266e-15            -0.000508           1.678319e-07             0.000169             False          743
+pulse_48h  15.0 371 -1.407920    0.000000e+00     -0.000000e+00            -0.000027           8.946999e-09             0.000009             False          743
+ pulse_1h  15.0   1  0.494857    2.982359e+01      2.982359e+01          -238.190932          -2.836769e+01            29.823592              True          743
+ pulse_1h  15.0   2  0.489715    2.583871e+01      2.583871e+01          -136.545670          -2.900814e+01            25.838710              True          743
+ pulse_1h  15.0   3  0.484572    2.093865e+01      2.093865e+01           -93.060040          -2.353008e+01            24.588303              True          743
+ pulse_1h  15.0   8  0.458859    8.920488e+00      8.920488e+00           -31.700886          -7.914689e+00            12.941211             False          743
+ pulse_1h  15.0  16  0.417718    1.685042e+00      1.685042e+00           -11.901312          -2.003692e+00             4.662973             False          743
+ pulse_1h  15.0  32  0.335436    1.014172e-02      1.463281e-02            -3.549481          -3.571311e-01             1.237132             False          743
+ pulse_1h  15.0  33  0.330293    6.672087e-03      1.065368e-02            -3.350167          -3.304815e-01             1.163346             False          743
+ pulse_1h  15.0  49  0.248011    4.881521e-07      8.274296e-05            -1.566612          -1.263168e-01             0.525616             False          743
+ pulse_1h  15.0  92  0.026877    0.000000e+00     -0.000000e+00            -0.447686          -3.069434e-02             0.146936             False          743
+ pulse_1h  15.0  98 -0.003979    2.360266e-15      2.360266e-15            -0.394036          -2.674377e-02             0.129194             False          743
+ pulse_1h  15.0 371 -1.407920    0.000000e+00     -0.000000e+00            -0.021143          -1.420789e-03             0.006876             False          743
+All isolated errors refer to the 743-section numerical reference, not observed truth. Dip is percent of allocated imposed pulse amplitude, not percent total discharge. The 12 h pulse has baseline10% and excess90% of Q_reference; small dips in that test do not imply negative total flow. The 1 h pulse can produce negative total flow for very low counts. Saved-event dip fields are intentionally blank: that input itself drops below its initial flow, so crossing that baseline is not an unphysical-dip test.
+The link-only saved-event peak can jump between nearly equal maxima and is not the same metric as the full network outlet peak. Use the network-pair table for parent-child conclusions. Nominal mean and variance agree between grid rules; high-order waveform errors and oscillations can still differ.
+
+NATIVE CHECKS, INCLUDING INTERNAL SUBSECTIONS
+           min_total_q  worst_pulse12_internal_dip_pct
+profile
+cap_16        0.216871                        0.021885
+cap_2         0.216871                        3.236341
+cap_3         0.216871                        1.749849
+cap_32        0.216871                        0.000117
+cap_4         0.216871                        1.064877
+cap_8         0.216871                        0.238775
+factor_12     0.216871                        3.477968
+factor_16     0.216871                        3.477968
+factor_2      0.216871                        0.012520
+factor_3      0.216871                        0.233711
+factor_4      0.216871                        0.233729
+factor_6      0.216871                        3.477960
+factor_8      0.216871                        3.477968
+
+TOTAL NUMERICAL SECTIONS ACROSS 16 BASE NETWORKS
+profile
+adaptive_nonpositive_x     6317
+cap_16                     6243
+cap_2                      5615
+cap_3                      5766
+cap_32                     6306
+cap_4                      5879
+cap_8                      6101
+factor_12                  5334
+factor_16                  5325
+factor_2                   5713
+factor_3                   5545
+factor_4                   5467
+factor_6                   5389
+factor_8                   5357
+physical_200              39001
+unsegmented_actual         5315
+
+VERIFICATION
+{
+  "states": 80,
+  "parent_child_pairs": 64,
+  "new_network_grid_rules": 13,
+  "forcings_per_network": 3,
+  "native_runs": 416,
+  "isolated_link_runs": 380,
+  "max_native_vs_frequency_peak_error_s": 0.41093665379321465,
+  "max_native_time_halving_peak_change_s": 0.4288495824312122,
+  "max_nominal_moment_relative_difference": 7.089606812263755e-14,
+  "max_edge_zero_frequency_gain_error": 9.49880174516693e-10,
+  "minimum_network_dt_upper_s": 15.659839708349251,
+  "minimum_native_total_discharge_cms": 0.2168705154051255,
+  "scope": "Constant reference Q, c and hydraulic geometry, n=.035; selected population only; standard two-time upstream boundary; no production code changed."
+}
+
+RECOMMENDATION
+Do not treat98 as a necessary stability count. Two or three sections do not provide adequate protection across the tested forcings; nor does a single relaxed hydraulic multiplier guarantee accuracy across the networks.
+For a general positive-response requirement, use N=max(1,ceil(L/(Ld+c*dt))) together with the d>=0 guard, or retain the slightly more conservative dt-independent Ld rule. Recheck after changing dt or hydraulic/calibration parameters.
+For fewer sections, define acceptable pulse undershoot, waveform error and parent-child peak-contrast error, then choose the coarsest grid that passes those checks under the fastest relevant forcing. Keep unchanged anchored exterior links on the same grid in parent and child comparisons. This is an empirical tolerance policy, not a new universal stability theorem.
+For the specific 74 km link,16 sections greatly reduce the12 h dip; 32 reduces it to roughly0.0001% but does not eliminate artifacts for all sharper forcing. Across64 pairs cap32 limits the tested saved-event contrast differences to6.06 minutes. A tighter required timing tolerance must refine affected reaches further; even the original Ld rule has that6.06-minute worst case.
+
+Literature context: Ponce and Theurer, Accuracy Criteria in Diffusion Routing (1982), https://ponce.sdsu.edu/accuracy_criteria_in_diffusion_routing.html distinguishes bounded routing from accuracy, including negative outflow artifacts on coarse grids. The quantitative conclusions above come from the archived experiments, not that paper.
+
+Artifacts: sensitivity.png; edge975_sensitivity.csv; metrics.csv; pairs.csv; pair_changes.csv; pair_summary.csv; coefficient_audit.csv; native_verification.csv; native_vs_frequency.csv; verification.json; sources.json; caps/ and factors/ waveforms and source manifests. Scripts and their helper dependencies are archived in execution_records/. Production code and notebooks were not changed by this experiment.

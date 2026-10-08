@@ -1,0 +1,22 @@
+import sys,json
+import numpy as np,pandas as pd
+from concurrent.futures import ProcessPoolExecutor
+sys.path.insert(0,'/private/tmp');import cunge_cap_test as c
+FACTORS=[2,3,4,6,8,12,16]
+def setup(f,qref,qmid):
+ s=c.setup(f,qref,qmid);f=s['f'];L=f.link_length_m.to_numpy();speed=f.rapid_celerity_mps.to_numpy();ld=qref*s['shares']/(f.width.to_numpy()*f.slope.to_numpy()*speed)
+ for factor in FACTORS:
+  N=np.maximum(1,np.ceil(L/(factor*ld))).astype(int);dx=L/N;x=.5*(1-ld/dx);label=f'factor_{factor}';s['xs'][label]=x;s['variants'][id(x)]=(dx/speed,N,dx,label)
+ return s
+c.t.c.setup=setup
+def worker(ex):
+ c.t.c.run(ex,step=150,tag='factors',profiles=[f'factor_{n}' for n in FACTORS],clocks=[15.])
+ g=json.loads((c.O/'factors'/ex/'grid.json').read_text());rows=[]
+ for state,path,fp in g['sources']:
+  s=setup(pd.read_parquet(path),g['reference_cms'],g['midpoint_cms'])
+  for label in [f'factor_{n}' for n in FACTORS]:
+   x=s['xs'][label];k,N,dx,_=s['variants'][id(x)];rows.append(dict(example=ex,state=state,profile=label,segments=int(N.sum()),negative_current_coefficient_edges=int((15<2*k*x).sum()),minimum_dt_upper_s=float((2*k*(1-x)).min())))
+ pd.DataFrame(rows).to_csv(c.O/'factors'/ex/'grid_audit.csv',index=False)
+ return ex
+if __name__=='__main__':
+ with ProcessPoolExecutor(max_workers=2) as pool:print(list(pool.map(worker,sorted(c.t.c.SOURCES))),flush=True)

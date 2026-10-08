@@ -53,13 +53,15 @@ def speed_change_pct(lag_change_pct):
 
 
 CATEGORY_NAMES = {
+    "island-only collapse": "Island-only collapse",
+    "island collapse": "Island collapse",
     "nested unit": "Nested",
     "part of compound unit": "Part of compound",
     "single simple": "Single unit",
     "compound indep": "Compound unit",
     "compound unit compound": "Compound unit",
 }
-CATEGORY_COLORS = {"Nested": "#2ca02c", "Part of compound": "#ff7f0e",
+CATEGORY_COLORS = {"Island-only collapse": "#8c564b", "Island collapse": "#8c564b", "Nested": "#2ca02c", "Part of compound": "#ff7f0e",
                    "Single unit": "#1f77b4", "Compound unit": "#d62728"}
 
 

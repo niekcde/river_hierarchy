@@ -1,0 +1,55 @@
+FORMAL CALIBRATION TARGET SPECIFICATION — 6 October 2026
+Status: observation-based review specification; not applied to calibration or production.
+
+PRIMARY OBJECTIVE
+Calibrate the base-state model downstream event-crest time against the specified downstream UTC target. Use the identical target for fixed-X and Cunge. Retain existing forcing timestamps, Q reference, geometry, parameter bounds and routing policy for this target-only comparison. All child states inherit the resulting base n; children are not calibrated.
+
+CREST INTERVALS
+Intervals describe which observed crest times are being represented; they are not statistical confidence intervals. A midpoint is a deterministic representative time, not a claim of sub-sample observational precision. Retained individual peaks have a point interval, which does not imply zero measurement uncertainty. Record downstream observation cadence and model report cadence separately. Report signed error to midpoint and distance outside the crest interval; use the existing sampling-tolerance diagnostic separately and state its definition. Do not widen intervals to rescue a fit. Exact data timestamps replace rounded plotted-day endpoints for 11 and 13.
+
+MODEL TIMING AND UPSTREAM REFERENCES
+Primary residual = model downstream peak UTC minus target downstream UTC. The present calibration implementation uses model lag relative to PREPARED inlet maximum minus observed gauge-to-gauge lag relative to OBSERVED upstream maximum. These are not necessarily identical clocks: the prepared peak can differ from the observed peak. A future implementation must use the UTC residual, or exactly equivalent target offset from the prepared inlet. This table records both upstream references explicitly. Upstream equal-max spans are diagnostic; this specification does not silently redefine upstream peaks. Future gauge-to-gauge midpoint lags must use a reviewed upstream crest definition. Never resample or translate the forcing merely to align these timestamps.
+
+MODEL PEAK DEFINITION
+For the ordinary unimodal/merged-crest cases, retain the existing sampled event maximum as model observable during the target-only experiment, with first-tie handling explicitly reported. Inspect plateau/model interpolation sensitivity separately; do not silently change both definitions. Event 48 uses the user-selected middle of the three equal observed global maxima on June 2. Its nominal target is an actual observation timestamp, not the midpoint of the first-to-last crest interval. The earlier broad-crest alternative is not adopted; the model observable remains its event maximum.
+
+INTERPRETATION CHOICES
+37 has three equal highest samples; the user accepted the full first-to-last span midpoint. 45 was corrected by the user to the narrow 20 June 20:00–20:40 UTC span with nominal target 20:20 UTC; all other targets were accepted. The completed reviewed calibration snapshot predates this correction, so 45 requires a target-specific refit before production. 48 is resolved by the user: 2025-06-02 23:45 UTC, the middle of three equal maxima. Its crest span remains 2025-06-02 22:15 to 2025-06-03 01:30 UTC. Case 56 retains its current peak as requested, without declaring it erroneous. Case 11 stays a diagnostic case with unresolved Cunge calibration; target revision alone is not evidence of resolution.
+
+RECALIBRATION HANDOFF
+Freeze the resolved table and include its hash in calibration provenance. Recalibrate base states only; report old/new n, UTC residual, crest-interval residual, shape diagnostics and numerical checks. The inlet-reference correction may matter even for retained observed targets: reuse completed hierarchy outputs only when the final chosen n and all routing inputs remain identical. Do not treat preliminary targets or ambiguous feature matches as production-ready. Existing outputs and workbooks are unchanged.
+
+
+TARGET TABLE
+02 | specified | target 2025-08-01T23:00:00+00:00 | shift 0.0 min | crest 2025-08-01T23:00:00+00:00 to 2025-08-01T23:00:00+00:00
+  Retain the selected observed peak.
+03 | specified | target 2023-02-17T20:22:30+00:00 | shift 157.5 min | crest 2023-02-17T17:45:00+00:00 to 2023-02-17T23:00:00+00:00
+  Midpoint of the contiguous exact-maximum plateau.
+05 | specified | target 2024-01-08T17:15:00+00:00 | shift 0.0 min | crest 2024-01-08T17:15:00+00:00 to 2024-01-08T17:15:00+00:00
+  Retain the selected observed peak despite adjacent small fluctuations.
+11 | specified | target 2024-05-20T10:37:30+00:00 | shift 547.5 min | crest 2024-05-20T01:30:00+00:00 to 2024-05-20T19:45:00+00:00
+  User-specified 16.063–16.823 day span, resolved to exact observation timestamps. Diagnostic only: Cunge remains unresolved.
+13 | specified | target 2024-10-06T17:52:30+00:00 | shift 217.5 min | crest 2024-10-06T14:15:00+00:00 to 2024-10-06T21:30:00+00:00
+  User-specified 5.583–5.885 day plateau, resolved to exact observation timestamps; short intervening dips are retained.
+15 | specified | target 2026-04-03T14:28:08+00:00 | shift 30.0 min | crest 2026-04-03T13:58:08+00:00 to 2026-04-03T14:58:08+00:00
+  Midpoint of the contiguous exact-maximum plateau.
+21 | specified | target 2025-07-30T12:30:00+00:00 | shift 0.0 min | crest 2025-07-30T12:30:00+00:00 to 2025-07-30T12:30:00+00:00
+  Retain the selected observed peak.
+22 | specified | target 2025-08-20T00:45:00+00:00 | shift 75.0 min | crest 2025-08-19T23:30:00+00:00 to 2025-08-20T02:00:00+00:00
+  Midpoint of the full span covering the two equal-maximum crest blocks; the intervening dip belongs to this crest.
+37 | user_accepted | target 2014-06-28T09:15:00+00:00 | shift 120.0 min | crest 2014-06-28T07:15:00+00:00 to 2014-06-28T11:15:00+00:00
+  User accepted: span all THREE equal highest samples; use midpoint from first to last, retaining all three.
+41 | specified | target 2024-07-17T20:15:00+00:00 | shift 0.0 min | crest 2024-07-17T20:15:00+00:00 to 2024-07-17T20:15:00+00:00
+  Retain the first selected maximum as requested; a second equal maximum 30 minutes later is documented, not silently substituted.
+45 | user_corrected | target 2024-06-20T20:20:00+00:00 | shift 20.0 min | crest 2024-06-20T20:00:00+00:00 to 2024-06-20T20:40:00+00:00
+  User corrected: three nearly equal observed crests on 2024-06-20 at 20:00, 20:20 and 20:40 UTC. Narrow span 20:00–20:40; nominal target 20:20.
+46 | specified | target 2024-09-03T12:15:00+00:00 | shift 0.0 min | crest 2024-09-03T12:15:00+00:00 to 2024-09-03T12:15:00+00:00
+  Retain the selected observed peak.
+48 | user_selected | target 2025-06-02T23:45:00+00:00 | shift 90.0 min | crest 2025-06-02T22:15:00+00:00 to 2025-06-03T01:30:00+00:00
+  User selected the June 2 version: middle chronological sample among the three equal global maxima, 2025-06-02 23:45 UTC. The earlier broad-crest alternative is not adopted.
+54 | specified | target 2023-06-22T18:15:00+00:00 | shift 335.0 min | crest 2023-06-22T12:40:00+00:00 to 2023-06-22T23:50:00+00:00
+  Midpoint between maxima of the two broad crest lobes, selected in observation-only day windows 4.2–4.75 and 4.8–5.3.
+55 | specified | target 2025-04-17T02:00:00+00:00 | shift 0.0 min | crest 2025-04-17T02:00:00+00:00 to 2025-04-17T02:00:00+00:00
+  Retain the selected observed peak.
+56 | specified | target 2025-06-27T14:40:00+00:00 | shift 0.0 min | crest 2025-06-27T14:40:00+00:00 to 2025-06-27T14:40:00+00:00
+  Retain current peak provisionally. Local sharpness alone is insufficient evidence to reject it.

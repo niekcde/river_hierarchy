@@ -1,0 +1,121 @@
+from pathlib import Path
+import sys,json,hashlib,time
+import numpy as np
+import pandas as pd
+import networkx as nx
+from scipy.signal import lfilter
+from scipy.sparse import csc_matrix
+from scipy.sparse.linalg import factorized
+ROOT=Path('/Users/6256481/Code/river-hierarchy')
+sys.path.insert(0,str(ROOT/'RAPID/src'))
+from rapid_tools.engine import ccc_mat,rte_mat,mus_rte
+OUT=ROOT/'RAPID/validation/cunge_sensitivity_pilot_20261005';OUT.mkdir(exist_ok=True)
+SRC=ROOT/'RAPID/validation/cunge_x_20261005'
+sha=lambda p:hashlib.sha256(Path(p).read_bytes()).hexdigest()
+codefiles=list((ROOT/'RAPID/src').rglob('*.py'))+[ROOT/'RAPID/investigations/audit_cunge_x.py']
+before={str(p):sha(p) for p in codefiles}
+allseg=pd.read_parquet(SRC/'segments.parquet');allseg=allseg[allseg.scenario.eq('stored_reference')]
+links=allseg.groupby(['example','parent_link_id'],as_index=False).agg(length_m=('link_length_m','sum'),Lcrit_m=('length_for_x_zero_m','first'))
+links['x_original_length']=.5*(1-links.Lcrit_m/links.length_m)
+links.to_csv(OUT/'original_reach_x.csv',index=False)
+ls=[]
+for lo in [0,1000,5000,10000]:
+ d=links[links.length_m>=lo];ls.append(dict(min_length_m=lo,reaches=len(d),negative_percent=100*d.x_original_length.lt(0).mean(),median_x=d.x_original_length.median()))
+pd.DataFrame(ls).to_csv(OUT/'length_summary.csv',index=False)
+sources={s['example']:s for s in json.loads((SRC/'provenance.json').read_text())['sources']}
+refs=pd.read_csv(SRC/'reference_sections.csv',dtype={'example':str}).set_index('example')
+
+def route(f,x,dt,forcing,base,verify=False):
+ G=nx.DiGraph();out={}
+ for i,r in enumerate(f.itertuples()):G.add_edge(r.u,r.v);out.setdefault(r.u,[]).append(i)
+ roots=[v for v in G if G.in_degree(v)==0];ends=[v for v in G if G.out_degree(v)==0]
+ assert len(roots)==len(ends)==1
+ signals={roots[0]:forcing-base};shares={roots[0]:1.};minimum=np.inf;neg=0;idx=0;edge_states=[];edge_final=[];expanded=[]
+ den=dt+2*f.rapid_k.to_numpy()*(1-x);a=(dt-2*f.rapid_k.to_numpy()*x)/den;b=(dt+2*f.rapid_k.to_numpy()*x)/den;c=(2*f.rapid_k.to_numpy()*(1-x)-dt)/den
+ assert (abs(c)<1).all()
+ for node in nx.topological_sort(G):
+  signal=signals.pop(node);share=shares.pop(node)
+  if node==ends[0]:answer=signal+base;continue
+  ids=out[node];width=f.iloc[ids].width.sum()
+  for i in ids:
+   r=f.iloc[i];ratio=r.width/width;s=signal*ratio;flowshare=share*ratio
+   u=node
+   for j in range(int(r['count'])):
+    num=[a[i]+b[i]] if node==roots[0] and j==0 else [a[i],b[i]]
+    s=lfilter(num,[1,-c[i]],s)
+    mn=float(s.min()+base*flowshare);minimum=min(minimum,mn);neg+=int(np.count_nonzero(s+base*flowshare < -1e-10*base))
+    if verify:
+     v=int(r.v) if j==r['count']-1 else -1000000-idx
+     expanded.append((u,v,r.width,r.rapid_k,x[i],flowshare));u=v;idx+=1
+     edge_final.append(s[-1])
+   signals[r.v]=signals.get(r.v,0)+s;shares[r.v]=shares.get(r.v,0)+flowshare
+ error=None
+ if verify:
+  net=np.zeros((len(expanded),len(expanded)))
+  for i,(_,v,_,_,_,_) in enumerate(expanded):
+   ids=[j for j,e in enumerate(expanded) if e[0]==v]
+   for j in ids:net[j,i]=expanded[j][2]/sum(expanded[k][2] for k in ids)
+  mats=rte_mat(csc_matrix(net),*ccc_mat(np.array([e[3] for e in expanded]),np.array([e[4] for e in expanded]),dt))
+  solve=factorized(mats[0]);state=np.zeros(len(expanded));q=[]
+  for value in forcing-base:
+   ext=np.array([value*e[5] if e[0]==roots[0] else 0. for e in expanded])
+   _,state=mus_rte(*mats,1,state,ext,solve)
+   q.append(sum(state[j] for j,e in enumerate(expanded) if e[1]==ends[0])+base)
+  error=max(float(np.max(abs(np.array(q)-answer))),float(np.max(abs(state-edge_final))))
+  assert error<1e-8*max(forcing),error
+ return answer,minimum,neg,error
+
+rows=[];verifyrows=[];series={}
+for ex in ['02','03','48']:
+ f=pd.read_parquet(sources[ex]['frame']).copy().reset_index(drop=True)
+ s=allseg[allseg.example.eq(ex)].groupby('parent_link_id').first()
+ xmc=f.id_link.map(s.x_current_k).to_numpy();np.testing.assert_allclose(f.rapid_k,f.id_link.map(s.rapid_k))
+ assert int(f['count'].sum())==len(allseg[allseg.example.eq(ex)])
+ ref=float(refs.loc[ex,'reference_discharge_cms']);base=.1*ref
+ # Verify array-filter evaluation against the existing engine on each actual network.
+ test=base+(.9*ref)*np.sin(np.linspace(0,np.pi,80))**2
+ for label,x in [('fixed_x',np.full(len(f),.1)),('cunge_x',xmc)]:
+  _,_,_,error=route(f,x,30,test,base,True);verifyrows.append(dict(example=ex,method=label,max_absolute_engine_error=error))
+ # A conservative long recession window, identical between methods and clocks.
+ tail=max(30*86400,24*float((f.rapid_k*(1-xmc)).max()))
+ end=5*86400+tail
+ for dt in [30.,15.]:
+  t=np.arange(0,np.ceil(end/dt)+1)*dt
+  pulse=np.where((t>=86400)&(t<=5*86400),np.sin(np.pi*np.clip((t-86400)/(4*86400),0,1))**2,0.)
+  forcing=base+.9*ref*pulse
+  for label,x in [('fixed_x',np.full(len(f),.1)),('cunge_x',xmc)]:
+   q,mn,neg,_=route(f,x,dt,forcing,base)
+   dev=q-base;peak=int(q.argmax());lag=(t[peak]-t[forcing.argmax()])/3600
+   mean=(t@dev)/dev.sum();variance=((t-mean)**2@dev)/dev.sum()
+   row=dict(example=ex,method=label,dt_seconds=dt,reference_cms=ref,lag_hours=lag,peak_cms=q.max(),peak_excess_cms=dev.max(),centroid_lag_hours=(mean-(t@(forcing-base))/(forcing-base).sum())/3600,rms_width_hours=np.sqrt(variance)/3600,volume_relative_error=dev.sum()/(forcing-base).sum()-1,final_excess_fraction=abs(dev[-1])/(.9*ref),minimum_native_flow_cms=mn,negative_native_flow_count=neg,tail_days=tail/86400)
+   assert np.isfinite(q).all() and neg==0,row
+   assert abs(row['volume_relative_error'])<1e-5 and row['final_excess_fraction']<1e-7,row
+   rows.append(row)
+   # Compact five-minute samples for inspection; metrics use every native step.
+   take=int(300/dt);key=(ex,dt)
+   if key not in series:series[key]=pd.DataFrame(dict(time_hours=t[::take]/3600,inflow_cms=forcing[::take]))
+   series[key][label+'_cms']=q[::take]
+   print(row,flush=True)
+ result=pd.DataFrame(rows);result.to_csv(OUT/'metrics.csv',index=False)
+ for (case,dt),tab in series.items():tab.to_parquet(OUT/f'hydrograph_{case}_dt{dt:g}.parquet',index=False)
+pd.DataFrame(verifyrows).to_csv(OUT/'engine_parity.csv',index=False)
+comparisons=[]
+for (ex,dt),g in pd.DataFrame(rows).groupby(['example','dt_seconds']):
+ a=g.set_index('method').loc['fixed_x'];b=g.set_index('method').loc['cunge_x']
+ comparisons.append(dict(example=ex,dt_seconds=dt,baseline_lag_h=a.lag_hours,cunge_lag_h=b.lag_hours,peak_time_change_h=b.lag_hours-a.lag_hours,peak_excess_change_pct=100*(b.peak_excess_cms/a.peak_excess_cms-1),rms_width_change_pct=100*(b.rms_width_hours/a.rms_width_hours-1),centroid_lag_change_h=b.centroid_lag_hours-a.centroid_lag_hours))
+pd.DataFrame(comparisons).to_csv(OUT/'comparison.csv',index=False)
+after={str(p):sha(p) for p in codefiles};assert before==after
+(OUT/'provenance.json').write_text(json.dumps(dict(scope='Isolated X-only sensitivity, current base networks 02,03,48; no child or observed-flow validation',forcing='Steady 0.1 Qref base; sin-squared positive pulse from day 1 to 5, peak Qref at day 3; same shape in each network',routing='Exact native-step linear Muskingum recurrence evaluated on DAG with scipy.signal.lfilter; first external-input segment uses a+b as existing engine; verified against unchanged engine on all three real networks',parameter='X from stored reference discharge allocated by widths; current K, geometry, celerity caps, segmentation and split ratios unchanged',negative_x='Retained, no clipping; every segment checked at every native step',original_reach_x='Original physical lengths, local capped c, slope, Q allocation; diagnostic only, no unsegmented routing',source_audit_sha256=sha(SRC/'provenance.json'),source_files=[sources[e] for e in ['02','03','48']],model_code_hashes_unchanged=before,temporary_execution_script=str(Path(__file__)),temporary_script_sha256=sha(__file__)),indent=2))
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+fig,axes=plt.subplots(3,1,figsize=(10,9),constrained_layout=True)
+for ax,ex in zip(axes,['02','03','48']):
+ d=series[(ex,15.)];ref=float(refs.loc[ex,'reference_discharge_cms'])
+ ax.plot(d.time_hours/24,d.inflow_cms/ref,color='.65',ls='--',label='Inflow')
+ ax.plot(d.time_hours/24,d.fixed_x_cms/ref,color='#2563eb',label='Current X = 0.1')
+ ax.plot(d.time_hours/24,d.cunge_x_cms/ref,color='#d97706',label='Cunge-derived X, fixed K')
+ ax.set(xlim=(0,15),ylabel='Q / reference Q',title=f'Network {ex}');ax.grid(alpha=.2);ax.legend(fontsize=8)
+axes[-1].set_xlabel('Days');fig.suptitle('X-only sensitivity · controlled 48-hour rise and 48-hour recession\nCurrent geometry and K · 15-second timestep · not observational validation')
+fig.savefig(OUT/'hydrographs.png',dpi=160)
+print(pd.DataFrame(comparisons).to_string(index=False),flush=True)

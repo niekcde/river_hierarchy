@@ -1,0 +1,13 @@
+import sys,numpy as np
+from concurrent.futures import ProcessPoolExecutor
+sys.path.insert(0,'/private/tmp');import cunge_segmentation_test as t
+base_setup=t.setup
+
+def setup(f,qref,qmid):
+ s=base_setup(f,qref,qmid);f=s['f'];L=f.link_length_m.to_numpy();speed=f.rapid_celerity_mps.to_numpy();ld=qref*s['shares']/(f.width.to_numpy()*f.slope.to_numpy()*speed);N=np.maximum(1,np.ceil(L/ld)).astype(int);dx=L/N;x=.5*(1-ld/dx);assert (x<=1e-12).all();s['xs']['adaptive_nonpositive_x']=x;s['variants'][id(x)]=(dx/speed,N,dx,'adaptive_nonpositive_x');return s
+
+t.setup=setup;t.c.setup=setup
+
+def worker(ex):return t.c.run(ex,step=150,tag='adaptive',profiles=['adaptive_nonpositive_x'],clocks=[15.])
+if __name__=='__main__':
+ with ProcessPoolExecutor(max_workers=2) as pool:print(list(pool.map(worker,sorted(t.c.SOURCES))),flush=True)

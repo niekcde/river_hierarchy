@@ -1,0 +1,133 @@
+from pathlib import Path
+import sys,json,time,hashlib
+import numpy as np,pandas as pd,networkx as nx
+from scipy.fft import rfft,irfft,next_fast_len
+from concurrent.futures import ProcessPoolExecutor
+R=Path('/Users/6256481/Code/river-hierarchy');O=R/'RAPID/validation/cunge_parent_child_20261005';S=R/'RAPID/validation/cunge_x_20261005'
+SEL=pd.read_parquet(O/'selected_pairs.parquet');SOURCES={s['example']:s for s in json.loads((S/'provenance.json').read_text())['sources']}
+PROFILES=['fixed_0.0','fixed_0.1','fixed_0.3','cunge_reference','cunge_midpoint']
+
+def setup(f,qref,qmid):
+ f=f.reset_index(drop=True).copy();G=nx.DiGraph();edges={}
+ for i,r in enumerate(f.itertuples()):G.add_edge(r.u,r.v);edges.setdefault(r.u,[]).append(i)
+ order=list(nx.topological_sort(G));roots=[n for n in G if G.in_degree(n)==0];ends=[n for n in G if G.out_degree(n)==0];assert len(roots)==len(ends)==1
+ root,end=roots[0],ends[0];shares={root:1.};ratios=np.zeros(len(f));qshare=np.zeros(len(f))
+ for u in order:
+  ids=edges.get(u,[]);total=f.iloc[ids].width.sum()
+  for i in ids:
+   r=f.iloc[i];ratios[i]=r.width/total;qshare[i]=shares[u]*ratios[i];shares[r.v]=shares.get(r.v,0)+qshare[i]
+ assert np.isclose(shares[end],1.)
+ assert np.isfinite(f.select_dtypes('number')).all().all()
+ np.testing.assert_allclose(f.rapid_k,f.rapid_effective_length_m/f.rapid_celerity_mps)
+ denom=f.width.to_numpy()*f.slope.to_numpy()*f.rapid_celerity_mps.to_numpy()*f.rapid_effective_length_m.to_numpy()
+ xs={p:np.full(len(f),float(p.split('_')[1])) for p in PROFILES if p.startswith('fixed')}
+ xs.update(cunge_reference=.5*(1-qref*qshare/denom),cunge_midpoint=.5*(1-qmid*qshare/denom))
+ return dict(f=f,order=order,root=root,end=end,edges=edges,ratios=ratios,xs=xs,shares=qshare)
+
+def moments(s,x,dt):
+ # Exact moments of the discrete linear transfer, including held inlet forcing.
+ f=s['f'];k=f.rapid_k.to_numpy();count=f['count'].to_numpy();mu=count*k;var=count*k*k*(1-2*x)
+ for i in s['edges'][s['root']]:
+  mu[i]+= -k[i]*x[i]-dt/2
+  var[i]+= (k[i]*(1-x[i]))**2-dt*dt/4-k[i]**2*(1-2*x[i])
+ vals={s['root']:np.array([1.,0.,0.])}
+ for u in s['order']:
+  v=vals.pop(u)
+  if u==s['end']:ans=v;continue
+  for i in s['edges'][u]:
+   r=f.iloc[i];w=s['ratios'][i];mass,m1,m2=v
+   v2=w*np.array([mass,m1+mass*mu[i],m2+2*mu[i]*m1+mass*(mu[i]**2+var[i])])
+   vals[r.v]=vals.get(r.v,np.zeros(3))+v2
+ assert abs(ans[0]-1)<1e-12
+ return ans[1],max(0,ans[2]-ans[1]**2)
+
+def transfer(s,x,dt,n,step,alpha):
+ f=s['f'];k=f.rapid_k.to_numpy();count=f['count'].to_numpy(int);den=dt+2*k*(1-x)
+ a=(dt-2*k*x)/den;b=(dt+2*k*x)/den;c=(2*k*(1-x)-dt)/den
+ assert (abs(c)<1).all()
+ result=np.empty(n//2+1,complex)
+ target=f.v.to_numpy();order=s['order'];ratios=s['ratios'];edges=s['edges'];root=s['root'];end=s['end']
+ for start in range(0,len(result),8192):
+  freq=np.arange(start,min(start+8192,len(result)))/(n*step)
+  z=np.exp((-alpha-2j*np.pi*freq)*dt);values={root:np.ones(len(z),complex)}
+  for u in order:
+   signal=values.pop(u)
+   if u==end:result[start:start+len(z)]=signal;continue
+   for i in edges[u]:
+    h=(a[i]+b[i]*z)/(1-c[i]*z)
+    h=h**count[i] if u!=root else (a[i]+b[i])/(1-c[i]*z)*h**(count[i]-1)
+    val=signal*ratios[i]*h;v=target[i]
+    values[v]=values.get(v,0)+val
+ return result
+
+def peak(t,y):
+ i=int(np.argmax(y))
+ if i==0 or i==len(y)-1:return float(t[i]),'boundary'
+ if y[i]==y[i-1] or y[i]==y[i+1]:return float(t[i]),'tie'
+ den=y[i-1]-2*y[i]+y[i+1];delta=.5*(y[i-1]-y[i+1])/den
+ return float(t[i]+np.clip(delta,-.5,.5)*(t[1]-t[0])),'interpolated'
+
+def metrics(t,q,forcing,base,final,kind,mu,var,rise):
+ p,status=peak(t,q);ip,_=peak(t,forcing);excess=q.max()-max(base,final)
+ threshold=.01*(forcing.max()-max(base,final))
+ # Event duration uses common forcing-derived thresholds across parents and children.
+ depart=np.flatnonzero(abs(q-base)>threshold);outside=np.flatnonzero(abs(q-final)>threshold)
+ duration=np.nan;duration_status='censored'
+ if len(depart) and len(outside) and depart[0]>0 and outside[-1]<len(t)-1:
+  def cross(i,arr):return t[i]+(t[i+1]-t[i])*(threshold-arr[i])/(arr[i+1]-arr[i])
+  start=cross(depart[0]-1,abs(q-base));finish=cross(outside[-1],abs(q-final));duration=(finish-start)/3600;duration_status='resolved'
+ return dict(peak_time_h=p/3600,peak_status=status,lag_h=(p-ip)/3600,peak_cms=float(q.max()),peak_excess_cms=float(excess),minimum_outlet_cms=float(q.min()),initial_error_fraction=float(abs(q[0]-base)/(forcing.max()-forcing.min())),final_error_fraction=float(abs(q[-1]-final)/(forcing.max()-forcing.min())),event_duration_h=duration,event_duration_status=duration_status,centroid_lag_h=mu/3600 if kind!='saved_event' else np.nan,rms_width_h=np.sqrt(var+(2*rise)**2*(1/12-1/(2*np.pi*np.pi)))/3600 if kind!='saved_event' else np.nan)
+
+def run(ex,step=600.,tag='main',profiles=None,clocks=None,tilt=20.):
+ profiles=profiles or PROFILES;clocks=clocks or [30.,15.]
+ dest=O/tag/ex;dest.mkdir(parents=True,exist_ok=True)
+ src=SOURCES[ex];root=Path(src['hydrograph']).parent.parent.parent;inv=pd.read_csv(root/'inventory.csv',dtype={'example':str})
+ pick=SEL[SEL.example_id.eq(ex)];wanted=[('S000_base',src['frame'],Path(src['hydrograph']).parent.parent.name)]
+ for r in pick.itertuples():
+  m=inv[inv.fingerprint.eq(r.fingerprint)].iloc[0];wanted.append((r.state_id,m.frame,r.fingerprint))
+ ref=json.loads(Path(src['policy_manifest']).read_text())['reference_kb_summary']['reference_discharge_cms']
+ h=pd.read_csv(src['hydrograph']);tt=h.time_seconds.to_numpy();qq=h.q_inflow_cms.to_numpy();qmid=(qq[0]+qq.max())/2
+ change=np.flatnonzero(abs(np.diff(qq))>np.ptp(qq)*1e-10);lo=max(0,int(np.searchsorted(tt,tt[change[0]]-2*86400)));hi=min(len(tt)-1,change[-1]+2)
+ st=tt[lo:hi+1]-tt[lo];sq=qq[lo:hi+1]
+ setups={name:setup(pd.read_parquet(path),ref,qmid) for name,path,fp in wanted}
+ maxmu=max(moments(s,s['xs']['cunge_reference'],30)[0] for s in setups.values())
+ end=max(st[-1],5*86400)+max(30*86400,4*maxmu)
+ # Exponential tilt makes periodic wrap negligible without requiring the full long tail.
+ n=next_fast_len(int(np.ceil(2*end/step)));t=np.arange(n)*step;alpha=tilt/(n*step);nt=int(np.floor(end/step))+1
+ forcings={};rises={}
+ for kind,rise in [('pulse_48h',48*3600),('pulse_12h',12*3600)]:
+  p=np.sin(np.pi*np.clip((t-86400)/(2*rise),0,1))**2;p[(t<86400)|(t>86400+2*rise)]=0
+  forcings[kind]=.1*ref+.9*ref*p;rises[kind]=rise
+ forcings['saved_event']=np.interp(t,st,sq);rises['saved_event']=0
+ spectra={kind:rfft((q-q[0])*np.exp(-alpha*t)) for kind,q in forcings.items()}
+ metadata=dict(example=ex,step_seconds=step,nfft=n,alpha=alpha,analyzed_days=t[nt-1]/86400,actual_start_offset_seconds=float(tt[lo]),actual_input_end_seconds=float(st[-1]),reference_cms=ref,midpoint_cms=qmid,scope='Damped frequency-domain evaluation at specified report grid; native routing coefficients unchanged',sources=wanted)
+ (dest/'grid.json').write_text(json.dumps(metadata,indent=2))
+ rows=[];audits=[]
+ for name,path,fp in wanted:
+  s=setups[name]
+  for profile in profiles:
+   x=s['xs'][profile]
+   audits.append(dict(state=name,profile=profile,segments=int(s['f']['count'].sum()),x_min=x.min(),x_median=np.median(np.repeat(x,s['f']['count'].astype(int))),x_max=x.max(),negative_x_percent=100*np.average(x<0,weights=s['f']['count'])))
+   for dt in clocks:
+    if tag=='main' and dt==15 and profile not in ['fixed_0.1','cunge_reference']:continue
+    H=transfer(s,x,dt,n,step,alpha);mu,var=moments(s,x,dt)
+    waves=pd.DataFrame({'time_seconds':t[:nt]})
+    for kind,q in forcings.items():
+     output=q[0]+irfft(spectra[kind]*H,n)[:nt]*np.exp(alpha*t[:nt])
+     assert np.isfinite(output).all()
+     m=metrics(t[:nt],output,q[:nt],q[0],q[-1],kind,mu,var,rises[kind])
+     rows.append(dict(example=ex,state=name,fingerprint=fp,profile=profile,dt_s=dt,forcing=kind,**m))
+     waves[kind+'_inflow']=q[:nt];waves[kind+'_outlet']=output
+    waves.to_parquet(dest/f'{fp}_{profile}_dt{dt:g}.parquet',index=False)
+  print(tag,ex,name,'done',flush=True)
+  pd.DataFrame(rows).to_csv(dest/'metrics.csv',index=False)
+ pd.DataFrame(audits).to_csv(dest/'x_audit.csv',index=False)
+ print('FINISHED',tag,ex,'seconds grid',step,'nfft',n,flush=True)
+ return ex
+
+if __name__=='__main__':
+ import argparse
+ a=argparse.ArgumentParser();a.add_argument('--examples',nargs='+');a.add_argument('--step',type=float,default=600);a.add_argument('--tag',default='main');a.add_argument('--tilt',type=float,default=20);a.add_argument('--profiles',nargs='+');a.add_argument('--workers',type=int,default=2);args=a.parse_args()
+ examples=args.examples or sorted(SEL.example_id.unique())
+ from functools import partial
+ with ProcessPoolExecutor(max_workers=args.workers) as pool:list(pool.map(partial(run,step=args.step,tag=args.tag,profiles=args.profiles,tilt=args.tilt),examples))

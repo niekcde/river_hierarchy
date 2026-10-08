@@ -1,0 +1,23 @@
+import sys,json
+import numpy as np,pandas as pd
+from concurrent.futures import ProcessPoolExecutor
+sys.path.insert(0,'/private/tmp')
+import cunge_segmentation_native as n
+import cunge_cap_test as c
+def worker(ex):
+ grid=json.loads((c.OLD/'refined'/ex/'grid.json').read_text());changes=pd.read_csv(c.OLD/'main_pair_changes.csv',dtype={'example':str});g=changes[(changes.example==ex)&(changes.profile=='unsegmented_actual')&(changes.forcing=='saved_event')];child=g.loc[g.change_h.abs().idxmax(),'state'];rows=[]
+ for state,path,fp in grid['sources']:
+  if state not in ['S000_base',child]:continue
+  s=c.setup(pd.read_parquet(path),grid['reference_cms'],grid['midpoint_cms'])
+  w=pd.read_parquet(c.OLD/'refined'/ex/f'{fp}_unsegmented_actual_dt15.parquet');tg=w.time_seconds.to_numpy()
+  for cap in c.CAPS:
+   profile=f'cap_{cap}'
+   for forcing in ['saved_event','pulse_12h']:
+    for dt in [15.,7.5]:
+     tn=np.arange(int(tg[-1]/dt)+1)*dt;flow=np.interp(tn,tg,w[forcing+'_inflow']);q,mn,under=n.route(s,s['xs'][profile],dt,flow);pk,_=c.t.c.peak(tn,q)
+     rows.append(dict(example=ex,state=state,profile=profile,forcing=forcing,dt_s=dt,peak_h=pk/3600,peak_cms=q.max(),minimum_all_segments=mn,minimum_excess_fraction=under if forcing=='pulse_12h' else np.nan))
+  print(ex,state,'native complete',flush=True)
+ pd.DataFrame(rows).to_csv(c.O/f'native_{ex}.csv',index=False)
+ return ex
+if __name__=='__main__':
+ with ProcessPoolExecutor(max_workers=2) as pool:print(list(pool.map(worker,['15','37','48','54'])),flush=True)

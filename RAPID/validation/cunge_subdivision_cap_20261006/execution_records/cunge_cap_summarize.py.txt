@@ -1,0 +1,38 @@
+import sys,json,shutil
+from pathlib import Path
+import numpy as np,pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+sys.path.insert(0,'/private/tmp');import cunge_cap_test as c
+O=c.O;OLD=c.OLD
+def pairs(m):
+ rows=[]
+ for (ex,p,dt,forcing),g in m.groupby(['example','profile','dt_s','forcing']):
+  parent=g[g.state=='S000_base'].iloc[0]
+  for _,r in g[g.state!='S000_base'].iterrows():rows.append(dict(example=ex,state=r.state,profile=p,dt_s=dt,forcing=forcing,delta_peak_h=r.peak_time_h-parent.peak_time_h,peak_excess_change_pct=100*(r.peak_excess_cms/parent.peak_excess_cms-1)))
+ return pd.DataFrame(rows)
+def main():
+ m=pd.concat([pd.read_csv(p,dtype={'example':str}) for p in (O/'caps').glob('*/metrics.csv')]);assert len(m)==80*6*3
+ factors=pd.concat([pd.read_csv(p,dtype={'example':str}) for p in (O/'factors').glob('*/metrics.csv')]);assert len(factors)==80*7*3;m=pd.concat([m,factors])
+ old=pd.read_csv(OLD/'refined_metrics.csv',dtype={'example':str});old=old[old.profile.isin(['unsegmented_actual','physical_200','physical_100'])]
+ adaptive=pd.read_csv(OLD/'adaptive_metrics.csv',dtype={'example':str});m=pd.concat([m,old,adaptive]);m.to_csv(O/'metrics.csv',index=False);p=pairs(m);p.to_csv(O/'pairs.csv',index=False)
+ ref=p[p.profile=='physical_200'];z=p.merge(ref,on=['example','state','dt_s','forcing'],suffixes=('','_ref'));z['change_min']=60*(z.delta_peak_h-z.delta_peak_h_ref);z['amplitude_contrast_change_pp']=z.peak_excess_change_pct-z.peak_excess_change_pct_ref;z['resolved_flip']=(z.delta_peak_h*z.delta_peak_h_ref<0)&(z.delta_peak_h.abs()>1/60)&(z.delta_peak_h_ref.abs()>1/60);z.to_csv(O/'pair_changes.csv',index=False)
+ summary=z.groupby(['forcing','profile']).agg(n=('state','size'),median_abs_change_min=('change_min',lambda a:a.abs().median()),max_abs_change_min=('change_min',lambda a:a.abs().max()),pairs_over_5min=('change_min',lambda a:(a.abs()>5).sum()),pairs_over_1min=('change_min',lambda a:(a.abs()>1).sum()),resolved_flips=('resolved_flip','sum'),max_amplitude_contrast_change_pp=('amplitude_contrast_change_pp',lambda a:a.abs().max())).reset_index();summary.to_csv(O/'pair_summary.csv',index=False)
+ print(summary.to_string(index=False),flush=True)
+ iso=pd.read_csv(O/'edge975_sensitivity.csv');iso.loc[iso.forcing=='saved_event',['outlet_dip_pct','internal_dip_pct']]=np.nan;iso.to_csv(O/'edge975_sensitivity.csv',index=False)
+ cv=pd.read_csv(O/'edge975_curves.csv');fig,axs=plt.subplots(2,2,figsize=(12,8),constrained_layout=True)
+ colors={1:'#bd4937',2:'#d97a25',3:'#b39b32',4:'#899d28',8:'#419d7a',16:'#3285bc',32:'#635aab',98:'#333333',743:'#111111'}
+ for ax,kind in zip(axs[0],['pulse_12h','pulse_1h']):
+  for count in [1,2,3,8,16,98]:
+   r=cv[(cv.forcing==kind)&(cv.N==count)];ax.plot(r.time_h,r.q_normalized,label=f'{count} sections',color=colors[count],lw=1.5)
+  ax.axhline(0,color='grey',lw=.6);ax.set(xlim=(24,60 if kind=='pulse_12h' else 40),xlabel='Time (hours)',ylabel='Excess flow / inlet pulse amplitude',title=f'74 km link: {kind.split("_")[1]} rise');ax.legend(fontsize=8,ncol=2)
+ for kind,marker in [('pulse_12h','o'),('pulse_48h','s'),('pulse_1h','^')]:
+  r=iso[(iso.dt_s==15)&(iso.forcing==kind)];axs[1,0].plot(r.N,np.maximum(r.internal_dip_pct,1e-9),marker=marker,ms=3,label=kind)
+ axs[1,0].set(xscale='log',yscale='log',ylim=(1e-6,100),xlabel='Sections in the 74 km link',ylabel='Largest internal dip (% inlet amplitude)',title='Dip depends on hydrograph rise time');axs[1,0].axhline(.1,color='grey',ls=':');axs[1,0].legend(fontsize=8)
+ for kind,marker in [('saved_event','o'),('pulse_12h','s'),('pulse_48h','^')]:
+  r=summary[(summary.forcing==kind)&summary.profile.str.startswith('cap_')].copy();r['N']=r.profile.str.split('_').str[1].astype(int);r=r.sort_values('N');axs[1,1].plot(r.N,r.max_abs_change_min,marker=marker,label=kind)
+ axs[1,1].set(xscale='log',yscale='log',xlabel='Maximum sections per link',ylabel='Largest pair-contrast difference (minutes)',title='64 pairs relative to physical 200 m grid');axs[1,1].axhline(5,color='grey',ls=':');axs[1,1].legend(fontsize=8)
+ fig.suptitle('Cunge subdivision sensitivity — fixed hydraulics, no length floor, dt = 15 s');fig.savefig(O/'sensitivity.png',dpi=170);plt.close(fig)
+ print('SAVED WORST',z[(z.forcing=='saved_event')&z.profile.str.startswith('cap_')].sort_values('change_min',key=abs,ascending=False).head(12)[['example','state','profile','change_min']].to_string(index=False))
+if __name__=='__main__':main()

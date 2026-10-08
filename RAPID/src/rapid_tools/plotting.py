@@ -18,6 +18,8 @@ SECONDS_PER_HOUR = 3600.0
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[3] / "network_variants" / "output"
 
 CATEGORY_COLOR_MAP = {
+    "island-only collapse": "#8c564b",
+    "island collapse": "#8c564b",
     "single simple": "#1f77b4",
     "compound indep": "#9467bd",
     "compound unit compound": "#d62728",
@@ -26,6 +28,10 @@ CATEGORY_COLOR_MAP = {
 }
 
 TIMING_Y_METRIC_LABELS = {
+    "interpolated_lag_shift_pct": "Refined peak-lag change relative to parent modeled lag (%)",
+    "interpolated_peak_shift_hours": "Refined child − parent peak timing (h)",
+    "event_duration_change_pct": "Event-duration change vs parent [%; 1% plateau thresholds]",
+    "peak_excess_change_pct": "Peak-excess change vs parent [%]",
     "centroid50_shift_hours": "Centroid shift above 50% peak [hours]",
     "centroid75_shift_hours": "Centroid shift above 75% peak [hours]",
     "peak_time_shift_hours": "Peak-time shift [hours]",

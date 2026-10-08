@@ -1,0 +1,68 @@
+import sys,json
+from pathlib import Path
+import numpy as np,pandas as pd
+from scipy.signal import lfilter
+from concurrent.futures import ProcessPoolExecutor
+sys.path.insert(0,'/private/tmp')
+import cunge_segmentation_adaptive as a
+t=a.t
+OLD=t.O
+O=t.c.R/'RAPID/validation/cunge_subdivision_cap_20261006'
+CAPS=[2,3,4,8,16,32]
+base_setup=a.setup
+def setup(f,qref,qmid):
+ s=base_setup(f,qref,qmid);f=s['f'];L=f.link_length_m.to_numpy();c=f.rapid_celerity_mps.to_numpy();ld=qref*s['shares']/(f.width.to_numpy()*f.slope.to_numpy()*c)
+ for cap in CAPS:
+  N=np.minimum(np.maximum(1,np.ceil(L/ld)).astype(int),cap);dx=L/N;x=.5*(1-ld/dx);label=f'cap_{cap}';s['xs'][label]=x;s['variants'][id(x)]=(dx/c,N,dx,label)
+ return s
+t.c.setup=setup;t.c.O=O
+def worker(ex):
+ t.c.run(ex,step=150,tag='caps',profiles=[f'cap_{n}' for n in CAPS],clocks=[15.])
+ g=json.loads((O/'caps'/ex/'grid.json').read_text());rows=[]
+ for state,path,fp in g['sources']:
+  s=setup(pd.read_parquet(path),g['reference_cms'],g['midpoint_cms'])
+  for label in [f'cap_{n}' for n in CAPS]:
+   x=s['xs'][label];k,N,dx,_=s['variants'][id(x)];rows.append(dict(example=ex,state=state,profile=label,segments=int(N.sum()),negative_current_coefficient_edges=int((15<2*k*x).sum()),minimum_dt_upper_s=float((2*k*(1-x)).min())))
+ pd.DataFrame(rows).to_csv(O/'caps'/ex/'grid_audit.csv',index=False)
+ return ex
+def isolated():
+ g=json.loads((OLD/'refined/37/grid.json').read_text());state='CB001_bubble_3';_,path,fp=next(r for r in g['sources'] if r[0]==state);s=setup(pd.read_parquet(path),g['reference_cms'],g['midpoint_cms']);f=s['f'];idx=int(np.flatnonzero(f.id_link.eq(975))[0]);L=float(f.iloc[idx].link_length_m);speed=float(f.iloc[idx].rapid_celerity_mps);ld=g['reference_cms']*s['shares'][idx]/(f.iloc[idx].width*f.iloc[idx].slope*speed)
+ w=pd.read_parquet(OLD/'refined/37'/f'{fp}_unsegmented_actual_dt15.parquet');rows=[];curves=[]
+ for dt in [15.,7.5]:
+  time=np.arange(int(w.time_seconds.iloc[-1]/dt)+1)*dt
+  for kind in ['saved_event','pulse_12h','pulse_48h','pulse_1h','step']:
+   if kind.startswith('pulse'):
+    rise=float(kind.split('_')[1][:-1])*3600;p=np.sin(np.pi*np.clip((time-86400)/(2*rise),0,1))**2;p[(time<86400)|(time>86400+2*rise)]=0;flow=g['reference_cms']*(.1+.9*p)
+   elif kind=='step':flow=g['reference_cms']*(.1+.9*(time>=86400))
+   else:flow=np.interp(time,w.time_seconds,w.saved_event_inflow)
+   amp=np.ptp(flow);x=s['xs']['adaptive_nonpositive_x'];k,N,dx,_=s['variants'][id(x)];den=dt+2*k*(1-x);aa=(dt-2*k*x)/den;bb=(dt+2*k*x)/den;dd=(2*k*(1-x)-dt)/den
+   # Capture identical upstream hydrograph at the anchored start of edge 975.
+   signals={s['root']:flow};target=f.v.to_numpy();inlet=None
+   for u in s['order']:
+    if u==s['end']:break
+    sig=signals.pop(u)
+    for i in s['edges'][u]:
+     val=sig*s['ratios'][i];eq=flow[0]*s['shares'][i]
+     if i==idx:inlet=val.copy()
+     for j in range(N[i]):val,_=lfilter([aa[i],bb[i]],[1,-dd[i]],val,zi=[(bb[i]+dd[i])*eq])
+     signals[target[i]]=signals.get(target[i],0)+val
+   eq=flow[0]*s['shares'][idx];localamp=amp*s['shares'][idx];outs={};internal={}
+   counts=list(range(1,17))+[17,20,24,25,32,33,48,49,64,90,91,92,93,94,95,96,97,98,128,200,371,743]
+   for count in counts:
+    cell=L/count;kk=cell/speed;xx=.5*(1-ld/cell);den=dt+2*kk*(1-xx);ca=(dt-2*kk*xx)/den;cb=(dt+2*kk*xx)/den;cd=(2*kk*(1-xx)-dt)/den;assert 0<=cd<1
+    val=inlet.copy();worst=0.
+    for j in range(count):
+     val,_=lfilter([ca,cb],[1,-cd],val,zi=[(cb+cd)*eq]);worst=min(worst,float((val.min()-eq)/localamp))
+    outs[count]=val;internal[count]=worst
+   ref=outs[743];refpeak=t.c.peak(time,ref)[0];refamp=ref.max()-eq
+   for count,val in outs.items():
+    peak=t.c.peak(time,val)[0];rows.append(dict(forcing=kind,dt_s=dt,N=count,x=.5*(1-ld/(L/count)),outlet_dip_pct=max(0.,(eq-val.min())/localamp*100),internal_dip_pct=-internal[count]*100,peak_time_error_min=(peak-refpeak)/60 if kind!='step' else np.nan,peak_excess_error_pct=100*((val.max()-eq)/refamp-1),max_shape_error_pct=100*np.max(abs(val-ref))/localamp,negative_total_q=bool(val.min()<0),reference_N=743))
+    if dt==15 and kind in ['pulse_12h','pulse_1h'] and count in [1,2,3,4,8,16,32,98,743]:
+     mask=time<=4*86400;curves.append(pd.DataFrame(dict(time_h=time[mask][::20]/3600,q_normalized=(val[mask][::20]-eq)/localamp,N=count,forcing=kind)))
+   print('isolated',dt,kind,'done',flush=True)
+ pd.DataFrame(rows).to_csv(O/'edge975_sensitivity.csv',index=False);pd.concat(curves).to_csv(O/'edge975_curves.csv',index=False)
+ (O/'edge975_parameters.json').write_text(json.dumps(dict(example='37',state=state,id_link=975,L_m=L,c_mps=speed,Ld_m=float(ld),N_nonpositive_x=int(np.ceil(L/ld)),N_positive_impulse_dt15=int(np.ceil(L/(ld+speed*15))),scope='Only edge 975 varied; upstream forcing and all other edges held at adaptive_nonpositive_x; edge outlet measured at node 648.'),indent=2))
+if __name__=='__main__':
+ if '--isolated' in sys.argv:isolated()
+ else:
+  with ProcessPoolExecutor(max_workers=2) as pool:print(list(pool.map(worker,sorted(t.c.SOURCES))),flush=True)

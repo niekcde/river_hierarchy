@@ -16,6 +16,9 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS = {
+    "prepare_cunge_grid": ("cunge", "freeze_grid"),
+    "compute_cunge_parameters": ("cunge", "parameters"),
+    "write_cunge_prepared_state": ("cunge", "write_prepared_state"),
     "build_all_matched_link_summary": ("analysis", "build_all_matched_link_summary"),
     "build_combined_analysis_frame": ("analysis", "build_combined_analysis_frame"),
     "build_matched_corridor_hydrograph_frame": ("analysis", "build_matched_corridor_hydrograph_frame"),

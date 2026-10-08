@@ -1,0 +1,37 @@
+from pathlib import Path
+import numpy as np,pandas as pd,json
+from scipy.stats import spearmanr
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import Ridge
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import r2_score,mean_absolute_error
+R=Path('/Users/6256481/Code/river-hierarchy');O=R/'RAPID/validation/cunge_physical_assessment_20261005';O.mkdir(exist_ok=True)
+features=pd.read_parquet(R/'RAPID/validation/cunge_parent_child_20261005/selected_pairs.parquet')
+y=pd.read_csv(R/'RAPID/validation/cunge_parent_child_20261005/refined_pairs.csv',dtype={'example':str});y=y[(y.forcing=='saved_event')&(y.dt_s==30)&y.profile.isin(['fixed_0.1','cunge_reference','cunge_midpoint'])]
+cols=['omega','resistance_log','length_fraction','width_fraction','parent_equivalent_length','parent_elongation','parent_dominant_width_fraction','parent_path_length_cv','signed_length_width_association','domain_reference_slope','log_equivalent_length_ratio','log_elongation_ratio','change_path_length_cv','change_width_dominance','upstream_shortest_length_m','downstream_shortest_length_m']
+x=features[['example_id','state_id']+cols];y=y.drop(columns=[c for c in cols if c in y]);d=y.merge(x,left_on=['example','state'],right_on=['example_id','state_id'],validate='many_to_one')
+responses=['delta_peak_h','lag_change_pct','peak_excess_change_pct','duration_change_pct']
+sets={'omega':['omega'],'components':['resistance_log','length_fraction','width_fraction'],'selected_six':['resistance_log','width_fraction','parent_equivalent_length','parent_dominant_width_fraction','signed_length_width_association','domain_reference_slope'],'all_geometry':cols[1:10],'geometry_change_context':cols[1:]}
+(O/'predictor_design.json').write_text(json.dumps(dict(features=cols,sets=sets,responses=responses,models=['standardized ridge alpha=1','histogram boosting:80 iterations,7 leaves,minleaf20,l2=1'],validation='Leave one whole river out; same folds/features/settings across parameterizations; no hyperparameter or feature selection',scope='Exploratory conditional performance on previously chosen 64 stress pairs; not population or independent external validation',missing='Use identical complete-pair subset across methods for each response; durations may be censored'),indent=2))
+corr=[];pred=[]
+for response in responses:
+ valid=d.pivot(index=['example','state'],columns='profile',values=response).notna().all(axis=1);ix=set(valid[valid].index)
+ z=d[[tuple(r) in ix for r in d[['example','state']].values]]
+ for profile,g in z.groupby('profile'):
+  for col in cols:corr.append(dict(response=response,profile=profile,predictor=col,n=len(g),spearman=spearmanr(g[col],g[response]).statistic))
+  for group,cc in sets.items():
+   for kind in ['ridge','boosted']:
+    for ex in sorted(g.example.unique()):
+     train=g[g.example!=ex];test=g[g.example==ex]
+     model=make_pipeline(StandardScaler(),Ridge(alpha=1.)) if kind=='ridge' else HistGradientBoostingRegressor(max_iter=80,max_leaf_nodes=7,min_samples_leaf=20,l2_regularization=1,early_stopping=False,random_state=20261005)
+     model.fit(train[cc],train[response]);p=model.predict(test[cc])
+     for r,estimate in zip(test.itertuples(),p):pred.append(dict(response=response,profile=profile,feature_set=group,model=kind,example=ex,state=r.state,y=getattr(r,response),predicted=estimate,training_mean=float(train[response].mean())))
+  print(response,profile,'done',flush=True)
+p=pd.DataFrame(pred);p.to_parquet(O/'predictor_predictions.parquet',index=False);pd.DataFrame(corr).to_csv(O/'predictor_correlations.csv',index=False)
+rows=[]
+for key,g in p.groupby(['response','profile','feature_set','model']):
+ mae=mean_absolute_error(g.y,g.predicted);zero=abs(g.y).mean();mean=mean_absolute_error(g.y,g.training_mean)
+ rows.append(dict(zip(['response','profile','feature_set','model'],key),n=len(g),r2=r2_score(g.y,g.predicted),mae=mae,skill_vs_zero=1-mae/zero,skill_vs_training_mean=1-mae/mean))
+s=pd.DataFrame(rows);s.to_csv(O/'predictor_scores.csv',index=False)
+print(s[(s.response=='delta_peak_h')&(s.model=='boosted')].to_string(index=False))

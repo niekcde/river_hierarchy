@@ -1,0 +1,50 @@
+from pathlib import Path
+import numpy as np,pandas as pd,json
+from scipy.stats import spearmanr
+R=Path('/Users/6256481/Code/river-hierarchy');O=R/'RAPID/validation/cunge_parent_child_20261005';sel=pd.read_parquet(O/'selected_pairs.parquet')
+
+def pairs(tag):
+ fs=list((O/tag).glob('*/metrics.csv'))
+ if not fs:return pd.DataFrame()
+ d=pd.concat([pd.read_csv(p,dtype={'example':str}) for p in fs],ignore_index=True)
+ rows=[]
+ for (ex,profile,dt,forcing),g in d.groupby(['example','profile','dt_s','forcing']):
+  p=g[g.state.eq('S000_base')].iloc[0]
+  for c in g[~g.state.eq('S000_base')].itertuples():
+   row=dict(example=ex,state=c.state,profile=profile,dt_s=dt,forcing=forcing,
+    delta_peak_h=c.peak_time_h-p.peak_time_h,lag_change_pct=100*(c.lag_h/p.lag_h-1) if p.lag_h>0 else np.nan,
+    parent_lag_h=p.lag_h,child_lag_h=c.lag_h,peak_excess_change_pct=100*(c.peak_excess_cms/p.peak_excess_cms-1),
+    duration_change_pct=100*(c.event_duration_h/p.event_duration_h-1),
+    rms_width_change_pct=100*(c.rms_width_h/p.rms_width_h-1),centroid_shift_h=c.centroid_lag_h-p.centroid_lag_h,
+    min_outlet=min(c.minimum_outlet_cms,p.minimum_outlet_cms),initial_error=max(c.initial_error_fraction,p.initial_error_fraction),
+    duration_valid=c.event_duration_status=='resolved' and p.event_duration_status=='resolved')
+   rows.append(row)
+ ans=pd.DataFrame(rows).merge(sel[['example_id','state_id','omega','plot_category','family','interpolated_peak_shift_hours','interpolated_lag_shift_pct']],left_on=['example','state'],right_on=['example_id','state_id'],validate='many_to_one')
+ ans.to_csv(O/f'{tag}_pairs.csv',index=False);return ans
+
+def report(tag):
+ d=pairs(tag);rows=[]
+ if d.empty:return
+ for (forcing,dt),g in d.groupby(['forcing','dt_s']):
+  b=g[g.profile.eq('fixed_0.1')].set_index(['example','state'])
+  if b.empty:continue
+  for profile,z in g.groupby('profile'):
+   if profile=='fixed_0.1':continue
+   z=z.set_index(['example','state']);ix=z.index.intersection(b.index);a=b.loc[ix];z=z.loc[ix]
+   for metric,tol in [('delta_peak_h',1/60),('lag_change_pct',.1),('peak_excess_change_pct',.1),('rms_width_change_pct',.1),('centroid_shift_h',1/60),('duration_change_pct',.1)]:
+    valid=a[metric].notna()&z[metric].notna();aa=a.loc[valid,metric];zz=z.loc[valid,metric]
+    if not len(aa):continue
+    strong=aa.abs()>tol;both=strong&(zz.abs()>tol);flip=both&(aa*zz<0);diff=zz-aa
+    rows.append(dict(forcing=forcing,dt_s=dt,profile=profile,metric=metric,n=len(aa),spearman=spearmanr(aa,zz).statistic,
+      median_abs_difference=diff.abs().median(),p90_abs_difference=diff.abs().quantile(.9),max_abs_difference=diff.abs().max(),
+      raw_sign_flips=int((aa*zz<0).sum()),resolved_baseline=int(strong.sum()),resolved_both=int(both.sum()),resolved_sign_flips=int(flip.sum()),
+      median_baseline_abs=aa.abs().median(),median_alternative_abs=zz.abs().median()))
+ pd.DataFrame(rows).to_csv(O/f'{tag}_agreement.csv',index=False)
+ if rows:print(pd.DataFrame(rows).query("metric=='delta_peak_h'").to_string(index=False))
+ actual=d[(d.forcing=='saved_event')&(d.profile=='fixed_0.1')&(d.dt_s==30)].copy();actual['difference_minutes']=60*(actual.delta_peak_h-actual.interpolated_peak_shift_hours);actual.to_csv(O/f'{tag}_production_parity.csv',index=False)
+ if len(actual):print('BASELINE SAVED PARITY abs minutes',actual.difference_minutes.abs().quantile([.5,.9,1]).to_dict());print(actual.nlargest(5,'difference_minutes')[['example','state','delta_peak_h','interpolated_peak_shift_hours','difference_minutes']].to_string(index=False))
+ print('INITIAL MAX',d.initial_error.max(),'MIN FLOW',d.min_outlet.min(),'DURATION INVALID',(~d.duration_valid).sum())
+
+if __name__=='__main__':
+ import sys
+ report(sys.argv[1] if len(sys.argv)>1 else 'main')

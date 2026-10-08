@@ -36,6 +36,7 @@ from .k_values import (
     select_coordinated_routing_timesteps,
 )
 from .registry import RapidStateContext, iter_preparable_states, load_state_registry
+from .celerity_regularization import regularize_routing_celerity
 
 SECONDS_PER_HOUR = 3600.0
 
@@ -140,6 +141,9 @@ class RapidPrepConfig:
     kb_model_path: str | None = None
     kb_width_sample_field: str = "wid_adj_routing"
     kb_width_percentile: float | None = None
+    depth_width_exponent: float | None = None
+    coefficient_policy: str = "nonnegative"
+    initial_flow_mode: str = "zero"
     n_manning: float = 0.35
     min_width: float = 1.0
     min_effective_length_for_k_m: float | None = None
@@ -147,6 +151,8 @@ class RapidPrepConfig:
     min_celerity_mps: float = 0.28
     max_celerity_mps: float = 1.524
     use_stability_effective_length_cap: bool = False
+    use_routing_celerity_regularization: bool = False
+    routing_celerity_regularization_margin: float = 0.01
     stability_effective_length_cap_margin_seconds: float = 10.0
     stability_effective_length_cap_celerity_rel_buffer: float = 0.03
     preferred_routing_dt_seconds: int | None = None
@@ -317,13 +323,19 @@ def split_links_into_subreaches(
         rapid_links["subreach_count"] = 1
         rapid_links["subreach_length_fraction"] = 1.0
         rapid_links["rapid_link_split"] = False
+        # Zero is RAPID's downstream-termination sentinel, not a usable reach
+        # identifier. Keep original link IDs in the parent mapping.
+        reserved = rapid_links["reach_id"].eq(0)
+        if reserved.any():
+            next_id = max(0, int(rapid_links["reach_id"].max())) + 1
+            rapid_links.loc[reserved, "reach_id"] = range(next_id, next_id + int(reserved.sum()))
         return rapid_links, rapid_nodes
 
     link_sort_order = pd.to_numeric(prepared_links["id_link"], errors="coerce")
     rapid_links_records: list[pd.Series] = []
     virtual_node_records: list[dict[str, object]] = []
     next_virtual_node_id = int(rapid_nodes["id_node"].max()) + 1 if not rapid_nodes.empty else 1
-    next_reach_id = int(pd.to_numeric(prepared_links["id_link"], errors="coerce").max()) + 1 if not prepared_links.empty else 1
+    next_reach_id = max(0, int(pd.to_numeric(prepared_links["id_link"], errors="coerce").max())) + 1 if not prepared_links.empty else 1
 
     for _, row in prepared_links.assign(_rapid_sort_id=link_sort_order).sort_values("_rapid_sort_id").drop(columns="_rapid_sort_id").iterrows():
         parent_link_id = int(row["id_link"])
@@ -355,7 +367,7 @@ def split_links_into_subreaches(
 
         node_sequence.append(int(row["id_ds_node"]))
 
-        if subreach_count == 1:
+        if subreach_count == 1 and parent_link_id != 0:
             reach_ids = [parent_link_id]
         else:
             reach_ids = list(range(next_reach_id, next_reach_id + subreach_count))
@@ -1019,11 +1031,22 @@ def prepare_state(
     forcing_table: pd.DataFrame | None = None,
     forcing_metadata: Mapping[str, object] | None = None,
     reference_kb_summary: Mapping[str, object] | None = None,
-    planned_routing_dt_seconds: int | None = None,
+    planned_routing_dt_seconds: float | None = None,
     timestep_selection: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     prep_config = prep_config or RapidPrepConfig()
     forcing_config = forcing_config or ForcingConfig()
+    if prep_config.coefficient_policy not in {"nonnegative", "signed_current_inflow"}:
+        raise ValueError("Unknown routing coefficient policy.")
+    if prep_config.coefficient_policy == "signed_current_inflow" and (prep_config.use_stability_effective_length_cap or prep_config.use_routing_celerity_regularization):
+        raise ValueError("Signed routing must keep hydraulic K fixed; disable adaptive length/celerity correction.")
+    if prep_config.use_routing_celerity_regularization:
+        if prep_config.use_stability_effective_length_cap:
+            raise ValueError('Routing celerity regularization cannot be combined with effective-length correction.')
+        if not prep_config.use_celerity_capping:
+            raise ValueError('Explicit routing regularization requires configured common celerity caps.')
+        if planned_routing_dt_seconds is None:
+            raise ValueError('Supply an explicit shared planned_routing_dt_seconds for routing regularization.')
     context.rapid_prep_dir.mkdir(parents=True, exist_ok=True)
 
     links = gpd.read_file(context.link_widths_path)
@@ -1094,6 +1117,7 @@ def prepare_state(
             kb_reference_width_m=selected_kb.reference_width_m,
             kb_reference_slope=selected_kb.reference_slope,
             kb_reference_depth_m=selected_kb.reference_depth_m,
+            depth_width_exponent=prep_config.depth_width_exponent,
             n_manning=prep_config.n_manning,
             min_width=prep_config.min_width,
             min_effective_length_m=prep_config.min_effective_length_for_k_m,
@@ -1102,6 +1126,14 @@ def prepare_state(
             max_celerity_mps=prep_config.max_celerity_mps,
         ),
     )
+    if prep_config.use_routing_celerity_regularization:
+        rapid_links = regularize_routing_celerity(
+            rapid_links, dt_seconds=planned_routing_dt_seconds,
+            x_value=prep_config.x_value,
+            margin=prep_config.routing_celerity_regularization_margin,
+            min_celerity_mps=prep_config.min_celerity_mps,
+            max_celerity_mps=prep_config.max_celerity_mps,
+        )
     if prep_config.use_stability_effective_length_cap:
         rapid_links = apply_stability_effective_length_cap(
             rapid_links,
@@ -1171,16 +1203,17 @@ def prepare_state(
             routing_dt_seconds = compute_routing_dt_seconds(
                 rapid_links["rapid_k"],
                 x_value=prep_config.x_value,
+                coefficient_policy=prep_config.coefficient_policy,
                 forcing_dt_seconds=forcing_dt_seconds,
                 preferred_routing_dt_seconds=(
-                    int(planned_routing_dt_seconds)
+                    float(planned_routing_dt_seconds)
                     if planned_routing_dt_seconds is not None
                     else prep_config.preferred_routing_dt_seconds
                 ),
             )
             if (
                 planned_routing_dt_seconds is not None
-                and int(routing_dt_seconds) != int(planned_routing_dt_seconds)
+                and not np.isclose(routing_dt_seconds, planned_routing_dt_seconds, rtol=0, atol=1e-9)
             ):
                 raise ValueError(
                     f"State {context.state_id} resolved routing_dt_seconds={routing_dt_seconds}, "
@@ -1204,6 +1237,7 @@ def prepare_state(
             fallback_forcing_dt_seconds, fallback_routing_dt_seconds = find_nearby_compatible_forcing_and_routing_dt(
                 rapid_links["rapid_k"],
                 x_value=prep_config.x_value,
+                coefficient_policy=prep_config.coefficient_policy,
                 forcing_dt_seconds=forcing_dt_seconds,
                 preferred_routing_dt_seconds=prep_config.preferred_routing_dt_seconds,
                 search_max_offset_seconds=prep_config.forcing_dt_search_max_offset_seconds,
@@ -1256,7 +1290,18 @@ def prepare_state(
         forcing.to_csv(forcing_table_path, index=False)
         inflow_path = write_inflow_netcdf(rapid_links_total_order, forcing, context.rapid_prep_dir / "inflow.nc")
 
+    coefficient_audit = None
+    if routing_dt_seconds is not None:
+        k = rapid_links["rapid_k"].to_numpy(); x = prep_config.x_value; dt = routing_dt_seconds
+        a = (dt - 2*k*x) / (dt + 2*k*(1-x))
+        c = (2*k*(1-x) - dt) / (dt + 2*k*(1-x))
+        if prep_config.coefficient_policy == "nonnegative" and (a < -1e-12).any():
+            raise ValueError("Negative current-inflow coefficient under nonnegative policy.")
+        if (c < -1e-12).any() or (c >= 1).any():
+            raise ValueError("Routing timestep violates the retained upper bound.")
+        coefficient_audit = dict(policy=prep_config.coefficient_policy, negative_current_inflow_count=int((a<0).sum()), minimum_current_inflow=float(a.min()), minimum_previous_outflow=float(c.min()), maximum_previous_outflow=float(c.max()))
     manifest = {
+        "coefficient_audit": coefficient_audit,
         "state_id": context.state_id,
         "state_role": context.state_role,
         "state_dir": str(context.state_dir),
@@ -1323,6 +1368,7 @@ def prepare_state(
         "diagnostics": {
             "link_multiplier": float(len(rapid_links) / len(prepared_links)) if len(prepared_links) else float("nan"),
             "n_celerity_capped": int(rapid_links["rapid_celerity_capped"].fillna(False).sum()) if "rapid_celerity_capped" in rapid_links.columns else 0,
+            "n_routing_celerity_regularized": int(rapid_links["rapid_celerity_regularization_applied"].sum()) if "rapid_celerity_regularization_applied" in rapid_links.columns else 0,
             "pct_celerity_capped": float(rapid_links["rapid_celerity_capped"].fillna(False).astype(bool).mean()) if "rapid_celerity_capped" in rapid_links.columns and len(rapid_links) else float("nan"),
             "min_link_length_m": float(rapid_links["link_length_m"].min()) if len(rapid_links) else float("nan"),
             "max_link_length_m": float(rapid_links["link_length_m"].max()) if len(rapid_links) else float("nan"),
@@ -1391,6 +1437,7 @@ def prepare_state(
             else 0.0
         ),
         "n_celerity_capped": int(rapid_links["rapid_celerity_capped"].fillna(False).sum()) if "rapid_celerity_capped" in rapid_links.columns else 0,
+        "n_routing_celerity_regularized": int(rapid_links["rapid_celerity_regularization_applied"].sum()) if "rapid_celerity_regularization_applied" in rapid_links.columns else 0,
         "pct_celerity_capped": float(rapid_links["rapid_celerity_capped"].fillna(False).astype(bool).mean()) if "rapid_celerity_capped" in rapid_links.columns and len(rapid_links) else float("nan"),
         "min_link_length_m": float(rapid_links["link_length_m"].min()) if len(rapid_links) else float("nan"),
         "max_link_length_m": float(rapid_links["link_length_m"].max()) if len(rapid_links) else float("nan"),
@@ -1414,10 +1461,10 @@ def prepare_state(
         "rapid_k_min": float(rapid_links["rapid_k"].min()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
         "rapid_k_max": float(rapid_links["rapid_k"].max()) if "rapid_k" in rapid_links.columns and len(rapid_links) else float("nan"),
         "stability_length_cap_dt_min_after_seconds": float(
-            compute_dt_bounds(rapid_links["rapid_k"], x_value=prep_config.x_value)[0]
+            compute_dt_bounds(rapid_links["rapid_k"], x_value=prep_config.x_value, coefficient_policy=prep_config.coefficient_policy)[0]
         ),
         "stability_length_cap_dt_max_after_seconds": float(
-            compute_dt_bounds(rapid_links["rapid_k"], x_value=prep_config.x_value)[1]
+            compute_dt_bounds(rapid_links["rapid_k"], x_value=prep_config.x_value, coefficient_policy=prep_config.coefficient_policy)[1]
         ),
         "status": "prepared",
     }
@@ -1435,6 +1482,12 @@ def prepare_experiment(
     registry = load_state_registry(experiment_path)
     prep_rows: list[dict[str, object]] = []
     prep_config = prep_config or RapidPrepConfig()
+    if prep_config.use_routing_celerity_regularization:
+        raise ValueError(
+            'Automatic experiment clock planning does not yet support routing celerity '
+            'regularization. Use prepare_state with an explicitly shared '
+            'planned_routing_dt_seconds for the reviewed parent-child comparison.'
+        )
     forcing_config = forcing_config or ForcingConfig()
     resolved_prep_config = prep_config
     resolved_work_root = (

@@ -1,0 +1,18 @@
+from pathlib import Path
+import pandas as pd,numpy as np,json
+O=Path('/Users/6256481/Code/river-hierarchy/RAPID/validation/cunge_segmentation_20261006')
+def collect(tag):
+ metrics=pd.concat([pd.read_csv(p,dtype={'example':str}) for p in (O/tag).glob('*/metrics.csv')],ignore_index=True);rows=[]
+ for (ex,profile,dt,forcing),g in metrics.groupby(['example','profile','dt_s','forcing']):
+  p=g[g.state=='S000_base'].iloc[0]
+  for _,r in g[g.state!='S000_base'].iterrows():rows.append(dict(example=ex,state=r.state,profile=profile,dt_s=dt,forcing=forcing,delta_peak_h=r.peak_time_h-p.peak_time_h,peak_excess_change_pct=100*(r.peak_excess_cms/p.peak_excess_cms-1),parent_peak_h=p.peak_time_h,child_peak_h=r.peak_time_h))
+ pairs=pd.DataFrame(rows);pairs.to_csv(O/f'{tag}_pairs.csv',index=False);metrics.to_csv(O/f'{tag}_metrics.csv',index=False)
+ return metrics,pairs
+if __name__=='__main__':
+ m,p=collect('main');a=pd.concat([pd.read_csv(p,dtype={'example':str}) for p in (O/'main').glob('*/segmentation_audit.csv')]);a.to_csv(O/'segmentation_audit.csv',index=False)
+ print('CLOCK AUDIT');print(a.groupby('profile').agg(min_upper=('nonnegative_previous_outflow_upper_s','min'),max_lower=('all_coeff_lower_s','max'),neg_current=('current_negative_at30','sum'),neg_previous=('previous_inflow_negative_at30','sum'),neg_out=('previous_outflow_negative_at30','sum')).to_string())
+ print('STATE ACCURACY RELATIVE TO DIFFUSION');ref=m[m.profile=='diffusion_exact'];z=m.merge(ref,on=['example','state','forcing','dt_s'],suffixes=('','_ref'));z['error_peak_h']=z.peak_time_h-z.peak_time_h_ref;z['error_peak_pct']=100*(z.peak_excess_cms/z.peak_excess_cms_ref-1);z.to_csv(O/'main_diffusion_errors.csv',index=False)
+ print(z[z.forcing=='saved_event'].groupby('profile').agg(median_abs_h=('error_peak_h',lambda x:x.abs().median()),max_abs_h=('error_peak_h',lambda x:x.abs().max()),median_abs_peak_pct=('error_peak_pct',lambda x:x.abs().median())).to_string())
+ print('PAIRS VS CURRENT');b=p[p.profile=='current_200_floor'];q=p.merge(b,on=['example','state','forcing','dt_s'],suffixes=('','_base'));q['change_h']=q.delta_peak_h-q.delta_peak_h_base;q['resolved_flip']=(q.delta_peak_h*q.delta_peak_h_base<0)&(q.delta_peak_h.abs()>1/60)&(q.delta_peak_h_base.abs()>1/60);q.to_csv(O/'main_pair_changes.csv',index=False)
+ print(q[q.forcing=='saved_event'].groupby('profile').agg(median_abs_change_h=('change_h',lambda x:x.abs().median()),max_abs_change_h=('change_h',lambda x:x.abs().max()),flips=('resolved_flip','sum')).to_string())
+ print('WORST UNSEG PAIRS');print(q[(q.forcing=='saved_event')&(q.profile=='unsegmented_actual')].sort_values('change_h',key=lambda x:abs(x),ascending=False)[['example','state','change_h','delta_peak_h','delta_peak_h_base']].head(8).to_string(index=False))

@@ -1,0 +1,26 @@
+from pathlib import Path
+import numpy as np,pandas as pd,json,shutil
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+R=Path('/Users/6256481/Code/river-hierarchy');O=R/'RAPID/validation/cunge_physical_assessment_20261005';P=R/'RAPID/validation/cunge_parent_child_20261005'
+rows=[]
+for path in (O/'diffusion_sweep').glob('*/metrics.csv'):
+ d=pd.read_csv(path,dtype={'example':str});ex=path.parent.name
+ for (profile,forcing),g in d.groupby(['profile','forcing']):
+  parent=g[g.state=='S000_base'].iloc[0]
+  for _,v in g[g.state!='S000_base'].iterrows():rows.append(dict(example=ex,state=v.state,forcing=forcing,lambda_diffusion=float(profile.split('_')[1]),delta_peak_h=v.peak_time_h-parent.peak_time_h))
+d=pd.DataFrame(rows);b=pd.read_csv(P/'refined_pairs.csv',dtype={'example':str});b=b[(b.dt_s==30)&b.example.isin(d.example.unique())&b.profile.isin(['fixed_0.1','cunge_reference'])].copy();b['lambda_diffusion']=b.profile.map({'fixed_0.1':0.,'cunge_reference':1.});d=pd.concat([d,b[d.columns]]);d.sort_values(['example','state','forcing','lambda_diffusion']).to_csv(O/'diffusion_sweep_pairs.csv',index=False)
+fig,ax=plt.subplots(1,2,figsize=(11,4.3),layout='constrained')
+for forcing,color in [('saved_event','#1678b5'),('pulse_48h','#d17a00'),('pulse_12h','#738c26')]:
+ g=d[(d.example=='41')&(d.state=='S130_unit_126')&(d.forcing==forcing)].sort_values('lambda_diffusion');ax[0].plot(g.lambda_diffusion,g.delta_peak_h,'o-',label=forcing.replace('_',' '),color=color)
+ax[0].axhline(0,color='0.5',lw=.8);ax[0].set(xlabel='Fraction of change from fixed X to Cunge X',ylabel='Child − parent peak time (hours)',title='River 41 / S130: reversal follows added diffusion');ax[0].legend()
+m=pd.read_csv(O/'mechanism_moments.csv',dtype={'example':str});g=m[(m.example=='41')&m.state.isin(['S000_base','S130_unit_126'])]
+for state,label,color,offset in [('S000_base','Parent','#1678b5',-.17),('S130_unit_126','Child','#d17a00',.17)]:
+ vals=g[g.state==state].set_index('profile').loc[['fixed_0.1','cunge_reference']].response_std_h;ax[1].bar(np.arange(2)+offset,vals,width=.32,label=label,color=color)
+ax[1].set(xticks=[0,1],xticklabels=['Fixed X = 0.1','Cunge reference X'],ylabel='Response standard deviation (hours)',title='The child broadens more strongly under Cunge');ax[1].legend();fig.savefig(O/'physical_mechanism.png',dpi=180);plt.close(fig)
+print(d[(d.example=='41')&(d.state=='S130_unit_126')].pivot(index='lambda_diffusion',columns='forcing',values='delta_peak_h').to_string())
+# Archive exact execution scripts so temporary code is reviewable.
+a=O/'execution_records';a.mkdir(exist_ok=True)
+for name in ['cunge_assess_predictors.py','cunge_assess_calibration.py','cunge_assess_calibration_v2.py','cunge_assess_calibration_remaining.py','cunge_assess_mechanism.py','cunge_assess_report.py']:
+ shutil.copyfile(Path('/private/tmp')/name,a/(name+'.txt'))

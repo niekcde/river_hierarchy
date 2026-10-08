@@ -1,0 +1,81 @@
+CUNGE PHYSICAL AND CALIBRATION REASSESSMENT — 2026-10-05
+
+CONCLUSIONS
+The earlier argument for retaining fixed X on the basis of reversals and a weaker resistance correlation was not justified. Reversals are a sensitivity result, not a failure criterion. Broader predictor performance is mixed. Cunge deserves consideration on physical grounds, but the existing X-only substitution is not equivalent to a complete Muskingum-Cunge implementation.
+
+A previously unseparated implementation effect is material: the RAPID external-inflow boundary applies (a+b)*I_current at the first routing cell. Classical upstream-boundary Muskingum applies a*I_current+b*I_previous. This difference is small at the original X in these tests, but can be enormous for negative Cunge X. It must not be interpreted as hydraulic evidence against Cunge. No production source or notebook was edited for this assessment.
+
+PREDICTORS: WHAT WAS TESTED
+The same previously selected 64 stress pairs across all 16 rivers, saved-event response, routing dt=30 s and the original common n=.035, with fixed X=0.1, Cunge stored-reference X, and Cunge midpoint X. Sixteen geometry/context predictors, five predeclared predictor sets, ridge and histogram boosting, four responses. Leave-one-whole-river-out folds were identical across parameterizations; preprocessing fitted inside each training fold. No hyperparameter tuning or feature-set selection. Durations used the same 60 uncensored complete pairs across methods. These are exploratory conditional scores on purposively selected stress pairs, not population-wide or external physical validation.
+
+Examples of held-out ridge R2, fixed X -> stored-reference Cunge X:
+  Absolute peak-time difference, geometry/change/context: 0.605 -> 0.780.
+    MAE 0.868 -> 0.656 h; MAE skill against zero-change prediction 0.211 -> 0.302.
+  Percentage lag difference, same predictor set: 0.879 -> 0.302.
+  Peak-excess percentage change, same predictor set: 0.647 -> -0.025.
+  Peak-excess percentage change, selected-six set: -0.115 -> 0.243.
+    Despite improved R2, this model still loses to predicting zero change in MAE.
+  Duration-change models generally do not beat simple baselines.
+Seven of sixteen individual predictors strengthen in absolute Spearman association with absolute peak-time differences. Omega weakens in rank correlation but its ridge R2 strengthens for the absolute timing response. Rank correlation, prediction error, and physical correctness are different questions. The response distribution also changes between parameterizations; cross-method R2 alone is not sufficient. These predictor results apply to the original RAPID-inlet X sensitivity experiment, not the separate standard-boundary calibration or a complete Cunge implementation.
+
+MECHANISM
+With K=dx/c, the usual matched diffusivity is
+  D_numeric = c*dx*(1/2-X),  D_hydraulic = Q/(2*B*S).
+The Cunge X formula matches these quantities. B is water-surface top width, approximated here by routing width under the rectangular-channel assumption. A fixed X=0.1 instead gives D_numeric=0.4*c*dx. Therefore changing X can be a large change in spreading even if median changes in the selected peak metric are small. The calculation matches assumed hydraulic diffusivity; it does not measure real-world diffusivity.
+
+All 80 original selected states were checked for diffusivity matching and exact discrete response moments. The Cunge equality passes at relative tolerance 1e-10. Across the 16 parents, the median ratio of Manning-implied discharge to allocated stored reference discharge ranges approximately 0.236–1.110. The present depth, discharge, n, and celerity caps do not form a uniformly Manning-consistent hydraulic state.
+
+For river 41 / S130_unit_126, saved-event child-minus-parent peak lag changes from +1.210 h (fixed X) to -2.658 h (Cunge reference X). The full impulse-response mean child-minus-parent lag remains +1.558 h. Fixed-X parent/child response standard deviations are 5.11/4.34 h; Cunge values are 59.89/79.78 h. A later mean and earlier maximum are compatible when spreading/skew changes. At fractions 0, .25, .5, .75, 1 of the X change, saved-event peak contrasts are +1.210, -1.515, -2.305, -2.555, -2.658 h. The sign also changes for the controlled 12 h and 48 h pulses. These diagnostics were extended across the six rivers containing the original eight saved-event reversals.
+
+BOUNDARY ABLATION
+In engine.py, rte_mat sets q_external=c1+c2; the first cell therefore has a different transfer from an upstream-boundary cell. Its mean includes an extra -K*X-dt/2 relative to the standard discrete upstream transfer. For strongly negative X this extra filtering can dominate the response and does not disappear just by reducing dt.
+
+River 15, stored-reference Cunge X, n=.010, same forcing/geometry/caps:
+  Existing RAPID external inlet: peak lag 107.100 h.
+  Standard two-time upstream boundary: peak lag 10.247 h.
+  Reviewed observed target: 13.0097 h.
+At the original calibrated n=.011875 these lags are 117.678 versus 11.569 h. All segment flows remain positive in these ablations. This is a boundary-representation experiment, not a production correction or a claim that lateral inflow should always use an upstream-boundary equation.
+
+For the river-41 reversing pair, the standard boundary retains the reversal: fixed X +1.210 h, Cunge X -2.672 h. Thus that reversal is not created by the RAPID inlet artifact.
+
+INDEPENDENT DIFFUSION-EQUATION BENCHMARK
+For the same river-41 parent and four children, solve the constant-coefficient linear advection-diffusion equation on each physical reach using the exact downstream/radiation-boundary Laplace transfer
+  H(s)=exp[-2*s*L/(c+sqrt(c^2+4*D*s))].
+Use the same c, reference D, branch shares, geometry, forcing, and upstream boundary. This is an independent benchmark for the assumed linear diffusion equation, not a full hydraulic solver or observational validation. The single-reach impulse density integrates to unit mass and yields mean L/c and variance 2*D*L/c^3. Numerical integration checks its transform to 8.9e-15 in the chosen verification cases.
+
+For S130, the saved-event contrast is -1.463 h with hydraulic diffusion versus +1.212 h at the fixed-X nominal diffusion. The reversal persists for both controlled pulses. The 300 s -> 150 s output-grid refinement changes individual peak times by at most 13.45 s across the five states, two diffusivities and three forcings. The ~1.21 h gap between Cunge's -2.672 h and the diffusion benchmark's -1.463 h is material. The direction is compatible with diffusion physics, but quantitative accuracy of this very-negative-X discretization is not established by matching D or by time-step convergence alone.
+
+CALIBRATION DESIGN
+Use the reviewed workbook and exactly the same saved events, timing targets, geometry, depth relation, celerity caps and forcing cadence as rapid_travel_time_calibration.ipynb. The workbook SHA256 matches the cached refinement manifest. Reproduce all 16 existing fixed-X native calibrations. Then run a matched fixed-X control and two fixed-reference Cunge choices with the standard upstream boundary: midpoint of event initial/peak flow, and stored reference discharge. Recompute c(n), K(n) and X(n) at every n. Grid .010–.100, include old best n, refine all detected target crossings, separately search the notebook's .025–.060 comparison band. Check selected fits with half the native routing time step. No new hold-out events were introduced; this is calibration, not validation of predictive accuracy.
+
+Long adaptive tails distinguish boundary maxima from resolved peaks. Earlier broad native-inlet searches developed extreme decay tails in several rivers; incomplete native-inlet profiles are retained as partial caches and excluded from full-cohort calibration conclusions. The completed standard-boundary comparison is the primary calibration comparison. A denser .0025 n grid checks the difficult river-11 case. Its modeled peak remains around 4–8.24 h across the tested range versus the 63.5 h reviewed target. Its observed maximum has ties/separate sampled blocks and data gaps; this target cannot by itself establish that either routing approach is physically superior.
+
+CALIBRATION RESULTS
+               profile  n_cases  fits  fits_in_comparison_band  fitted_n_min  fitted_n_max  half_clock_max_shift_s  tail_unsettled_best
+   current_rapid_fixed       16    16                        4      0.011719      0.079531                     0.0                    0
+  cunge_event_midpoint       16    15                        7      0.013125      0.066875                     0.0                    0
+cunge_stored_reference       16    15                        6      0.013125      0.068750                     0.0                    0
+             fixed_0.1       16    16                        4      0.011719      0.079531                     0.0                    0
+
+Ranges compared on the SAME 15 successfully fitted rivers:
+               profile  n  baseline_n_min  baseline_n_max  cunge_n_min  cunge_n_max  baseline_range  cunge_range  baseline_ratio  cunge_ratio
+  cunge_event_midpoint 15        0.011719        0.056875     0.013125     0.066875        0.045156     0.053750        4.853333     5.095238
+cunge_stored_reference 15        0.011719        0.056875     0.013125     0.068750        0.045156     0.055625        4.853333     5.238095
+
+The midpoint formulation fits 7/16 cases within the notebook comparison band, versus 4/16 currently; the stored-reference formulation fits 6/16. The difference between 6 and 7 depends on river 02: its stored-reference best band error is 3.033 h against a 3.000 h sampling-based tolerance, a marginal distinction. More cases entering the band is a favorable signal, but the fitted n span does not shrink on a matched cohort. Excluding the unfitted high-n river 11 from Cunge while retaining it in the baseline would misleadingly suggest narrowing. No selected calibrated peak changes at the saved output cadence when native dt is halved; this is not a claim of zero sub-cadence error. All selected simulations have settled tails. All sixteen native fixed-X baselines reproduce the notebook calibrated lag exactly at saved cadence.
+
+For the final river-46 stored-reference grid, remote n>=.04 trials can stop once an already simulated global maximum occurs later than the target plus tolerance. Any future higher maximum would occur later still, so the positive timing-error sign and rejection are certain. Such trial errors are explicitly marked lower bounds, not converged hydrograph metrics. The selected fit and common-band candidate use fully settled simulations.
+
+INTERPRETATION
+More fits within a defensible roughness band would be useful supporting evidence. A narrower range alone is not a physical objective across heterogeneous rivers. A convincing selection argument needs physically coherent hydraulic inputs and comparable or better prediction of independent events, including hydrograph timing, attenuation and spread. Present n values are effective parameters conditional on the imposed depth/geometry/caps and selected peak definition. With fixed depths and uncapped c proportional to 1/n, Cunge's hydraulic D stays fixed while temporal spreading scales roughly as n^3 in variance; changing n no longer simply stretches the hydrograph in time.
+
+This assessment supports continuing a fair Cunge evaluation and retracting the reversals/correlation-based rejection. It does not justify labelling the current model validated by Cunge, or asserting that an X-only production edit supplies the complete method. The boundary treatment, hydraulic closure and quantitative diffusion accuracy must be addressed explicitly.
+
+SOURCES
+HEC-HMS Technical Reference: https://www.hec.usace.army.mil/confluence/hmsdocs/hmstrm/channel-flow/muskingum-cunge-model
+RAPID/src/rapid_tools/engine.py (ccc_mat, rte_mat, mus_rte)
+RAPID/notebooks/rapid_travel_time_calibration.ipynb
+RAPID/outputs/travel_time_calibration_refined/refinement_manifest.json
+RAPID/validation/cunge_parent_child_20261005/REPORT.txt
+
+Artifacts: predictor_design.json, predictor_scores.csv, predictor_correlations.csv, predictor_predictions.parquet; mechanism_moments.csv, diffusion_sweep_pairs.csv, physical_mechanism.png; inlet_ablation.csv; diffusion_equation_comparison.csv and diffusion_analytic_verification.json; calibration_two_time_comparison.csv, calibration_summary.csv, calibration_matched_ranges.csv, calibration_comparison.png, calibration_case11.png; verification.json; execution_records/*.py.txt.

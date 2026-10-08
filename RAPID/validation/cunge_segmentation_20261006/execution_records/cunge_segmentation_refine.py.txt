@@ -1,0 +1,7 @@
+import sys
+from concurrent.futures import ProcessPoolExecutor
+sys.path.insert(0,'/private/tmp');import cunge_segmentation_test as t
+
+def worker(ex):return t.c.run(ex,step=150,tag='refined',profiles=t.PROFILES,clocks=[15.])
+if __name__=='__main__':
+ with ProcessPoolExecutor(max_workers=2) as pool:print(list(pool.map(worker,sorted(t.c.SOURCES))),flush=True)

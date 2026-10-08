@@ -40,6 +40,7 @@ class RapidResultStorageConfig:
     """
 
     compact_qout: bool = False
+    compact_geometry: bool = False
     retain_prepared_inputs: bool = True
     write_mapping_parquet: bool = False
 
@@ -183,6 +184,15 @@ def _publish_compact_result(
             # volume. Preserve the existing cross-device behavior in that rare
             # case, while keeping the zero-extra-space same-volume path above.
             shutil.copy2(reach_geometry, retained_geometry)
+        if storage.compact_geometry:
+            if not storage.write_mapping_parquet:
+                raise ValueError("Compact geometry requires the full Parquet attribute mapping.")
+            import geopandas as gpd
+            geometry = gpd.read_file(retained_geometry, columns=["reach_id"])
+            temporary_geometry = retained_geometry.with_name("compact_geometry.tmp.gpkg")
+            geometry.to_file(temporary_geometry, driver="GPKG")
+            os.replace(temporary_geometry, retained_geometry)
+            result["geometry_attributes_in_mapping"] = True
         result["rapid_reach_attributes_gpkg"] = str(retained_geometry)
         result["rapid_reach_attributes_sha256"] = _sha256(retained_geometry)
     if storage.compact_qout:
@@ -277,6 +287,8 @@ def net_mat(
     hash_total: dict[int, int],
     river_ids_basin: np.ndarray,
     hash_basin: dict[int, int],
+    *,
+    dtype=np.float32,
 ) -> csc_matrix:
     rows: list[int] = []
     cols: list[int] = []
@@ -292,7 +304,7 @@ def net_mat(
     return csc_matrix(
         (values, (rows, cols)),
         shape=(len(river_ids_basin), len(river_ids_basin)),
-        dtype=np.float32,
+        dtype=dtype,
     )
 
 
@@ -302,7 +314,7 @@ def k_x_vec(kpr_csv: str | Path, xpr_csv: str | Path, basin_to_total: np.ndarray
     return k_total[basin_to_total], x_total[basin_to_total]
 
 
-def ccc_mat(kpr_basin: np.ndarray, xpr_basin: np.ndarray, dt_routing: int) -> tuple[csc_matrix, csc_matrix, csc_matrix]:
+def ccc_mat(kpr_basin: np.ndarray, xpr_basin: np.ndarray, dt_routing: float) -> tuple[csc_matrix, csc_matrix, csc_matrix]:
     denominator = dt_routing / 2.0 + kpr_basin * (1.0 - xpr_basin)
     c1 = (dt_routing / 2.0 - kpr_basin * xpr_basin) / denominator
     c2 = (dt_routing / 2.0 + kpr_basin * xpr_basin) / denominator
@@ -341,9 +353,11 @@ def read_inflow_netcdf(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.nda
     return river_ids, time, m3_riv, dt_forcing
 
 
-def stp_cor(dt_forcing: int, dt_routing: int) -> int:
+def stp_cor(dt_forcing: int, dt_routing: float) -> int:
+    if not np.isfinite(dt_routing) or dt_routing <= 0:
+        raise ValueError("Routing timestep must be finite and positive.")
     quotient = dt_forcing / dt_routing
-    if round(quotient) != quotient:
+    if not np.isclose(quotient, round(quotient), rtol=0, atol=1e-9):
         raise ValueError(
             f"The quotient of forcing dt ({dt_forcing}) and routing dt ({dt_routing}) must be an integer."
         )
@@ -358,12 +372,31 @@ def mus_rte(
     q_out_initial: np.ndarray,
     q_external_avg: np.ndarray,
     solver,
+    diagnostics: dict[str, float] | None = None,
+    *,
+    previous_external: np.ndarray | None = None,
+    previous_inflow_matrix: csc_matrix | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Route held forcing; optionally correct the first substep's inlet history.
+
+    q_external remains C1+C2. For an explicit upstream boundary, subtract
+    C2*(current-previous) on the first substep only. Subsequent substeps have
+    identical current and previous held inflow. Omission preserves legacy use.
+    """
+    if (previous_external is None) != (previous_inflow_matrix is None):
+        raise ValueError("Supply both previous external inflow and its coefficient matrix.")
     q_out_final = q_out_initial.copy()
     q_out_avg = np.zeros_like(q_out_initial)
-    for _ in range(n_substeps):
+    for substep in range(n_substeps):
         rhs = q_external.dot(q_external_avg) + q_out.dot(q_out_final)
+        if substep == 0 and previous_external is not None:
+            rhs += previous_inflow_matrix.dot(previous_external - q_external_avg)
         q_out_final = solver(rhs)
+        if diagnostics is not None:
+            if not np.isfinite(q_out_final).all():
+                raise ValueError("Routing produced nonfinite substep discharge.")
+            diagnostics["minimum_substep_flow_cms"] = min(diagnostics["minimum_substep_flow_cms"], float(q_out_final.min()))
+            diagnostics["maximum_substep_flow_cms"] = max(diagnostics["maximum_substep_flow_cms"], float(q_out_final.max()))
         q_out_avg += q_out_final
     q_out_avg = q_out_avg / float(n_substeps)
     return q_out_avg, q_out_final
@@ -393,7 +426,7 @@ def write_qout_netcdf(
 def run_prepared_state(
     prep_dir: str | Path,
     *,
-    routing_timestep_seconds: int | None = None,
+    routing_timestep_seconds: float | None = None,
     output_path: str | Path | None = None,
     return_qout: bool = False,
 ) -> Path | tuple[Path, np.ndarray]:
@@ -418,26 +451,72 @@ def run_prepared_state(
     river_ids_total, downstream_ids, downstream_ratios, downstream_counts = con_vec(con_csv)
     river_ids_basin = bas_vec(bas_csv)
     hash_total, hash_basin, basin_to_total = hsh_tbl(river_ids_total, river_ids_basin)
-    net = net_mat(downstream_ids, downstream_counts, downstream_ratios, hash_total, river_ids_basin, hash_basin)
+    network_dtype = manifest.get("prep_config", {}).get("network_dtype", "float32")
+    if network_dtype not in {"float32", "float64"}:
+        raise ValueError("Unknown network precision.")
+    net = net_mat(downstream_ids, downstream_counts, downstream_ratios, hash_total, river_ids_basin, hash_basin,
+                  dtype=np.dtype(network_dtype))
 
     kpr_basin, xpr_basin = k_x_vec(kpr_csv, xpr_csv, basin_to_total)
     if routing_timestep_seconds is None:
-        routing_timestep_seconds = int(manifest["routing"]["routing_dt_seconds"])
-    c1, c2, c3 = ccc_mat(kpr_basin, xpr_basin, int(routing_timestep_seconds))
+        routing_timestep_seconds = float(manifest["routing"]["routing_dt_seconds"])
+    policy = manifest.get("prep_config", {}).get("coefficient_policy", "nonnegative")
+    dt = float(routing_timestep_seconds)
+    if policy not in {"nonnegative", "signed_current_inflow", "signed_inflow"}:
+        raise ValueError(f"Unknown coefficient policy: {policy}")
+    if not np.isfinite(xpr_basin).all() or (xpr_basin >= .5).any():
+        raise ValueError("Routing requires finite X less than 0.5.")
+    if policy != "signed_inflow" and (xpr_basin < 0).any():
+        raise ValueError("Negative X requires the signed_inflow coefficient policy.")
+    if not np.isfinite(kpr_basin).all() or (kpr_basin <= 0).any():
+        raise ValueError("Routing requires finite positive K.")
+    if not np.isfinite(dt) or dt <= 0 or (dt > 2*kpr_basin*(1-xpr_basin) + 1e-10).any():
+        raise ValueError("Routing timestep violates the retained upper bound.")
+    if policy == "nonnegative" and (dt < 2*kpr_basin*xpr_basin - 1e-10).any():
+        raise ValueError("Routing timestep violates the nonnegative-coefficient policy.")
+    c1, c2, c3 = ccc_mat(kpr_basin, xpr_basin, float(routing_timestep_seconds))
     linear, q_external, q_out = rte_mat(net, c1, c2, c3)
 
     inflow_river_ids, time, m3_riv, dt_forcing = read_inflow_netcdf(inflow_nc)
     if not np.array_equal(np.array(river_ids_total, dtype=np.int64), inflow_river_ids):
         raise ValueError("The river IDs in rat_srt.csv and inflow.nc do not match.")
-    n_substeps = stp_cor(dt_forcing, int(routing_timestep_seconds))
+    n_substeps = stp_cor(dt_forcing, float(routing_timestep_seconds))
+    boundary_mode = manifest.get("prep_config", {}).get("boundary_mode", "legacy_held_external")
+    if boundary_mode not in {"legacy_held_external", "upstream_two_time"}:
+        raise ValueError(f"Unknown boundary mode: {boundary_mode}")
+    if boundary_mode == "upstream_two_time":
+        is_root = np.asarray(net.getnnz(axis=1) == 0)
+        if np.any(m3_riv[:, basin_to_total][:, ~is_root] != 0):
+            raise ValueError("Two-time upstream mode requires external forcing only at inlet reaches.")
 
     q_out_initial = np.zeros(len(river_ids_basin), dtype=np.float64)
+    initial_mode = manifest.get("prep_config", {}).get("initial_flow_mode", "zero")
+    if initial_mode == "steady_first_inflow":
+        steady_rhs = m3_riv[0][basin_to_total] / float(dt_forcing)
+        q_out_initial = factorized(identity(len(river_ids_basin), format="csc") - net)(steady_rhs)
+        if not np.isfinite(q_out_initial).all() or (q_out_initial < 0).any():
+            raise ValueError("Initial steady flow is invalid.")
+    elif initial_mode != "zero":
+        raise ValueError(f"Unknown initial flow mode: {initial_mode}")
+    previous_external = (steady_rhs.copy() if initial_mode == "steady_first_inflow"
+                         else np.zeros(len(river_ids_basin)))
+
     qout_records = np.zeros((len(time), len(river_ids_basin)), dtype=np.float64)
     solver = factorized(linear)
     _ = splu(linear)
 
+    substep_audit = {"minimum_substep_flow_cms": float(q_out_initial.min()),
+                     "maximum_substep_flow_cms": float(q_out_initial.max())}
+    on_initial_plateau = initial_mode == "steady_first_inflow"
     for timestep_index in range(len(time)):
         q_external_avg = m3_riv[timestep_index][basin_to_total] / float(dt_forcing)
+        if on_initial_plateau and np.array_equal(q_external_avg, steady_rhs):
+            # Exact declared equilibrium: long constant spin-up intervals add
+            # no dynamics and need no repeated sparse solves.
+            qout_records[timestep_index, :] = q_out_initial
+            previous_external = q_external_avg.copy()
+            continue
+        on_initial_plateau = False
         q_out_avg, q_out_initial = mus_rte(
             linear,
             q_external,
@@ -446,11 +525,29 @@ def run_prepared_state(
             q_out_initial,
             q_external_avg,
             solver,
+            diagnostics=substep_audit,
+            previous_external=previous_external if boundary_mode == "upstream_two_time" else None,
+            previous_inflow_matrix=c2 if boundary_mode == "upstream_two_time" else None,
         )
+        previous_external = q_external_avg.copy()
         qout_records[timestep_index, :] = q_out_avg
 
     qout_path = Path(output_path).expanduser().resolve() if output_path is not None else prep_path / DEFAULT_QOUT_NAME
+    if not np.isfinite(qout_records).all():
+        raise ValueError("Routing produced nonfinite discharge.")
     write_qout_netcdf(qout_path, river_ids_basin, time, qout_records)
+    qout_path.with_suffix(".audit.json").write_text(json.dumps({
+        "coefficient_policy": policy,
+        "initial_flow_mode": initial_mode,
+        "boundary_mode": boundary_mode,
+        "network_dtype": network_dtype,
+        "routing_dt_seconds": dt,
+        "minimum_reported_flow_cms": float(qout_records.min()),
+        "negative_reported_flow_count": int((qout_records < 0).sum()),
+        **substep_audit,
+        "scope": "every reach at every native routing substep, plus forcing-interval means",
+        "flow_clipped": False,
+    }, indent=2))
     if return_qout:
         return qout_path, qout_records
     return qout_path

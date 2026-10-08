@@ -1,0 +1,56 @@
+from pathlib import Path
+import sys,json,inspect
+import numpy as np,pandas as pd
+from concurrent.futures import ProcessPoolExecutor
+sys.path.insert(0,'/private/tmp');import cunge_pairs_run as c
+O=c.R/'RAPID/validation/cunge_segmentation_20261006';O.mkdir(exist_ok=True)
+original=c.setup
+PROFILES=['current_200_floor','physical_200','physical_100','unsegmented_actual','unsegmented_floor200','diffusion_exact']
+def setup(f,qref,qmid):
+ s=original(f,qref,qmid);f=s['f'];L=f.link_length_m.to_numpy();speed=f.rapid_celerity_mps.to_numpy();ld=qref*s['shares']/(f.width.to_numpy()*f.slope.to_numpy()*speed);s['variants']={};s['audit']=[]
+ for label in PROFILES:
+  if label=='current_200_floor':N=f['count'].to_numpy(int);dx=f.rapid_effective_length_m.to_numpy()
+  elif label.startswith('physical_'):
+   target=float(label.split('_')[1]);N=np.maximum(1,np.rint(L/target)).astype(int);dx=L/N
+  else:N=np.ones(len(f),int);dx=np.maximum(L,200) if label=='unsegmented_floor200' else L.copy()
+  k=dx/speed;x=.5*(1-ld/dx);s['xs'][label]=x;s['variants'][id(x)]=(k,N,dx,label)
+  upper=2*k*(1-x);lower=2*k*np.abs(x)
+  s['audit'].append(dict(profile=label,segments=int(N.sum()),physical_length_m=L.sum(),represented_length_m=float((dx*N).sum()),negative_x_pct=100*np.average(x<0,weights=N),x_min=x.min(),x_max=x.max(),all_coeff_lower_s=lower.max(),nonnegative_previous_outflow_upper_s=upper.min(),all_coeff_interval_exists=bool(lower.max()<=upper.min()),current_negative_at30=int(np.sum(30<2*k*x)),previous_inflow_negative_at30=int(np.sum(30<-2*k*x)),previous_outflow_negative_at30=int(np.sum(30>upper))))
+ s['variants'][id(s['xs']['cunge_reference'])]=s['variants'][id(s['xs']['current_200_floor'])]
+ return s
+
+def moments(s,x,dt):
+ k,N,dx,label=s['variants'][id(x)];mu=N*k;var=N*k*k*(1-2*x);vals={s['root']:np.array([1.,0.,0.])};v=s['f'].v.to_numpy()
+ for u in s['order']:
+  mass,m1,m2=vals.pop(u)
+  if u==s['end']:ans=np.array([mass,m1,m2]);continue
+  for i in s['edges'][u]:
+   val=s['ratios'][i]*np.array([mass,m1+mass*mu[i],m2+2*mu[i]*m1+mass*(mu[i]**2+var[i])]);vals[v[i]]=vals.get(v[i],np.zeros(3))+val
+ assert abs(ans[0]-1)<1e-12
+ return ans[1],max(0,ans[2]-ans[1]**2)
+
+def transfer(s,x,dt,n,step,alpha):
+ k,N,dx,label=s['variants'][id(x)];den=dt+2*k*(1-x);a=(dt-2*k*x)/den;b=(dt+2*k*x)/den;d=(2*k*(1-x)-dt)/den
+ assert (abs(d)<1).all();v=s['f'].v.to_numpy();speed=s['f'].rapid_celerity_mps.to_numpy();D=speed*dx*(.5-x);result=np.empty(n//2+1,complex)
+ for start in range(0,len(result),8192):
+  lap=alpha+2j*np.pi*np.arange(start,min(start+8192,len(result)))/(n*step);z=np.exp(-lap*dt);values={s['root']:np.ones(len(z),complex)}
+  for u in s['order']:
+   signal=values.pop(u)
+   if u==s['end']:result[start:start+len(z)]=signal;continue
+   for i in s['edges'][u]:
+    h=np.exp(-2*lap*dx[i]*N[i]/(speed[i]+np.sqrt(speed[i]**2+4*D[i]*lap))) if label=='diffusion_exact' else ((a[i]+b[i]*z)/(1-d[i]*z))**N[i]
+    values[v[i]]=values.get(v[i],0)+signal*s['ratios'][i]*h
+ return result
+c.setup=setup;c.moments=moments;c.transfer=transfer;c.O=O
+
+def worker(ex):
+ c.run(ex,step=300,tag='main',profiles=PROFILES,clocks=[30.])
+ grid=json.loads((O/'main'/ex/'grid.json').read_text());rows=[]
+ for state,path,fp in grid['sources']:
+  s=setup(pd.read_parquet(path),grid['reference_cms'],grid['midpoint_cms'])
+  for row in s['audit']:rows.append(dict(example=ex,state=state,**row))
+ pd.DataFrame(rows).to_csv(O/'main'/ex/'segmentation_audit.csv',index=False)
+ return ex
+if __name__=='__main__':
+ with ProcessPoolExecutor(max_workers=2) as pool:list(pool.map(worker,sorted(c.SOURCES)))
+ print('ALL FINISHED',flush=True)

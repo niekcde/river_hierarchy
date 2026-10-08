@@ -1,0 +1,32 @@
+from pathlib import Path
+import sys,json
+import numpy as np,pandas as pd
+from concurrent.futures import ProcessPoolExecutor
+sys.path.insert(0,'/private/tmp');import cunge_pairs_run as exp
+R=exp.R;O=R/'RAPID/validation/cunge_physical_assessment_20261005';PAIR=R/'RAPID/validation/cunge_parent_child_20261005'
+original_setup=exp.setup
+
+def setup(f,qref,qmid):
+ s=original_setup(f,qref,qmid)
+ for lam in [.25,.5,.75]:s['xs'][f'blend_{lam}']=.1+lam*(s['xs']['cunge_reference']-.1)
+ return s
+exp.setup=setup;exp.O=O
+
+def worker(ex):return exp.run(ex,step=300,tag='diffusion_sweep',profiles=['blend_0.25','blend_0.5','blend_0.75'],clocks=[30.])
+
+def moments_audit():
+ rows=[]
+ for gridpath in sorted((PAIR/'refined').glob('*/grid.json')):
+  grid=json.loads(gridpath.read_text());ex=grid['example'];q=grid['reference_cms']
+  for name,path,fp in grid['sources']:
+   s=setup(pd.read_parquet(path),q,grid['midpoint_cms']);f=s['f']
+   qm=.6*f.rapid_celerity_mps_raw.to_numpy()*f.width.to_numpy()*f.depth_m.to_numpy();qr=s['shares']*q
+   for profile in ['fixed_0.1','cunge_reference']:
+    x=s['xs'][profile];mu,var=exp.moments(s,x,30)
+    physical=qr/(2*f.width.to_numpy()*f.slope.to_numpy());numerical=f.rapid_celerity_mps.to_numpy()*f.rapid_effective_length_m.to_numpy()*(.5-x)
+    if profile=='cunge_reference':np.testing.assert_allclose(numerical,physical,rtol=1e-10)
+    rows.append(dict(example=ex,state=name,profile=profile,mean_response_h=mu/3600,response_std_h=np.sqrt(var)/3600,response_variance_h2=var/3600**2,median_diffusivity_ratio=float(np.median(numerical/physical)),median_manning_q_over_allocated=float(np.median(qm/qr)),median_cunge_length_scale_m=float(np.median(qr/(f.width*f.slope*f.rapid_celerity_mps))),nlinks=len(f)))
+ pd.DataFrame(rows).to_csv(O/'mechanism_moments.csv',index=False)
+if __name__=='__main__':
+ moments_audit()
+ with ProcessPoolExecutor(max_workers=2) as pool:list(pool.map(worker,['05','15','22','37','41','46']))

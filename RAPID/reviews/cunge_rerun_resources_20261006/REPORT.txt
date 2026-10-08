@@ -1,0 +1,41 @@
+CUNGE RERUN RESOURCE SNAPSHOT — 6 October 2026
+
+{
+  "scope": "All 16 including diagnostic 11, 2230 unique within-network states. Current calibration tails; no rerouting, recalibration or deletion.",
+  "dense_arrays_gib": 121.5176919400692,
+  "existing_completed_gib": 14.352178098633885,
+  "external_free_gib": 311.03515625,
+  "local_free_gib": 38.909912109375,
+  "two_worker_scaled_hours": [
+    12.324987865896905,
+    14.431398344238684
+  ],
+  "assumptions": [
+    "alpha=2, existing bounds/caps and reference discharge; section counts frozen across n",
+    "full f8 inflow.nc and Qout.nc at reporting cadence, no native substep storage",
+    "uncompleted networks use current base calibration horizon; future tail extension increases disk and time",
+    "measured wall proxies are exterior_invariance.csv to completion.json mtimes; initial geometry-preparation time excluded",
+    "recorded engine seconds exclude preflight and independent cascade; not total job time",
+    "two workers are local processes, not compute nodes"
+  ]
+}
+
+Per-network dense prep + output GiB, two-worker scaled hours (not measured forecast):
+02: 0.152 GiB; 0.01–0.01 h
+03: 0.077 GiB; 0.01–0.01 h
+05: 0.184 GiB; 0.01–0.01 h
+11: 0.687 GiB; 0.03–0.04 h
+13: 0.452 GiB; 0.04–0.05 h
+15: 4.451 GiB; 1.39–1.62 h
+21: 0.077 GiB; 0.00–0.00 h
+22: 53.947 GiB; 4.84–5.67 h
+37: 8.184 GiB; 1.64–1.92 h
+41: 3.115 GiB; 0.40–0.47 h
+45: 0.697 GiB; 0.03–0.04 h
+46: 44.530 GiB; 3.12–3.66 h
+48: 1.553 GiB; 0.14–0.16 h
+54: 0.536 GiB; 0.04–0.04 h
+55: 2.831 GiB; 0.63–0.74 h
+56: 0.044 GiB; 0.00–0.00 h
+
+Planning allowances: approximately 130 GiB final artifact size at existing horizons; budget 160–200 GiB for growth and transient space, subject to recalibrated tail preflight. Current runner reserves 4*estimated Qout +10 GiB per network; retain that check. Full sequential-network run at two local workers: plan 15–20 h; one worker roughly 24–32 h (lower-confidence extrapolation, not benchmark). Calibration: old two-method trial routing sums to 45 min; allow 1–2 h plus engineering/review time. New targets not wired into calibration; runner calibration path and shared-link acceptance must be updated before launch. Case 11 diagnostic status retained. Preserve old small summaries/outlet waves/provenance; replace old bulky prep/Qout after each new network validates. No data deleted by this audit.

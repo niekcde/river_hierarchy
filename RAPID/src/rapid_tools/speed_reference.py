@@ -72,7 +72,8 @@ def build_speed_reference_frame(example_ids, *, output_root, gauge_root=None):
                 raise ValueError("Expected one observed-gauge configuration")
             up, down = str(match.iloc[0].Up).strip(), str(match.iloc[0].Down).strip()
             row.update(up_station=up, down_station=down)
-            ref = output_root / f"{example}_indep__anchored/reference_section"
+            suffix = "_direction130" if example == "15" else ""
+            ref = output_root / f"{example}_indep{suffix}__anchored/reference_section"
             summary = json.loads((ref / "reference_section_summary.json").read_text())
             if not summary.get("single_thread"):
                 raise ValueError("Reference geometry is not marked single-thread")

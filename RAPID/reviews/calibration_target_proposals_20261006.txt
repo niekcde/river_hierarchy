@@ -1,0 +1,34 @@
+CALIBRATION TARGET REVIEW — 6 October 2026
+Status: proposals recorded; NOT IMPLEMENTED. User explicitly retains current runs.
+
+Reason: current observed_target uses the first sampled global maximum. Flat crests and adjacent similar peaks can make that an unrepresentative timing target. Aim for representative observed event-crest timing, without exhaustive hydrograph optimisation.
+
+User proposals and provisional assessment:
+02: current target correct; retain.
+03: midpoint of observed plateau.
+05: current target good; retain.
+11: not currently used; interval 16.063–16.823 plotted days, midpoint 16.443 days. Retain interval. This does not solve the known Cunge timing failure.
+13: plateau 5.583–5.885 plotted days, midpoint 5.734 days. Retain interval.
+15: midpoint of plateau.
+21: current target good; retain.
+22: midpoint between two high peaks, if they represent one event crest. User notes single-peaked inflow and smoother model output; final target must be justified from observations, not model fit.
+37: possibly between the two highest peaks; needs observation review.
+41: current target good; retain.
+45: current target acceptable; possibly centre the three highest peaks if minor fluctuations of one crest. Provisional.
+46: current target good; retain.
+48: select middle of three peaks. Clarify middle actual peak versus midpoint between outer peaks; check corresponding upstream feature.
+54: midpoint between the two peaks, if one event crest.
+55: current target good; retain.
+56: retain current selected peak provisionally; sharpness alone is not evidence that it is an outlier. Check neighbouring observations.
+
+Proposed common protocol (not approved for implementation):
+- Record observation-based crest interval plus nominal midpoint, or a clear individual peak.
+- Convert plotted days to absolute UTC using each panel's downstream observation-window start. Do not use forcing start blindly.
+- Use identical reviewed targets for fixed-X and Cunge.
+- Calibrate nominal downstream timing; report interval acceptance and plausible n range without false midpoint precision.
+- Review upstream plateaus too when reporting gauge-to-gauge lag (including 13,15,45,48). Comparing modelled downstream timing directly with the reviewed UTC target avoids inconsistent reference offsets. Do not shift the input hydrograph.
+- Freeze the reviewed table before recalibration. Recalibrate base only and inherit n across child states.
+- Keep shape, magnitude and volume as diagnostics. Do not select targets to maximise predictor correlations or to favour a method.
+- Existing runs remain preliminary results. Changed targets can change n and therefore parent-child responses upon rerunning; existing stored responses themselves are not modified.
+
+No calibration settings, workbook, running jobs or production inputs changed by this record.

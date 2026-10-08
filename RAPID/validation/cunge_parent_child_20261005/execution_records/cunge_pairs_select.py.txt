@@ -1,0 +1,30 @@
+from pathlib import Path
+import pandas as pd,numpy as np,json,hashlib
+R=Path('/Users/6256481/Code/river-hierarchy');O=R/'RAPID/validation/cunge_parent_child_20261005';O.mkdir(exist_ok=True)
+d=pd.read_parquet(R/'RAPID/validation/all_pairs_lag_20261005/features.parquet');assert len(d)==2214
+selected=[]
+for ex,g in d.groupby('example_id'):
+ chosen={}
+ def add(idx,why):chosen.setdefault(idx,[]).append(why)
+ add(g.interpolated_peak_shift_hours.idxmin(),'most_negative_existing_peak_shift')
+ add(g.interpolated_peak_shift_hours.idxmax(),'most_positive_existing_peak_shift')
+ add(g.interpolated_peak_shift_hours.abs().idxmin(),'smallest_absolute_existing_peak_shift')
+ # Add the highest-exposure missing family, then category, without new-X outcomes.
+ rest=g.loc[~g.index.isin(chosen)]
+ fams=set(g.loc[list(chosen),'family']);cats=set(g.loc[list(chosen),'plot_category'])
+ rank=rest.assign(missing_family=~rest.family.isin(fams),missing_category=~rest.plot_category.isin(cats))
+ idx=rank.sort_values(['missing_family','missing_category','matched_len_frac'],ascending=False).index[0]
+ add(idx,'missing_family_category_then_largest_affected_length')
+ # If extrema/near-zero overlap, fill deterministically by exposure.
+ for idx in g.sort_values('matched_len_frac',ascending=False).index:
+  if len(chosen)>=4:break
+  if idx not in chosen:add(idx,'fill_largest_affected_length')
+ for idx,why in chosen.items():
+  row=g.loc[idx].to_dict();row['selection_reason']=';'.join(why);selected.append(row)
+s=pd.DataFrame(selected);assert len(s)==64 and not s.duplicated(['example_id','fingerprint']).any()
+s.to_parquet(O/'selected_pairs.parquet',index=False)
+cols=['example_id','state_id','family','plot_category','fingerprint','interpolated_peak_shift_hours','interpolated_lag_shift_pct','matched_len_frac','width_fraction_of_total_raw','omega','selection_reason']
+s[cols].to_csv(O/'selected_pairs.csv',index=False)
+plan=dict(scope='64 distinct base-child pairs, 4 per network, all 16 real networks; purposive stress sample, not random population inference',selection='Fixed before new X outcomes: strongest negative, strongest positive, near-zero existing absolute peak shift; add missing family/category with greatest affected length',parameters=['fixed_0.0','fixed_0.1','fixed_0.3','cunge_reference','cunge_midpoint'],forcings=['saved_event','controlled_48h_rise_48h_fall','controlled_12h_rise_12h_fall'],hydraulics='Unchanged current K, celerity, effective segment lengths, depth, geometry; Q allocated per state using production branch width fractions',primary_metrics=['child-minus-parent peak time hours','percentage change in peak lag using each method parent as denominator'],secondary_metrics=['peak excess change','centroid change','pulse width change'],numerics='Exact linear transfer of existing recurrence; validate against native recurrence; common clocks within comparison; timestep and output-resolution checks; quantify causal wrap and tails',interpretation='Robustness to X, not physical validation; no model fitting; no production rerouting or edits',source_sha256=hashlib.sha256((R/'RAPID/validation/all_pairs_lag_20261005/features.parquet').read_bytes()).hexdigest())
+(O/'design.json').write_text(json.dumps(plan,indent=2))
+print(s.groupby(['family','plot_category']).size().to_string());print(s[cols].to_string(index=False))

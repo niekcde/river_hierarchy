@@ -1,0 +1,17 @@
+import sys,inspect
+import numpy as np
+sys.path.insert(0,'/private/tmp');import cunge_pairs_run as c
+code=inspect.getsource(c.moments).replace("for i in s['edges'][s['root']]:","for i in []:");exec(code,c.__dict__)
+def transfer(s,x,dt,n,step,alpha):
+ f=s['f'];speed=f.rapid_celerity_mps.to_numpy();dx=f.rapid_effective_length_m.to_numpy();length=dx*f['count'].to_numpy();diff=speed*dx*(.5-x);assert (diff>0).all();target=f.v.to_numpy();result=np.empty(n//2+1,complex)
+ for start in range(0,len(result),8192):
+  freq=np.arange(start,min(start+8192,len(result)))/(n*step);lap=alpha+2j*np.pi*freq;values={s['root']:np.ones(len(lap),complex)}
+  for u in s['order']:
+   signal=values.pop(u)
+   if u==s['end']:result[start:start+len(lap)]=signal;continue
+   for i in s['edges'][u]:
+    h=np.exp(-2*lap*length[i]/(speed[i]+np.sqrt(speed[i]**2+4*diff[i]*lap)))
+    v=target[i];values[v]=values.get(v,0)+signal*s['ratios'][i]*h
+ return result
+c.transfer=transfer;c.O=c.R/'RAPID/validation/cunge_physical_assessment_20261005'
+c.run('41',step=150,tag='continuous_diffusion_refined',profiles=['fixed_0.1','cunge_reference'],clocks=[30.])

@@ -1,0 +1,37 @@
+import sys,json
+from pathlib import Path
+import numpy as np,pandas as pd
+from scipy.signal import lfilter
+from concurrent.futures import ProcessPoolExecutor
+sys.path.insert(0,'/private/tmp');import cunge_segmentation_test as t
+O=t.O
+
+def route(s,x,dt,flow):
+ k,N,dx,label=s['variants'][id(x)];den=dt+2*k*(1-x);a=(dt-2*k*x)/den;b=(dt+2*k*x)/den;d=(2*k*(1-x)-dt)/den;assert (d>=0).all() and (d<1).all()
+ signals={s['root']:flow};v=s['f'].v.to_numpy();mn=np.inf;under=0.
+ for u in s['order']:
+  signal=signals.pop(u)
+  if u==s['end']:return signal,mn,under
+  for i in s['edges'][u]:
+   val=signal*s['ratios'][i];eq=flow[0]*s['shares'][i]
+   for _ in range(N[i]):
+    val,_=lfilter([a[i],b[i]],[1.,-d[i]],val,zi=[(b[i]+d[i])*eq]);mn=min(mn,float(val.min()));under=min(under,float((val.min()-eq)/(np.ptp(flow)*s['shares'][i])))
+   signals[v[i]]=signals.get(v[i],0)+val
+ raise ValueError('No outlet')
+
+def worker(ex):
+ grid=json.loads((O/'refined'/ex/'grid.json').read_text());changes=pd.read_csv(O/'main_pair_changes.csv',dtype={'example':str});g=changes[(changes.example==ex)&(changes.profile=='unsegmented_actual')&(changes.forcing=='saved_event')];child=g.loc[g.change_h.abs().idxmax(),'state'];rows=[]
+ for state,path,fp in grid['sources']:
+  if state not in ['S000_base',child]:continue
+  s=t.setup(pd.read_parquet(path),grid['reference_cms'],grid['midpoint_cms'])
+  for profile in ['current_200_floor','physical_200','unsegmented_actual']:
+   w=pd.read_parquet(O/'refined'/ex/f'{fp}_{profile}_dt15.parquet');tg=w.time_seconds.to_numpy()
+   for forcing in ['saved_event','pulse_12h']:
+    for dt in [15.,7.5]:
+     tn=np.arange(int(tg[-1]/dt)+1)*dt;flow=np.interp(tn,tg,w[forcing+'_inflow']);q,mn,under=route(s,s['xs'][profile],dt,flow);pk,status=t.c.peak(tn,q)
+     rows.append(dict(example=ex,state=state,profile=profile,forcing=forcing,dt_s=dt,peak_h=pk/3600,peak_cms=q.max(),minimum_all_segments=mn,minimum_excess_fraction=under if forcing=='pulse_12h' else np.nan))
+  print(ex,state,'native done',flush=True)
+ pd.DataFrame(rows).to_csv(O/f'native_{ex}.csv',index=False)
+ return ex
+if __name__=='__main__':
+ with ProcessPoolExecutor(max_workers=2) as pool:print(list(pool.map(worker,['15','37','48','54'])),flush=True)

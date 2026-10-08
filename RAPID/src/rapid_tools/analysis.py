@@ -788,6 +788,11 @@ def load_reach_wave_stack(
     qout_path = _as_path(qout_nc)
     resolved_run_dir = _as_path(run_dir) if run_dir is not None else None
     reaches = gpd.read_file(_resolve_reach_attributes_gpkg(prep_path, resolved_run_dir))
+    if resolved_run_dir is not None and (resolved_run_dir / "rapid_link_mapping.parquet").exists():
+        mapping = pd.read_parquet(resolved_run_dir / "rapid_link_mapping.parquet")
+        extra = [column for column in mapping if column not in reaches.columns]
+        if extra:
+            reaches = reaches.merge(mapping[["reach_id", *extra]], on="reach_id", how="left", validate="one_to_one")
     reaches["reach_id"] = pd.to_numeric(reaches["reach_id"], errors="coerce").astype(int)
     river_ids, time_seconds, qout = _load_qout(qout_path)
     reach_index = reaches.set_index("reach_id", drop=False)

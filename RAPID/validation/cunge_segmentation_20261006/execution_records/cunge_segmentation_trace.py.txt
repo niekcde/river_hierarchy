@@ -1,0 +1,22 @@
+import sys,json
+import numpy as np,pandas as pd
+from scipy.signal import lfilter
+sys.path.insert(0,'/private/tmp');import cunge_segmentation_adaptive as a
+O=a.t.O;ex='37';state='CB001_bubble_3';g=json.loads((O/'refined'/ex/'grid.json').read_text());_,path,fp=next(r for r in g['sources'] if r[0]==state);s=a.setup(pd.read_parquet(path),g['reference_cms'],g['midpoint_cms']);w=pd.read_parquet(O/'refined'/ex/f'{fp}_unsegmented_actual_dt15.parquet');dt=15.;time=np.arange(int(w.time_seconds.iloc[-1]/dt)+1)*dt;flow=np.interp(time,w.time_seconds,w.pulse_12h_inflow);amp=np.ptp(flow)
+def run(profile,pick=None):
+ x=s['xs'][profile];k,N,dx,label=s['variants'][id(x)];den=dt+2*k*(1-x);aa=(dt-2*k*x)/den;bb=(dt+2*k*x)/den;dd=(2*k*(1-x)-dt)/den;signals={s['root']:flow};v=s['f'].v.to_numpy();worst=0;trace=None;meta=None
+ for u in s['order']:
+  sig=signals.pop(u)
+  if u==s['end']:continue
+  for i in s['edges'][u]:
+   val=sig*s['ratios'][i];eq=flow[0]*s['shares'][i]
+   for j in range(N[i]):val,_=lfilter([aa[i],bb[i]],[1,-dd[i]],val,zi=[(bb[i]+dd[i])*eq])
+   under=(val.min()-eq)/(amp*s['shares'][i])
+   if (pick is None and under<worst) or pick==i:
+    worst=under;trace=(val-eq)/(amp*s['shares'][i]);meta=dict(index=int(i),id_link=int(s['f'].iloc[i].id_link),physical_length_m=float(s['f'].iloc[i].link_length_m),celerity_mps=float(s['f'].iloc[i].rapid_celerity_mps),x=float(x[i]),a=float(aa[i]),b=float(bb[i]),d=float(dd[i]),N=int(N[i]),minimum_excess_fraction=float(under))
+   signals[v[i]]=signals.get(v[i],0)+val
+ return trace,meta
+trace,meta=run('unsegmented_actual');df=pd.DataFrame(dict(time_h=time/3600,unsegmented=trace));metadata={'unsegmented_actual':meta}
+for p in ['physical_200','adaptive_nonpositive_x']:
+ tr,m=run(p,meta['index']);df[p]=tr;metadata[p]=m
+metadata.update(example=ex,state=state,forcing='pulse_12h',dt_s=dt);df[df.time_h<=120].iloc[::10].to_csv(O/'undershoot_trace.csv',index=False);(O/'undershoot_trace.json').write_text(json.dumps(metadata,indent=2));print(metadata,flush=True)

@@ -5,6 +5,7 @@ from typing import Mapping
 
 import numpy as np
 import pandas as pd
+from network_variants.reference_context import anchored_depth_and_kb
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +18,7 @@ class KValueConfig:
     kb_reference_width_m: float | None = None
     kb_reference_slope: float | None = None
     kb_reference_depth_m: float | None = None
+    depth_width_exponent: float | None = None
     n_manning: float = 0.35
     min_width: float = 1.0
     min_effective_length_m: float | None = None
@@ -95,14 +97,18 @@ def compute_k_values(
     frame["rapid_kb_reference_depth_m"] = (
         float(config.kb_reference_depth_m) if config.kb_reference_depth_m is not None else np.nan
     )
-    frame["rapid_celerity_mps_raw"] = (
-        (5.0 / (3.0 * float(config.n_manning)))
-        * np.sqrt(frame["slope_used"].astype(float))
-        * (
-            (frame["rapid_width_m"].astype(float) ** (2.0 / 3.0))
-            / (float(config.kb_value) ** (2.0 / 3.0))
+    if config.depth_width_exponent is None:
+        depth = frame["rapid_width_m"].to_numpy() / float(config.kb_value)
+    else:
+        depth, local_kb = anchored_depth_and_kb(
+            frame["rapid_width_m"], reference_width_m=config.kb_reference_width_m,
+            reference_depth_m=config.kb_reference_depth_m, exponent=config.depth_width_exponent,
         )
-    ).astype(float)
+        frame["rapid_kb_value"] = local_kb
+        frame["rapid_kb_source_method"] = "anchored_depth_width"
+    frame["rapid_depth_m"] = depth
+    frame["rapid_depth_width_exponent"] = config.depth_width_exponent
+    frame["rapid_celerity_mps_raw"] = (5.0 / (3.0 * config.n_manning)) * depth**(2.0/3.0) * np.sqrt(frame["slope_used"].astype(float))
     if config.use_celerity_capping:
         frame["rapid_celerity_mps"] = frame["rapid_celerity_mps_raw"].clip(
             lower=float(config.min_celerity_mps),
@@ -149,15 +155,24 @@ def compute_k_values(
 def compute_dt_bounds(
     k_values: pd.Series,
     *,
-    x_value: float,
+    x_value: float | np.ndarray | pd.Series,
+    coefficient_policy: str = "nonnegative",
 ) -> tuple[float, float]:
+    if coefficient_policy not in {"nonnegative", "signed_current_inflow", "signed_inflow"}:
+        raise ValueError("Unknown coefficient policy")
     finite = pd.to_numeric(k_values, errors="coerce")
-    finite = finite[np.isfinite(finite)]
+    if not np.isfinite(finite).all() or (finite <= 0).any():
+        raise ValueError("Routing K values must be finite and positive.")
     if finite.empty:
         raise ValueError("No finite RAPID K values were available for routing dt selection.")
-    dt_min = float(np.max(2.0 * finite * x_value))
-    dt_max = float(np.min(2.0 * finite * (1.0 - x_value)))
-    return dt_min, dt_max
+    x = np.broadcast_to(np.asarray(x_value, dtype=float), finite.shape)
+    if not np.isfinite(x).all() or (x >= .5).any():
+        raise ValueError("Muskingum X must be finite and less than 0.5.")
+    if coefficient_policy != "signed_inflow" and (x < 0).any():
+        raise ValueError("Negative X requires the signed_inflow coefficient policy.")
+    dt_min = float(np.max(2.0 * finite * np.abs(x)))
+    dt_max = float(np.min(2.0 * finite * (1.0 - x)))
+    return (dt_min if coefficient_policy == "nonnegative" else 0.0), dt_max
 
 
 def apply_stability_effective_length_cap(
@@ -286,9 +301,10 @@ def compute_routing_dt_seconds(
     *,
     x_value: float,
     forcing_dt_seconds: int,
-    preferred_routing_dt_seconds: int | None = None,
-) -> int:
-    dt_min, dt_max = compute_dt_bounds(k_values, x_value=x_value)
+    preferred_routing_dt_seconds: float | None = None,
+    coefficient_policy: str = "nonnegative",
+) -> int | float:
+    dt_min, dt_max = compute_dt_bounds(k_values, x_value=x_value, coefficient_policy=coefficient_policy)
     return compute_routing_dt_seconds_from_bounds(
         dt_min=dt_min,
         dt_max=dt_max,
@@ -303,15 +319,29 @@ def compute_routing_dt_seconds_from_bounds(
     dt_min: float,
     dt_max: float,
     forcing_dt_seconds: int,
-    preferred_routing_dt_seconds: int | None = None,
+    preferred_routing_dt_seconds: float | None = None,
     x_value: float | None = None,
-) -> int:
+) -> int | float:
     if dt_min > dt_max:
         x_text = f"{x_value}" if x_value is not None else "unknown"
         raise ValueError(
             f"No stable RAPID routing timestep exists for x={x_text}. "
             f"Computed dt_min={dt_min:.3f} > dt_max={dt_max:.3f}."
         )
+
+    # An explicit fractional clock must satisfy the same bounds and divide
+    # the forcing interval into whole substeps. Existing integer selection
+    # remains unchanged for backward-compatible runs.
+    if preferred_routing_dt_seconds is not None:
+        preferred = float(preferred_routing_dt_seconds)
+        if not np.isfinite(preferred) or preferred <= 0:
+            raise ValueError("Preferred routing timestep must be finite and positive.")
+        if not preferred.is_integer():
+            quotient = forcing_dt_seconds / preferred
+            if (preferred < dt_min - 1e-9 or preferred > dt_max + 1e-9
+                    or not np.isclose(quotient, round(quotient), rtol=0, atol=1e-9)):
+                raise ValueError("Fractional routing timestep violates bounds or forcing divisibility.")
+            return preferred
 
     candidates: list[int] = []
     for candidate in range(1, int(forcing_dt_seconds) + 1):
@@ -340,8 +370,9 @@ def find_nearby_compatible_forcing_and_routing_dt(
     forcing_dt_seconds: int,
     preferred_routing_dt_seconds: int | None = None,
     search_max_offset_seconds: int = 120,
+    coefficient_policy: str = "nonnegative",
 ) -> tuple[int, int]:
-    dt_min, dt_max = compute_dt_bounds(k_values, x_value=x_value)
+    dt_min, dt_max = compute_dt_bounds(k_values, x_value=x_value, coefficient_policy=coefficient_policy)
     if dt_min > dt_max:
         raise ValueError(
             f"No stable RAPID routing timestep exists for x={x_value}. "

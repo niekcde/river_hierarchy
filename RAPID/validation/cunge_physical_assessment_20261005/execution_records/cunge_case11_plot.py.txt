@@ -1,0 +1,14 @@
+from pathlib import Path
+import pandas as pd,numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+O=Path('/Users/6256481/Code/river-hierarchy/RAPID/validation/cunge_physical_assessment_20261005');root=O/'calibration_two_time_boundary/11';fig,ax=plt.subplots(1,2,figsize=(12,4),layout='constrained')
+for profile,label,color in [('fixed_0.1','Fixed X = 0.1','#333333'),('cunge_event_midpoint','Cunge: midpoint','#1678b5'),('cunge_stored_reference','Cunge: reference','#d17a00')]:
+ d=pd.read_parquet(root/f'{profile}_best_wave.parquet');t=(pd.to_datetime(d.time_utc)-pd.to_datetime(d.time_utc.iloc[int(d.inflow.to_numpy().argmax())])).dt.total_seconds()/3600;ax[0].plot(t,d.outlet,label=label,color=color)
+ if profile=='fixed_0.1':ax[0].plot(t,d.inflow,color='0.65',lw=.8,alpha=.8,label='Inflow')
+ax[0].axvline(63.5,color='red',ls='--',label='Reviewed observed peak lag');ax[0].set(xlim=(-110,230),xlabel='Hours relative to inflow maximum',ylabel='Discharge (m³/s)',title='River 11: hydrograph shape changes the selected peak');ax[0].legend(fontsize=8)
+s=pd.read_csv(O/'calibration_case11_dense/11/trials.csv');
+for p,l,col in [('cunge_event_midpoint','Cunge: midpoint','#1678b5'),('cunge_stored_reference','Cunge: reference','#d17a00')]:
+ g=s[(s.profile==p)&(~s.half_clock)].sort_values('n');ax[1].plot(g.n,g.lag_h,'o-',markersize=3,label=l,color=col)
+ax[1].axhline(63.5,color='red',ls='--');ax[1].set(xlabel='Manning n',ylabel='Simulated peak lag (hours)',title='Denser n search: 0.0025 spacing');ax[1].legend(fontsize=8);fig.savefig(O/'calibration_case11.png',dpi=170)

@@ -1,0 +1,89 @@
+from pathlib import Path
+import sys,json,math,hashlib
+import numpy as np,pandas as pd,networkx as nx
+from scipy.signal import lfilter
+from concurrent.futures import ProcessPoolExecutor
+sys.path.insert(0,'/private/tmp');import cunge_pairs_run as previous
+R=previous.R;O=R/'RAPID/validation/cunge_physical_assessment_20261005';O.mkdir(exist_ok=True)
+old=pd.read_csv(R/'RAPID/outputs/travel_time_calibration_refined/refined_candidates.csv',dtype={'example':str}).set_index('example')
+schedule=pd.read_csv(R/'RAPID/outputs/travel_time_calibration/reviewed_schedule.csv',dtype={'example':str}).set_index('example')
+PROFILES=['fixed_0.1','cunge_event_midpoint','cunge_event_peak','cunge_stored_reference']
+
+def route(s,k,x,flow,nsub,dt):
+ f=s['f'];out=s['edges'];signals={s['root']:np.repeat(flow,nsub)};steady={s['root']:float(flow[0])};mn=np.inf
+ den=dt+2*k*(1-x);a=(dt-2*k*x)/den;b=(dt+2*k*x)/den;c=(2*k*(1-x)-dt)/den
+ assert (abs(c)<1).all()
+ v=f.v.to_numpy();count=f['count'].to_numpy(int)
+ for node in s['order']:
+  signal=signals.pop(node);initial=steady.pop(node)
+  if node==s['end']:return signal.reshape(-1,nsub).mean(axis=1),mn
+  for i in out[node]:
+   fraction=s['ratios'][i] if node==s['root'] else float(np.float32(round(s['ratios'][i],6)))
+   value=signal*fraction;eq=initial*fraction
+   for seg in range(count[i]):
+    b0,b1=(a[i]+b[i],0.) if node==s['root'] and seg==0 else (a[i],b[i])
+    value,_=lfilter([b0,b1],[1.,-c[i]],value,zi=[(b1+c[i])*eq]);mn=min(mn,float(value.min()))
+   assert np.isfinite(value).all()
+   signals[v[i]]=signals.get(v[i],0)+value;steady[v[i]]=steady.get(v[i],0)+eq
+ assert False
+
+def run(ex):
+ dest=O/'calibration'/ex;dest.mkdir(parents=True,exist_ok=True);r=old.loc[ex];w=schedule.loc[ex]
+ wave=pd.read_parquet(r.hydrograph_path);times=pd.to_datetime(wave.time_utc,utc=True);first=pd.Timestamp(w.first_sample);last=pd.Timestamp(w.last_sample)
+ event=wave.loc[(times>=first)&(times<=last),'q_inflow_cms'].to_numpy();assert len(event)>2
+ step=float(r.forcing_step_s);np.testing.assert_allclose([event[0],event[-1]],[w.q_initial,w.q_final])
+ src=previous.SOURCES[ex];f=pd.read_parquet(src['frame']);ref=json.loads(Path(src['policy_manifest']).read_text())['reference_kb_summary']['reference_discharge_cms'];s=previous.setup(f,ref,(event[0]+event.max())/2)
+ # Same native clock as prior refined calibration, preserving the output cadence.
+ dt=float(r.routing_dt_s);nsub=int(round(step/dt));assert abs(step/nsub-dt)<1e-8
+ qrefs={'cunge_event_midpoint':(event[0]+event.max())/2,'cunge_event_peak':event.max(),'cunge_stored_reference':ref}
+ denom=f.width.to_numpy()*f.slope.to_numpy()*f.rapid_effective_length_m.to_numpy();length=f.rapid_effective_length_m.to_numpy();raw=f.rapid_celerity_mps_raw.to_numpy()
+ tail0=max(int(round((pd.Timestamp(w.simulation_end)-last).total_seconds()/step)),int(math.ceil(3*86400/step)))
+ cache={};trial_rows=[]
+ def evaluate(profile,n,save=False,half=False):
+  n=float(n);key=(profile,round(n,12),half)
+  if key in cache and not save:return cache[key]
+  path=dest/f'{profile}_n{n:.10f}'+Path('') if False else dest/f'{profile}_n{n:.10f}{"_half" if half else ""}.json'
+  if path.exists() and not save:
+   result=json.loads(path.read_text());cache[key]=result;trial_rows.append(result);return result
+  c=np.clip(raw*.035/n,.05,5);k=length/c
+  x=np.full(len(f),.1) if profile=='fixed_0.1' else .5*(1-qrefs[profile]*s['shares']/(denom*c))
+  count=tail0;settled=False
+  for extension in range(8):
+   flow=np.r_[event,np.full(count,event[-1])];q,mn=route(s,k,x,flow,nsub*(2 if half else 1),dt/(2 if half else 1));t=np.arange(len(flow))*step
+   amplitude=q.max()-max(event[0],event[-1]);outside=np.flatnonzero((t>=(len(event)-1)*step)&(abs(q-event[-1])>.001*amplitude));j=int(outside[-1]+1) if len(outside) else len(event)-1
+   settled=j<len(t) and t[j]+2*86400<=t[-1]
+   if settled:break
+   count=max(2*count,count+int(math.ceil(2*86400/step)))
+  if not settled:raise ValueError(('unsettled',ex,profile,n,len(flow)))
+  pi=int(q.argmax());assert 0<pi<len(q)-1 and mn>=-1e-8
+  lag=(pi-int(event.argmax()))*step/3600;err=lag-float(r.observed_lag_h)
+  result=dict(example=ex,profile=profile,n=n,lag_h=lag,error_h=err,abs_error_h=abs(err),peak_cms=float(q.max()),minimum_segment_flow=mn,tail_extensions=extension,simulation_days=t[-1]/86400,half_clock=half,dt_s=dt/(2 if half else 1),x_min=x.min(),x_max=x.max(),cap_fraction=float(np.average(c!=raw*.035/n,weights=f['count'])),observed_lag_h=float(r.observed_lag_h),timing_resolution_h=float(r.timing_resolution_h),forcing_step_s=step)
+  path.write_text(json.dumps(result,indent=2));cache[key]=result
+  if not half:trial_rows.append(result)
+  if save:pd.DataFrame(dict(time_utc=first+pd.to_timedelta(t,unit='s'),inflow=flow,outlet=q)).to_parquet(dest/f'{profile}_best_wave.parquet',index=False)
+  return result
+ baseline=evaluate('fixed_0.1',r.n_manning);assert abs(baseline['lag_h']-r.simulated_lag_h)<step/3600+1e-8
+ summaries=[]
+ for profile in PROFILES:
+  grid=np.unique(np.r_[.01,.0125,.015,.02,.025,.03,.035,.04,.05,.06,.08,.1,r.n_manning])
+  for n in grid:evaluate(profile,n)
+  def entries(lo,hi):return sorted([v for (p,n,h),v in cache.items() if p==profile and not h and lo-1e-12<=n<=hi+1e-12],key=lambda v:v['n'])
+  def solve(lo,hi):
+   for iteration in range(12):
+    ordered=entries(lo,hi);best=min(ordered,key=lambda v:(v['abs_error_h'],abs(v['n']-.035)))
+    if best['abs_error_h']<=step/7200+1e-12:break
+    crossings=[(a,b) for a,b in zip(ordered[:-1],ordered[1:]) if a['error_h']*b['error_h']<0 and b['n']-a['n']>1e-7]
+    if not crossings:break
+    for a,b in crossings:evaluate(profile,(a['n']+b['n'])/2)
+   return min(entries(lo,hi),key=lambda v:(v['abs_error_h'],abs(v['n']-.035)))
+  best=solve(.01,.1);band=solve(.025,.06);best=solve(.01,.1)
+  best=evaluate(profile,best['n'],save=True);check=evaluate(profile,best['n'],half=True)
+  vals=entries(.01,.1);eligible=[v['n'] for v in vals if v['abs_error_h']<=float(r.timing_resolution_h)]
+  summaries.append(dict(**best,old_n=float(r.n_manning),old_error_h=float(r.abs_error_h),baseline_reproduction_error_h=baseline['lag_h']-float(r.simulated_lag_h),within_sampling=best['abs_error_h']<=float(r.timing_resolution_h),boundary=best['n'] in [.01,.1],common_band_n=band['n'],common_band_error_h=band['abs_error_h'],common_band_within_sampling=band['abs_error_h']<=float(r.timing_resolution_h),half_clock_lag_change_seconds=3600*(check['lag_h']-best['lag_h']),sampled_n_min_within_tolerance=min(eligible) if eligible else None,sampled_n_max_within_tolerance=max(eligible) if eligible else None,q_reference_used=qrefs.get(profile),target_notes=r.target_notes))
+  pd.DataFrame(summaries).to_csv(dest/'best.csv',index=False);pd.DataFrame(trial_rows).drop_duplicates(['profile','n','half_clock']).to_csv(dest/'trials.csv',index=False)
+  print(ex,profile,'n',best['n'],'error min',best['abs_error_h']*60,'band h',band['abs_error_h'],flush=True)
+ return ex
+if __name__=='__main__':
+ with ProcessPoolExecutor(max_workers=2) as pool:list(pool.map(run,old.index))
+ best=pd.concat([pd.read_csv(p,dtype={'example':str}) for p in (O/'calibration').glob('*/best.csv')]);best.to_csv(O/'calibration_comparison.csv',index=False)
+ print(best.groupby('profile').agg(n_min=('n','min'),n_max=('n','max'),n_median=('n','median'),fitted=('within_sampling','sum'),band_fitted=('common_band_within_sampling','sum')).to_string(),flush=True)

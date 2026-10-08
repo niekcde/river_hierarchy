@@ -1,0 +1,9 @@
+import sys,inspect
+sys.path.insert(0,'/private/tmp');import cunge_pairs_run as c
+for fn in [c.transfer,c.moments]:
+ code=inspect.getsource(fn)
+ if fn==c.transfer:code=code.replace("h=h**count[i] if u!=root else (a[i]+b[i])/(1-c[i]*z)*h**(count[i]-1)","h=h**count[i]")
+ else:code=code.replace("for i in s['edges'][s['root']]:","for i in []:")
+ exec(code,c.__dict__)
+c.O=c.R/'RAPID/validation/cunge_physical_assessment_20261005'
+c.run('41',step=300,tag='two_time_boundary_pairs',profiles=['fixed_0.1','cunge_reference'],clocks=[30.])

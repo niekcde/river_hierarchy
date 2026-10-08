@@ -1,0 +1,108 @@
+CUNGE SEGMENTATION AND TIMESTEP TEST — 2026-10-06
+
+Scope
+80 hydraulic states (16 parents, 64 selected children), three forcings: saved event and smooth 12 h / 48 h rising-and-falling pulses. All use the standard two-time upstream boundary, fixed reference Cunge parameters, original n=.035, existing capped celerities and per-state width-based reference-flow allocation. Geometry, slopes, widths, celerity and branch shares are identical across segmentation variants within a state. Changed child hydraulics are the existing prepared frames; this is not implementation of a new exterior-inheritance policy. No production code or notebook edits.
+
+Previous unsegmented check
+The earlier cunge_sensitivity_pilot_20261005 provenance explicitly says original physical lengths were used for an X diagnostic only. No unsegmented hydrograph routing was performed there.
+
+Spatial scenarios
+current_200_floor: existing segment counts and effective lengths including 200 m floor.
+physical_200: rounded 200 m target count, each subreach length equals actual original length/count; no floor.
+physical_100: same with 100 m target.
+unsegmented_actual: one routing element per original edge, actual length.
+unsegmented_floor200: one per edge, max(actual length,200 m).
+diffusion_exact: independent constant-coefficient advection-diffusion transfer on each actual edge, same c and hydraulic diffusivity, downstream radiation boundary. This benchmarks the assumed equation, not observations or full channel hydraulics.
+adaptive_nonpositive_x: N=max(1,ceil(L/Ld)); dx=L/N; recalculate X from dx. No X clipping and no length inflation. This ensures X<=0 and hence nonnegative current-inflow coefficient for any positive time step. It is a tested candidate rule, not a uniquely optimal grid or proof of physical accuracy.
+
+Results
+On the 16 base networks, current preparation routes 39,001 subreaches for 5,315 original edges. Actual total edge length is 7,765,774 m; current represented length is 7,926,424 m (about 2.07% extra). Selective subdivision uses 6,317 subreaches and splits 300 original edges, while preserving actual length.
+
+All comparisons below use physical_200 as reference at dt=15 s and report grid 150 s. Discarding subdivision changes the median saved-event parent-child peak contrast by about 2.86 s but the worst by 3.234 h (river 37 / CB001_bubble_3). Eight pairs change by more than one minute; four by more than five minutes; one by more than one hour. No resolved saved-event signs flip (both magnitudes must exceed one minute). physical_100 versus physical_200 changes pair contrasts by at most 1.63 s for saved events. Selective subdivision changes saved-event pair contrasts by a median 0.75 s, maximum 6.06 min; no resolved signs flip in any of the three forcings.
+
+The lack of sign reversals is NOT an acceptance criterion by itself. Native recurrence checks reveal an unphysical undershoot with no subdivision: under a strictly positive pulse on a constant baseline, one internal outflow falls below baseline by 7.36% of that edge's allocated inlet-pulse amplitude. Total discharge remains positive. The problematic edge is an equivalent child edge in river 37, physical length 74.275 km, c=3.359 m/s, X=.494857, current-inflow coefficient a=-.97831 at dt=15 s. With physical_200 it has 371 subreaches; the selective rule needs 98. The material undershoot disappears under both. It persists under unsegmented dt=7.5 s: this is not resolved by reducing dt alone. A minimum-length floor does not fix the coarse long-edge representation.
+
+Temporal and evaluation checks
+Initial sweep dt=30 s / report=300 s; repeated all six original spatial scenarios at dt=15 s / report=150 s. Native direct recurrence on 8 states from four rivers, saved events and 12 h pulses, three original spatial scenarios and the adaptive rule, at dt=15 and 7.5 s. See verification.json for counts and maximum discrepancies. Flow is checked at every native step of every routed subreach. Native direct calculations use forcing interpolated from the refined experiment grid; they verify routing and temporal sensitivity, not the correctness of the original observation sampling convention.
+
+Timestep interpretation
+Let denom=dt+2K(1-X), a=(dt-2KX)/denom, b=(dt+2KX)/denom, d=(2K(1-X)-dt)/denom.
+Current fixed-X Muskingum practice drops dt>=2KX (a>=0), retains dt<=2K(1-X) (d>=0), and audits finite/nonnegative flows. Dropping that lower bound is not equivalent to dropping all accuracy requirements.
+For negative Cunge X, a is automatically positive but b may be negative. If ALL three coefficients were required nonnegative, the interval would be 2K*abs(X)<=dt<=2K(1-X). The globally required interval is absent in this test. Negative b need not produce a negative impulse response: h0=a and hj=(b+d*a)*d^(j-1), with b+d*a=4K*dt/denom^2>0. Thus a>=0 and 0<=d<1 give a nonnegative response even if b<0. The tested adaptive rule guarantees a>=0; selecting dt below the common upper bound gives d>=0. Allowance for signed previous-inflow coefficients must be explicit in Cunge preparation/validation; the current fixed-X policy name alone is insufficient.
+
+With Cunge K=dx/c and X=.5*(1-Ld/dx), the retained upper bound becomes dt<=(dx+Ld)/c. This is a non-oscillatory previous-outflow-coefficient guard, not a general necessary condition for linear stability. For fixed coefficients K>0 and X<=.5 on our feed-forward network with conservative nonnegative split fractions, linear boundedness/non-amplification does not require every routing coefficient to be nonnegative. Stable output can nevertheless be inaccurate or undershoot.
+
+The strictest upper limit over these 80 states is 48.3797 s for current floored preparation and 15.65984 s for actual-length and adaptive cases. dt=15 s respects the retained upper guard; actual implementation should derive a common clock from all states with its safety margin and forcing cadence, rather than hardcode 15 s. Recalculate bounds after calibration or any hydraulic change. Lowering dt does not make a negative current-inflow coefficient positive; for positive X it can make that coefficient more negative.
+
+Recommendation
+Use actual lengths and remove the blanket 200 m minimum-length modification as the preferred candidate, with a newly selected common clock. Replace blanket subdivision with tested selective subdivision rather than remove subdivision everywhere. The L/Ld rule is a concrete inexpensive positivity-preserving candidate. Preserve grids on inherited unchanged reaches between parents and children under the agreed reference policy. Verify accuracy over the full intended population and recalibrate after changing the routing configuration.
+
+Caveats
+These results are for Cunge X recomputed at each spatial resolution. They must not be transferred directly to fixed-X Muskingum: its nominal diffusivity c*dx*(.5-X) changes with dx. Cunge matches nominal diffusivity across resolutions, but not every higher-order property of the diffusion equation. In these tests substantial absolute peak-time discrepancies from the independent diffusion benchmark remain even between the 100 and 200 m resolutions. Agreement between those grids, positivity, and consistent pair signs therefore do not by themselves establish physical validation.
+
+Sources
+https://ponce.sdsu.edu/accuracy_criteria_in_diffusion_routing.html
+https://ponce.sdsu.edu/muskingum_cunge_method_with_variable_parameters.html
+RAPID/src/rapid_tools/engine.py, lines 446-454 (existing coefficient policy).
+RAPID/validation/cunge_sensitivity_pilot_20261005/provenance.json (earlier diagnostic scope).
+
+Detailed comparison summary (hours)
+    forcing                profile  n  median_abs_change_h  maximum_abs_change_h  resolved_sign_flips
+  pulse_12h adaptive_nonpositive_x 64         1.187281e-04              0.013254                    0
+  pulse_12h      current_200_floor 64         1.415162e-02              1.001667                    1
+  pulse_12h        diffusion_exact 64         2.179095e-02              1.164300                    8
+  pulse_12h           physical_100 64         2.727617e-07              0.000097                    0
+  pulse_12h           physical_200 64         0.000000e+00              0.000000                    0
+  pulse_12h     unsegmented_actual 64         1.922441e-04              0.979224                    0
+  pulse_12h   unsegmented_floor200 64         7.659857e-03              1.391417                    0
+  pulse_48h adaptive_nonpositive_x 64         4.024088e-05              0.008276                    0
+  pulse_48h      current_200_floor 64         1.404824e-02              1.001930                    0
+  pulse_48h        diffusion_exact 64         7.129325e-03              1.181525                    3
+  pulse_48h           physical_100 64         1.446719e-07              0.000011                    0
+  pulse_48h           physical_200 64         0.000000e+00              0.000000                    0
+  pulse_48h     unsegmented_actual 64         4.657835e-05              0.125592                    0
+  pulse_48h   unsegmented_floor200 64         6.699353e-03              0.511263                    0
+saved_event adaptive_nonpositive_x 64         2.067112e-04              0.100999                    0
+saved_event      current_200_floor 64         1.426457e-02              1.012605                    0
+saved_event        diffusion_exact 64         1.993590e-02              1.209933                    3
+saved_event           physical_100 64         5.262703e-07              0.000452                    0
+saved_event           physical_200 64         0.000000e+00              0.000000                    0
+saved_event     unsegmented_actual 64         7.938180e-04              3.233835                    0
+saved_event   unsegmented_floor200 64         6.950880e-03              3.673001                    0
+
+Verification
+{
+  "states": 80,
+  "parent_child_pairs": 64,
+  "rivers": 16,
+  "forcings": [
+    "saved_event",
+    "pulse_12h",
+    "pulse_48h"
+  ],
+  "n_manning": 0.035,
+  "main_dt_s": 30,
+  "main_report_s": 300,
+  "refined_dt_s": 15,
+  "refined_report_s": 150,
+  "native_runs": 128,
+  "native_checked_rivers": [
+    "15",
+    "37",
+    "48",
+    "54"
+  ],
+  "native_max_peak_shift_halving_seconds": 0.22142311638617684,
+  "native_vs_frequency_max_peak_difference_seconds": 1.0304253954927844,
+  "native_minimum_discharge": 0.2168705154033592,
+  "unsegmented_worst_positive_pulse_undershoot_fraction": -0.0736359647352867,
+  "adaptive_worst_positive_pulse_undershoot_fraction": -2.668060465046855e-13,
+  "source_code_edited": false,
+  "scope": "Constant-reference Cunge at original n and capped c; same hydraulics and flow shares within each state across spatial variants; standard upstream boundary. Not recalibration, full population validation, or variable-parameter Cunge."
+}
+
+Infinite-duration linear transfer mass check: 560 state/parameterization combinations, maximum |H(0)-1| = 1.4818215543499491e-09. This does not claim every truncated output window contains the full routed event volume.
+
+
+74 KM EDGE ANCHOR AUDIT
+Example 37, anchored compound state CB001_bubble_3, link 975, boundaries 20 -> 648, length 74,274.651 m. This is the pre-existing collapsed replacement edge for a parent domain of 946 edges, not a merge across the collapse boundary. All 29 exterior edges have exactly identical full prepared-frame attributes in parent and child. Both boundary nodes and heads are retained. See edge975_anchor_check.json and edge975_parent_child_map.png. Numerical segmentation changes do not remove those topological boundaries.

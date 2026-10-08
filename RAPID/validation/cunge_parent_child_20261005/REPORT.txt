@@ -1,0 +1,75 @@
+PARENT–CHILD ROBUSTNESS TO MUSKINGUM X — 5 OCTOBER 2026
+
+Finding: the selected parent–child peak-timing relationships are robust to changing a uniform X from 0.1 to 0 or 0.3, but not uniformly robust to Cunge-derived X. Keep the accepted baseline; explicitly report this structural sensitivity. This is not independent hydraulic validation.
+
+DESIGN
+64 canonical pairs (four per river) from the complete 2,214-pair inventory; all 16 rivers, 80 unique routed states including parents. Selection was frozen before new-X outcomes: extremes of existing signed timing response, near-zero response, and added family/category coverage weighted by affected length. It is a purposive stress sample, not a random prevalence estimate.
+Five parameterizations: fixed X=0, 0.1, 0.3; unclipped Cunge X at stored reference discharge; unclipped Cunge X at the midpoint of saved-event initial and peak inflow. Each state uses its own production width-based steady flow allocation. Reference choices are held fixed across forcing tests; no discharge-dependent X updates.
+Three forcings: the saved inlet event (linearly interpolated); controlled sinusoidal-squared pulses with 48-hour or 12-hour rise and equally long recession. Controlled baseflow=0.1 Qref, peak=Qref. K, geometry, segmentation, caps and branch-splitting rules retained. This tests X only, not a hydraulically reconciled full Muskingum–Cunge model.
+Exact discrete linear transfer of the existing recurrence evaluated by exponentially tilted Fourier inversion. Primary report grid 300 seconds, routing clocks 30 and 15 seconds; complete coarse 600-second check. The preserved external-input convention is (C1+C2) on the first inlet cell. Independent causal native-step calculations use 60-second steps and audit every segment at every step.
+Preferred grid: 2,400 state hydrographs and 1,920 paired results. Primary peak times use local quadratic interpolation of the global maximum. Lag percentages use the parent lag under the same parameterization. All 64 primary pairs retained for every condition.
+
+PRIMARY AGREEMENT (64 pairs each; a resolved reversal requires both shifts >1 minute in magnitude)
+    forcing         profile  spearman  median_abs_difference  p90_abs_difference  max_abs_difference  resolved_both  resolved_sign_flips
+  pulse_12h  cunge_midpoint  0.646474               0.040522            1.420591            4.949377             51                    9
+  pulse_12h cunge_reference  0.603114               0.050588            1.517788            4.969573             51                   11
+  pulse_12h       fixed_0.0  0.999954               0.000041            0.004987            0.014460             51                    0
+  pulse_12h       fixed_0.3  0.999908               0.000080            0.011436            0.035082             51                    0
+  pulse_48h  cunge_midpoint  0.694963               0.014015            1.445173            4.395837             50                    7
+  pulse_48h cunge_reference  0.687454               0.022950            1.599869            4.418307             51                    8
+  pulse_48h       fixed_0.0  1.000000               0.000003            0.000459            0.002551             51                    0
+  pulse_48h       fixed_0.3  1.000000               0.000005            0.000909            0.004985             51                    0
+saved_event  cunge_midpoint  0.580678               0.026763            1.695642            3.831996             48                    8
+saved_event cunge_reference  0.584799               0.023017            1.727906            3.868033             49                    8
+saved_event       fixed_0.0  0.999817               0.000647            0.014071            0.045610             49                    0
+saved_event       fixed_0.3  0.998352               0.002493            0.041410            0.264481             49                    0
+Absolute differences in the table are HOURS of change in the child-minus-parent timing contrast, not whole-network arrival-time changes.
+All eight saved-event reversals also exceed a five-minute magnitude threshold under both methods. Six exceed fifteen minutes under both. Their native-step calculations independently confirm the signs.
+
+SAVED-EVENT REVERSALS
+example         state  baseline_peak_shift_h  alternative_peak_shift_h  contrast_change_h
+     05   S040_unit_3               0.184062                 -0.312844          -0.496906
+     15 S127_unit_205              -1.387828                  0.457688           1.845516
+     22   S170_unit_6              -1.325369                  0.329634           1.655003
+     37 S214_unit_265               1.128369                 -0.590923          -1.719292
+     41 S130_unit_126               1.210474                 -2.657559          -3.868033
+     41 island_41_136               0.282225                 -0.219026          -0.501251
+     46  S142_unit_37               1.820989                 -1.279743          -3.100732
+     46  S139_unit_13              -2.011018                  0.407883           2.418900
+
+METRIC-SPECIFIC FINDINGS
+Full-pulse centroid contrasts are invariant here to numerical precision. These are analytic moments over the entire linear response, not truncated-event centroids. The same inlet contribution cancels within these selected pairs; internal mean travel time is controlled by K. Do not substitute this metric retroactively for the study’s peak-lag endpoint.
+Peak and duration/width effects can change. For the 12-hour pulse, Cunge-reference versus fixed-X parent–child peak-excess effects have Spearman rho approximately 0.55 and maximum difference approximately 29 percentage points. Full-response RMS width is highly tail-sensitive; large changes are not equivalent to comparable changes in event duration.
+Duration uses departure/return thresholds of 1% of inlet excess, common across the pair. Some Cunge tails do not settle within the reporting window (8 unavailable duration comparisons for the sharper-pulse Cunge-reference condition and 4 for the saved-event condition); those durations remain censored, never treated as zero. Peak results retain all 64 pairs.
+The descriptive omega–peak-shift rank association retains its broad negative sign (saved event: approximately -0.66 at fixed X and -0.56 with Cunge-reference), but individual predictions/signs are not preserved. No model was retrained, and these selected-sample associations are not population prediction scores.
+
+NUMERICAL VERIFICATION
+{
+  "selected_pairs": 64,
+  "rivers": 16,
+  "selected_states_including_bases": 80,
+  "preferred_hydrographs": 2400,
+  "preferred_pair_comparisons": 1920,
+  "reporting_grid_max_pair_peak_difference_seconds": 34.749123387564396,
+  "clock_max_pair_peak_difference_seconds": 3.121542144231171,
+  "wrap_max_pair_peak_difference_seconds": 0.0007406205440430025,
+  "frequency_screen_minimum_outlet_cms": 29.732688852532764,
+  "maximum_initial_error_fraction": 1.0550700584503115e-09,
+  "native_state_runs": 74,
+  "native_pair_comparisons": 42,
+  "native_max_pair_peak_error_seconds": 1.5376684315469902,
+  "native_negative_segment_steps": 0,
+  "native_minimum_segment_flow_cms": 0.216870515405127,
+  "maximum_centroid_contrast_change_seconds": 6.5491612133428134e-09,
+  "production_source_changes_since_pilot": []
+}
+Changing damping from 20 to 30 was checked on all selected states in networks 11, 37, 41 and 46. Independent native checks include all eight saved-event resolved reversals, plus low-sensitivity and extreme-X controls, and every resolved reversal for the sharper pulse. No negative native segment flows occurred in those targeted checks. The broader Fourier screen checks outlet flows, not every internal segment. This is empirical positivity for tested forcings, not a universal positivity proof.
+Analytic DC gain is unity by the recurrence and network flow-split closure, so full-response volume is conserved. Long Cunge tails prevent claiming that every finite output window captures all volume. No negative-flow clipping or X clipping was used.
+
+INTERPRETATION
+The initial three-parent pilot understated the risk for pairwise conclusions. A small absolute whole-network hydrograph change can be large relative to a simplification effect. The current baseline remains a valid explicitly specified routing experiment, but the results do not support a blanket claim that peak-lag direction or magnitude is insensitive to diffusion parameterization.
+Interpret as numerical/structural sensitivity, not evidence that Cunge-derived X is physically correct. Allocated Q and prescribed depth/celerity are not necessarily one consistent Manning state; large negative X and slope sensitivity remain physical-interpretation limitations. Observations or a suitable hydraulic benchmark are needed to select the more accurate formulation.
+Selected sample deliberately includes extremes and is not representative enough to infer the percentage of all 2,214 pairs that would reverse. All production code hashes match the preceding pilot; no production parameters or results were changed.
+
+ARTIFACTS
+design.json; selected_pairs.csv; refined_pairs.csv; method_contrasts.csv; refined_agreement.csv; saved_event_reversals.csv; native_validation.csv; verification.json; omega_associations.csv; within_river_ranks.csv; provenance.json. Figures: peak_relationships.png and example_41_reversal.png. Complete hydrographs in refined/. Temporary analysis scripts are preserved as non-executable text in execution_records/.

@@ -759,3 +759,80 @@ approach used here:
 Legacy RAPID copies under `synthetic_runs/legacy/` remain useful for
 backtracking, but the shared package in `RAPID/src/rapid_tools/` is the active
 implementation that both workflows should converge on.
+
+## Event forcing limitations and discharge-shape audit — 5 October 2026
+
+Reference **HYDROGRAPH-MEAN-SPREAD-2026-10-05**, added during interpretation of the all-pair predictor results and example 37's competing peaks. The current experiments route an upstream input hydrograph without observed lateral-inflow or tributary hydrographs. Internal branching/reconnection is represented, but added catchment inflow is not. Missing inputs can contribute to downstream discharge, shape and timing disagreement; they are not demonstrated to explain all disagreement. Gauge uncertainty, hydraulic assumptions, storage and event-window selection also matter.
+
+The [mean-discharge and standard-deviation audit](validation/hydrograph_mean_spread_20261005/README.md) compares arithmetic upstream/downstream gauge means within shared observed windows, with sample counts, cadence/gap diagnostics and time-weighted means as a sensitivity check. Mean discharge differences are descriptive evidence of a discharge mismatch, not direct estimates of tributary flow or causal attribution. No independent-sample significance test is applied to autocorrelated hydrograph observations.
+
+Discharge standard deviation is a candidate whole-hydrograph variability/smoothing descriptor. It is distinct from temporal spread, event duration and maximum peak attenuation. Its window dependence must be checked before adopting it as a response metric. Existing response definitions and routing remain unchanged.
+
+The [standard-sampling TV audit](validation/standard_total_variation_20261005/README.md) extends the roughness diagnostic to all 2,214 pairs at 1-, 2- and 4-hour time-averaged sampling, with the user-proposed event windows recorded separately from unchanged production forcing.
+
+## Buffer tests completed — 5 October 2026
+
+[EVENT-BUFFERS-2026-10-05](validation/event_buffer_tests_20261005/README.md) audits all 2,230 existing routed states and tests cropped-event forcing on 39 selected states across all 16 examples. Full-waveform 0/6/24-hour spin-up comparisons agree within numerical precision under the current steady-flow initialization. A 0.1%-of-parent-amplitude settling criterion sustained for 24 hours plus a further 24-hour tail gives an estimated 83% reduction in aggregate simulated duration and 77% in segment-routing substeps. These are projections, not measured batch wall-time savings. Tested children can settle later than the parent, so every future child requires the final-settlement check. Production remains unchanged; the new windows/buffers are not yet activated.
+
+Exact event and buffer timestamps are now documented in the review workbook's **Routing windows** sheet and the [routing schedule README](reviews/routing_windows/README.md), including the precise Excel cell locations. This records the tested proposal without activating new production forcing.
+
+## Travel-time calibration notebook
+
+[rapid_travel_time_calibration.ipynb](notebooks/rapid_travel_time_calibration.ipynb)
+fits one Manning roughness value per original network to the selected event's
+observed first-maximum travel time. It reads the reviewed Excel event windows,
+keeps BASED depth, width–depth exponent, slopes, widths and Muskingum X fixed,
+and routes only `S000_base`. A coarse n grid and local refinement retain
+sampling ties, peak-interpretation notes and search-boundary warnings.
+
+The workbook's shortened tail is checked and extended for each trial. A common
+safe clock covers each search bracket; sparse-recurrence comparisons and native
+segment flow checks accompany the trials. Cached candidates, hydrographs and
+audits are isolated in `RAPID/outputs/travel_time_calibration/`. Production inputs
+and the review workbook are unchanged. Separate-event validation and variant
+reruns are outside this notebook's calibration scope.
+
+Sections 9–12 refine the candidates within diagnostic bounds of 0.010–0.100
+using bracketed lag residuals, stopping at the sampled-output timing scale.
+They retain a separate 0.025–0.060 comparison band based on common natural-channel
+examples. Published alluvial-bed guidance also permits lower roughness under
+specific conditions; neither band establishes physical acceptability at a site.
+The notebook links HEC-RAS, FHWA and USGS guidance and marks site roughness as
+unverified. Refined outputs are isolated in
+`RAPID/outputs/travel_time_calibration_refined/`, with timestep checks and the
+forcing-peak offset reported separately from the fitted propagation lag.
+
+## Constant-reference Muskingum–Cunge candidate
+
+`rapid_tools.cunge` prepares the reviewed anchored hydraulic link frames with
+`alpha=2`, exact physical lengths, link-specific reference discharge, and
+`K=dx/c`, `X=(1-Q/(B*S*c*dx))/2`. It freezes the numerical grid across the
+Manning-n search; each trial updates celerity, K and X together. Manning n is
+the only calibrated parameter. Negative X is allowed under the explicit
+`signed_inflow` policy, with native discharge and undershoot audits.
+
+The engine's opt-in `upstream_two_time` boundary includes both inlet time
+levels. Existing prepared states retain their legacy boundary by default.
+The new numerical prep writes runnable connectivity, K/X, forcing NetCDF,
+link mapping and manifests directly from the audited hydraulic frames. The
+mapping preserves physical anchor nodes; source GIS geometry is retained in
+its original state directory rather than rebuilt.
+
+The parent-only assessment is reproducible with:
+
+```sh
+python RAPID/investigations/cunge_calibration.py --workers 2
+python RAPID/investigations/cunge_validation.py select
+python RAPID/investigations/cunge_validation.py independent --workers 2
+python RAPID/investigations/cunge_validation.py prepared --workers 2
+python RAPID/investigations/cunge_report.py
+```
+
+Use an environment with NumPy, pandas, SciPy, NetworkX, PyArrow, openpyxl and
+the existing RAPID analysis dependencies. Results and new prep bundles live
+under `RAPID/outputs/cunge_calibration_alpha2/`; `REPORT.txt` distinguishes
+calibration, numerical checks and automatically screened independent events.
+The fixed-X comparison uses the same new grid and corrected inlet, so it is
+a controlled comparison of X formulations rather than a reproduction of the
+historical 200 m production setup. Existing results and production defaults
+are retained. Child runs are outside this assessment.
