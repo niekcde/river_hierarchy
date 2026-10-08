@@ -15,6 +15,7 @@ from hierarchy_level_definition.metrics.equivalent_resistance import (
     compute_K_manning,
     compute_geometry,
     solve_bubble_equivalent_K,
+    solve_bubble_equivalent_K_continuation,
 )
 from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import (
     StructuralUnit,
@@ -57,6 +58,7 @@ class BubbleEquivalentResistanceConfig:
     geometry_method: str = "wide"
     kb_mode: str = "fixed"
     kb_value: float = 20.0
+    depth_width_exponent: float | None = None
     reference_kb_summary: Mapping[str, Any] | None = None
     width_field_candidates: tuple[str, ...] = WIDTH_FIELD_CANDIDATES
     length_field_candidates: tuple[str, ...] = LENGTH_FIELD_CANDIDATES
@@ -72,9 +74,55 @@ class BubbleEquivalentResistanceConfig:
     solver_backend: str = "dense_legacy"
     sparse_min_internal_nodes: int = 64
     solver_cache_dir: str | None = None
+    # Empty preserves the direct solver. A decreasing schedule activates
+    # smoothness continuation as a numerical preconditioner only.
+    solver_continuation_eps_schedule: tuple[float, ...] = ()
+    solver_energy_max_iterations: int = 20_000
+    solver_energy_max_function_evaluations: int = 50_000
+    solver_polish_max_function_evaluations: int = 4_000
     conditional_residual_relative_tolerance: float = 0.01
     extended_residual_relative_allowance: float = 0.015
     conditional_k_relative_tolerance: float = 0.02
+
+
+def solve_bubble_with_config(
+    bubble_nodes: pd.DataFrame,
+    bubble_edges: pd.DataFrame,
+    *,
+    upstream_node: int,
+    downstream_node: int,
+    optional_H_guess: Any,
+    config: BubbleEquivalentResistanceConfig,
+) -> dict[str, Any]:
+    """Solve one bubble using the configured direct or continuation route."""
+    schedule = tuple(float(value) for value in config.solver_continuation_eps_schedule)
+    common = {
+        "upstream_node": int(upstream_node),
+        "downstream_node": int(downstream_node),
+        "optional_H_guess": optional_H_guess,
+        "solver_backend": config.solver_backend,
+        "sparse_min_internal_nodes": config.sparse_min_internal_nodes,
+        "solver_cache_dir": config.solver_cache_dir,
+        "energy_max_iterations": config.solver_energy_max_iterations,
+        "energy_max_function_evaluations": config.solver_energy_max_function_evaluations,
+        "polish_max_function_evaluations": config.solver_polish_max_function_evaluations,
+    }
+    if schedule:
+        if not config.smooth:
+            raise ValueError("Smoothness continuation requires config.smooth=True.")
+        return solve_bubble_equivalent_K_continuation(
+            bubble_nodes,
+            bubble_edges,
+            eps_schedule=schedule,
+            **common,
+        )
+    return solve_bubble_equivalent_K(
+        bubble_nodes,
+        bubble_edges,
+        smooth=config.smooth,
+        eps=config.smooth_eps,
+        **common,
+    )
 
 
 def _resolve_first_present(columns: Sequence[str], candidates: Sequence[str]) -> str | None:
@@ -197,6 +245,14 @@ def prepare_bubble_resistance_edges(
         default_value=resolved_kb.kb_value,
     )
 
+    if config.depth_width_exponent is not None:
+        from network_variants.reference_context import anchored_depth_and_kb
+        _, local_kb = anchored_depth_and_kb(width_values,
+            reference_width_m=resolved_kb.reference_width_m,
+            reference_depth_m=resolved_kb.reference_depth_m,
+            exponent=config.depth_width_exponent)
+        kb_values = pd.Series(local_kb, index=frame.index)
+        kb_source = "anchored_depth_width"
     geometry = compute_geometry(width_values.to_numpy(dtype=float), kb_values.to_numpy(dtype=float), method=config.geometry_method)
     prepared = frame.copy()
     prepared["edge_id"] = prepared["id_link"].astype(int)
@@ -659,17 +715,13 @@ def _solve_with_neutral_head_fallback(
         if optional_guess is not None
         else "solver_default_initialization"
     )
-    primary = solve_bubble_equivalent_K(
+    primary = solve_bubble_with_config(
         bubble_nodes,
         bubble_edges,
         upstream_node=int(upstream_node),
         downstream_node=int(downstream_node),
         optional_H_guess=optional_guess,
-        smooth=config.smooth,
-        eps=config.smooth_eps,
-        solver_backend=config.solver_backend,
-        sparse_min_internal_nodes=config.sparse_min_internal_nodes,
-        solver_cache_dir=config.solver_cache_dir,
+        config=config,
     )
     primary = dict(primary)
     primary_success = bool(primary["solver_success"])
@@ -709,17 +761,13 @@ def _solve_with_neutral_head_fallback(
     neutral_guess = {int(node_id): 0.5 for node_id in node_ids}
     neutral_guess[int(upstream_node)] = 1.0
     neutral_guess[int(downstream_node)] = 0.0
-    fallback = solve_bubble_equivalent_K(
+    fallback = solve_bubble_with_config(
         bubble_nodes,
         bubble_edges,
         upstream_node=int(upstream_node),
         downstream_node=int(downstream_node),
         optional_H_guess=neutral_guess,
-        smooth=config.smooth,
-        eps=config.smooth_eps,
-        solver_backend=config.solver_backend,
-        sparse_min_internal_nodes=config.sparse_min_internal_nodes,
-        solver_cache_dir=config.solver_cache_dir,
+        config=config,
     )
     fallback = dict(fallback)
     fallback_success = bool(fallback["solver_success"])

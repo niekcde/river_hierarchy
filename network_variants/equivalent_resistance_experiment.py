@@ -31,7 +31,9 @@ from hierarchy_level_definition.metrics import (
     compute_bubble_equivalent_metrics,
     prepare_bubble_resistance_edges,
     resolve_length_field_candidates,
-    solve_bubble_equivalent_K,
+)
+from hierarchy_level_definition.metrics.bubble_equivalent_metrics import (
+    solve_bubble_with_config,
 )
 from rapid_tools.forcing import ForcingConfig, prepare_forcing_table
 from rapid_tools.reference_section import compute_reference_section_kb
@@ -422,6 +424,7 @@ def load_manifest_equivalent_resistance_config(
         "kb_field_candidates",
         "manning_n_field_candidates",
         "chezy_cz_field_candidates",
+        "solver_continuation_eps_schedule",
     )
     for field_name in tuple_fields:
         if field_name in normalized and normalized[field_name] is not None:
@@ -701,17 +704,13 @@ def _compute_equivalent_resistance(
             if any(column in node_subset.columns for column in NODE_HEAD_FIELD_CANDIDATES)
             else None
         )
-        result = solve_bubble_equivalent_K(
+        result = solve_bubble_with_config(
             node_subset,
             prepared_edges,
             upstream_node=int(upstream_node),
             downstream_node=int(downstream_node),
             optional_H_guess=optional_head_guess,
-            smooth=config.smooth,
-            eps=config.smooth_eps,
-            solver_backend=config.solver_backend,
-            sparse_min_internal_nodes=config.sparse_min_internal_nodes,
-            solver_cache_dir=config.solver_cache_dir,
+            config=config,
         )
         return result, resolved_kb.to_dict()
     except Exception as exc:
@@ -1926,6 +1925,14 @@ def run_equivalent_resistance_experiment(
         raise ValueError(f"Unsupported experiment mode {mode!r}. Expected one of {SUPPORTED_MODES}.")
 
     config = equivalent_resistance_config or BubbleEquivalentResistanceConfig()
+    if config.depth_width_exponent is not None and (experiment_path / "equivalent_transition_registry.csv").exists():
+        stored_config, _ = load_manifest_equivalent_resistance_config(experiment_path)
+        if stored_config.depth_width_exponent != config.depth_width_exponent:
+            raise ValueError(
+                "Selected-domain transition results use a different depth-width policy. "
+                "Refresh those transitions before rebuilding aggregate resistance tables; "
+                "otherwise historical values would overwrite the new calculations."
+            )
     config, reference_kb_summary, forcing_metadata = _resolve_equivalent_reference_kb_summary(
         experiment_dir=experiment_path,
         equivalent_resistance_config=config,
@@ -2069,6 +2076,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="fixed",
         help="How to resolve kb for the equivalent-resistance workflow.",
     )
+    parser.add_argument("--equivalent-depth-width-exponent", type=float, default=None, help="Anchored local depth exponent; requires stored BASED reference width and depth.")
     parser.add_argument("--equivalent-kb-value", type=float, default=20.0, help="Fixed kb scalar when equivalent-kb-mode=fixed.")
     parser.add_argument(
         "--equivalent-kb-model-path",
@@ -2108,6 +2116,28 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Override the internal-node threshold used by auto.",
+    )
+    parser.add_argument(
+        "--equivalent-continuation-eps",
+        nargs="+",
+        type=float,
+        default=None,
+        help=(
+            "Strictly decreasing smoothing-epsilon schedule for an optional "
+            "equivalent-resistance continuation solve. Omit to retain the direct solver."
+        ),
+    )
+    parser.add_argument(
+        "--equivalent-energy-max-iterations",
+        type=int,
+        default=None,
+        help="Override energy-stage iterations for direct or continuation solves.",
+    )
+    parser.add_argument(
+        "--equivalent-polish-max-function-evaluations",
+        type=int,
+        default=None,
+        help="Override sparse-polish evaluations for direct or continuation solves.",
     )
     parser.add_argument("--equivalent-forcing-path", default=None, help="Forcing CSV/parquet used when equivalent-kb-mode=based_reference_section.")
     parser.add_argument("--equivalent-forcing-station-key", default=None, help="Station key used when equivalent-kb-mode=based_reference_section.")
@@ -2174,6 +2204,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             else 64
         ),
     )
+    if args.equivalent_depth_width_exponent is not None:
+        equivalent_resistance_config = replace(equivalent_resistance_config, depth_width_exponent=args.equivalent_depth_width_exponent)
     if args.equivalent_solver_backend is not None:
         equivalent_resistance_config = replace(
             equivalent_resistance_config,
@@ -2183,6 +2215,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         equivalent_resistance_config = replace(
             equivalent_resistance_config,
             sparse_min_internal_nodes=args.equivalent_sparse_min_internal_nodes,
+        )
+    if args.equivalent_continuation_eps is not None:
+        equivalent_resistance_config = replace(
+            equivalent_resistance_config,
+            solver_continuation_eps_schedule=tuple(args.equivalent_continuation_eps),
+        )
+    if args.equivalent_energy_max_iterations is not None:
+        equivalent_resistance_config = replace(
+            equivalent_resistance_config,
+            solver_energy_max_iterations=args.equivalent_energy_max_iterations,
+        )
+    if args.equivalent_polish_max_function_evaluations is not None:
+        equivalent_resistance_config = replace(
+            equivalent_resistance_config,
+            solver_polish_max_function_evaluations=args.equivalent_polish_max_function_evaluations,
         )
     if equivalent_resistance_config.solver_cache_dir is None:
         equivalent_resistance_config = replace(

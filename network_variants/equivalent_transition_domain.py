@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -13,9 +13,7 @@ from hierarchy_level_definition.metrics import BubbleEquivalentResistanceConfig
 from hierarchy_level_definition.metrics.bubble_equivalent_metrics import (
     _select_stable_solver_attempt,
     prepare_bubble_resistance_edges,
-)
-from hierarchy_level_definition.metrics.equivalent_resistance import (
-    solve_bubble_equivalent_K,
+    solve_bubble_with_config,
 )
 from network_variants.equivalent_resistance_experiment import (
     _compute_equivalent_resistance,
@@ -343,6 +341,62 @@ def load_parent_to_child_anchor_map(
     return resolved, methods
 
 
+def complete_anchor_map_from_unchanged_lineage(
+    *, parent_links: pd.DataFrame, child_links: pd.DataFrame,
+    parent_to_child_node: Mapping[int, int], lineage: pd.DataFrame,
+    anchors: Sequence[int],
+) -> tuple[dict[int, int], list[dict[str, Any]]]:
+    """Recover missing anchors from a retained link with a matched opposite end.
+
+    Never infer identity from proximity or majority votes. Require a unique
+    unchanged one-to-one parent link, consistent directed endpoints, and an
+    already matched opposite endpoint. Domain closure must still be checked by
+    ``build_matched_child_domain`` after this recovery.
+    """
+    parent_nodes = set(_int_values(parent_links.id_us_node)) | set(_int_values(parent_links.id_ds_node))
+    mapping = {int(p): int(c) for p, c in parent_to_child_node.items() if int(p) in parent_nodes}
+    original = dict(mapping)
+    audit = []
+    parents = parent_links.set_index("id_link", verify_integrity=True)
+    children = child_links.set_index("id_link", verify_integrity=True)
+    required = {"lineage_type", "id_link", "dominant_parent_link_id", "matched_parent_us_node", "matched_parent_ds_node"}
+    if not required.issubset(lineage.columns):
+        return mapping, audit
+    for anchor in anchors:
+        anchor = int(anchor)
+        if anchor in mapping:
+            continue
+        candidates = {}
+        for row in lineage[lineage.lineage_type.eq("unchanged_1to1")].itertuples():
+            if pd.isna(row.dominant_parent_link_id) or pd.isna(row.matched_parent_us_node) or pd.isna(row.matched_parent_ds_node):
+                continue
+            parent_id, child_id = int(row.dominant_parent_link_id), int(row.id_link)
+            if parent_id not in parents.index or child_id not in children.index:
+                continue
+            p, c = parents.loc[parent_id], children.loc[child_id]
+            pu, pv = int(p.id_us_node), int(p.id_ds_node)
+            cu, cv = int(c.id_us_node), int(c.id_ds_node)
+            if (pu, pv) != (int(row.matched_parent_us_node), int(row.matched_parent_ds_node)):
+                continue
+            if anchor == pu and original.get(pv) == cv:
+                candidate = cu
+            elif anchor == pv and original.get(pu) == cu:
+                candidate = cv
+            else:
+                continue
+            if candidate in mapping.values():
+                continue
+            candidates.setdefault(candidate, []).append({"parent_link": parent_id, "child_link": child_id})
+        if len(candidates) > 1:
+            raise ValueError(f"Ambiguous retained-link lineage for parent anchor {anchor}: {sorted(candidates)}")
+        if candidates:
+            child_node, evidence = next(iter(candidates.items()))
+            mapping[anchor] = child_node
+            audit.append(dict(parent_node=anchor, child_node=child_node,
+                              method="unchanged_link_with_matched_opposite_endpoint", evidence=evidence))
+    return mapping, audit
+
+
 def build_matched_child_domain(
     *,
     parent_domain: HydraulicDomain,
@@ -382,6 +436,78 @@ def build_matched_child_domain(
         selected_unit_is_closed=parent_domain.selected_unit_is_closed,
         selected_unit_violating_link_ids=parent_domain.selected_unit_violating_link_ids,
     )
+
+
+def enclose_domain_at_surviving_anchors(
+    *, parent_domain: HydraulicDomain, parent_links: pd.DataFrame,
+    child_links: pd.DataFrame, parent_to_child_node: Mapping[int, int],
+) -> tuple[HydraulicDomain, HydraulicDomain, dict[str, Any]]:
+    """Recover a local comparison when collapse removes its original ports.
+
+    Candidate upstream boundaries dominate the original source; downstream
+    boundaries postdominate the original sink. Require complete closed domains
+    in both networks and a unique inclusion-smallest parent domain. Never use
+    nearest-coordinate substitutes or automatically expand to the whole river.
+    """
+    original = parent_domain
+    missing = [n for n in (original.source_node, original.sink_node) if n not in parent_to_child_node]
+    if not missing:
+        child = build_matched_child_domain(parent_domain=original, child_links=child_links,
+                                          parent_to_child_node=parent_to_child_node)
+        return original, child, {"expanded": False}
+    graph = nx.DiGraph(zip(parent_links.id_us_node.astype(int), parent_links.id_ds_node.astype(int)))
+    sources = [n for n in graph if graph.in_degree(n) == 0]
+    sinks = [n for n in graph if graph.out_degree(n) == 0]
+    if len(sources) != 1 or len(sinks) != 1 or not nx.is_directed_acyclic_graph(graph):
+        raise ValueError("Enclosing-domain recovery requires a single-inlet, single-outlet DAG.")
+    upstream = nx.immediate_dominators(graph, sources[0])
+    downstream = nx.immediate_dominators(graph.reverse(), sinks[0])
+
+    def surviving_chain(node, dominators):
+        result = []
+        while True:
+            if node in parent_to_child_node:
+                result.append(node)
+            if dominators[node] == node:
+                return result
+            node = dominators[node]
+
+    original_ids = set(original.links.id_link)
+    candidates = []
+    for source in surviving_chain(original.source_node, upstream):
+        for sink in surviving_chain(original.sink_node, downstream):
+            links = extract_complete_directed_domain(parent_links, source, sink)
+            ids = set(links.id_link)
+            if not original_ids.issubset(ids) or len(ids) == len(parent_links):
+                continue
+            if audit_hydraulic_domain_closure(links, parent_links, source, sink)["is_closed"]:
+                candidates.append(replace(original, source_node=source, sink_node=sink, links=links,
+                                          domain_type="enclosing_surviving_anchor_domain"))
+    candidates.sort(key=lambda d: len(d.links))
+    best = None
+    for candidate in candidates:
+        ids = set(candidate.links.id_link)
+        if best is not None and set(best[0].links.id_link).issubset(ids):
+            continue
+        try:
+            child = build_matched_child_domain(parent_domain=candidate, child_links=child_links,
+                                              parent_to_child_node=parent_to_child_node)
+        except ValueError:
+            continue
+        if best is not None:
+            raise ValueError("Ambiguous enclosing domains: no unique inclusion-smallest closed comparison.")
+        best = candidate, child
+    if best is None:
+        raise ValueError("No local closed comparison with surviving anchors; whole-network substitution is disabled.")
+    parent, child = best
+    audit = dict(expanded=True, method="inclusion_smallest_closed_surviving_dominator_boundaries",
+        missing_parent_nodes=missing, original_parent_source=original.source_node,
+        original_parent_sink=original.sink_node, parent_source=parent.source_node,
+        parent_sink=parent.sink_node, child_source=child.source_node, child_sink=child.sink_node,
+        original_parent_link_ids=sorted(int(n) for n in original_ids),
+        added_parent_link_ids=sorted(int(n) for n in set(parent.links.id_link)-original_ids),
+        parent_n_links=len(parent.links), child_n_links=len(child.links))
+    return parent, child, audit
 
 
 def solve_hydraulic_domain(
@@ -445,17 +571,13 @@ def solve_hydraulic_domain(
     neutral_guess = {int(node): 0.5 for node in incident_nodes}
     neutral_guess[domain.source_node] = 1.0
     neutral_guess[domain.sink_node] = 0.0
-    fallback = solve_bubble_equivalent_K(
+    fallback = solve_bubble_with_config(
         fallback_nodes,
         prepared_edges,
         upstream_node=domain.source_node,
         downstream_node=domain.sink_node,
         optional_H_guess=neutral_guess,
-        smooth=config.smooth,
-        eps=config.smooth_eps,
-        solver_backend=config.solver_backend,
-        sparse_min_internal_nodes=config.sparse_min_internal_nodes,
-        solver_cache_dir=config.solver_cache_dir,
+        config=config,
     )
     fallback = dict(fallback)
     selected, selected_initialization = _select_stable_solver_attempt(

@@ -27,8 +27,8 @@ SOLVER_BACKENDS = (
     "auto",
 )
 DEFAULT_SPARSE_MIN_INTERNAL_NODES = 64
-SOLVER_ALGORITHM_VERSION = "equivalent-resistance-energy-sparse-v1"
-SOLVER_CACHE_SCHEMA_VERSION = "equivalent-resistance-solve-cache-v2"
+SOLVER_ALGORITHM_VERSION = "equivalent-resistance-energy-sparse-v2"
+SOLVER_CACHE_SCHEMA_VERSION = "equivalent-resistance-solve-cache-v3"
 
 
 def _cache_scalar(value: Any) -> Any:
@@ -65,6 +65,9 @@ def _solver_cache_key(
     requested_solver_backend: str,
     resolved_solver_backend: str,
     sparse_min_internal_nodes: int,
+    energy_max_iterations: int,
+    energy_max_function_evaluations: int,
+    polish_max_function_evaluations: int,
 ) -> str:
     edge_records = [
         (
@@ -105,6 +108,9 @@ def _solver_cache_key(
         "solver_backend_requested": requested_solver_backend,
         "solver_backend_resolved": resolved_solver_backend,
         "sparse_min_internal_nodes": int(sparse_min_internal_nodes),
+        "energy_max_iterations": int(energy_max_iterations),
+        "energy_max_function_evaluations": int(energy_max_function_evaluations),
+        "polish_max_function_evaluations": int(polish_max_function_evaluations),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -584,6 +590,9 @@ def solve_bubble_equivalent_K(
     solver_backend: str = "dense_legacy",
     sparse_min_internal_nodes: int = DEFAULT_SPARSE_MIN_INTERNAL_NODES,
     solver_cache_dir: str | Path | None = None,
+    energy_max_iterations: int = 20_000,
+    energy_max_function_evaluations: int = 50_000,
+    polish_max_function_evaluations: int = 4_000,
 ) -> dict[str, Any]:
     """Solve a normalized unit-head equivalent resistance for a bubble subgraph.
 
@@ -601,6 +610,13 @@ def solve_bubble_equivalent_K(
         )
     if int(sparse_min_internal_nodes) < 1:
         raise ValueError("sparse_min_internal_nodes must be at least 1.")
+    for name, value in {
+        "energy_max_iterations": energy_max_iterations,
+        "energy_max_function_evaluations": energy_max_function_evaluations,
+        "polish_max_function_evaluations": polish_max_function_evaluations,
+    }.items():
+        if int(value) < 1:
+            raise ValueError(f"{name} must be at least 1.")
 
     node_frame, edge_frame = _canonicalize_nodes_and_edges(nodes, edges)
     edge_nodes = pd.Index(pd.unique(pd.concat([edge_frame["u"], edge_frame["v"]], ignore_index=True)))
@@ -755,6 +771,9 @@ def solve_bubble_equivalent_K(
             requested_solver_backend=requested_solver_backend,
             resolved_solver_backend=resolved_solver_backend,
             sparse_min_internal_nodes=int(sparse_min_internal_nodes),
+            energy_max_iterations=int(energy_max_iterations),
+            energy_max_function_evaluations=int(energy_max_function_evaluations),
+            polish_max_function_evaluations=int(polish_max_function_evaluations),
         )
         solver_cache_path = (
             Path(solver_cache_dir).expanduser() / solver_cache_key
@@ -796,8 +815,8 @@ def solve_bubble_equivalent_K(
                 options={
                     "ftol": 1e-15,
                     "gtol": 1e-10,
-                    "maxiter": 20000,
-                    "maxfun": 50000,
+                    "maxiter": int(energy_max_iterations),
+                    "maxfun": int(energy_max_function_evaluations),
                     "maxls": 50,
                 },
             )
@@ -836,7 +855,7 @@ def solve_bubble_equivalent_K(
                 xtol=1e-12,
                 ftol=1e-12,
                 gtol=1e-12,
-                max_nfev=4000,
+                max_nfev=int(polish_max_function_evaluations),
                 jac=sparse_jacobian,
                 tr_solver="lsmr",
             )
@@ -899,7 +918,7 @@ def solve_bubble_equivalent_K(
                 xtol=1e-12,
                 ftol=1e-12,
                 gtol=1e-12,
-                max_nfev=4000,
+                max_nfev=int(polish_max_function_evaluations),
                 **solve_kwargs,
             )
             solved_heads = assemble_heads(solve_result.x)
@@ -1021,6 +1040,9 @@ def solve_bubble_equivalent_K(
         "polish_residual_norm": polish_residual_norm,
         "polish_residual_relative": polish_residual_relative,
         "sparse_min_internal_nodes": int(sparse_min_internal_nodes),
+        "energy_max_iterations": int(energy_max_iterations),
+        "energy_max_function_evaluations": int(energy_max_function_evaluations),
+        "polish_max_function_evaluations": int(polish_max_function_evaluations),
         "solver_cache_hit": False,
         "solver_cache_key": solver_cache_key,
         "solver_cache_path": (
@@ -1049,6 +1071,91 @@ def solve_bubble_equivalent_K(
     return result
 
 
+def solve_bubble_equivalent_K_continuation(
+    nodes: pd.DataFrame | Sequence[Mapping[str, Any]] | nx.Graph | nx.DiGraph | nx.MultiGraph | nx.MultiDiGraph | None,
+    edges: pd.DataFrame | Sequence[Mapping[str, Any]] | nx.Graph | nx.DiGraph | nx.MultiGraph | nx.MultiDiGraph,
+    upstream_node: Any,
+    downstream_node: Any,
+    optional_H_guess: Any = None,
+    *,
+    eps_schedule: Sequence[float] = (1e-4, 1e-6, 1e-8, 1e-10),
+    continuity_abs_tolerance: float = 1e-8,
+    continuity_rel_tolerance: float = 1e-3,
+    solver_backend: str = "energy_sparse",
+    sparse_min_internal_nodes: int = DEFAULT_SPARSE_MIN_INTERNAL_NODES,
+    solver_cache_dir: str | Path | None = None,
+    energy_max_iterations: int = 20_000,
+    energy_max_function_evaluations: int = 50_000,
+    polish_max_function_evaluations: int = 4_000,
+) -> dict[str, Any]:
+    """Solve by smoothness continuation, retaining the final target equation.
+
+    Each preliminary stage has the same graph and resistance law but a larger
+    smoothing epsilon. Its normalized heads become the next stage's initial
+    guess. The final stage uses the last value in ``eps_schedule``; therefore
+    continuation changes numerical conditioning only, not the reported
+    hydraulic model. A failed intermediate stage is retained as an initial
+    guess when it has finite heads, so the audit shows every attempted stage.
+    """
+    schedule = tuple(float(value) for value in eps_schedule)
+    if not schedule or any(not np.isfinite(value) or value <= 0.0 for value in schedule):
+        raise ValueError("eps_schedule must contain one or more finite positive values.")
+    if any(next_eps >= eps for eps, next_eps in zip(schedule, schedule[1:])):
+        raise ValueError("eps_schedule must be strictly decreasing from smooth to target.")
+
+    current_guess = optional_H_guess
+    stage_rows: list[dict[str, Any]] = []
+    result: dict[str, Any] | None = None
+    for stage_index, epsilon in enumerate(schedule, start=1):
+        result = solve_bubble_equivalent_K(
+            nodes,
+            edges,
+            upstream_node=upstream_node,
+            downstream_node=downstream_node,
+            optional_H_guess=current_guess,
+            smooth=True,
+            eps=epsilon,
+            continuity_abs_tolerance=continuity_abs_tolerance,
+            continuity_rel_tolerance=continuity_rel_tolerance,
+            solver_backend=solver_backend,
+            sparse_min_internal_nodes=sparse_min_internal_nodes,
+            solver_cache_dir=solver_cache_dir,
+            energy_max_iterations=energy_max_iterations,
+            energy_max_function_evaluations=energy_max_function_evaluations,
+            polish_max_function_evaluations=polish_max_function_evaluations,
+        )
+        stage_rows.append(
+            {
+                "stage_index": stage_index,
+                "eps": epsilon,
+                "solver_success": bool(result.get("solver_success", False)),
+                "solver_optimizer_success": bool(result.get("solver_optimizer_success", False)),
+                "solver_solution_stage": result.get("solver_solution_stage", ""),
+                "solver_message": result.get("solver_message", ""),
+                "residual_relative": result.get("residual_relative", np.nan),
+                "K_eq": result.get("K_eq", np.nan),
+                "Q_unit": result.get("Q_unit", np.nan),
+                "energy_stage_nit": result.get("energy_stage_nit", np.nan),
+                "polish_nfev": result.get("polish_nfev", np.nan),
+            }
+        )
+        node_heads = result.get("node_heads")
+        if isinstance(node_heads, pd.DataFrame) and {
+            "node_id", "head_norm"
+        }.issubset(node_heads.columns):
+            candidate = pd.to_numeric(node_heads["head_norm"], errors="coerce")
+            if candidate.notna().all():
+                current_guess = dict(zip(node_heads["node_id"], candidate, strict=True))
+
+    assert result is not None  # Schedule validation above guarantees a stage.
+    result = dict(result)
+    result["solver_method"] = f"continuation::{result.get('solver_method', '')}"
+    result["continuation_used"] = True
+    result["continuation_eps_schedule"] = list(schedule)
+    result["continuation_stages"] = stage_rows
+    return result
+
+
 __all__ = [
     "compare_states",
     "compute_K_chezy",
@@ -1059,4 +1166,5 @@ __all__ = [
     "reduce_simple_parallel",
     "reduce_simple_series",
     "solve_bubble_equivalent_K",
+    "solve_bubble_equivalent_K_continuation",
 ]

@@ -114,3 +114,17 @@ def resolve_kb_context(
 
 
 __all__ = ["ResolvedKbContext", "resolve_kb_context"]
+
+
+def anchored_depth_and_kb(widths, *, reference_width_m, reference_depth_m, exponent):
+    """Shared depth geometry for routing and equivalent resistance."""
+    width = np.asarray(widths, dtype=float)
+    if not np.isfinite(width).all() or (width <= 0).any():
+        raise ValueError('Anchored depth requires finite positive widths.')
+    values = [reference_width_m, reference_depth_m, exponent]
+    if any(v is None or not np.isfinite(v) for v in values):
+        raise ValueError('Anchored depth requires finite reference width/depth and exponent.')
+    if reference_width_m <= 0 or reference_depth_m <= 0 or not 0 <= exponent <= 1:
+        raise ValueError('Invalid anchored depth parameters.')
+    depth = reference_depth_m * (width / reference_width_m) ** exponent
+    return depth, width / depth
