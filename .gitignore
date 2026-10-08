@@ -31,3 +31,21 @@ RAPID/notebooks/link_*_bank_targets*.png
 /RAPID/classification/results/
 /RAPID/notebooks/newplot_2.png
 /network_variants/island_topology_review_registry.csv
+
+# Regenerable hydraulic investigations (large intermediate tables/hydrographs).
+# Validation reports and reproduction scripts remain versioned below.
+/RAPID/assets/*_20261002*/
+
+# Regenerable validation data and rendered figures; retain source and reports.
+/RAPID/validation/**/*.parquet
+/RAPID/validation/**/*.csv
+/RAPID/validation/**/*.json
+/RAPID/validation/**/*.png
+/RAPID/validation/**/*.pdf
+/RAPID/validation/**/*.xlsx
+
+# Local review workbooks, rendered review pages, and Excel lock files.
+/hydrograph_match_review.xlsx
+/RAPID/reviews/*.xlsx
+/RAPID/reviews/calibration_targets_20261006/review.html
+~$*.xlsx
