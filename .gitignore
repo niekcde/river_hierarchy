@@ -36,6 +36,9 @@ RAPID/notebooks/link_*_bank_targets*.png
 # Validation reports and reproduction scripts remain versioned below.
 /RAPID/assets/*_20261002*/
 
+# Generated reviewed-geometry releases (registries, contracts, and geometry data).
+/RAPID/assets/reviewed_geometry_*/
+
 # Regenerable validation data and rendered figures; retain source and reports.
 /RAPID/validation/**/*.parquet
 /RAPID/validation/**/*.csv
