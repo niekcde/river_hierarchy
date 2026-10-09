@@ -67,3 +67,25 @@ def test_ambiguous_coincident_ports_are_not_silently_merged():
     child=pd.DataFrame(dict(id_us_node=[10],id_ds_node=[11],link_length_m=[20.]))
     with pytest.raises(ValueError,match='Ambiguous'):
         match_child_nodes(bn,cn,base,child)
+
+
+def test_validated_displaced_identity_survives_hydraulic_rematching():
+    import geopandas as gpd
+    from shapely.geometry import Point
+    from network_variants.shared_head_reconstruction import match_child_nodes
+    bn=gpd.GeoDataFrame(dict(id_node=[0,1]),geometry=[Point(0,0),Point(1,0)])
+    cn=gpd.GeoDataFrame(dict(id_node=[10,11]),geometry=[Point(0,0),Point(1.1,0)])
+    base=pd.DataFrame(dict(id_us_node=[0],id_ds_node=[1],actual_length_m=[1.]))
+    child=pd.DataFrame(dict(id_us_node=[10],id_ds_node=[11],link_length_m=[1.1]))
+    m,unknown,qa=match_child_nodes(bn,cn,base,child,validated_correspondences={11:1})
+    assert m=={10:0,11:1} and not unknown
+    with pytest.raises(ValueError,match='collides'):
+        match_child_nodes(bn,cn,base,child,validated_correspondences={11:0})
+
+
+def test_explicit_exterior_heads_remain_fixed_during_trial_reconstruction():
+    base,nodes,links=fixture();links.loc[links.u.eq(2),'link_length_m']=200.
+    out,qa=reconstruct_shared_heads(links,base,nodes,nodes.set_index('id_node')['head'],fixed_node_ids=[2])
+    assert out.loc[out.u.eq(2),'head_us'].iloc[0]==2.
+    assert out.loc[out.v.eq(2),'head_ds'].iloc[0]==2.
+    assert (out.slope>0).all()

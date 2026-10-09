@@ -27,6 +27,7 @@ dependencies:
   - pytest>=8,<9
   - jupyterlab
   - ipykernel
+  - ipywidgets>=8.1,<9
 
   - pip:
       # Create the fork on GitHub first:

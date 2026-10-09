@@ -46,15 +46,19 @@ def _constrained_least_squares(C, b, lower, initial):
     raise RuntimeError(f'Head allocation did not converge: primal={primal}, stationarity={stationarity}')
 
 
-def reconstruct_shared_heads(links, base_links, base_nodes, mapped_heads, *, floor_fraction=.01):
+def reconstruct_shared_heads(links, base_links, base_nodes, mapped_heads, *, floor_fraction=.01, fixed_node_ids=()):
     """Keep unchanged domains; jointly re-solve interiors of changed domains.
 
     `links` has u,v,link_length_m; base_links has id_us_node,id_ds_node,
     actual_length_m,ownership_kind,ownership_domain_id. Matched child nodes use
     base IDs; genuinely new vertices must have fresh IDs. Reference anchors
     and positions come from base_nodes. Width is intentionally absent.
+    `fixed_node_ids` optionally protects additional reference heads, e.g. all
+    exterior nodes in an isolated boundary-contract trial. Defaults are unchanged.
     """
     f=links.copy();heads=mapped_heads.copy();bn=base_nodes.set_index('id_node');base=base_links
+    explicit_fixed=set(map(int,fixed_node_ids))
+    if not explicit_fixed<=set(heads.index):raise ValueError('Explicit fixed node lacks a reference head')
     unit_mask=base.ownership_kind.isin(['simple_unit','compound_bubble'])
     units=[];protected=set()
     for _,g in base[unit_mask].groupby(['ownership_kind','ownership_domain_id']):
@@ -76,6 +80,7 @@ def reconstruct_shared_heads(links, base_links, base_nodes, mapped_heads, *, flo
         if affected&(vs-boundary):free|=(vs-protected)&nodes
         elif any(u in vs and v in vs for u,v in changed):free|=(vs-protected)&nodes
     free|=(affected-protected)&nodes
+    free-=explicit_fixed
     graph=nx.DiGraph();graph.add_edges_from(zip(f.u,f.v))
     if not nx.is_directed_acyclic_graph(graph):raise ValueError('Child graph is not acyclic')
     # All original exterior/profile anchors remain hard constraints.
@@ -104,7 +109,7 @@ def reconstruct_shared_heads(links, base_links, base_nodes, mapped_heads, *, flo
     return f,dict(changed_links=len(changed),free_nodes=len(free),released_interior_anchors=released,patches=audits)
 
 
-def match_child_nodes(base_nodes, child_nodes, base_links, child_links, *, tolerance_m=1e-5):
+def match_child_nodes(base_nodes, child_nodes, base_links, child_links, *, tolerance_m=1e-5, validated_correspondences=None):
     """Injective coordinate matching, resolving coincident child ports by topology.
 
     A raster collapse can create two distinct graph nodes at the same point.
@@ -112,6 +117,10 @@ def match_child_nodes(base_nodes, child_nodes, base_links, child_links, *, toler
     incident links, then greatest unchanged incident length. That node inherits
     the base head. The other is a genuinely new hydraulic node, not a self-loop.
     Ambiguous ties fail explicitly; numeric node-ID equality is not evidence.
+    `validated_correspondences` optionally supplies raw-child -> original-parent
+    IDs already justified by boundary-contract/topology checks. These survive
+    coordinate rematching. Contradictory or colliding identities fail explicitly;
+    do not pass an unvalidated nearest-node matching table here.
     """
     from scipy.spatial import cKDTree
     bx=np.c_[base_nodes.geometry.x,base_nodes.geometry.y]
@@ -119,6 +128,17 @@ def match_child_nodes(base_nodes, child_nodes, base_links, child_links, *, toler
     distance,ix=cKDTree(bx).query(np.c_[child_nodes.geometry.x,child_nodes.geometry.y])
     ids=child_nodes.id_node.astype(int).to_numpy();parent=base_nodes.id_node.astype(int).to_numpy()[ix]
     candidates={int(v):int(p) for v,p,d in zip(ids,parent,distance) if d<=tolerance_m}
+    explicit={int(c):int(p) for c,p in (validated_correspondences or {}).items()}
+    if not set(explicit)<=set(ids) or not set(explicit.values())<=set(base_nodes.id_node):
+        raise ValueError('Validated correspondence refers to an absent node')
+    if len(set(explicit.values()))!=len(explicit):
+        raise ValueError('Validated correspondences are not injective')
+    for c,p in explicit.items():
+        if c in candidates and candidates[c]!=p:
+            raise ValueError('Validated correspondence contradicts an exact coordinate identity')
+        if any(other!=c and old==p for other,old in candidates.items()):
+            raise ValueError('Validated correspondence collides with an exact coordinate identity')
+    candidates.update(explicit)
     old={}
     for r in base_links.itertuples():
         direct=getattr(r,'ownership_kind','simple_unit') not in ['simple_unit','compound_bubble']
@@ -146,4 +166,4 @@ def match_child_nodes(base_nodes, child_nodes, base_links, child_links, *, toler
     for v in ids:
         if v not in mapping:mapping[int(v)]=next_id;unknown.add(next_id);next_id+=1
     assert len(set(mapping.values()))==len(mapping)
-    return mapping,unknown,dict(coincident_ports=collisions,max_nearest_distance_m=float(distance.max()))
+    return mapping,unknown,dict(coincident_ports=collisions,max_nearest_distance_m=float(distance.max()),validated_correspondences=explicit)

@@ -1825,6 +1825,7 @@ def merge_local_patch_variant(
     downstream_boundary_node_ids: tuple[int, ...] | None = None,
     merge_stage: str = "scientific_anchored",
     expected_cycle_reduction_override: int | None = None,
+    include_exterior_direction_scaffold: bool = False,
 ) -> LocalPatchMergeResult:
     """Conservatively replace a prescribed contract domain in the parent graph.
 
@@ -2419,19 +2420,52 @@ def merge_local_patch_variant(
             node_rows.append(values)
     merged_nodes = gpd.GeoDataFrame(node_rows, geometry=parent_nodes.geometry.name, crs=parent_nodes.crs)
     retained_selected_scaffold_ids = retained_context.intersection(replacement_ids)
-    merged_links, final_direction_summary = _orient_inserted_components_from_parent_order(
-        merged_links,
-        merged_nodes,
-        inserted_link_ids=set(inserted["id_link"].astype(int)),
-        fixed_scaffold_link_ids=retained_selected_scaffold_ids,
-        parent_node_order=parent_order,
-        protected_source_node_ids={
-            *prescribed_upstream_boundary_ids
-        },
-        protected_sink_node_ids={
-            *prescribed_downstream_boundary_ids
-        },
-    )
+    exterior_direction_scaffold_ids: set[int] = set()
+    if include_exterior_direction_scaffold:
+        # An island can share a side branch with a surviving neighbouring
+        # island. The retained exterior branch must participate in orientation:
+        # omitting it hides a cycle from the local harmonic solve.
+        inserted_nodes = set(inserted["id_us_node"].astype(int)).union(
+            inserted["id_ds_node"].astype(int)
+        )
+        exterior_direction_scaffold_ids = set(
+            outside.loc[
+                outside["id_us_node"].astype(int).isin(inserted_nodes)
+                & outside["id_ds_node"].astype(int).isin(inserted_nodes),
+                "id_link",
+            ].astype(int)
+        ).difference(replacement_ids)
+    if include_exterior_direction_scaffold:
+        debug_dir = Path(output_dir) / "direction_input"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        merged_links.to_file(debug_dir / "links.gpkg", driver="GPKG")
+        merged_nodes.to_file(debug_dir / "nodes.gpkg", driver="GPKG")
+    try:
+        merged_links, final_direction_summary = _orient_inserted_components_from_parent_order(
+            merged_links,
+            merged_nodes,
+            inserted_link_ids=set(inserted["id_link"].astype(int)),
+            fixed_scaffold_link_ids=retained_selected_scaffold_ids.union(exterior_direction_scaffold_ids),
+            parent_node_order=parent_order,
+            protected_source_node_ids={
+                *prescribed_upstream_boundary_ids
+            },
+            protected_sink_node_ids={
+                *prescribed_downstream_boundary_ids
+            },
+        )
+    except ValueError as error:
+        if not include_exterior_direction_scaffold or "valid cut-to-cut DAG" not in str(error):
+            raise
+        from network_variants.island_boundary_orientation import orient_with_exterior_constraints
+        merged_links, final_direction_summary = orient_with_exterior_constraints(
+            merged_links,
+            inserted_link_ids=set(inserted["id_link"].astype(int)),
+            source_nodes=set(prescribed_upstream_boundary_ids),
+            sink_nodes=set(prescribed_downstream_boundary_ids),
+            parent_node_order=parent_order,
+        )
+        final_direction_summary["initial_harmonic_error"] = str(error)
     (
         merged_links,
         post_direction_duplicate_parent_by_inserted,
@@ -2628,6 +2662,7 @@ def merge_local_patch_variant(
         "matching_order": "provisional_direction_hints_then_trim_then_authoritative_parent_match",
         "direction_summary": dict(direction_summary),
         "final_inserted_direction_summary": final_direction_summary,
+        "exterior_direction_scaffold_link_ids": sorted(exterior_direction_scaffold_ids),
         "pre_direction_reverse_parent_duplicates": pre_direction_duplicate_audit,
         "preserved_boundary_interface_link_ids": [],
         "anchored_replacement_incidence": anchored_incidence_audit,

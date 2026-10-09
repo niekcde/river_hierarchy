@@ -4,11 +4,20 @@ import json
 import pandas as pd
 from audit_all_anchoring import OUT
 
+def table(frame):
+ return '\n'.join(['| '+' | '.join(map(str,frame.columns))+' |','| '+' | '.join(['---']*len(frame.columns))+' |']+['| '+' | '.join(map(str,row))+' |' for row in frame.itertuples(index=False,name=None)])
+
 def run():
  keys=['example','family','state','fingerprint']
  a=pd.read_csv(OUT/'transition_audit.csv',dtype={'example':str});g=pd.read_csv(OUT/'geometry_verification.csv',dtype={'example':str});b=pd.read_csv(OUT/'boundary_geometry_details.csv',dtype={'example':str});i=pd.read_csv(OUT/'incidence_and_comparison_domains.csv',dtype={'example':str})
  assert len(a)==len(g)==len(i)==3477
  assert a.error.isna().all() and g.geometry_error.isna().all()
+ refresh=Path('network_variants/output').resolve().parent/'hydraulic_refresh/shared-head-anchored-depth-signed-inflow-20261003'
+ for ex,group in a.groupby('example'):
+  inv=pd.read_csv(refresh/ex/'inventory.csv');inv=inv[inv.status.eq('ready')&~inv.state.eq('S000_base')]
+  merged=group.merge(inv,on=['family','state'],suffixes=('_audit','_refresh'),validate='one_to_one')
+  assert len(merged)==len(group)==len(inv)
+  assert (merged.frame_path==merged.frame).all() and (merged.fingerprint_audit==merged.fingerprint_refresh).all()
  a=a.merge(g,on=keys,validate='one_to_one',suffixes=('','_geometry')).merge(i,on=keys,validate='one_to_one')
  agg=b.groupby(keys).agg(max_anchor_displacement_m=('nearest_child_node_distance_m','max'),missing_anchor_on_existing_line=('classification',lambda x:sum(x=='node_missing_line_passes_original_anchor')),coordinate_present_mapping_review=('classification',lambda x:sum(x=='coordinate_present_mapping_requires_review'))).reset_index()
  a=a.merge(agg,on=keys,validate='one_to_one')
@@ -18,6 +27,7 @@ def run():
  flags=['missing_exact_anchor','anchor_displacement_over_100m','exterior_geometry_changed','exterior_width_change_over_1pct','exterior_slope_change_over_1pct','island_target_domain_mismatch','explicit_contract_anchor_missing','incidence_failure']
  unique=a.groupby(['example','fingerprint']).agg(**{f:(f,'max') for f in flags},geometry_anchor_domain_pass=('geometry_anchor_domain_pass','min'),strict_anchor_and_exterior_pass=('strict_anchor_and_exterior_pass','min'),logical_entries=('state','size'),states=('state',lambda x:';'.join(x))).reset_index()
  summary=unique.groupby('example').agg(unique_pairs=('fingerprint','size'),missing_exact_anchor=('missing_exact_anchor','sum'),over_100m=('anchor_displacement_over_100m','sum'),exterior_geometry_changed=('exterior_geometry_changed','sum'),geometry_anchor_domain_pass=('geometry_anchor_domain_pass','sum'),strict_pass=('strict_anchor_and_exterior_pass','sum')).reset_index()
+ a[a.anchor_displacement_over_100m|a.island_target_domain_mismatch].sort_values(['example','max_anchor_displacement_m'],ascending=[True,False]).to_csv(OUT/'priority_review.csv',index=False)
  a.to_csv(OUT/'review_registry.csv',index=False);unique.to_csv(OUT/'unique_pair_review.csv',index=False);summary.to_csv(OUT/'network_summary.csv',index=False)
  # Known positive/negative controls establish selected-domain distinction.
  def case(ex,state):return a[(a.example==ex)&a.state.eq(state)].iloc[0]
@@ -44,7 +54,7 @@ This is a strict **original selected-domain preservation audit**, not a new hydr
 
 Aliases remain individually auditable in review_registry.csv. For this table, a pair fails if any associated selected domain fails; identical output fingerprints can have different target metadata.
 
-{summary.to_markdown(index=False)}
+{table(summary)}
 
 - Missing one or more exact original boundary nodes: **{qa['unique_flag_counts']['missing_exact_anchor']}** unique pairs.
 - At least one required boundary more than 100 m from every child node: **{qa['unique_flag_counts']['anchor_displacement_over_100m']}** unique pairs.
@@ -60,7 +70,15 @@ Aliases remain individually auditable in review_registry.csv. For this table, a 
 4. Compare **every** original exterior reach, including reaches missing from the child. Endpoint/length correspondence checks hydraulic attributes; normalized vector shapes plus topological equality check geometry independently of raw IDs and harmless vertex resampling.
 5. Check required incoming/outgoing incidence of candidate replacement links. This is necessary but not sufficient: an altered exterior edge can belong to the candidate set. The separate exterior checks prevent treating that as a clean pass.
 6. Read recorded local-patch contracts where available, and separately record existing enlarged comparison domains. Missing contract metadata is not evidence of a clean state.
-7. Confirm known positive and negative case-41 controls and an independently found missing split in case 13. All source and geometry reads completed without errors.
+7. Confirm known positive and negative case-41 controls and an independently found missing split in case 13. All source and geometry reads completed without errors. The existing shared-head reconstruction, anchor-lineage recovery and surviving-anchor-domain tests were also run: **15 passed**. These tests verify their existing contracts; they do not override the final-artifact failures reported here.
+
+## Additional coverage and controls
+
+Logical-family coverage: {a.groupby('family').size().to_dict()}. Missing exact interfaces occur in independent, compound and island families; this is not exclusively an island problem. Recorded explicit local-patch contracts are available for {int(a.contract_found.sum())} entries; {int(a.explicit_contract_anchor_missing.sum())} entries lose at least one required anchor also named in that contract. Contract metadata alone is not used to clear an output. Candidate replacement incidence fails for {int(a.incidence_failure.sum())} entries. {int(a.comparison_domain_type.eq('enclosing_surviving_anchor_domain').sum())} entries explicitly record an existing surviving-anchor expansion; other domain files need not carry that metadata, so 'not_recorded' must not be interpreted as 'not expanded'.
+
+Largest observed required-anchor displacements (distance to the nearest child node, not measured routing error):
+
+{table(top[['example','state','parent_node_id','nearest_child_node_distance_m','nearest_child_line_distance_m']].head(10))}
 
 ## Why the flags differ in severity
 
@@ -74,7 +92,9 @@ Exterior slopes and heads require separate interpretation. reconstruct_shared_he
 - **S076_unit_3**: the whole compound collapse retains its required outer interface. Removal of internal nodes 5 and 7 is expected here; it is not misclassified as an anchoring failure.
 - **island_41_005**: exact-node checks alone would pass, but the wrong small-unit target domain remains flagged. The prior raster/vector trace showed that the actual large-island target was filled and its new channel subsequently removed by cleanup. The result was deletion of old link 7. Target correctness and anchoring correctness are independent tests.
 - **island_41_006**: small-island geometry/anchors are retained. Exterior connector slopes nevertheless change under shared-head reconstruction; this prevents a strict hydraulic-exterior pass, but does not make it the same geometric defect as S016.
-- The prior complete island scan's **18 incorrectly containing source domains, all in 41**, remain flagged. Four were confirmed pure branch deletion; the other fourteen require their own repair assessment. That earlier target-containment result is not expanded into an unsupported claim that all other raster targets are perfect.
+- The prior complete island scan's **18 source domains that do not adequately contain their target islands, all in 41**, remain flagged. Four were confirmed pure branch deletion; the other fourteen require their own repair assessment. That earlier target-containment result is not expanded into an unsupported claim that all other raster targets are perfect.
+
+The stored manifest for **13/S039_unit_33** reports two anchor splits and a valid graph, yet required node 64 has no final child node within approximately 1,032 m, even though a child line passes through its location. **15/S135_unit_144** similarly reports four splits and a valid graph while required node 281 is about 522 m from the nearest final node. Thus 'segmentation applied' plus 'graph valid' is not a sufficient final-artifact certificate. For **41/S016_unit_4**, the respective nearest-node distances for required nodes 5 and 7 are approximately **812 m and 1,361 m**, both with a child line passing through the original point.
 
 ## Mechanisms and next repair gates
 
@@ -86,6 +106,7 @@ Repair priorities: (1) the 18 wrong island domains in 41 and confirmed branch-de
 
 ## Review artifacts
 
+- priority_review.csv: 51 unique pairs (57 logical entries) with a boundary over 100 m from every child node and/or a known wrong island domain. This is a prioritization set, not an exhaustive list of defects.
 - review_registry.csv: one row per logical transition, complete flags, IDs, source paths, distances, contract and comparison-domain information.
 - unique_pair_review.csv / network_summary.csv: deduplicated counts.
 - boundary_geometry_details.csv / largest_anchor_displacements.csv: original node, nearest child node, line distance and classification.
@@ -93,6 +114,7 @@ Repair priorities: (1) the 18 wrong island domains in 41 and confirmed branch-de
 - exterior_property_changes.csv.gz: matched exterior link changes, with widths/slopes and changed-field names.
 - incidence_and_comparison_domains.csv: interface direction checks and existing domain expansions.
 - validation.json: scope and control assertions.
+- missing_anchor_examples.html: interactive parent/child geometry for confirmed missing-boundary examples in 41, 13, 15 and 02.
 
 Reproduce with audit_all_anchoring.py, verify_anchoring_geometry.py, audit_anchor_incidence.py, then summarize_anchoring_audit.py (all under RAPID/investigations). These scripts write only investigation outputs and do not alter production.
 '''
