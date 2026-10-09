@@ -210,8 +210,13 @@ def main(example='03',workers=2,check_only=False,overwrite=False):
  (OUT/'completion.json').write_text(json.dumps(finish,indent=2));print(json.dumps(finish),flush=True)
 
 def cli():
+ # Explicit versioned path: no legacy publication/deletion or obsolete calibration.
+ if '--common-grid' in sys.argv[1:]:
+  from rapid_tools.common_grid_production import cli as common_grid_cli
+  return common_grid_cli([arg for arg in sys.argv[1:] if arg != '--common-grid'])
  global CALIBRATION
  parser=argparse.ArgumentParser(description='Run full Cunge hierarchies sequentially with inherited parent calibration.')
+ parser.add_argument('--common-grid',action='store_true',help='Use the common-grid production path; combine with --help for its separate options.')
  parser.add_argument('--examples',nargs='+',default=['03'],help='Example numbers, e.g. 2 5 13 15; processed in this order.')
  parser.add_argument('--workers',type=int,default=2,help='Concurrent states within each example; examples remain sequential.')
  parser.add_argument('--output-root',type=Path,default=ROOT/'RAPID/outputs/cunge_full_hierarchy_pilot')

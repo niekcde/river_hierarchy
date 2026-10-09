@@ -1,0 +1,160 @@
+ATTENUATION INVESTIGATION — agreed direction, 2026-10-08
+
+Keep existing Manning n fixed during this investigation. Do not run another n
+search to compensate for attenuation. Diagnose the hydraulic state and numerical
+representation before production acceptance. Network 46 is first priority;
+02/05 are secondary amplitude checks and 22 a timing check. Include all 15 in the
+read-only discharge consistency screen. Network-41 geometry remains unchanged.
+
+REQUIRED DISCHARGE COMPARISON
+For every reach compare:
+ A. The allocated reference discharge actually used in Cunge's X/diffusivity.
+ B. Q_M = (B/n) h^(5/3) sqrt(S), the discharge implied by prescribed width, depth,
+    slope and fitted n under the SAME wide-channel approximation as raw celerity.
+Record Q_A/Q_M, both actual values, depth, width, slope, n, raw/capped c, allocation,
+reach length, subdivision, K, X and local memory. A ratio is a consistency screen,
+not proof that either discharge is the true local flow. Trace depth anchoring,
+slope provenance/units, width representativeness and width-based branch allocation.
+
+Counterfactual required depth h_A = [Q_A*n/(B*sqrt(S))]^(3/5) helps quantify the
+mismatch. It is not automatically adopted: slope or allocation could instead be
+wrong, or uniform-flow assumptions could be unsuitable (e.g. backwater).
+Do not independently substitute Q_M for allocated reach Q: this generally breaks
+network continuity and must not alter the measured upstream forcing.
+
+HOW THE EVIDENCE MAY JUSTIFY CHANGING X
+Preferred: identify defensible hydraulic inputs/state, recalculate c, K and X
+consistently, and compare with the unchanged baseline at fixed n. Keep network
+flow allocation conservative. Isolate input changes in controlled comparisons.
+A depth-only consistency alternative with fixed B/S/Q changes c and K/X but leaves
+D=Q/(2BS) unchanged: it must not be promised to cure excessive physical diffusion.
+If slope, effective width or allocation changes, explicitly show how D changes.
+Do not choose a slope floor, X clip or depth simply because it improves peak fit.
+
+A direct X adjustment remains a possible EMPIRICAL model alternative, not an
+established hydraulic correction. If investigated, parameterize an explicit
+positive diffusivity multiplier beta: X=0.5-beta*D/(c*dx). beta=1 retains Cunge;
+beta<1 reduces assumed diffusivity. Justify any beta range independently, report
+it, and validate on independent events where available. If selected using this
+same event's peak, call it calibration, not physical validation. No beta has been
+selected or adopted. Keep the distinction from fixed-X routing explicit.
+
+VALIDATION BEFORE ACCEPTANCE
+Recalculate grid coefficients when changing numerical cell length; compare spatial
+refinements as well as existing temporal controls. Check pulse behaviour, flow
+nonnegativity, volume/storage accounting and event shape/feature timing, not just
+maximum height. Compare initialization alternatives using supported antecedent
+observations, without mixing an initialization change into an X-only attribution.
+A stable calculation or a visually good fit alone does not establish physical
+validity. Very low-slope/backwater conditions may require another routing model.
+
+DECISION
+Correct demonstrated input errors first. Compare defensible coherent-state and
+numerical alternatives next. If none resolves the mismatch, report a limitation
+of the constant-reference model; consider a separately validated variable-state
+or hydraulic alternative. Do not launch the full production rerun solely on the
+basis of a tuned X or another Manning search.
+
+IMPLEMENTED SCREEN
+RAPID/investigations/audit_hydraulic_discharge_consistency.py
+Outputs under RAPID/outputs/common_grid_validation_20261008/a5520880422b/:
+ hydraulic_discharge_consistency_summary.csv
+ hydraulic_discharge_consistency_reaches.parquet
+ hydraulic_discharge_consistency_protocol.json
+The required-depth calculation is checked by reconstructing allocated Q, and
+Q_M is independently checked against 0.6*c_raw*B*h. No routing inputs are changed.
+
+USER PREFERENCE AND OVERLAP FOLLOW-UP — 2026-10-08
+User prefers investigating direct X adjustment while retaining settled hydraulic
+inputs and Manning n. Do not reopen or change those inputs as a default remedy.
+Preferred diagnostic parameterization remains an explicit diffusivity multiplier,
+not clipping numerical X at an arbitrary lower bound. This changes the routing
+model's assumed attenuation; it is not a validated physical correction yet.
+Keep c/K and the prescribed hydraulic inputs fixed for this attribution. Use one
+explicit parameter policy across parent/child comparisons; do not separately fit
+children in a way that removes the hierarchy effect being investigated.
+No multiplier has been fitted or adopted. Select scoring/validation evidence
+before accepting a correction; matching peak height alone is insufficient.
+
+The location-level overlap audit now confirms that extreme X is NOT universally
+associated with a large reference/Manning-discharge ratio: 55/148 reaches with
+X<-100 have ratio>10; 19/148 have ratio<=1. For 46 the counts are 18/49 and 1/49.
+Therefore the discharge mismatch cannot justify a universal ratio-based X fix.
+The depth/slope/cell-length term remains important even at a ratio of one.
+See EXTREME_X_DISCHARGE_OVERLAP.txt and the associated reach CSV in the output folder.
+
+46 BETA EXPERIMENT COMPLETED — 2026-10-08
+Tested beta=1,0.75,0.5,0.25 at fixed n/K and current equilibrium initialization.
+Reduced diffusion raises the peak but delays it markedly. beta=0.25 yields
+1873.19 m3/s versus raw observed 2118.45, with a 2002.5-minute target error.
+No tested uniform beta fixes both timing and amplitude. Half-dt and half-cell-size
+controls show <=0.451 m3/s changes and <=2-minute peak shifts, so the trade-off
+persists under these numerical refinements. No beta adopted; no n search.
+See output folder 46_diffusion_multiplier/ for offline Plotly, all waves, metrics,
+numerical checks, protocol and RESULTS.txt. Keep production baseline unchanged.
+
+USER-AUTHORIZED CONDITIONAL N REFIT — 2026-10-08
+User next proposed combining beta=0.25 with Manning-n recalibration, timing as
+primary and peak height as a soft target. Fixed-n restriction is superseded for
+this requested comparison. beta=.25 + fitted n=.0162109375 gives -0.5-minute
+peak timing error, 2001.32 m3/s peak (-5.53% against raw observed), and raw RMSE
+127.74 versus baseline 153.11. Promising exploratory candidate, not adopted.
+K/celerity change with n; hydraulic geometry/reference Q and initialization stay
+fixed. Both numerical controls retain peak time. See BETA025_REFIT_RESULTS.txt.
+No joint beta optimization, accepted height tolerance, independent-event validation
+or final antecedent-state validation has been completed.
+
+FOLLOW-UP ANTECEDENT / OTHER CASES / HEIGHT TARGETS — 2026-10-08
+At beta=.25 and fitted n=.0162109375, 46's real 30/90-day antecedent runs move
+peak timing six minutes and peak height -4.7 m3/s compared with equilibrium.
+Whole-event differences reach 257 m3/s; initial state cannot be declared irrelevant
+for whole-event scoring. 30/90-day curves agree within .032 m3/s. No blanket waiver.
+Additional timing-only conditional n fits at beta=1/.25 for 02,05,55,56 produce
+peak increases ~5.1/4.9/1.8/0.5%. Downstream/upstream mismatch is not solved.
+All 15 draft manual height-review records created, with no accepted bounds yet.
+See HEIGHT_TARGET_POLICY.txt and output beta_followups/RESULTS.txt and HTML files.
+
+15-EXAMPLE CALIBRATION COMPLETED — 2026-10-08
+User authorized calibration against the recorded shifted/manual soft-height list.
+Versioned review candidates: RAPID/outputs/common_grid_height_calibration_20261008/fca75ef22cf5/.
+All 15 selected timing features fit within one minute on their selected numerical
+grids. 11/12 height intervals met; 05 falls 31.23 m3/s below its lower bound at
+beta=.01. Point residuals: 03 +2.640%, 46 -0.048%, 54 +0.140%. No range widened.
+Beta=1 retained for 13/37/48/55/56; n retimed. 54 uses its two-lobe midpoint,
+not its global maximum or the separate first-crest hierarchy convention.
+46 selected beta=.04754745, n=.01429262; physical geometry unchanged, eightfold
+numerical subdivision after observed spatial sensitivity. 16x/8x cells and
+half-dt controls retain its peak time; max differences .0278/.0111 m3/s.
+7/30-day antecedent at final 46 parameters moves peak +1min, height about -0.5
+m3/s, but earlier event differences remain large (~338 m3/s).
+CRITICAL: matching 46's height/time targets worsens full shifted event RMSE from
+170.56 to 210.06 m3/s. Earlier beta=.25 conditional-n candidate had shifted RMSE
+156.16 but a ~7.22% shifted height deficit. Neither peak fit nor RMSE alone is
+independent validation. 05's full shifted RMSE also worsens. Review full curves.
+All 15 selected waves replayed from saved beta/n/grid/timestep with numerical
+agreement and nonnegative native flows. Original input/code/target hashes intact.
+Outputs: 15_panel_calibrated_full.html, 15_panel_calibrated_crest.html,
+calibration_results.html, comparison.csv, REPORT.txt, per-case wave/parameter/
+trial files. No original production parameters or hierarchy outputs overwritten.
+Production runner integration, source-clock/gap eligibility and hierarchy-level
+validation remain outstanding; these are completed base calibration candidates.
+
+USER HEIGHT-BOUND REVISION 2 — 2026-10-08
+User raised 02 lower bound to 2800; changed 03 from shifted downstream point to
+lower bound 2550, closer to input; lowered 21 to 14350 and 41 to 7500. Existing
+upper bounds retained except 03, whose explicitly communicated working upper
+bound is the common-grid input peak 2631.413. 05/46/54 accepted as current results;
+all eleven unaffected waves retained byte-for-byte. Manual ranges are modelling
+criteria, not measurement confidence intervals. No target widening.
+New separate calibration: RAPID/outputs/common_grid_height_calibration_20261008/33847083c6ea/.
+02: range 2800–3079.754; peak 2824.670; beta=.1, n=.06089150; +0.5min.
+03: range 2550–2631.413; peak 2557.290; beta=.17782794, n=.03438618; 0min.
+21: range 14350–14500; peak 14362.414; beta=.42044821, n=.02362721; -0.5min.
+41: range 7500–7700; peak 7501.979; beta=.89773462, n=.02099772; +0.5min.
+All four revised bands satisfied. 02 required fourfold numerical subdivision
+and a small n retiming at fixed beta after a five-minute spatial sensitivity;
+eightfold versus fourfold and half-dt then retain peak time (max Q differences
+.4684/.0186 m3/s). Other revised spatial checks shift peak at most one minute.
+All revised outputs replayed; retained waves verified identical to revision 1.
+Original revision 1 and its plots remain available. No production/hierarchy
+replacement. Target file: manual_height_targets_revision2.json in this directory.

@@ -1,0 +1,76 @@
+DRAFT HEIGHT-TARGET POLICY — 2026-10-08
+
+Purpose: timing is primary; height is a soft secondary objective when observable
+and comparable with the modeled boundary conditions. No target bounds adopted.
+
+1. Use the downstream observation of the SAME selected event feature, rather
+than the upstream maximum or automatically the downstream global maximum.
+Upstream Q is the forcing/reference. Setting downstream target = upstream peak
+implicitly asks for no peak attenuation and is not a neutral target definition.
+For plateaus or multiple crests, record which statistic is meant (plateau level,
+selected crest height, or separate crest levels). Preserve reviewed timing targets.
+
+2. Check comparability before applying a height penalty. Check represented gauge
+locations, lateral inflows, diversions, drainage-area differences, gauge quality,
+clock alignment, initialization and observation coverage. Downstream peaks above
+upstream peaks in the common observation window flag this issue; they do not alone
+prove lateral inflow, since antecedent storage and incomplete windows also matter.
+The current routing has one supplied inlet, conservative branch allocation and no
+new lateral inputs. Do not ask X to manufacture missing flow or exploit numerical
+overshoot. A good normalized shape fit is not proof of an absolute amplitude fit.
+
+3. Populate a semi-manual review record for every example:
+  - Selected timing feature and source support/cadence.
+  - Original measured downstream height(s), on the common reporting support.
+  - Raw selected-crest point range for context; NOT an uncertainty interval.
+  - Baseline treatment if assessing peak excess instead of absolute discharge.
+  - Accepted lower/upper height, units, evidence/rationale and reviewer status.
+  - Whether height is eligible for calibration; secondary weight/tolerance.
+Bounds must come from measurement/reconstruction/baseline uncertainty or explicit
+scientific acceptance criteria, not from widening the range until the model fits.
+An optional interval objective is zero height penalty inside accepted [L,U] and
+increasing distance outside. Timing admissibility remains a separate primary
+constraint. No numeric weight or universal percentage has been selected.
+
+4. Where absolute flows are not directly comparable, do not substitute upstream
+height as an observed downstream target. Either represent/correct a demonstrated
+boundary mismatch, omit the height objective and retain timing/shape calibration,
+or adopt an independently justified attenuation range explicitly as a prior.
+The latter is a modeling assumption, not a measured downstream calibration target.
+
+5. A dimensionless alternative, if justified, is downstream peak EXCESS divided
+by upstream peak EXCESS, using explicitly reviewed pre-event baselines. Both use
+the same upstream reference; do not normalize each curve independently to its
+own maximum. Baseline subtraction cannot remove time-varying lateral inflows.
+A ratio above one is a comparability flag for this routing setup, not something
+to clamp or silently reinterpret. The current display shift is not automatically
+an accepted baseline correction for calibration.
+
+6. Choose beta only after that review; fit n conditionally to the existing timing
+feature, then compare admissible fits on height and full shape. Do not transfer
+beta=.25 to all cases automatically. Apply an accepted per-example calibration
+unchanged to its hierarchy children so their differences remain observable.
+
+Initial review material (all 15):
+RAPID/outputs/common_grid_validation_20261008/a5520880422b/beta_followups/
+ height_target_review.html — human-readable evidence and notes
+ height_target_review.json — editable records, accepted bounds left null
+These are draft evidence records, not approved targets or uncertainty estimates.
+
+Reference: HEC calibration procedure compares modeled outflow against downstream
+observations, including peaks, timing and volume:
+https://www.hec.usace.army.mil/confluence/hmsdocs/hmstrm/calibration/summary-of-the-calibration-procedure
+
+USER CLARIFICATION — 2026-10-08
+For 03,05,46,54 the user explicitly means the SHIFTED downstream curve shown in
+the common-initial-forcing figure. This is now an intentional baseline-adjusted
+height objective, superseding the raw-discharge-only default for those targets.
+Keep the additive offset frozen to the original initial forcing plateau and first
+supported downstream mean. Do not recompute it from a fitted/antecedent outlet.
+Keep original discharge as a separate diagnostic, not the selected height target.
+05's range is shifted selected downstream peak through 1100 m3/s. 03/46/54 have
+soft nominal heights; no hard acceptance widths have been specified. For 54 the
+nominal height refers to the taller crest in the selected two-crest span, with
+both crests retained for shape review; the timing midpoint stays unchanged.
+Authoritative proposal: manual_height_targets_proposal.json and its HTML view.
+No calibration against this confirmed target list has yet been performed.

@@ -501,6 +501,9 @@ def run_prepared_state(
     previous_external = (steady_rhs.copy() if initial_mode == "steady_first_inflow"
                          else np.zeros(len(river_ids_basin)))
 
+    averaging = manifest.get("prep_config", {}).get("output_averaging", "endpoint_rectangle")
+    if averaging not in {"endpoint_rectangle", "linear_state_interval_mean"}:
+        raise ValueError(f"Unknown output averaging: {averaging}")
     qout_records = np.zeros((len(time), len(river_ids_basin)), dtype=np.float64)
     solver = factorized(linear)
     _ = splu(linear)
@@ -517,6 +520,7 @@ def run_prepared_state(
             previous_external = q_external_avg.copy()
             continue
         on_initial_plateau = False
+        interval_initial = q_out_initial.copy()
         q_out_avg, q_out_initial = mus_rte(
             linear,
             q_external,
@@ -530,6 +534,8 @@ def run_prepared_state(
             previous_inflow_matrix=c2 if boundary_mode == "upstream_two_time" else None,
         )
         previous_external = q_external_avg.copy()
+        if averaging == "linear_state_interval_mean":
+            q_out_avg += (interval_initial-q_out_initial)/(2*n_substeps)
         qout_records[timestep_index, :] = q_out_avg
 
     qout_path = Path(output_path).expanduser().resolve() if output_path is not None else prep_path / DEFAULT_QOUT_NAME
@@ -542,6 +548,7 @@ def run_prepared_state(
         "boundary_mode": boundary_mode,
         "network_dtype": network_dtype,
         "routing_dt_seconds": dt,
+        "output_averaging": averaging,
         "minimum_reported_flow_cms": float(qout_records.min()),
         "negative_reported_flow_count": int((qout_records < 0).sum()),
         **substep_audit,

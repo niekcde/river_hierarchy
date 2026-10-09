@@ -1,0 +1,77 @@
+COMMON-GRID PRODUCTION INTEGRATION — 2026-10-08
+
+Entry point
+RAPID/investigations/cunge_full_hierarchy_reviewed.py --common-grid
+(or PYTHONPATH=RAPID/src python -m rapid_tools.common_grid_production)
+
+The explicit --common-grid mode selects the new calibrated workflow. The legacy
+command remains available for reproducibility; running it without this switch
+still selects its historical calibration and output convention.
+
+Current pinned calibration bundle
+RAPID/outputs/common_grid_height_calibration_20261008/33847083c6ea
+This is the user's accepted revision 2, including the accepted 05 height shortfall.
+No calibration is repeated by the new runner. Each child inherits base Manning n,
+diffusion multiplier beta and subdivision multiplier (02: 4; 46: 8; others: 1).
+Reference discharge and geometry retain their frozen policy; network 41 geometry
+is unchanged and 11 remains excluded. An inventory base must reproduce the frozen
+calibration frame before its children can be routed. Untouched exterior changes
+are blocked unless covered by the existing exact-source-hash review evidence.
+
+Shared representation
+Raw frozen upstream and downstream observations are linearly reconstructed and
+integrated into UTC-aligned 60-second (or validation 30-second) interval means.
+Files retain start, end and midpoint labels, observation support flags, gap flags
+and explicit forcing endpoint extension flags. No downstream extrapolation.
+The initial state remains equilibrium at the original initial forcing value.
+A single native clock is shared across selected states and reporting resolutions;
+it is an exact divisor of both intervals and respects bounds evaluated AFTER the
+beta and spatial subdivision adjustments. Native discharge is audited, not clipped.
+Outlet interval means use trapezoidal integration of native states. The sparse
+engine now supports this convention through output_averaging in its preparation
+manifest. Historical manifests retain their original rectangle convention.
+
+Calibration feature
+Uses the reviewed model feature, including 54's two-lobe midpoint and the frozen
+observational target time. Physical lobe separation is preserved at 30 and 60 s.
+This is explicitly distinct from the historical hierarchy first-crest metric.
+No additional native maximum is stored as a competing discharge representation.
+
+Reproduce all base checks (use a NEW output directory)
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python \
+  RAPID/investigations/cunge_full_hierarchy_reviewed.py --common-grid \
+  --examples 02 03 05 13 15 21 22 37 41 45 46 48 54 55 56 \
+  --output-root RAPID/outputs/my_common_grid_base_check \
+  --steps 60 30 --diagnostic-gaps
+
+Reproduce selected hierarchy checks (first distinct parent-child pair per example)
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python \
+  RAPID/investigations/cunge_full_hierarchy_reviewed.py --common-grid \
+  --examples 02 03 46 54 --pairs 1 --engine-check \
+  --output-root RAPID/outputs/my_common_grid_pair_check --diagnostic-gaps
+
+Validation outputs
+RAPID/outputs/common_grid_production_integration_20261008/verified_bases
+RAPID/outputs/common_grid_production_integration_20261008/verified_pairs
+Each case records source/code hashes, a runnable-code snapshot, parameters,
+reconstructed forcing, compact outlet interval means, selected feature metrics,
+resolution controls and completion scope. Existing directories are never replaced.
+Sparse-engine checks use a short real crest excerpt with explicit initialization;
+these independently check solver and averaging parity, not full-event sparse runs.
+See integration_validation.json and REPORT.txt in the integration output root for
+measured results. Earlier base_smoke/base_replay/parent_child folders are development
+checks; verified_* are the checks against the final implementation of this stage.
+
+Acceptance scope and next stage
+This stage integrates and verifies the reviewed base calibration and four example
+transitions. It does not claim final observation approval or a completed hierarchy
+batch. --diagnostic-gaps is an explicit reproduction option: omission rejects long
+upstream gaps. It never turns flagged interpolations into approved observations.
+21/22 source timezone ambiguity and local sampling/gap eligibility (notably 55)
+remain open. A 60-second report interval does not create 60-second observations.
+The reviewed diagnostic post-event tail is retained; full-tail settling and volume
+acceptance are still required before final duration/volume hierarchy products.
+Full-hierarchy routing is available via --all-states, with the same exterior gates;
+this integration has not launched that batch. Every result retains
+final_scientific_acceptance=false until these remaining requirements are handled.
+No child is fitted, and display normalization does not alter physical routing data.

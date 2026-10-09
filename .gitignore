@@ -48,4 +48,5 @@ RAPID/notebooks/link_*_bank_targets*.png
 /hydrograph_match_review.xlsx
 /RAPID/reviews/*.xlsx
 /RAPID/reviews/calibration_targets_20261006/review.html
+/RAPID/reviews/common_grid_production_20261008/manual_height_targets_proposal.html
 ~$*.xlsx

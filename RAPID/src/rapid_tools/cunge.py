@@ -80,12 +80,14 @@ def freeze_grid(frame, reference_discharge_cms, *, n_bounds=(.01, .1), alpha=2.,
     return f
 
 
-def parameters(grid, n, *, method='cunge'):
+def parameters(grid, n, *, method='cunge', beta=1.):
     """Update c, K and X together; all geometry, Q and counts stay frozen."""
     if not np.isfinite(n) or not grid.grid_n_min.iloc[0] <= n <= grid.grid_n_max.iloc[0]:
         raise ValueError("Manning n is outside the frozen-grid calibration bounds.")
     if method not in {'cunge', 'fixed_x'}:
         raise ValueError("Unknown routing method.")
+    if not np.isfinite(beta) or beta <= 0 or (method != 'cunge' and beta != 1.):
+        raise ValueError("Positive beta is supported for Cunge only.")
     f = grid.copy()
     raw = f.celerity_times_n / n
     c = np.clip(raw, f.celerity_min_mps, f.celerity_max_mps)
@@ -96,6 +98,8 @@ def parameters(grid, n, *, method='cunge'):
     f['rapid_celerity_capped'] = ~np.isclose(c, raw, rtol=1e-12, atol=1e-12)
     f['rapid_k'] = dx/c
     f['rapid_x'] = .5*(1-ld/dx) if method == 'cunge' else .1
+    f['rapid_x'] = .5-beta*(.5-f.rapid_x) if method == 'cunge' else f.rapid_x
+    f['diffusion_multiplier'] = float(beta)
     f['hydraulic_length_scale_m'] = ld
     f['hydraulic_diffusivity_m2_s'] = f.reference_discharge_cms/(2*f.width*f.slope)
     f['routing_method'] = method
@@ -182,12 +186,15 @@ def expand_links(frame):
     return pd.DataFrame(rows)
 
 
-def write_prepared_state(frame, flow, forcing_step_s, routing_dt_s, output_dir, *, metadata=None):
+def write_prepared_state(frame, flow, forcing_step_s, routing_dt_s, output_dir, *, metadata=None,
+                         output_averaging="endpoint_rectangle"):
     """Write runnable RAPID inputs directly from an audited hydraulic frame.
 
     CSV mapping preserves physical anchors and within-link cell positions;
     this numerical prep does not require GIS geometry or regenerate slopes.
     """
+    if output_averaging not in {"endpoint_rectangle", "linear_state_interval_mean"}:
+        raise ValueError("Unknown output averaging convention.")
     if forcing_step_s != int(forcing_step_s) or forcing_step_s <= 0:
         raise ValueError("NetCDF forcing step must be a positive integer number of seconds.")
     from .engine import stp_cor
@@ -227,7 +234,9 @@ def write_prepared_state(frame, flow, forcing_step_s, routing_dt_s, output_dir, 
                     prep_config=dict(routing_method=str(frame.routing_method.iloc[0]), cunge_alpha=float(frame.cunge_alpha.iloc[0]),
                                      n_manning=float(frame.n_manning.iloc[0]), coefficient_policy='signed_inflow',
                                      boundary_mode='upstream_two_time', initial_flow_mode='steady_first_inflow',
-                                     network_dtype='float64', reference_parameters_frozen=True),
+                                     network_dtype='float64', output_averaging=output_averaging,
+                                     diffusion_multiplier=float(frame.get('diffusion_multiplier', pd.Series([1.])).iloc[0]),
+                                     reference_parameters_frozen=True),
                     routing=dict(routing_dt_seconds=float(routing_dt_s), forcing_dt_seconds=int(forcing_step_s)),
                     original_links=len(frame), numerical_sections=len(cells),
                     physical_length_m=float(frame.link_length_m.sum()), represented_length_m=float(cells.link_length_m.sum()),

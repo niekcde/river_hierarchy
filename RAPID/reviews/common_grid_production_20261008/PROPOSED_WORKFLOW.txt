@@ -1,0 +1,132 @@
+PROPOSED PRODUCTION RESAMPLING WORKFLOW — 2026-10-08
+Status: recorded proposal; core and diagnostic pilots implemented. Production
+calibration and hierarchy migration, final acceptance and full reruns outstanding.
+
+1. Preserve and identify inputs
+Freeze source point observations, clock interpretation, geometry, reference flow,
+spatial grid, existing parameters and reviewed Excel targets with content hashes.
+Write new versioned outputs. Retain old results. Keep network-41 geometry outside
+this work and example 11 excluded unless separately reviewed.
+
+2. Resolve observation support before fitting
+Retain raw timestamps and values. Resolve 21/22 source timezone ambiguity before
+final fits; do not guess a shift. Determine local sampling regimes and actual
+outages, rather than treating every interval >2 whole-event nominal cadences as
+missing data. Example 55 is hourly around its crests. Interpolation cannot supply
+sub-hour observational precision there. Record reconstruction flags and explicit
+accepted intervals. Do not silently fill long gaps for production calibration.
+
+3. Prepare a single common comparison grid
+Use UTC-midnight-aligned 60-second intervals as the working production candidate
+for every gauge and routed output. Store interval start, end and midpoint label.
+Reconstruct accepted point observations linearly and integrate exactly over each
+interval: integral(Q dt)/interval duration. Use that convention for upstream and
+downstream gauges alike. Do not average an unequal number of point samples.
+Do not shift target times to the nearest reporting bin.
+If a source is already an interval mean, respect its stated support rather than
+silently treating it as an instantaneous point. Preserve provenance for this.
+Use finer common intervals if the intended model comparison demonstrably needs
+them; interpolation improves numerical representation, not observed precision.
+
+4. Establish initial state and usable forcing window
+Equilibrium at the first forcing value is an explicit initial-state assumption.
+Where sensitivity requires it, use actual antecedent observations and increase
+the lookback until the event hydrograph AND selected feature converge to the
+required tolerance. No universal 90-day window. Network 46 needs particular
+attention: 30/90-day diagnostic agreement is evidence at existing n, not final
+approval for every refit or hierarchy. Do not cross the rejected long seasonal gap.
+Record any short endpoint extension and its limit; do not extrapolate downstream
+observations. Recheck initialization after calibration changes parameters.
+
+5. Route and report on consistent support
+Supply the common-grid upstream interval means to the solver under its explicit
+held-boundary convention. Keep the stable internal solver timestep separate from
+the reporting interval. Apply the same native clock across paired methods and
+hierarchy comparisons where feasible; retain coefficient-policy checks.
+Integrate native outlet states with the validated trapezoidal reconstruction into
+the SAME UTC intervals used for observations. Include the correct initial state.
+Persist interval means and support/quality metadata, not large native reach arrays.
+Do not retain a second native-maximum discharge as a competing comparison product.
+Feature timestamps and diagnostic metrics may still be stored as metadata.
+
+6. Make the calibration feature explicit
+Keep reviewed Excel targets and their meaning: a unique crest, plateau midpoint,
+or selected multi-crest feature. Implement corresponding model feature operators
+rather than substituting every global maximum. In particular preserve 03's plateau
+and resolve 54's model counterpart to the recorded observed two-crest midpoint;
+its provisional first-crest hierarchy choice is separate. Treat near-equal maximum
+bins as a timing ambiguity, not a large hydrograph change. Set timing tolerances
+with reference to local observational support, reconstruction and numerical tests.
+Use physical discharge for quantitative amplitude checks. Display normalization
+must not silently alter calibration observations or objectives.
+
+7. Integrate and reassess base results
+Connect the shared preparation/output functions to both production calibration
+runners, then rerun all retained bases with existing n first. User direction on
+2026-10-08: hold Manning n fixed during the attenuation investigation; do not
+automatically launch another n search. Any later refit needs evidence from the
+accepted hydraulic/temporal framework. Existing pilot fits are not new common-grid
+calibrations. Audit extreme-X/low-slope cases
+before accepting hydraulic interpretation; do not automatically clip X or slopes.
+Extend post-event tails until required settling/volume checks converge, explicitly
+identifying artificial held-tail forcing and excluding it from observational scores.
+Choose and record metric-specific acceptance tolerances before final acceptance.
+
+8. Verify the complete pipeline
+Require input-integral consistency, matched input/output support, masks and clock
+provenance; check nonnegative outputs and coefficient diagnostics. Compare 60s
+with duration-aggregated 30s means; separately halve the native timestep. Validate
+feature timing, not just mean discharge. Repeat initial-state checks for final n.
+The existing 150 base pilots and controls support the core but do not replace
+end-to-end production-runner verification.
+
+9. Validate hierarchy sensitivity, then run the batch
+Test selected matched parent-child transitions at 60s versus 30s, including small
+timing differences and problematic examples. Tighten the common interval if these
+comparisons require it. Once accepted, run the full hierarchy with the same forcing,
+initialization policy, feature operator and comparable solver settings. Record any
+unresolved source/feature limitations instead of giving unsupported precision.
+
+10. Deliver reproducible review products
+Versioned outlet interval means, parameters, target/features, metrics, flags and
+source/code hashes; updated 15-panel Plotly views with marked calibration targets.
+For display, use a common initial-forcing scale; only downstream observations get
+a constant initial-baseline shift. Hover retains original measured discharge.
+Keep physical-discharge scores separate from this display transformation.
+
+Existing core: RAPID/src/rapid_tools/common_grid.py and time_support.py.
+Diagnostic evidence: RAPID/outputs/common_grid_validation_20261008/a5520880422b/.
+This proposal does not authorize silently resolving outstanding source-clock or
+feature-interpretation choices and does not claim production reruns are complete.
+
+Attenuation follow-up: see ATTENUATION_INVESTIGATION.txt in this directory.
+Explicitly compare allocated reference Q with Manning-implied Q before deciding
+whether an evidence-based recomputation or empirical adjustment of X is justified.
+
+Progress update — 2026-10-08:
+The user subsequently authorized a joint beta/n base calibration using the
+confirmed manual/shifted height targets. All 15 base review candidates are now
+computed under the common-grid investigation runner, saved separately in
+RAPID/outputs/common_grid_height_calibration_20261008/fca75ef22cf5/.
+This supersedes the earlier statement that no common-grid recalibration has run;
+it does NOT complete production-runner migration or hierarchy reruns. See the
+calibration report and ATTENUATION_INVESTIGATION.txt for unmet soft targets,
+whole-hydrograph trade-offs, numerical/antecedent controls and provisional flags.
+
+Current base review revision 2:
+RAPID/outputs/common_grid_height_calibration_20261008/33847083c6ea/.
+Only 02/03/21/41 refitted to the user's updated lower bounds; all four ranges met.
+Other case outputs, including accepted 05/46/54, retained. This remains a base
+calibration review; the production/hierarchy and source-quality caveats above apply.
+
+Integration update — 2026-10-08
+The user authorized starting production integration. The explicit --common-grid
+production runner now consumes revision-2 n/beta and spatial controls, reconstructs
+both gauges on common support, and reports outlet interval means. All 15 bases
+replay exactly; four sampled parent-child transitions (02/03/46/54) were run at
+60/30 seconds, with independent sparse-engine excerpt parity and 43 tests passing.
+Detailed status/commands: INTEGRATION.txt. Measured evidence:
+RAPID/outputs/common_grid_production_integration_20261008/REPORT.txt.
+This supersedes the earlier statement that no production integration exists.
+The legacy command remains unchanged unless --common-grid is selected. Full batch,
+observation-source qualification and full-tail acceptance remain outstanding.
