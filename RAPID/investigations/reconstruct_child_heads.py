@@ -29,8 +29,11 @@ def source_inventory(ex):
         if (exp/'transition_registry.csv').exists():
             t=pd.read_csv(exp/'transition_registry.csv')
             parents=dict(zip(t.child_state_id,t.parent_state_id))
-        for state in sorted((exp/'states').iterdir()):
-            if not state.is_dir():continue
+        # Official registry membership excludes temporary promotion directories.
+        state_ids=pd.read_csv(exp/'state_registry.csv').state_id.astype(str)
+        for state_id in sorted(state_ids):
+            state=exp/'states'/state_id
+            if not state.is_dir():raise FileNotFoundError(f'Registered state directory missing: {state}')
             rows.append(dict(example=ex,family=family,state=state.name,
                 parent_state=parents.get(state.name,'S000_base'),
                 manifest=str(state/'hydraulic_context/hydraulic_context_manifest.json')))

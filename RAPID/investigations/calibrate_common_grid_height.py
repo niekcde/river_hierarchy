@@ -34,24 +34,29 @@ def feature(q,t,ex,review):
     center=float((t[top[0]]+t[top[end]])/2)
     return center,maximum,'exact_plateau_midpoint' if end else 'single_smoothed_crest',[float(t[top[0]]),float(t[top[end]])]
 
-def calibrate(ex,dest_string):
+def calibrate(ex,dest_string, *, beta_bounds=(.01,2.), previous_selection=None):
     dest=Path(dest_string);out=dest/ex;out.mkdir(exist_ok=True)
     target=next(r for r in json.loads((dest/'height_targets.json').read_text())['records'] if r['example']==ex)
     review=next(r for r in json.loads((dest/'timing_targets.json').read_text())['records'] if r['example']==ex)
     comp=pd.read_csv(SOURCE/'baseline/RAPID/outputs/cunge_calibration_reviewed_20261006/comparison.csv',dtype={'example':str})
     row=comp[(comp.example==ex)&(comp.method=='cunge')].iloc[0]
     folder=SOURCE/'baseline'/Path(row.output_dir).relative_to(ROOT)
-    grid=pd.read_parquet(folder/'frozen_grid.parquet');data=pd.read_parquet(SOURCE/ex/'60s.parquet')
+    grid=pd.read_parquet(folder/'frozen_grid.parquet')
+    subdivision=(previous_selection or {}).get('subdivision_multiplier',1)
+    grid['count']*=subdivision;grid['rapid_effective_length_m']=grid.link_length_m/grid['count']
+    data=pd.read_parquet(SOURCE/ex/'60s.parquet')
     meta=next(r for r in json.loads((SOURCE/ex/'60s.json').read_text()) if r['method']=='cunge')
     valid=data.downstream_cms.notna().to_numpy();ids=np.flatnonzero(valid)
     t=(data.time_utc.astype('int64').to_numpy()/1e9);tt=t[valid]
-    goal=pd.Timestamp(review['target_utc']).timestamp();q0=meta['initial_cms'];dt=meta['dt_s'];orig_n=meta['n_manning']
+    goal=pd.Timestamp(review['target_utc']).timestamp();q0=meta['initial_cms'];dt=(previous_selection or {}).get('native_dt_s',meta['dt_s']);orig_n=meta['n_manning']
     lower=target['low_cms'];upper=target['high_cms'];is_point=lower is None
     if is_point:lower=upper=target['height_target_nominal_cms']
     scale=max((lower+upper)/2,1e-12)
     records=[];cache={};beta_fits={};errors=[]
     def run(beta,n,keep=False):
-        beta=float(beta);n=float(n);key=(beta,n)
+        beta=float(beta);n=float(n)
+        if not beta_bounds[0]<=beta<=beta_bounds[1]:raise ValueError('Beta outside declared search bounds')
+        key=(beta,n)
         if key in cache and not keep:return cache[key]
         f=cunge.parameters(grid,n,method='cunge',beta=beta)
         try:
@@ -69,7 +74,7 @@ def calibrate(ex,dest_string):
         beta=float(beta)
         if beta in beta_fits:return beta_fits[beta]
         # Coarse n scan catches peak switches; refine every sign-changing bracket.
-        ns=np.unique(np.r_[.01,.0175,.025,.04,.07,.1,orig_n])
+        ns=np.unique(np.r_[.01,.0175,.025,.04,.07,.1,orig_n,(previous_selection or {}).get('n_manning',orig_n)])
         if beta_fits:
             nearest=min(beta_fits,key=lambda b:abs(math.log(b/beta)))
             ns=np.unique(np.r_[ns,beta_fits[nearest]['n_manning']])
@@ -100,6 +105,7 @@ def calibrate(ex,dest_string):
     if need:
         # Explore both directions when needed; stop intervals at first feasible beta.
         order=[.75,.5,.25,.1,.05,.01,1.5,2.] if baseline['peak_cms']<lower else [1.5,2.,.75,.5,.25,.1,.05,.01]
+        order=[b for b in order if beta_bounds[0]<=b<=beta_bounds[1]]
         for beta in order:
             r=fit_beta(beta)
             feasible=[x for x in beta_fits.values() if abs(x['timing_error_minutes'])<=1]
@@ -139,7 +145,7 @@ def calibrate(ex,dest_string):
     fitted=data.copy();fitted['calibrated_cunge_cms']=q
     fitted.to_parquet(out/'wave.parquet',index=False)
     shifted=data.downstream_cms.to_numpy()+target['downstream_display_offset_cms']
-    best.update(height_low_cms=lower,height_high_cms=upper,height_target_type='point' if is_point else 'interval',timing_within_one_minute=abs(best['timing_error_minutes'])<=1,height_range_met=best['height_distance_cms']==0 if not is_point else None,point_height_within_numerical_01pct=best['height_distance_fraction']<=.001 if is_point else None,original_n=orig_n,original_peak_cms=before_height,original_feature_utc=pd.Timestamp(before_tm,unit='s',tz='UTC').isoformat(),original_timing_error_minutes=(before_tm-goal)/60,shifted_rmse_cms=float(np.sqrt(np.mean((q[valid]-shifted[valid])**2))),original_shifted_rmse_cms=float(np.sqrt(np.mean((data.cunge_cms.to_numpy()[valid]-shifted[valid])**2))),raw_rmse_cms=float(np.sqrt(np.mean((q[valid]-data.downstream_cms.to_numpy()[valid])**2))),trials=len(records),beta_at_search_boundary=best['beta'] in [.01,2.],initialization='equilibrium at original first forcing',calibration_ready_for_production=False)
+    best.update(height_low_cms=lower,height_high_cms=upper,height_target_type='point' if is_point else 'interval',timing_within_one_minute=abs(best['timing_error_minutes'])<=1,height_range_met=best['height_distance_cms']==0 if not is_point else None,point_height_within_numerical_01pct=best['height_distance_fraction']<=.001 if is_point else None,original_n=orig_n,original_peak_cms=before_height,original_feature_utc=pd.Timestamp(before_tm,unit='s',tz='UTC').isoformat(),original_timing_error_minutes=(before_tm-goal)/60,shifted_rmse_cms=float(np.sqrt(np.mean((q[valid]-shifted[valid])**2))),original_shifted_rmse_cms=float(np.sqrt(np.mean((data.cunge_cms.to_numpy()[valid]-shifted[valid])**2))),raw_rmse_cms=float(np.sqrt(np.mean((q[valid]-data.downstream_cms.to_numpy()[valid])**2))),trials=len(records),beta_at_search_boundary=best['beta'] in beta_bounds,initialization='equilibrium at original first forcing',calibration_ready_for_production=False)
     warnings=[]
     if ex in ['21','22']:warnings.append('Source clock provisional; no timezone correction applied.')
     if ex=='55':warnings.append('Hourly crest sampling: numerical minute timing fit is not observational certainty.')
@@ -160,6 +166,7 @@ def calibrate(ex,dest_string):
         checks.append(dict(control=name,max_event_difference_cms=float(np.max(abs(qc[valid]-ref[valid]))),feature_shift_minutes=(tm-rt)/60,feature_kind=kind))
         if half is None:half=qc
     best['numerical_controls']=checks
+    best.update(native_dt_s=dt,subdivision_multiplier=subdivision,beta_bounds=list(beta_bounds))
     (out/'result.json').write_text(json.dumps(best,indent=2))
     (out/'beta_candidates.json').write_text(json.dumps(list(beta_fits.values()),indent=2))
     (out/'rejected_trials.json').write_text(json.dumps(errors,indent=2))

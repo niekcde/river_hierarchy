@@ -98,6 +98,11 @@ def build_strict_island_analysis_manifest(
         result.loc[index, "topology_review_code"] = decision["review_code"]
         result.loc[index, "topology_review_comment"] = decision["review_comment"]
 
+    # Published target-island equivalences remain excluded on a later refresh.
+    if "separate_observation_excluded" in result:
+        duplicate = result["separate_observation_excluded"].astype(str).str.lower().isin(["true", "1", "1.0"])
+        result.loc[duplicate & result["strict_analysis_status"].eq("include_primary_one_cycle_analysis"), "strict_analysis_status"] = "exclude_duplicate_use_independent"
+
     output_path = root / output_name
     result.to_csv(output_path, index=False)
     summary_path = output_path.with_suffix(".json")
@@ -111,7 +116,8 @@ def build_strict_island_analysis_manifest(
                 "example_id": example_id,
                 "n_observations": int(len(result)),
                 "n_included": int(result["strict_analysis_status"].eq("include_primary_one_cycle_analysis").sum()),
-                "n_excluded": int(result["strict_analysis_status"].eq("exclude_pruning_or_mask_topology_exception").sum()),
+                "n_excluded": int(result["strict_analysis_status"].str.startswith("exclude_").sum()),
+                "n_excluded_duplicates": int(result["strict_analysis_status"].eq("exclude_duplicate_use_independent").sum()),
                 "exclusions": decisions[["island_id", "review_code", "review_comment"]].to_dict("records"),
             },
             indent=2,

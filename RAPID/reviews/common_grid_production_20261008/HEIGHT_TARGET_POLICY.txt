@@ -74,3 +74,17 @@ nominal height refers to the taller crest in the selected two-crest span, with
 both crests retained for shape review; the timing midpoint stays unchanged.
 Authoritative proposal: manual_height_targets_proposal.json and its HTML view.
 No calibration against this confirmed target list has yet been performed.
+
+2026-10-09 — user-authorized bounded-beta check
+User accepted beta in [0.5, 2.0] and requested the new 15-panel figures plus a
+separate example-11 check. Former height ranges/points are soft references; they
+may be missed rather than reducing diffusivity below beta=0.5. No universal
+percentage attenuation range or new observational height target is imposed.
+Timing remains primary. Refit 02/03/05/21/22/46 (all had beta below 0.5), preserving
+their reviewed spatial refinements; retain the other nine existing within-bounds
+fits. The six refits select beta=0.5. These are new review outputs, not an overwrite
+of the previously accepted production bundle.
+Outputs: RAPID/outputs/bounded_beta_calibration_20261009/.
+Separate example 11: RAPID/outputs/bounded_beta_example11_20261009/.
+The 180-point diagnostic scan finds no favorable timing rescue for 11 in these
+bounds; retain its diagnostic status. Read each folder's REPORT.txt for evidence.

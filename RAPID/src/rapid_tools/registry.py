@@ -21,6 +21,8 @@ class RapidStateContext:
     status: str
     depth: int
     state_role: str
+    geometry_release: str | None = None
+    geometry_id: str | None = None
 
 
 def load_state_registry(experiment_dir: str | Path) -> pd.DataFrame:
@@ -31,7 +33,8 @@ def load_state_registry(experiment_dir: str | Path) -> pd.DataFrame:
     frame = pd.read_csv(registry_path)
     if "state_id" not in frame.columns or "state_dir" not in frame.columns:
         raise ValueError(f"State registry {registry_path} is missing required columns.")
-    return frame
+    from network_variants.reviewed_geometry import active_geometry
+    return active_geometry().annotate_state_registry(experiment_path, frame)
 
 
 def _optional_path(value: object) -> Path | None:
@@ -103,4 +106,6 @@ def iter_preparable_states(
             status=status or "complete",
             depth=int(row.get("depth", 0) or 0),
             state_role=state_role or "derived",
+            geometry_release=row.get("geometry_release"),
+            geometry_id=row.get("geometry_id"),
         )

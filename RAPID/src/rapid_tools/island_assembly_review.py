@@ -63,7 +63,7 @@ def plot_case(island,buffer_m=150,show_link_labels=False):
         visible=nodes[nodes.intersects(region)]
         fig.add_trace(go.Scatter(x=visible.geometry.x,y=visible.geometry.y,mode='markers',marker=dict(size=5,color=color),text=[f'C{int(r.id_node)} · {label(r.id_node)}' for r in visible.itertuples()],name='Child nodes',showlegend=False,hovertemplate='%{text}<extra></extra>'),1,col)
         ports=data['parent_nodes'][data['parent_nodes'].id_node.isin(co['boundary_nodes'])]
-        fig.add_trace(go.Scatter(x=ports.geometry.x,y=ports.geometry.y,mode='markers+text',marker=dict(size=11,color='#9b0089',symbol='circle-open',line=dict(width=2)),text=[f'P{int(n)}' for n in ports.id_node],textposition=['top left' if i%2 else 'bottom right' for i in range(len(ports))],textfont=dict(color='#9b0089',size=12),name='Required parent boundaries',legendgroup='boundaries',showlegend=col==1,hovertemplate='%{text}<extra></extra>'),1,col)
+        fig.add_trace(go.Scatter(x=ports.geometry.x,y=ports.geometry.y,mode='markers+text',marker=dict(size=11,color='#9b0089',symbol='circle-open',line=dict(width=2)),text=[f'P{int(n)}' for n in ports.id_node],textposition=[('top left' if r.geometry.x < min((q.geometry for q in ports.itertuples() if q.id_node != r.id_node), key=lambda g: g.distance(r.geometry)).x else 'bottom right') for r in ports.itertuples()],textfont=dict(color='#9b0089',size=12),name='Required parent boundaries',legendgroup='boundaries',showlegend=col==1,hovertemplate='%{text}<extra></extra>'),1,col)
         for r in data['islands'][data['islands'].intersects(region)].itertuples():
             clipped=r.geometry.intersection(region)
             if clipped.area<20:continue
@@ -71,7 +71,11 @@ def plot_case(island,buffer_m=150,show_link_labels=False):
             fig.add_annotation(x=pt.x,y=pt.y,text=txt,showarrow=False,font=dict(color='black' if target else 'white',size=11),bgcolor='#c3c3c3' if target else '#333',opacity=.93,row=1,col=col)
         fig.update_xaxes(range=[bounds[0],bounds[2]],title_text='Easting (m)',showgrid=False,row=1,col=col)
         fig.update_yaxes(range=[bounds[1],bounds[3]],title_text='Northing (m)' if col==1 else None,showgrid=False,row=1,col=col)
-    fig.update_yaxes(scaleanchor='x',scaleratio=1,constrain='domain',row=1,col=1)
+    # Give both panels identical physical scales without conflicting matches/scaleanchor constraints.
+    fig.update_xaxes(matches=None, constrain='domain')
+    fig.update_yaxes(matches=None, constrain='domain')
+    for col, anchor in [(1, 'x'), (2, 'x2')]:
+        fig.update_yaxes(scaleanchor=anchor, scaleratio=1, row=1, col=col)
     for color,name in [('#aaa','Collapsed island footprint'),('black','Remaining islands / land'),('white','Water')]:
         fig.add_trace(go.Scatter(x=[None],y=[None],mode='markers',marker=dict(color=color,size=12,line=dict(color='#555',width=1)),name=name),1,1)
     fig.update_layout(title=dict(text=f'Network 41 · Island {int(island)} · old / repaired<br><sup>{buffer_m:g} m context buffer · hover for link/node IDs · P = original parent; C = child-only node</sup>',x=.03),template='plotly_white',height=900,margin=dict(t=125,b=130,l=85,r=40),legend=dict(orientation='h',x=0,y=-.13,groupclick='togglegroup'),hovermode='closest',meta=dict(state=data['state'],geometry_accepted=True,buffer_m=buffer_m,production_changed=False))
@@ -95,6 +99,6 @@ def static_preview(island,path,buffer_m=150):
         for r in data['islands'][data['islands'].intersects(region)].itertuples():
             pt=r.geometry.intersection(region).representative_point();target=r.island_id==data['state'];ax.text(pt.x,pt.y,str(int(r.island_id.rsplit('_',1)[1])),ha='center',color='black' if target else 'white',fontsize=10,bbox=dict(facecolor='#ccc' if target else '#333',edgecolor='none',alpha=.85))
         for i,r in enumerate(data['parent_nodes'][data['parent_nodes'].id_node.isin(data['contract']['boundary_nodes'])].itertuples()):
-            ax.scatter(r.geometry.x,r.geometry.y,color='#9b0089',s=18);ax.annotate(f'P{r.id_node}',(r.geometry.x,r.geometry.y),xytext=(-5,8) if i%2 else (5,-12),textcoords='offset points',fontsize=9,color='#9b0089',bbox=dict(facecolor='white',alpha=.8,edgecolor='none',pad=1))
+            ax.scatter(r.geometry.x,r.geometry.y,color='#9b0089',s=18);ax.annotate(f'P{r.id_node}',(r.geometry.x,r.geometry.y),xytext=(-8,10) if r.geometry.x < min((q.geometry for q in data['parent_nodes'][data['parent_nodes'].id_node.isin(data['contract']['boundary_nodes'])].itertuples() if q.id_node != r.id_node), key=lambda g: g.distance(r.geometry)).x else (8,-15),ha='right' if r.geometry.x < min((q.geometry for q in data['parent_nodes'][data['parent_nodes'].id_node.isin(data['contract']['boundary_nodes'])].itertuples() if q.id_node != r.id_node), key=lambda g: g.distance(r.geometry)).x else 'left',textcoords='offset points',fontsize=9,color='#9b0089',bbox=dict(facecolor='white',alpha=.8,edgecolor='none',pad=1))
         ax.set(xlim=bounds[::2],ylim=bounds[1::2],title=title,xlabel='Easting (m)');ax.set_aspect('equal')
     axs[0].set_ylabel('Northing (m)');fig.suptitle(f'Network 41 · Island {island}\nGrey: collapsed island · Black: remaining land · White: water',fontsize=14);fig.tight_layout();fig.savefig(path,dpi=140);plt.close(fig)

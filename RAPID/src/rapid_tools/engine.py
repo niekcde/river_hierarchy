@@ -768,3 +768,9 @@ __all__ = [
     "stp_cor",
     "write_qout_netcdf",
 ]
+
+
+def run_master_run(manifest_path, *, workers=2, max_tail_extensions=7):
+    """Run the exact manifest/PREP selection with common-interval outlet storage."""
+    from .master_workflow import run
+    return run(manifest_path, workers=workers, max_tail_extensions=max_tail_extensions)

@@ -184,6 +184,13 @@ def exterior_check(example, parent, child, parent_fp, child_fp, paths):
 
 def run_case(bundle, example, output, *, assets=DEFAULT_ASSETS, pair_limit=0, all_states=False,
              steps=(60, 30), diagnostic_gaps=False, engine_check=False):
+    if pair_limit or all_states:
+        inventory_path = Path(assets)/str(example).zfill(2)/'inventory.csv'
+        inv = pd.read_csv(inventory_path, dtype={'example': str})
+        from network_variants.reviewed_geometry import active_geometry
+        active_geometry().assert_hydraulics_current(inv)
+        if (~inv.status.isin(['ready', 'excluded_topology_review', 'excluded_duplicate'])).any():
+            raise ValueError('Unresolved inventory statuses; review inputs before routing.')
     case = CalibrationCase(bundle, example)
     output = Path(output)/case.example
     output.mkdir(parents=True, exist_ok=False)
@@ -194,11 +201,7 @@ def run_case(bundle, example, output, *, assets=DEFAULT_ASSETS, pair_limit=0, al
     frames = {'base': refined_parameters(case.grid, case.selection)}
     comparisons, checks = [], []
     if pair_limit or all_states:
-        inventory_path = Path(assets)/case.example/'inventory.csv'
-        inv = pd.read_csv(inventory_path)
         paths.extend([inventory_path, REVIEW])
-        if (~inv.status.isin(['ready', 'excluded_topology_review'])).any():
-            raise ValueError('Unresolved inventory statuses; review inputs before routing.')
         inv = inv[inv.status.eq('ready')]
         candidates = inv[inv.parent_state.notna() & inv.parent_state.ne(inv.state)]
         selected = []

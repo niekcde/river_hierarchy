@@ -119,13 +119,15 @@ def parent_row(registry,family,state):
  return rows.iloc[0]
 
 def main(example='03',workers=2,check_only=False,overwrite=False):
+ all_inventory=pd.read_csv(ASSETS/'inventory.csv',dtype={'example':str})
+ from network_variants.reviewed_geometry import active_geometry
+ active_geometry().assert_hydraulics_current(all_inventory)
  if not check_only and (OUT/'completion.json').exists() and not overwrite:
   raise FileExistsError(f'{OUT} already completed; use a new --output-root or --overwrite.')
  OUT.mkdir(parents=True,exist_ok=True)
  if overwrite and not check_only:archive_small_previous(OUT)
- all_inventory=pd.read_csv(ASSETS/'inventory.csv')
- excluded=all_inventory[all_inventory.status.eq('excluded_topology_review')]
- blocked=all_inventory[~all_inventory.status.isin(['ready','excluded_topology_review'])]
+ excluded=all_inventory[all_inventory.status.isin(['excluded_topology_review','excluded_duplicate'])]
+ blocked=all_inventory[~all_inventory.status.isin(['ready','excluded_topology_review','excluded_duplicate'])]
  if len(blocked):raise ValueError(f'{example}: {len(blocked)} states have unresolved input status')
  excluded.to_csv(OUT/'excluded_states.csv',index=False)
  inv=all_inventory[all_inventory.status.eq('ready')].copy()
@@ -210,6 +212,9 @@ def main(example='03',workers=2,check_only=False,overwrite=False):
  (OUT/'completion.json').write_text(json.dumps(finish,indent=2));print(json.dumps(finish),flush=True)
 
 def cli():
+ if '--master-run' in sys.argv[1:]:
+  from rapid_tools.master_workflow import cli as master_cli
+  return master_cli([arg for arg in sys.argv[1:] if arg != '--master-run'])
  # Explicit versioned path: no legacy publication/deletion or obsolete calibration.
  if '--common-grid' in sys.argv[1:]:
   from rapid_tools.common_grid_production import cli as common_grid_cli

@@ -9,8 +9,8 @@ import export_common_grid_plotly as base
 from plotly.offline import get_plotlyjs
 from plotly.utils import PlotlyJSONEncoder
 
-def main():
- dest=Path(json.loads((ROOT/'RAPID/outputs/common_grid_height_calibration_20261008/latest.json').read_text())['directory'])
+def main(dest=None, previous=None, bounded=False):
+ dest=Path(dest) if dest is not None else Path(json.loads((ROOT/'RAPID/outputs/common_grid_height_calibration_20261008/latest.json').read_text())['directory'])
  protocol=json.loads((dest/'protocol.json').read_text());source=Path(protocol['source_directory'])
  panels=base.build(source)
  for p in panels:
@@ -19,6 +19,11 @@ def main():
   old=next(t for t in p['series'] if t['legendgroup']=='cunge_cms')
   original=dict(old);original.update(name='Original Cunge',legendgroup='original_cunge',line=dict(color='#9b7477',dash='dash',width=1.2),opacity=.7)
   original['hovertemplate']=old['hovertemplate'].replace('Cunge model','Original Cunge')
+  if previous is not None:
+   prior=pd.read_parquet(Path(previous)/ex/'wave.parquet').calibrated_cunge_cms.to_numpy()[valid]
+   original['name']='Previous unrestricted fit';original['y']=(prior/q0).tolist()
+   original['customdata']=[[c[0],float(prior[i]),'Previous unrestricted fit'] for i,c in enumerate(old['customdata'])]
+   original['hovertemplate']=old['hovertemplate'].replace('Cunge model','Previous unrestricted fit')
   p['series'].append(original)
   old['name']='Calibrated Cunge';old['y']=(q/q0).tolist()
   old['customdata']=[[c[0],float(q[i]),'Calibrated one-minute mean'] for i,c in enumerate(old['customdata'])]
@@ -51,6 +56,12 @@ def main():
  library=get_plotlyjs()
  for mode in ['full','crest']:
   template='''<!doctype html><html><head><meta charset="utf-8"><title>Calibrated timing and soft heights</title><style>body{font:14px Arial;margin:0;color:#202a34}header,.note{padding:18px 28px}p{line-height:1.5;max-width:1400px}.controls{position:sticky;top:0;background:#f4f6f9;padding:12px 28px;z-index:20;display:flex;gap:14px;align-items:center;flex-wrap:wrap}select,button{font:inherit;padding:7px}#context{padding:8px 28px}#plot{width:100%}</style><script>LIBRARY</script></head><body><header><h1>15-example calibration: timing primary, height soft</h1><p>Red: calibrated Cunge. Dashed muted red: original Cunge. Orange: unchanged fixed-X comparator. Green bands/lines: your height targets. Purple vertical lines: unchanged timing targets. Red diamonds: fitted timing feature (54 uses the two-lobe midpoint).</p><p>Shared initial-forcing scale; downstream alone receives its fixed initial-plateau shift. Hover retains original discharge. Full one-minute data; no decimation. Equilibrium-start base fits; provisional clocks and sampling flags retained. These are review candidates, not hierarchy or final production validation.</p></header><div class="controls"><label>Show <select id="panel"><option value="all">All 15 networks</option></select></label><label>View <select id="view"><option value="full">Complete event</option><option value="crest">Crest detail</option></select></label><button id="reset">Reset view</button><span id="status">Loading…</span></div><p id="context"></p><div id="plot"></div><div class="note"><p>Timing numerical tolerance: 1 minute, not observational uncertainty. Height intervals are modelling acceptance ranges; point targets use a 0.1% numerical search tolerance. 13/37/48 use the proposed ±1% current-height bands. 21/22 source clocks remain provisional; 55 is hourly at its crest. Diagnostic long-interval interpolation is retained and flagged. 05 may retain a soft-target shortfall; consult results. Target intervals were not widened. No production parameters or original results overwritten.</p><p>Self-contained Plotly HTML. Use network selection for a full-width view. Requires a modern browser with gzip decompression support.</p></div><script id="payload" type="application/octet-stream">PAYLOAD</script><script>const DEFAULT_MODE="MODE";SCRIPT</script></body></html>'''
+  if bounded:
+   template=template.replace('Dashed muted red: original Cunge.', 'Dashed muted red: previous unrestricted-beta fit.')
+   template=template.replace('Green bands/lines: your height targets.', 'Green bands/lines: former soft height preferences, now allowed to be missed.')
+   template=template.replace('Height intervals are modelling acceptance ranges; point targets use a 0.1% numerical search tolerance. 13/37/48 use the proposed ±1% current-height bands.', 'Beta is constrained to 0.5–2.0. Former height preferences are retained only as soft comparison references; no height-band pass is required. Timing remains primary.')
+   template=template.replace('Target intervals were not widened.', 'Height-reference misses are explicitly accepted for this bounded-beta check; no new observational targets were invented.')
+   template=template.replace('15-example calibration: timing primary, height soft', '15 networks: beta 0.5–2, timing primary, height soft')
   h=template.replace('"MODE"',json.dumps(mode)).replace('SCRIPT',base.SCRIPT).replace('PAYLOAD',packed).replace('LIBRARY',library)
   path=dest/f'15_panel_calibrated_{mode}.html';path.write_text(h)
   print(path,round(path.stat().st_size/1024**2,1),'MiB',flush=True)

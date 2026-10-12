@@ -1,0 +1,1 @@
+Superseded diagnostic: additional fixed-exterior constraints were withdrawn at user instruction. These historical flags do not indicate failures of the current slope implementation and are not acceptance gates. Use heads_status.csv, current_slope_validation.csv and regeneration_results.csv in the parent directory.

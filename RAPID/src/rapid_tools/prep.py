@@ -1047,6 +1047,8 @@ def prepare_state(
             raise ValueError('Explicit routing regularization requires configured common celerity caps.')
         if planned_routing_dt_seconds is None:
             raise ValueError('Supply an explicit shared planned_routing_dt_seconds for routing regularization.')
+    from network_variants.reviewed_geometry import active_geometry
+    active_geometry().assert_preparation_current(context)
     context.rapid_prep_dir.mkdir(parents=True, exist_ok=True)
 
     links = gpd.read_file(context.link_widths_path)
@@ -1794,3 +1796,9 @@ __all__ = [
     "write_reach_ratios_csv",
     "write_routing_parameter_files",
 ]
+
+
+def prepare_master_run(manifest_path, *, examples=None, max_states=None):
+    """Prepare compact routing jobs from the shared master run manifest."""
+    from .master_workflow import prepare
+    return prepare(manifest_path, examples=examples, max_states=max_states)

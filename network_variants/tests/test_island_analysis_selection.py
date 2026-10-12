@@ -46,3 +46,15 @@ def test_strict_manifest_retains_raw_inventory_and_records_reviewed_exclusion(tm
     summary = json.loads((root / "island_analysis_manifest_strict.json").read_text())
     assert summary["n_included"] == 1
     assert summary["n_excluded"] == 1
+
+
+def test_strict_refresh_preserves_published_duplicate_exclusion(tmp_path):
+    root=tmp_path/'41_island__anchored';root.mkdir()
+    (root/'experiment_manifest.json').write_text(json.dumps({'example_id':'41'}))
+    pd.DataFrame([dict(island_id='island_41_006',separate_observation_excluded=True)]).to_csv(root/'island_analysis_manifest.csv',index=False)
+    review=tmp_path/'review.csv'
+    pd.DataFrame(columns=['example_id','island_id','strict_analysis_status','review_code','review_comment']).to_csv(review,index=False)
+    result=build_strict_island_analysis_manifest(root,review_registry_path=review)
+    assert result.strict_analysis_status.iloc[0]=='exclude_duplicate_use_independent'
+    summary=json.loads((root/'island_analysis_manifest_strict.json').read_text())
+    assert summary['n_excluded']==1 and summary['n_included']==0

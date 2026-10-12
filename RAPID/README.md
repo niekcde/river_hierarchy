@@ -836,3 +836,55 @@ The fixed-X comparison uses the same new grid and corrected inlet, so it is
 a controlled comparison of X formulations rather than a reproduction of the
 historical 200 m production setup. Existing results and production defaults
 are retained. Child runs are outside this assessment.
+
+### Reviewed Cunge batch storage (2026-10-09)
+
+The `cunge_full_hierarchy_reviewed.py --master-run prep/run` CLI publishes
+completed products beside their geometry under
+`<example>_<family>__anchored/states/<state>/rapid/cunge/{prep,run}/`.
+One canonical state owns each unique hydraulic result; aliases have
+`rapid/cunge/reference.json`, and their registry rows point to the canonical
+product. Shared forcing is stored at `<example>_indep__anchored/rapid/cunge/`.
+The active `rapid_prep_registry.csv` and `rapid_run_registry.csv` identify Cunge
+and the compact outlet format explicitly. Outlet CSVs are supplied for the
+existing hydrograph loader; reach-time NetCDF products are not generated.
+
+Before active registries are replaced, their original versions and manifests
+are copied into each experiment's `rapid/legacy_constant_x/`. Existing legacy
+state `rapid/prep/` and `rapid/run/` products stay in place, preserving archived
+registry paths. No legacy discharge files are deleted. Batch folders retain
+checksummed computation outputs and recovery receipts; state publication is
+recorded in `reports/state_publication_{prep,run}.json`.
+
+For already-completed batches, `--master-run publish --manifest <manifest>`
+performs this placement without rerouting. Publishing a different run over an
+existing Cunge product is refused. Smoke tests with `--max-states` do not publish
+partial preparation into active experiment registries.
+
+### Batches including fully collapsed reference sections
+
+Use `RAPID/run_cunge_batch.py prep --examples ...` followed by the same entry
+point with `run --examples ... --workers 2` for future batches. This wrapper
+runs the existing network-family workflow and one fully collapsed Cunge case
+per selected example. It does not modify earlier/running batch manifests or
+their routing implementation. The lower-level `--master-run` entry point is
+network-family-only; use the new wrapper for inclusive future batches.
+
+For previously completed or running network examples, add `--centerline-only`
+to both commands. This prepares/routes only their reference sections and does
+not repeat the network families. Reference products live at
+`<example>_indep__anchored/reference_section/rapid/cunge/{prep,run}/`, with a
+reference-section run registry. Existing legacy outputs are retained.
+
+The collapsed geometry uses its measured routing width and the reference depth
+verified against the current base's anchored depth relationship. Its slope is
+the current base inlet/outlet head drop divided by collapsed geometry length;
+the old reference-section slope summary is not reused. Manning n, beta,
+reference discharge, subdivision policy and initial flow are inherited from
+the frozen calibration. Native time steps respect the same stability rule and
+are no coarser than an available published Cunge network clock; forcing and
+outlet means use the common 60-second grid. Reference cases are comparison
+runs, not separately recalibrated fits. Different native steps and trailing
+settling windows are recorded, while event scoring retains the observation
+window. All 15 reference sections passed input preparation; isolated routing
+checks cover 03, 46 and 54.

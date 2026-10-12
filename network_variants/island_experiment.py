@@ -1025,10 +1025,11 @@ def generate_island_hydraulic_contexts(
         backend = str(row.analysis_backend)
         state_dir = Path(str(row.analysis_state_dir)).resolve()
         strict_status = str(getattr(row, "strict_analysis_status", "")).strip()
-        if strict_status == "exclude_pruning_or_mask_topology_exception":
+        excluded_duplicate = str(getattr(row, "separate_observation_excluded", False)).lower() in {"true", "1", "1.0"}
+        if strict_status == "exclude_pruning_or_mask_topology_exception" or excluded_duplicate:
             records.append({
                 "island_id": island_id,
-                "hydraulic_context_action": "excluded_topology_review",
+                "hydraulic_context_action": "excluded_duplicate_use_independent" if excluded_duplicate else "excluded_topology_review",
                 "hydraulic_context_status": "excluded_from_primary_analysis",
                 "hydraulic_context_dir": "",
                 "link_hydraulic_context_path": "",
