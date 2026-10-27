@@ -54,12 +54,12 @@ def gauge_overlay(example, *, include_model=True, child_run_dir=None, normalize=
 
 
 def select_network_pairs(analysis, example, *, units=None, modes=None, max_pairs=6):
-    """Select explicit (mode, state_id) keys; None means all, capped visibly by caller."""
+    """Honor explicit alias keys; default browsing excludes technical aliases."""
     if not isinstance(max_pairs, int) or isinstance(max_pairs, bool) or max_pairs < 1:
         raise ValueError('max_pairs must be a positive integer')
     ex = str(example).zfill(2)
     frame = analysis.loc[analysis.example_id.astype(str).str.zfill(2).eq(ex)].copy()
-    if 'technical_alias' in frame:
+    if units is None and 'technical_alias' in frame:
         frame = frame.loc[~frame.technical_alias.fillna(False)]
     if modes is not None:
         frame = frame.loc[frame['mode'].isin(modes)]

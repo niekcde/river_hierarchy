@@ -120,11 +120,13 @@ def common_clock(grid, forcing_step_s, *, max_dt_s=15.):
     return forcing_step_s/nsub, nsub
 
 
-def route(frame, flow, nsub, dt, *, return_native=False):
+def route(frame, flow, nsub, dt, *, return_native=False, reach_callback=None):
     """Exact DAG cascade with two-time inlet and held forcing, steady start.
 
     Audits every native subsection. Negative flows are exposed, never clipped;
     callers must reject invalid trials before calibration scoring/publication.
+    Optional reach_callback(link_row_index, zero_based_subreach, native, equilibrium)
+    observes each routed subsection without changing the cascade.
     """
     flow = np.asarray(flow, dtype=float)
     if flow.ndim != 1 or len(flow) < 2 or not np.isfinite(flow).all() or (flow < 0).any():
@@ -153,8 +155,10 @@ def route(frame, flow, nsub, dt, *, return_native=False):
             row = f.iloc[i]
             val = sig*row.split_fraction
             eq = flow[0]*row.reference_flow_fraction
-            for _ in range(int(row['count'])):
+            for subreach_index in range(int(row['count'])):
                 val, _ = lfilter([a[i], b[i]], [1., -d[i]], val, zi=[(b[i]+d[i])*eq])
+                if reach_callback is not None:
+                    reach_callback(i, subreach_index, val, eq)
                 minimum = min(minimum, float(val.min()))
                 if nonnegative_pulse and amplitude:
                     dip = min(dip, (float(val.min())-eq)/(amplitude*row.reference_flow_fraction))

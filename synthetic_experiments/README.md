@@ -1,4 +1,8 @@
+> **Current hydraulic comparison (27 October 2026):** Three integrated methods—fixed BASED, fixed Manning and conservative variable Manning/MCT—use a 2:1 pulse. `branch_width_factor` expands only the internal test corridor; inlet and outlet retain the same reference width. Use `run_depth_comparison.py`, [the runbook](RUNBOOK.md#current-three-method-comparison-27-october-2026), and [the protocol](CUNGE_PROTOCOL.md). New executed sections in the existing notebooks display the completed comparison subsets. Historical fixed-X results and the active legacy selector are preserved; the expanded factorial is planned, not run.
+
 # Controlled synthetic experiments
+
+> **26 October 2026 restart:** the selected September results below remain historical fixed-X results. The current-method Cunge restart protocol and isolated pilot are documented in [CUNGE_PROTOCOL.md](CUNGE_PROTOCOL.md). The active analysis selector has not been promoted.
 
 New synthetic experiment implementation, separate from the preserved legacy
 workflow in `../synthetic_runs/`. Copied generator/plotting provenance is in

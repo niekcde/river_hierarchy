@@ -1,5 +1,7 @@
 # Running controlled synthetic experiments
 
+> **26 October 2026 restart:** the selected September results below remain historical fixed-X results. The current-method Cunge restart protocol and isolated pilot are documented in [CUNGE_PROTOCOL.md](CUNGE_PROTOCOL.md). The active analysis selector has not been promoted.
+
 Run commands from the repository root with the existing scientific environment:
 `/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python`.
 The entry point adds the new package, repository, and shared RAPID to its own
@@ -153,3 +155,88 @@ Tests include topology after collapse, width budgets, path head drops, shared
 segmentation parity, timestep-invariant forcing volume, closed resistance
 comparison domains, uniform-width resistance-ratio invariance, routing parity
 with the shared RAPID file engine, and resumable end-to-end comparisons.
+
+## Current three-method comparison (27 October 2026)
+
+Use `run_depth_comparison.py` for the 2:1 forcing, branch-width factors and conservative variable-depth method. The old `run_experiment.py` still represents historical routing.
+
+```bash
+# Plan the representative configurations and all three methods (does not route).
+python synthetic_experiments/run_depth_comparison.py \
+  --config synthetic_experiments/configs/depth_comparison_20261027.json \
+  --output synthetic_experiments/outputs/my_depth_comparison
+
+# Execute/resume that identical plan.
+python synthetic_experiments/run_depth_comparison.py \
+  --config synthetic_experiments/configs/depth_comparison_20261027.json \
+  --output synthetic_experiments/outputs/my_depth_comparison --run
+
+# A selected case/method (use a separate directory for a different plan).
+python synthetic_experiments/run_depth_comparison.py \
+  --config synthetic_experiments/configs/depth_comparison_20261027.json \
+  --output synthetic_experiments/outputs/my_variable_check \
+  --case narrow_long --method variable_manning --run
+
+# Explicit full-factorial plan; add --run only when intending the full batch.
+python synthetic_experiments/run_depth_comparison.py \
+  --config synthetic_experiments/configs/depth_comparison_20261027.json \
+  --output synthetic_experiments/outputs/my_factorial_comparison --factorial
+```
+
+Run with the river-hierarchy-rivgraph environment. For predictable CPU usage set `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1`. Variable routing requires a C++ compiler, compiled automatically into the temporary cache. No external-drive outputs are written by these commands. Failed/nonconverged runs are not complete. Do not reuse an output directory after changing its inputs or source code; the manifest check rejects mixed provenance.
+
+Review `responses.csv`, `groups/*/state_metrics.csv`, `parameters.csv`, `hydrographs.parquet` and `completion.json`. Geometry and method controls are in the new bottom sections of the existing notebooks. Baseline comparison output is `outputs/depth_methods_20261027`; long-narrow conservative checks are `outputs/depth_methods_stress_20261027`. Point `COMPARISON_OUTPUT` at another completed run to inspect it. The core factorial has not been run or fitted.
+
+## Two local workers — 27 October 2026
+
+The current depth-comparison runner supports `--workers 2` (two local processes,
+not a distributed multi-node scheduler). It caches identical state/tail calculations
+under an exclusive filesystem lock, saves compressed reporting-resolution traces
+and native-derived metrics, and aggregates responses every 100 groups and at the
+end. Numerical settings, tail doubling and convergence checks are unchanged.
+Cache keys include source provenance, prepared frame hashes, hydraulic settings
+and forcing. Raw native traces are not retained in the persistent cache.
+
+```bash
+cd /Users/6256481/Code/river-hierarchy
+caffeinate -i env OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
+  /opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python synthetic_experiments/run_depth_comparison.py \
+  --config synthetic_experiments/configs/depth_comparison_20261027.json \
+  --output /Volumes/PhD/river_hierarchy/synthetic_experiments/outputs/depth_methods_factorial_parallel_20261027 \
+  --factorial --workers 2 --run
+```
+
+Requires at least 40 GiB free on the output filesystem to enter the full factorial
+runner. Before each group, a 5 GiB minimum-free-space check stops additional work
+if necessary. This is a storage guard, not a guaranteed upper bound on storage.
+Free space or choose an output directory on a larger writable volume first.
+Do not run two independent CLI commands into the same output directory: use one
+command with two workers. Resume with the identical command and unchanged source;
+completed groups are reused. If changing output volume, use a new directory or
+copy the entire existing output directory before resuming. Earlier manifests
+from before the runner changes have different provenance and must not be mixed.
+
+Validation: 11 hydraulic tests passed, including exact cached/uncached comparison
+and source-key invalidation. A four-group/two-worker integration run and resume
+passed; all saved hydrographs were bit-for-bit identical to the pre-change
+benchmark. Measured peak RSS: 219–231 MiB per worker for those 20-km cases. Leave
+2–4 GB available for the overall job; these measurements do not bound every
+long-tail configuration. Smoke outputs: `outputs/two_worker_smoke_20261027/run`.
+The full grid was not launched by this validation.
+
+
+### Output location agreed 27 October 2026
+
+Save the full factorial outputs on the PhD drive:
+`/Volumes/PhD/river_hierarchy/synthetic_experiments/outputs/depth_methods_factorial_parallel_20261027`.
+The directory has been created. The manifest, shared cache, group hydrographs,
+parameters, metrics, resource audits, aggregate responses and completion markers
+all follow `--output`. Source/configuration remain in the repository. No full run
+has been started, and earlier local benchmark outputs have not been migrated.
+
+The drive had approximately 105 GiB free at this check. Its allocation unit is
+512 KiB (verified with statvfs and allocated size of an existing small file).
+Consequently, logical-size projections understate space used by the many small
+files; 105 GiB is not a verified sufficient-space guarantee for the whole batch.
+Keep the per-group 5 GiB free-space safeguard. Terminal output can also be saved
+on the drive by piping the command through `tee -a <output-directory>/run.log`.

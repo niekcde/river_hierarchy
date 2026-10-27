@@ -8,7 +8,7 @@ from synthetic_experiments.design import (
 
 @pytest.mark.parametrize("family", FAMILIES)
 def test_baseline_controls(family):
-    net = build_original(family)
+    net = build_original(family, Design(total_width_m=500, total_length_m=20000))
     assert sum(d["w"]*d["length_m"] for *_, d in net.G.edges(data=True)) == pytest.approx(500*20000)
     for path in nx.all_simple_edge_paths(net.G, (0., "main"), (20000., "main")):
         assert sum(net.G.edges[e]["length_m"] for e in path) == pytest.approx(20000)
@@ -16,7 +16,7 @@ def test_baseline_controls(family):
 
 
 def test_length_adjustment_preserves_path_heads():
-    net = build_original("nested")
+    net = build_original("nested", Design(total_width_m=500, total_length_m=20000))
     edge = next(e for e in net.G.edges(keys=True) if net.G.edges[e]["kind"] == "loop")
     before = net.G.edges[edge]["slope"]
     apply_heads_and_lengths(net, 2, {edge: 1.5})

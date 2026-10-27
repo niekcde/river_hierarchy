@@ -1,6 +1,6 @@
 import networkx as nx
 import pytest
-from synthetic_experiments.design import build_original
+from synthetic_experiments.design import build_original, Design
 from synthetic_experiments.collapse import drawable_graph, collapse_selected
 from hierarchy_level_definition.unit_detection.bifurcation_confluence_units import build_structural_units
 
@@ -22,7 +22,7 @@ def units(graph):
     ('crossover','downstream',1,(5000,12000)),('crossover','full',0,None),
 ])
 def test_realized_child_topology_and_controls(family,selection,remaining,extent):
-    original=drawable_graph(build_original(family))
+    original=drawable_graph(build_original(family, Design(total_width_m=500, total_length_m=20000)))
     detected=units(original)
     if selection=='full':
         selected=set().union(*(edges for _,edges in detected))
@@ -54,7 +54,7 @@ def test_main_island_preserves_small_island_and_length(outer,inner,multiplier):
     from synthetic_experiments.design import Design
     from synthetic_experiments.collapse import nested_main_island_edges
     from synthetic_experiments.networks import validate_graph
-    parent=drawable_graph(build_original('nested',Design(outer_a_fraction=outer,
+    parent=drawable_graph(build_original('nested',Design(total_width_m=500, total_length_m=20000, outer_a_fraction=outer,
         inner_fraction=inner,length_multiplier=multiplier)))
     child=collapse_selected(parent,nested_main_island_edges(parent))
     validate_graph(child)

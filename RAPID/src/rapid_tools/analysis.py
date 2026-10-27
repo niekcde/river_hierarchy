@@ -866,6 +866,17 @@ def _load_wave_state(experiment_dir: str | Path, state_id: str) -> _LoadedWaveSt
         raise KeyError(f"State '{state_id}' was not found in {experiment_path / 'rapid_run_registry.csv'}.")
     run_row = row.iloc[0].copy()
 
+    qout_value = run_row.get("qout_nc")
+    if pd.isna(qout_value) or not str(qout_value).strip():
+        raise ValueError(
+            f"State '{state_id}' has no registered reach-time discharge (qout_nc). "
+            f"Its {run_row.get('method', 'unknown')} run uses "
+            f"{run_row.get('output_format', 'an outlet-only format')}. "
+            "Peak-dot animation requires discharge at every reach; outlet hydrographs "
+            "cannot supply it. Generate reach-time outputs with the current run's "
+            "parameters and forcing before animating. Archived RAPID results are not used."
+        )
+
     # Experiments are sometimes archived under a new directory while their run
     # registry retains absolute paths from the original location.  Prefer those
     # registered paths when valid, but transparently use the conventional
@@ -874,6 +885,11 @@ def _load_wave_state(experiment_dir: str | Path, state_id: str) -> _LoadedWaveSt
         registered = _as_path(run_row[column])
         if registered.exists():
             return registered
+        if run_row.get("method") == "cunge":
+            raise FileNotFoundError(
+                f"Registered Cunge artifact is missing: {registered}. "
+                "Refusing to substitute legacy rapid/prep or rapid/run products."
+            )
         fallback = experiment_path / "states" / state_id
         for part in relative_parts:
             fallback /= part

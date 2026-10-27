@@ -16,6 +16,7 @@ class Design:
     total_length_m: float = 10000.0
     internal_location: str = "central"
     length_multiplier: float = 1.0
+    branch_width_factor: float = 1.0
 
     def __post_init__(self):
         if not all(math.isfinite(v) and v > 0 for v in
@@ -27,6 +28,8 @@ class Design:
             raise ValueError("Unknown internal location")
         if not math.isfinite(self.length_multiplier) or self.length_multiplier < 1:
             raise ValueError("Length multiplier must be finite and at least one")
+        if not math.isfinite(self.branch_width_factor) or self.branch_width_factor <= 0:
+            raise ValueError("Branch width factor must be finite and positive")
 
 
 def build_original(family, design=None):
@@ -50,6 +53,14 @@ def build_original(family, design=None):
                          a*(1-design.inner_fraction))
         elif family == "crossover":
             net.add_cross("A", "B", internal_start, internal_end, a*design.inner_fraction)
+    # Apply after the core builder's width-conserving topology operations.
+    # Expand the entire test corridor once, not repeatedly at nested junctions.
+    expansion = 1.0 if family == 'centerline' else design.branch_width_factor
+    for u, v, data in net.G.edges(data=True):
+        if net.G.nodes[u]['x'] >= p.xs and net.G.nodes[v]['x'] <= p.xe:
+            data['w'] *= expansion
+    net.G.graph.update(reference_width_m=p.W_total, branch_width_factor=expansion,
+                       corridor_start_m=p.xs, corridor_end_m=p.xe)
     factors = {}
     for u,v,k,d in net.G.edges(keys=True, data=True):
         target = ((family == "simple" and d.get("branch") == "A") or

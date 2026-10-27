@@ -1,0 +1,120 @@
+{
+  "reference": "SYN-DEPTH-COMPARISON-2026-10-27",
+  "status": "integrated_three_method_comparison",
+  "n_manning": 0.025,
+  "beta": 1.0,
+  "depth_alpha": 0.65,
+  "grid_alpha": 2.0,
+  "grid_n_bounds": [
+    0.01,
+    0.1
+  ],
+  "minimum_celerity_mps": 0.05,
+  "report_seconds": 60,
+  "maximum_native_dt_seconds": 15,
+  "baseflow_cms": 500,
+  "peak_cms": 1000,
+  "rise_hours": 12,
+  "fall_hours": 24,
+  "spinup_hours": 24,
+  "initial_tail_hours": 96,
+  "maximum_tail_hours": 1536,
+  "settling_fraction": 0.001,
+  "settling_guard_hours": 48,
+  "window_fractions": [
+    0.005,
+    0.01,
+    0.02
+  ],
+  "base_geometry": {
+    "total_width_m": 500,
+    "reference_slope": 0.0001,
+    "outer_a_fraction": 0.8,
+    "inner_fraction": 0.5,
+    "length_multiplier": 1.0,
+    "total_length_m": 20000,
+    "internal_location": "central",
+    "branch_width_factor": 1.0
+  },
+  "cases": {
+    "equal_split": {
+      "outer_a_fraction": 0.5
+    },
+    "baseline": {},
+    "narrow_long": {
+      "outer_a_fraction": 0.05,
+      "length_multiplier": 3
+    },
+    "dominant_long": {
+      "outer_a_fraction": 0.95,
+      "length_multiplier": 3
+    }
+  },
+  "subdivision_multiplier": 4,
+  "variable_method_status": "Todini storage-consistent MCT with 2007 corrigendum; native continuity and convergence audited",
+  "allocation_policy": "fixed outgoing width fractions; recombine at confluences; no dynamic conveyance-based reallocation",
+  "source_config": "synthetic_experiments/configs/cunge_pilot_20261026.json",
+  "methods": [
+    "fixed_based",
+    "fixed_manning",
+    "variable_manning"
+  ],
+  "branch_width_factors": [
+    1.0,
+    1.1,
+    1.2
+  ],
+  "segment_length_m": 200,
+  "dt_seconds": 15,
+  "tail_hours": 96,
+  "convergence": {
+    "maximum_tail_hours": 6144,
+    "mass_balance_tolerance": 1e-07,
+    "volume_tolerance": 1e-06,
+    "centroid_seconds": 1.0,
+    "final_excess_fraction": 1e-07
+  },
+  "grid": {
+    "total_width_m": [
+      250,
+      500,
+      1000
+    ],
+    "reference_slope": [
+      5e-05,
+      0.0001,
+      0.0005
+    ],
+    "outer_a_fraction": [
+      0.5,
+      0.8,
+      0.9
+    ],
+    "inner_fraction": [
+      0.2,
+      0.5,
+      0.8
+    ],
+    "length_multiplier": [
+      1.0,
+      1.25,
+      1.5
+    ],
+    "total_length_m": [
+      10000,
+      20000,
+      40000
+    ],
+    "internal_location": [
+      "upstream",
+      "central",
+      "downstream"
+    ],
+    "branch_width_factor": [
+      1.0,
+      1.1,
+      1.2
+    ]
+  },
+  "celerity_policy": "uncapped for all three comparison methods; maintain hydraulic consistency"
+}

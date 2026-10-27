@@ -1,0 +1,4 @@
+# Change log
+
+- 2026-10-19: Recorded research contract before fitting. Implemented separate audit, REML random-intercept companion, equal-network WLS, matched LONO, exclusion/refit sensitivities and network bootstrap. No frozen model or shared notebook edits authorized or required. GAM deferred to a separately documented stage after linear diagnostics.
+- 2026-10-19: Completed first-stage audit, 116 held-network companion fits across four scenarios, eight full-cohort/scenario fits, and 2,000 network draws per model. No bootstrap failures or zero-variance mixed-model boundaries. Independent statsmodels comparisons passed on three cohorts; dedicated notebook cells executed successfully. Corrected a redundant intermediate CSV write and labeled residual ratio axes explicitly as ln(1+child/parent); reran outputs with final source hashes. Documented the substantial linear performance gap and deferred GAM fitting to a separate design extension.

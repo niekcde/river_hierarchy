@@ -70,3 +70,6 @@ RAPID/notebooks/link_*_bank_targets*.png
 /RAPID/reviews/calibration_targets_20261006/review.html
 /RAPID/reviews/common_grid_production_20261008/manual_height_targets_proposal.html
 ~$*.xlsx
+
+# Regenerable export produced by scripts/export_swot_reach_percentiles.py.
+/swot_reach_percentiles.csv

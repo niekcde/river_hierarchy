@@ -60,3 +60,24 @@ def test_common_means_and_explicit_initialization_match_sparse_solver(method):
         previous = np.array([q])
     np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-11)
     assert audit['initial_outlet_cms'] == 2.
+
+
+def test_reach_capture_preserves_routing_and_records_each_subreach():
+    from rapid_tools.cunge import route
+    frame = pd.DataFrame(dict(id_link=[1, 2], u=[0, 1], v=[1, 2],
+        rapid_k=[30., 40.], rapid_x=[0.1, 0.2], count=[2, 3],
+        split_fraction=[1., 1.], reference_flow_fraction=[1., 1.]))
+    flow = np.array([2., 4., 8., 6., 2.])
+    expected, audit = route(frame, flow, 6, 10., return_native=True)
+    captured = {}
+    def capture(i, j, native, initial):
+        captured[i, j] = native.copy()
+        assert initial == 2.
+    actual, captured_audit = route(frame, flow, 6, 10., return_native=True, reach_callback=capture)
+    np.testing.assert_array_equal(actual, expected)
+    assert captured_audit == audit
+    assert set(captured) == {(0, 0), (0, 1), (1, 0), (1, 1), (1, 2)}
+    np.testing.assert_array_equal(captured[1, 2], expected)
+    # The intermediate link is independently reproducible as a truncated network.
+    upstream, _ = route(frame.iloc[:1], flow, 6, 10., return_native=True)
+    np.testing.assert_array_equal(captured[0, 1], upstream)

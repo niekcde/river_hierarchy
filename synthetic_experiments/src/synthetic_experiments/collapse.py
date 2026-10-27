@@ -64,6 +64,7 @@ def collapse_selected(graph, selected):
     h0, h1 = (graph.nodes[n]["head_m"] for n in (start,end))
     stations = sorted({graph.nodes[n]["x"] for n in nodes})
     child = nx.MultiDiGraph()
+    child.graph.update(copy.deepcopy(graph.graph))
     mapping = {n: (graph.nodes[n]["x"], "collapsed") for n in nodes}
     for n,d in graph.nodes(data=True):
         if n not in nodes:

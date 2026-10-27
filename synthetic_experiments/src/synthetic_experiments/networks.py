@@ -82,8 +82,17 @@ def validate_graph(graph):
         if graph.in_degree(node) and graph.out_degree(node):
             incoming = sum(d['w'] for *_,d in graph.in_edges(node,data=True))
             outgoing = sum(d['w'] for *_,d in graph.out_edges(node,data=True))
-            if not np.isclose(incoming,outgoing):
+            x = graph.nodes[node]['x']
+            factor = graph.graph.get('branch_width_factor', 1.0)
+            expected = (factor if x == graph.graph.get('corridor_start_m') else
+                        1/factor if x == graph.graph.get('corridor_end_m') else 1.)
+            if not np.isclose(outgoing, incoming*expected):
                 raise ValueError('Width budget not conserved at junction')
+    reference = graph.graph.get('reference_width_m')
+    if reference is not None:
+        for edges in (graph.out_edges(sources[0], data=True), graph.in_edges(sinks[0], data=True)):
+            if not np.isclose(sum(d['w'] for *_, d in edges), reference):
+                raise ValueError('Inlet and outlet must retain the reference width')
 
 
 def canonical_network(graph):

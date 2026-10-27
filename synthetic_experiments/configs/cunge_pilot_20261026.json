@@ -1,0 +1,50 @@
+{
+  "reference": "SYN-CUNGE-2026-10-26",
+  "status": "pilot_reference_not_full_grid_selection",
+  "n_manning": 0.025,
+  "beta": 1.0,
+  "depth_alpha": 0.65,
+  "grid_alpha": 2.0,
+  "grid_n_bounds": [
+    0.01,
+    0.1
+  ],
+  "minimum_celerity_mps": 0.05,
+  "report_seconds": 60,
+  "maximum_native_dt_seconds": 15,
+  "baseflow_cms": 100,
+  "peak_cms": 1000,
+  "rise_hours": 12,
+  "fall_hours": 24,
+  "spinup_hours": 24,
+  "initial_tail_hours": 96,
+  "maximum_tail_hours": 1536,
+  "settling_fraction": 0.001,
+  "settling_guard_hours": 48,
+  "window_fractions": [
+    0.005,
+    0.01,
+    0.02
+  ],
+  "base_geometry": {
+    "total_width_m": 500,
+    "reference_slope": 0.0001,
+    "outer_a_fraction": 0.8,
+    "inner_fraction": 0.5,
+    "length_multiplier": 1.0,
+    "total_length_m": 20000,
+    "internal_location": "central"
+  },
+  "cases": {
+    "baseline": {},
+    "narrow_long": {
+      "outer_a_fraction": 0.05,
+      "length_multiplier": 3
+    },
+    "dominant_long": {
+      "outer_a_fraction": 0.95,
+      "length_multiplier": 3
+    }
+  },
+  "subdivision_multiplier": 4
+}

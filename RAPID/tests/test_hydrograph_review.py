@@ -23,3 +23,16 @@ def test_native_gauge_event_keeps_its_utc(tmp_path,monkeypatch):
     monkeypatch.setattr(review,'DEFAULT_REFRESH_ROOT',tmp_path)
     h=pd.DataFrame(dict(time_utc=['2024-10-01T00:00:00Z']))
     t,_=review.event_clock('13',h);assert t.iloc[0].year==2024
+
+
+def test_explicit_alias_selection_is_allowed_but_default_is_unique():
+    frame=pd.DataFrame(dict(example_id=['46','46'],mode=['indep','compound'],
+        state_id=['S139_unit_13','CB006_bubble_101'],technical_alias=[False,True],
+        fingerprint=['shared','shared']))
+    selected,omitted=review.select_network_pairs(frame,'46',units=[('compound','CB006_bubble_101')])
+    assert selected.state_id.tolist()==['CB006_bubble_101']
+    assert omitted.empty
+    default,_=review.select_network_pairs(frame,'46')
+    assert default.state_id.tolist()==['S139_unit_13']
+    with pytest.raises(ValueError,match='Unknown units'):
+        review.select_network_pairs(frame,'46',units=[('compound','does_not_exist')])
