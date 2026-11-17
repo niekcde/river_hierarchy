@@ -1,0 +1,53 @@
+Why example 48 differs — input geometry and data-quality audit
+
+CONCLUSION
+The strongest cross-example distinction is pervasive steepness, not uniquely narrow widths. 48 also contains a specific flagged width correction and an uncertain outlet elevation match that deserve review. Neither has been established as a measurement error, and neither alone explains the independent growth seen in uniform analogues of other, uncorrected reaches. No input or solver was changed.
+
+COMPARABILITY
+Do not claim that only 48 can be unstable. The fitted 100/50 m refinement checks completed for 02, 03, 15, 56, 37; they passed under their fitted settings. The broad study also tested a seven-example grid subset at legacy roughness, with many limiter-related rejections, which are not synonymous with instability. Example 22 remains unresolved in timing calibration; its retained-limiter diagnostic conserved mass without negative-depth clipping but had a +320.5 minute timing error. No matched low-n, 25 m test has been performed for every network.
+
+WIDTH AND SLOPE COMPARISON (physical reaches; length weighting prevents cell count bias)
+Example | length-weighted median width m | length-weighted median slope m/km | 90th-percentile slope m/km | maximum slope m/km
+02 | 822.02 | 0.4276 | 0.6275 | 1.8837
+03 | 323.73 | 0.1793 | 0.2601 | 0.3570
+05 | 366.66 | 0.1212 | 0.1784 | 0.3229
+13 | 487.30 | 0.0883 | 0.2926 | 0.6922
+15 | 194.02 | 0.4122 | 0.6477 | 1.0455
+21 | 583.20 | 0.1543 | 0.5107 | 0.6754
+22 | 409.57 | 0.2355 | 0.5007 | 0.7115
+37 | 107.72 | 0.7066 | 0.8807 | 1.4011
+41 | 631.16 | 0.0725 | 0.1227 | 0.1759
+45 | 368.69 | 0.1095 | 0.1472 | 0.3420
+46 | 466.38 | 0.0664 | 0.2491 | 1.8790
+48 | 111.42 | 2.9267 | 3.9848 | 6.0331
+54 | 184.14 | 0.5532 | 1.0238 | 1.6890
+55 | 207.51 | 0.1786 | 0.2171 | 0.3408
+56 | 587.17 | 0.2242 | 0.3008 | 0.3480
+
+48's median slope is 2.927 m/km, 4.14 times the next steepest median. 83.1% of its total modelled channel length exceeds 2 m/km; no physical reach in the other 14 examples exceeds 2 m/km (maximum 1.884 m/km). This is not one isolated steep cell.
+48 and 37 have similar length-weighted median widths (~111 and ~108 m), whereas their median slopes are ~2.93 and ~0.71 m/km. 48's narrowest width is 16.3 m; other examples include widths below this. Total-width discontinuities at its junctions are not uniquely extreme: its largest aggregate ratio is 2.47, versus up to 11.31 elsewhere. Its longest reach (16.6 km) is also not the longest across these networks.
+
+ROUTED HYDRAULICS AND A COMMON-ROUGHNESS SCREEN
+Even at the stricter 48 setting n=0.02582031, 60.8% of its cell-length total has an outgoing internal face Fr>0.6 in the steady starting state; the next largest across the individually selected settings is 1.87%. These are different calibrated n values, so this is descriptive rather than a controlled comparison.
+At the failed 50 m timing-fit setting n=0.02079961, that proportion is 94.9%. Cells are assigned their maximum outgoing internal-face Fr, and then length weighted; this is a screening statistic, not a universal stability threshold.
+Using the SAME n=.020799605931143154 for all examples, normal-depth estimates at each current-MC fixed reference discharge give a length-weighted mean Fr of .773 for 48 versus .168–.408 for the other examples. This is an analytical normal-flow screen, not rerouted local-inertial hydraulics. It supports the distinction being broader than roughness selection alone.
+
+DOES THE STEEP SLOPE LOOK LIKE A PROCESSING ERROR?
+No obvious numerical conversion/sign mismatch was found: positive widths and slopes, exact agreement between stored slope and endpoint-head drop / physical length, and zero shared-node head inconsistencies. A fit through all raw matched WSE values gives 2.957 m/km; the same fit using processed heads gives 2.954 m/km. The preprocessing did not create the overall steepness. These fits use the stored reference distance, and are not independent observations or proof that the profile is correct.
+For reach 65, raw endpoint WSE gives slope 3.574 m/km and the used slope is 3.495 m/km; endpoint match distances are about 79 and 90 m. For long reach 161, raw slope is 1.871 m/km versus used 1.881 m/km, with matches about 21 and 16 m away. Both retain their steepness without the head adjustments. The independent unstable uniform-channel benchmarks used these reaches, not the flagged width-36 reach.
+
+CONCRETE WIDTH FLAG: REACH 36
+Measured wet width 158.5926 m; routing width 21.3196 m; automatic scale factor .13443 (86.6% reduction). Physical length is 122.15 m. Stored quality decision is correct_flag, with reason model_correction_outside_normal_scale_bounds. Width trimming reports no valid core (both endpoint trim methods invalid). Stored manual review says good / requires_correction=0, while the automatic correction was nevertheless applied. This is a provenance discrepancy worth reviewing, not proof that the raw width is hydraulically correct.
+The previous critical-interface audit places the 36→38 connection among the capped faces at legacy MC roughness. This makes the correction hydraulically relevant. In contrast, the widths of reaches 45, 65, 130, 161, 163, 164, 165 and 188 were uncorrected, had valid trimmed cores, zero invalid sample fraction and no corridor consistency flag.
+18 of 189 reaches in 48 have corrections; 5 are flagged. Similar or more numerous/severe corrections exist in other examples, so corrections alone do not uniquely distinguish 48.
+
+CONCRETE ELEVATION FLAG: OUTLET NODE 126
+Its matched SWORD WSE point is 1753.96 m away. Stored raw WSE is 1737.6802 m; processed outlet head is 1733.9613 m, a -3.7189 m adjustment. The existing matching flag nevertheless says within_tolerance=True. This long spatial match deserves checking, especially for reach 188 and the normal-flow boundary slope. The adjustment may be an intentional profile correction; this audit does not establish that it is wrong.
+
+CLARIFICATION OF THE FIRST DRYING LOCATION
+The 133.65 m reach 164 feeds TWO parallel branches: reach 165 is 87.09 m and reach 166 is 116.45 m. Their sum is 203.55 m. The earlier description of a narrowing to reach 165 concerned one branch only; this is not a whole-channel constriction from 134 to 87 m.
+
+RECOMMENDED ORDER
+First review the reach-36 correction against the original imagery/transects and the manual review, and review the outlet WSE match/profile adjustment. Keep measured source fields separate from corrected routing widths. Then perform explicitly labelled sensitivity checks if a plausible alternative input is established. Do not flatten slopes or widen channels simply to stabilise the solver. Regardless of those local flags, the broadly steep raw profile and growth in uncorrected reaches remain evidence that the local-inertial approximation is stressed under the present assumptions.
+
+Limit: this is a consistency/provenance audit, not independent surveying or image-based remeasurement. WSE remains a bed proxy. No claim is made that the observed river is unstable or that any particular source observation is erroneous.

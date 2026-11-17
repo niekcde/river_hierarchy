@@ -1,0 +1,35 @@
+Example 48 — isolated segmentation and timestep tests
+
+SCOPE
+Original local-inertial update and critical-flow cap, normal-flow outlet, fixed n=0.020799605931143154. No calibration or production-data edits. Full reference event; no collapse reruns. Widths, physical reach lengths, endpoint elevations, topology, roughness and forcing unchanged. Every variant independently equilibrated to maximum cell flow imbalance / inlet Q <1e-8. Spinup clipping is recorded separately.
+
+TEST DESIGN
+All grids have a maximum 50 m cell length. Baseline has 2824 cells and shortest cell 22.2692877119 m (reach 79).
+Split79: only reach 79 is split into two 11.13464385595 m cells. Baseline and split79 each run with adaptive CFL .35, then both with 1 s and 0.5 s caps. The adaptive runs are NOT exactly timestep-matched; the split79 1 s cap run also occasionally uses shorter CFL-limited steps. The 0.5 s pair is verified exactly timestep-matched.
+Shift161: replace its 333 equal 49.8570567194 m cells with 334 cells: two endpoint half-cells of 24.9285283597 m and 332 interior cells of 49.8570567194 m. This shifts interior interfaces half a cell while preserving total length and linear bed profile.
+Count161 control: 334 equal cells of 49.7077840945 m in reach 161. This distinguishes the shifted pattern from simply adding a cell.
+All four grid variants take exactly 0.5 s steps throughout in the additional matched comparisons. The preliminary 1 s cap did not provide exact matching for every variant. Minimum dt, maximum dt and step counts verify these matches. These spatial comparisons do not confound different timestep schedules.
+
+RESULTS
+Case | cells | shortest m | first clipping sample h | artificial water million m3 | maximum depth m | peak outlet m3/s
+50 m baseline / 0.5 s | 2824 | 22.269288 | 32.733333333333334 | 9.370277 | 10.739731 | 3368.722043
+50 m baseline / 1 s | 2824 | 22.269288 | 32.56666666666667 | 13.543743 | 10.972395 | 3800.397789
+50 m baseline / adaptive dt | 2824 | 22.269288 | 31.8 | 35.435155 | 12.519678 | 4114.046755
+Reach 161: extra uniform cell / 0.5 s | 2825 | 22.269288 | 32.733333333333334 | 8.666650 | 10.521278 | 3387.642454
+Reach 161: one extra uniform cell / 1 s | 2825 | 22.269288 | 32.56666666666667 | 13.392346 | 10.916620 | 3800.007673
+Shift cells in reach 161 / 0.5 s | 2825 | 22.269288 | 32.733333333333334 | 8.558278 | 10.826988 | 2978.353939
+Shift cells in reach 161 / dt capped at 1 s | 2825 | 22.269288 | 32.583333333333336 | 12.651618 | 10.903449 | 3300.315909
+Split reach 79 / 0.5 s | 2825 | 11.134644 | 32.733333333333334 | 9.513025 | 11.354614 | 3917.924542
+Split reach 79 / dt capped at 1 s | 2825 | 11.134644 | 32.56666666666667 | 13.761492 | 11.329442 | 4075.319733
+Split reach 79 / adaptive dt | 2825 | 11.134644 | 32.333333333333336 | 25.111681 | 12.551044 | 4541.454164
+
+CAUTION
+Clipping adds artificial water. A run with clipping is an invalid hydrograph, even if its water-balance residual after subtracting that clipping is small. Peak values from invalid runs are diagnostics, not valid flood predictions. Their differences cannot rank physical accuracy. First-clipping times are sampled at forcing output intervals, not exact first failing substeps.
+All cases start from independently equilibrated states appropriate to their grid. Tiny floating-point and steady-state differences can affect later unstable trajectories; the robust comparison is whether failure persists, not which chaotic spike is tallest.
+The shift161 test changes endpoint control-volume sizes and reach-interface face distances, as necessarily follows from the new cell layout. It preserves physical endpoint elevations but is not a test with identical discrete junction operators.
+This set does not validate all other networks or test a full shallow-water network solver.
+
+INTERPRETATION
+All ten event runs clip negative depths. All four exactly matched 0.5 s runs first register clipping in the same output interval, 32.7333 hours from forcing start. Splitting reach 79 and changing the cell arrangement/count in reach 161 therefore do not resolve this failure, nor materially move its sampled onset under a matched timestep.
+Reducing the baseline timestep from adaptive CFL .35 to fixed 1 s and then 0.5 s delays sampled onset from 31.8 to 32.5667 to 32.7333 hours and reduces artificial water from 35.4352 to 13.5437 to 9.3703 million m3, but failure remains. This is timestep sensitivity, not evidence of a converged stable solution.
+These tests do not prove that short cells can never matter. They show that the particular shortest cell and the tested grid alignment in reach 161 do not provide a segmentation-only remedy. Together with the previously saved straight-channel full-SWE versus local-inertial benchmark, the results continue to support a broader high-Froude/local-inertial formulation limitation under these assumed hydraulics. No production settings are changed.

@@ -1,0 +1,49 @@
+CURRENT-MC COMPARISON AND HYDRAULIC INVESTIGATION
+
+Correction: the initial broad-study MC curves came from October-13 runs. The accepted six-input quadratic ridge was trained on October-28 fixed-Manning-depth MC runs. Different depths, fitted n, computational cells and (in five selected collapses) bed profiles make these distinct MC configurations. The broad-study full-record ramp-baseline centroid also differs from the predictor target. The earlier smaller-effect trend and example-37 opposite-sign statement cannot be applied to the current MC setup.
+
+ADDITIONAL CALIBRATION DIAGNOSIS: the no-limiter-activation gate is an extra study restriction, not a requirement of the supplied MATLAB code, which deliberately includes the limiter. With it retained, example 48 at n=0.0207996059 has a 100 m timing error of -0.5 min; halving CFL gives -0.5 min. Both event runs conserve volume without negative-depth clipping. However, the 50 m tests at CFL 0.35, 0.175 and 0.0875 produce negative-depth clipping and are rejected. This is evidence of a cap-active numerical robustness problem, not a validated replacement fit. The earlier 53.5-minute limit is conditional on the uncapped acceptance rule, not an established limit of the supplied model. A separate limiter-retained test for 22 is recorded under limiter_retained_22/.
+
+Alignment: the 15 forcing series match exactly by timestamp and value. Current MC wave/parameter files were checked against their completion hashes and frozen under current_mc/. Predictor targets are reproduced independently to <1e-4 minutes using the existing fixed event window, constant baseline and exact piecewise-linear excess-flow moments without clipping. Bed-mismatched cases are excluded until their isolated rerun finishes. No predictor was refitted.
+
+Changed bed profiles (widths, lengths and topology unchanged):
+example         state  reaches  changed_head_reaches  changed_slope_reaches  maximum_head_change_m  maximum_absolute_slope_change  width_length_topology_identical
+     15 S171_unit_163      592                   155                    157               0.557165                       0.000627                             True
+     37 S256_unit_229      923                   892                    894               1.216916                       0.000533                             True
+     37 S274_unit_280      902                   871                    873               2.084973                       0.000401                             True
+     54  S055_unit_44      191                     7                      9               0.354980                       0.000571                             True
+     56   S015_unit_4       43                     3                      5               0.115932                       0.000101                             True
+
+Completed calibrated, geometry-matched cases: 25. Smaller magnitude with the same sign: 4; larger magnitude with the same sign: 20; opposite signs: 1. These are deliberately selected examples, not an independent population sample.
+
+Using one minute only as a descriptive size threshold (not a significance test), 13 effects are larger by more than one minute, 1 smaller by more than one minute, and 11 differ in magnitude by at most one minute. The only >1-minute reduction in the present completed sample is the larger selected collapse in 03; its saved predictor also underestimates the MC magnitude. The other smaller effects differ by only seconds, so counts alone should not be interpreted as a strong association test.
+
+Example 37: current-MC matched window and corrected local beds:
+        state  current_mc_minutes  local_minutes  corrected_bed_run  local_broad_centroid_minutes  legacy_bed_local_broad_centroid_minutes
+S256_unit_229            7.857353      20.090310               True                     27.423384                                31.757401
+S274_unit_280            0.322341      20.295596               True                     27.323805                                34.249210
+
+The older full-record local delays and the current matched-window delays are different metrics, not conflicting estimates. Correcting the beds reduces but does not remove the local delay. The current MC also predicts delays, not the large advances in the legacy reference.
+
+Hydraulic evidence: current-bed steady-storage and reach-flow diagnostics are in 37_current_bed_storage_comparison.csv and 37_current_bed_flow_diagnosis.csv. The larger collapse adds about 3.08 million m3 of local-model storage versus about 0.063 million m3 in a normal-depth calculation retaining fixed MC allocation at the same n and initial inflow. Local flow allocation differs from fixed MC shares; some branches reverse. This supports a storage/redistribution mechanism, but is not a unique attribution to backwater or proof of real-river behaviour. Storage divided by inflow is not asserted to equal flood-wave travel time.
+
+Combined junction diagnostic: four full min-width connections at a symmetric 2-in/2-out node overcount connecting width. Partitioning interface widths restores the 2 m uniform benchmark to 2.22e-15 m error. In the isolated example-37 legacy-bed test at frozen n, changing only those interfaces alters the paired collapse timing effects by at most 0.129 seconds. This does not explain the large delay; the alternative is a sensitivity hypothesis, not an adopted production fix.
+
+Limiter diagnosis: legacy-roughness failures in 15, 22 and 48 activate the cap in steady initial flow before the flood. The capped interfaces are not combined merge/split nodes. At the frozen capped profile, the uncapped stationary momentum balance would demand Fr about 1.09 (15), up to 3.77 (22), and up to 1.10 (48). These are diagnostic demands at that profile, not predictions of an uncapped solution. Smaller timesteps do not remove the steady cap. Increasing n can move a case into the uncapped regime, but does not by itself validate the hydraulics. The limiter is part of the supplied scheme; our strict acceptance rule deliberately excludes active limiting.
+
+Predictor comparison: saved six-input-with-G held-out predictions; no retraining on local-inertial results. Leave-river-out subset summary:
+strategy                                    leave_one_network_out
+repeat                                                          0
+cases                                                          25
+smaller_same_direction                                          4
+underpredicted_among_smaller                                    1
+wrong_prediction_direction_among_smaller                        0
+prediction_closer_to_local                                      8
+mae_vs_mc                                                2.759069
+mae_vs_local                                             6.580468
+
+All five compound-family and network-grouped repeats remain in matched_predictor_repeats.parquet and matched_predictor_summary.csv. Underestimation means a smaller magnitude with the correct sign; wrong signs are reported separately. Comparing predictions with another numerical model is not validation against observations.
+
+Future run: first freeze the current MC input version and common response definition. Audit discharge level/volume separately from timing and shape. Keep geometry fixed; fit n against a declared timing-plus-shape objective, reporting the trade-off and the raw versus predeclared-offset diagnostics separately. Resolve numerical regime issues before allowing calibration to compensate for them. Repeat targeted mesh checks for corrected bed profiles before a final production-grid verdict.
+
+Artifacts: matched_current_mc_plotly.html; 37_diagnostic_plotly.html; matched_current_mc_cases.csv; matched_predictor_summary.csv; limiter_face_diagnosis.csv; observed_fit_offset_diagnostic.csv. The main broad run remains a frozen legacy-reference experiment; its remaining jobs continue independently.

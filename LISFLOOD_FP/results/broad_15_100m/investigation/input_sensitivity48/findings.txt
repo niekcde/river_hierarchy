@@ -1,0 +1,69 @@
+Example 48: reach 36 and outlet input sensitivity
+
+SCOPE
+Input-only diagnostic. Original supplied-type local-inertial kernel with critical-flow cap retained; no positivity limiter, no q-centred smoothing. Fixed n=.020799605931143154, forcing, topology and reach lengths. Each variant re-equilibrated under its own geometry, then run through the same event. Original data and production settings were not edited.
+
+CHANGES TESTED
+W: restore reach 36 wet measured width, 21.319629 -> 158.592645 m. This tests removing the flagged correction; it does not assert the measurement is hydraulically correct.
+R: halve reach 36 head drop while preserving its midpoint elevation. Node 24 falls by .11646 m and node 25 rises by .11646 m; slope 3.813649 -> 1.906824 m/km. Both node values are shared by every incident reach, so slopes of reaches 33,35,36,37,38 change consistently. This is an explicitly artificial sensitivity, not an observation correction.
+O: raise outlet node 126 from 1733.961265 to raw matched WSE 1737.680160 m. Keep upstream node 125 fixed. Terminal reach-188 slope becomes 1.996035 instead of 2.352452 m/km. The normal-flow outlet closure remains in place and uses the updated terminal slope. This tests the geometry AND its consistent normal-flow rating, not a different boundary-condition type.
+All eight W/R/O combinations were tested at 100 and 50 m. Two additional cases use raw WSE at nodes 24/25: 1916.758400 and 1915.692170 m; reach-36 slope then becomes 8.728621 m/km (steeper, not flatter). Raw36 alone and W+raw36+O were run at both grids. W+O and W+R+O were also repeated at 50 m, CFL .175. Total 22 completed event simulations, each with steady-state preparation.
+
+CHECKS
+All variant widths/slopes remain positive; connected reaches retain identical node heads. Actual solver inputs are saved as event_input.npz; copied physical_parameters.parquet includes historical MC metadata that is not used by the dynamic solver. Manning n in the solver and result metadata is authoritative. Every steady state met max cell flow imbalance / inlet flow <1e-8. Spinup clipping is recorded separately and is not silently treated as validation.
+
+RESULTS
+Case | max cell length m | CFL | clipping million m3 | maximum depth m | outlet feature height m3/s | first clipping sample hour
+Baseline | 100 | .35 | 0.00000 | 1.1582 | 297.328 | none
+Width 36 | 100 | .35 | 0.00000 | 1.1582 | 297.327 | none
+Half slope 36 | 100 | .35 | 0.00000 | 1.1582 | 297.328 | none
+Raw outlet | 100 | .35 | 0.00000 | 1.2042 | 297.322 | none
+Width + half slope | 100 | .35 | 0.00000 | 1.1582 | 297.327 | none
+Width + outlet | 100 | .35 | 0.00000 | 1.2042 | 297.322 | none
+Half slope + outlet | 100 | .35 | 0.00000 | 1.2042 | 297.322 | none
+All (half slope) | 100 | .35 | 0.00000 | 1.2042 | 297.322 | none
+Raw heads 36 | 100 | .35 | 0.00000 | 1.1582 | 297.327 | none
+All (raw heads) | 100 | .35 | 0.00000 | 1.2042 | 297.322 | none
+Baseline | 50 | .35 | 33.81409 | 13.1254 | 4259.399 | 31.800
+Width 36 | 50 | .35 | 27.82289 | 12.6221 | 4275.476 | 32.217
+Half slope 36 | 50 | .35 | 37.12959 | 13.1585 | 4405.565 | 31.733
+Raw outlet | 50 | .35 | 29.10362 | 13.1409 | 3654.401 | 31.800
+Width + half slope | 50 | .35 | 27.74799 | 13.3658 | 5395.335 | 32.217
+Width + outlet | 50 | .35 | 23.34121 | 13.2123 | 4530.564 | 32.217
+Half slope + outlet | 50 | .35 | 32.32413 | 12.4470 | 3692.230 | 31.733
+All (half slope) | 50 | .35 | 23.42006 | 13.4847 | 4403.845 | 32.217
+Raw heads 36 | 50 | .35 | 25.55924 | 12.9741 | 4540.761 | 32.500
+All (raw heads) | 50 | .35 | 19.06510 | 13.9467 | 3780.619 | 32.267
+Width + outlet | 50 | .175 | 10.10088 | 11.8754 | 2895.056 | 32.46666666666667
+All (half slope) | 50 | .175 | 10.23450 | 11.9137 | 2910.046 | 32.63333333333333
+
+INTERPRETATION
+Every 100 m event remains free of negative-depth clipping. Every tested 50 m event still clips negative depths, including combined changes and smaller-CFL controls. These 50 m hydrographs are invalid predictions: clipping creates water. Differences in spike size or clipping volume are not treated as a ranking of input plausibility; the unstable trajectories can depend on very small initial-state differences.
+
+LOCAL RESPONSE (50 m steady state; maximum outgoing-face Fr includes reach-end faces)
+Baseline
+  Reach 36: mean depth 0.68278 m; maximum outgoing-face Fr 1.00000; terminal reach flow 36.1199 m3/s.
+  Reach 65: mean depth 0.84605 m; maximum outgoing-face Fr 0.91643; terminal reach flow 150.6143 m3/s.
+  Reach 161: mean depth 1.07696 m; maximum outgoing-face Fr 0.94658; terminal reach flow 264.8003 m3/s.
+  Reach 188: mean depth 1.06934 m; maximum outgoing-face Fr 0.75300; terminal reach flow 264.8003 m3/s.
+Width 36
+  Reach 36: mean depth 0.36614 m; maximum outgoing-face Fr 0.75024; terminal reach flow 74.8735 m3/s.
+  Reach 65: mean depth 0.84605 m; maximum outgoing-face Fr 0.91643; terminal reach flow 150.6143 m3/s.
+  Reach 161: mean depth 1.07696 m; maximum outgoing-face Fr 0.94658; terminal reach flow 264.8003 m3/s.
+  Reach 188: mean depth 1.06934 m; maximum outgoing-face Fr 0.75300; terminal reach flow 264.8003 m3/s.
+Raw outlet
+  Reach 36: mean depth 0.68278 m; maximum outgoing-face Fr 1.00000; terminal reach flow 36.1199 m3/s.
+  Reach 65: mean depth 0.84605 m; maximum outgoing-face Fr 0.91643; terminal reach flow 150.6143 m3/s.
+  Reach 161: mean depth 1.07696 m; maximum outgoing-face Fr 0.94658; terminal reach flow 264.8003 m3/s.
+  Reach 188: mean depth 1.12336 m; maximum outgoing-face Fr 0.69934; terminal reach flow 264.8003 m3/s.
+All (half slope)
+  Reach 36: mean depth 0.41032 m; maximum outgoing-face Fr 0.58105; terminal reach flow 75.7180 m3/s.
+  Reach 65: mean depth 0.84605 m; maximum outgoing-face Fr 0.91643; terminal reach flow 150.6143 m3/s.
+  Reach 161: mean depth 1.07696 m; maximum outgoing-face Fr 0.94658; terminal reach flow 264.8003 m3/s.
+  Reach 188: mean depth 1.12336 m; maximum outgoing-face Fr 0.69934; terminal reach flow 264.8003 m3/s.
+
+The restored width improves local conditions at reach 36; the adjusted outlet reduces the terminal slope and changes depth there. These local improvements do not eliminate the broader unstable regime. This supports the prior straight-channel benchmark evidence that the problem is not solely a bottleneck at reach 36 or this particular outlet elevation adjustment.
+It does NOT establish that the original width correction or outlet match is correct, or that no conceivable geometry/boundary alternative could help. No independent remapping or elevation survey was performed. The raw WSE alternative is not a verified bed elevation.
+
+DECISION
+None of these input variants is promoted into the production setup. Review the flagged width and outlet match on their own observational merits; do not tune them to suppress instability. The tested corrections are insufficient to make the current local-inertial formulation reliable at 50 m under the fixed roughness and forcing. A 25 m follow-up was not warranted because no 50 m variant passed the basic no-clipping requirement.

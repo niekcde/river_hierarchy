@@ -1,0 +1,239 @@
+BROAD LOCAL-INERTIAL ROUTING STUDY — 100 m working maximum
+
+
+
+COMPARISON CORRECTION (16 November): MC curves and mc_* columns below use the legacy October-13 reference, not the current fixed-Manning-depth MC setup used to train the accepted six-input predictor. The current MC also uses different collapsed bed profiles in five selected states. Do not interpret the legacy smaller-effect trend or example-37 sign reversal as a comparison against the current MC. See investigation/matched_current_mc_cases.csv and investigation/matched_current_mc_plotly.html for the matched centroid-window audit. Geometry-mismatched states are excluded from its strict comparison until rerun.
+
+CALIBRATION INTERPRETATION: unresolved statuses below are conditional on the strict no-limiter-activation gate. The supplied MATLAB scheme includes a critical-flow limiter. A separate limiter-retained example-48 diagnostic fits timing to -0.5 min at 100 m, also reproduced at half CFL, but 50 m checks produce negative-depth clipping and are not accepted. Thus the 53.5-minute uncapped offset is not a proven intrinsic calibration limit; the cap-active numerical regime needs further verification. See investigation/limiter_retained_48_fit.json.
+
+
+
+Completed original attempts: 15/15; calibration attempts: 15/15; timing-calibrated: 13; selected collapse attempts: 30/30; accepted: 30; fixed-roughness grid cases: 63/63 (including reused 100 m originals).
+
+
+
+Scope and comparability
+
+All 15 original networks; two geometrically selected collapses per example, nearest approximately 5% and 30% reduction in physical reach count. Grid subset: 02, 15, 22, 37, 46, 48, 56 at maximum lengths 200, 100 and 50 m. Selection precedes model outcomes. Full production across 2,202 saved network states is deferred.
+
+100 m is a maximum cell length, not a minimum. Each physical reach is divided into ceil(L/100) equal cells. Short physical reaches remain intact. MC retains its own original computational segmentation; both methods use the same physical network, forcing, measured widths and saved slopes.
+
+The solver is the audited custom Python CPU translation of the supplied MATLAB local-inertial method. It is not the official LISFLOOD-FP executable and does not solve the advective momentum term. Prior example-56 MATLAB agreement applies to the adapted CPU MATLAB method with aligned forcing and normal-flow closure, not the unchanged supplied GPU script. This broader study runs Python. Generalized three-way connectivity passed an analytical symmetric steady-flow check.
+
+MC uses fixed width-proportional split fractions and reference hydraulic depths; its fitted n changes celerity at fixed depth. The local-inertial model solves evolving depths and pressure-driven interface flows, so the bifurcation shares can change. Calibration values need not coincide between these formulations, and differences in collapse response cannot be attributed to backwater alone without further flow-field diagnostics.
+
+The MC depth column is its stored reference hydraulic depth; the local-inertial maximum is the maximum evolving water depth across cells and time. These are different quantities and should not be treated as two observed flood-depth estimates.
+
+Widths and proxy bed elevations are fixed; slopes reconstructed from endpoints exactly match saved slopes and node elevations are consistent across all originals. Bed elevations remain the previously agreed water-surface proxies. The downstream boundary is evolving normal flow Q=B h^(5/3) sqrt(S)/n, using terminal physical slope. No outlet extension or 200 m floor is introduced in this experiment.
+
+Steady initial flow is solved until maximum node imbalance / max(inflow,1) <1e-8. Held one-minute upstream forcing is integrated to one-minute outlet means. The full buffered MC forcing horizon is used for final runs.
+
+
+
+Metric definitions
+
+Collapse effects are child minus original; negative timing changes mean earlier passage. Peak timing uses a local quadratic interpolation around the global maximum, and is distinct from the reviewed calibration feature (especially the two-lobe midpoint in 54). The centroid uses positive excess above the common upstream baseline ramp between input-event start and end. Rising50/falling50 are crossing times at half each hydrograph’s peak excess above its initial discharge; they are not limb durations. All metrics use full one-minute output, not the reduced plotting data.
+
+
+
+Calibration and numerical acceptance
+
+Only Manning n is fitted, uniformly per original network, within 0.01–0.10. Smaller-network scan: 0.01, 0.0175, 0.025, 0.04, 0.07, 0.10 and the original MC n; sign-changing valid timing brackets are refined. Unresolved targets near an accepted/rejected roughness frontier receive up to nine additional bisections and timing-bracket refinement. For expensive networks 22, 37, 41, 46 and 55, calibration instead reuses the original full run and starts in the timing-correction direction at 0.75 or 1.25 times the MC n, expanding by a factor of 1.5 only when needed within the same bounds. Existing completed trials are retained. This is a local timing search, not an exhaustive search for all possible peak switches. The reviewed downstream crest-time feature is retained, including the two-lobe midpoint for 54 and middle chronological equal maximum for 48. Features are evaluated within the observed downstream time coverage from the input-event start, allowing downstream peaks after the upstream event ends. Search runs omit unnecessary long tails; the selected n is rechecked over the full horizon.
+
+A timing fit requires error <=1 minute. Height is a secondary selector among timing-feasible candidates, not a fitted second parameter. Raw RMSE/NSE are reported separately over observation-supported intervals without baseline adjustment. Timing agreement is not whole-hydrograph or independent validation. The selected n is frozen for the two collapses; transfers from an unresolved parent fit remain diagnostic.
+
+CFL starts at 0.35, with 0.175 and 0.0875 retries if needed. Event runs must have no active critical-flow cap, <1e-6 m3 depth-clipping addition and relative volume residual <1e-9. A cap-active steady initial state is recorded as outside this strict verified regime, without redundant time-step retries. A limiter rejection is not proof that the supplied capped algorithm is universally invalid; it prevents silently accepting a regime not validated by the prior study. Reverse internal discharge is diagnosed, not automatically rejected.
+
+Fitted original/collapse comparisons use the smallest accepted CFL required by that example: successful higher-CFL runs are repeated at this common setting, and the original timing fit is rechecked. Fixed-MC-roughness mesh tables retain their recorded CFL; differing CFL values must be recognized as combined space/time-step sensitivity, not pure spatial convergence.
+
+Tail settling is checked against 0.1% of the upstream flow range over the last 48 hours. Unsettled cases must not support centroid conclusions until their tails are extended.
+
+
+
+Calibration results
+
+example                   status     mc_n  selected_n  timing_error_minutes          feature_kind  height_distance_cms  raw_downstream_nse  mc_stored_reference_depth_max_m  maximum_depth_m     seconds
+     02        timing_calibrated 0.066712    0.057350              0.500000 single_smoothed_crest             0.000000            0.041992                         7.851254         7.218304   30.243095
+     03        timing_calibrated 0.043126    0.065969              0.000000 single_smoothed_crest            84.874333            0.387184                         4.169051         9.776161   47.558610
+     05        timing_calibrated 0.042388    0.054548             -0.500000 single_smoothed_crest            77.308925            0.615062                         4.264548         4.568937   98.019615
+     13        timing_calibrated 0.019666    0.013798              0.000000 single_smoothed_crest             0.000000          -11.379127                         4.315969         1.749625  136.363440
+     15        timing_calibrated 0.014309    0.016759              0.366667 single_smoothed_crest             0.000000           -2.801267                         3.234177         3.469869  216.510040
+     21        timing_calibrated 0.023948    0.037728             -0.500000 single_smoothed_crest            17.033850           -0.714337                         8.289446        14.976703  163.921719
+     22 timing_target_unresolved 0.014721    0.028465           1394.500000 single_smoothed_crest           209.598776          -36.273792                        12.155696        14.834057 1269.347067
+     37        timing_calibrated 0.029428    0.038698              0.500000 single_smoothed_crest             0.000000          -10.819839                         3.845323         4.470198  468.593127
+     41        timing_calibrated 0.020998    0.017288             -0.500000 single_smoothed_crest             0.000000           -3.087686                        10.072763         6.013115 1462.857244
+     45        timing_calibrated 0.021943    0.024471              0.500000 single_smoothed_crest             0.477369            0.261197                         3.572568         3.254992   94.213163
+     46        timing_calibrated 0.017839    0.018145              0.500000 single_smoothed_crest           117.848612            0.879872                         5.790528         4.280771  983.120351
+     48 timing_target_unresolved 0.023573    0.025820             53.500000  middle_equal_maximum             0.000000           -3.169939                         2.028893         1.318079   24.186255
+     54        timing_calibrated 0.030023    0.037649              0.000000     two_lobe_midpoint            24.773169            0.956987                         4.501705         4.833141  175.052945
+     55        timing_calibrated 0.027477    0.029164              0.500000 single_smoothed_crest             0.000000            0.760736                         2.576842         3.703929  620.396587
+     56        timing_calibrated 0.020447    0.025244             -0.500000 single_smoothed_crest             0.000000            0.970864                         2.598668         2.950296   52.142560
+
+
+
+Original runs at MC roughness
+
+example  valid        n  timing_error_minutes  maximum_depth_m  maximum_face_froude     seconds
+     02   True 0.066712                 158.5         7.834748             0.264400   17.095198
+     03   True 0.043126                -151.0         7.687217             0.199952   19.251786
+     05   True 0.042388                -742.5         3.990303             0.181956   39.518409
+     13   True 0.019666                1029.0         2.152620             0.548241   54.918742
+     15  False 0.014309                   NaN              NaN                  NaN   37.278036
+     21   True 0.023948                -252.5        11.481408             0.820967   31.799593
+     22  False 0.014721                   NaN              NaN                  NaN  431.527926
+     37   True 0.029428                -521.5         3.795357             0.673933  370.075389
+     41   True 0.020998                 535.5         6.737609             0.284234 1604.080455
+     45   True 0.021943                -174.5         3.067806             0.298917   98.899129
+     46   True 0.017839                 -76.5         4.246863             0.725469 2328.681961
+     48  False 0.023573                   NaN              NaN                  NaN    7.921244
+     54   True 0.030023                -134.5         4.277643             0.624939  173.189367
+     55   True 0.027477                -135.5         3.577683             0.265015  902.302048
+     56   True 0.020447                -132.5         2.601471             0.374005   52.623763
+
+
+
+Grid comparison: differences in collapse effects, 100 m minus 50 m (minutes)
+
+example           state       peak  centroid  rising50  falling50
+     02  CB002_bubble_2   0.112151  0.137082  0.132957   0.106979
+     02  CB004_bubble_1   0.093742  0.118008  0.111200   0.127909
+     37   S256_unit_229   0.256232  0.020052 -0.016690   0.068696
+     37   S274_unit_280 395.598740  0.194791  0.192285   0.155455
+     46 CB001_bubble_90   0.052097  0.025172 -0.003029   0.109248
+     46    S178_unit_44  -0.024610 -0.059496 -0.057291  -0.007515
+     56  CB001_bubble_8   0.172496  0.209276  0.184617   0.187604
+     56     S015_unit_4   0.095381  0.105825  0.096990   0.094333
+
+
+
+Grid differences are numerical-sensitivity diagnostics at fixed MC roughness. They do not prove asymptotic convergence for every fitted n. Small collapse signals can have large relative uncertainty even when absolute differences are small. The 100 m working choice is retained as requested; failures and larger sensitivities must remain visible before the full production run.
+
+
+
+Unsettled final tails: 0
+
+
+
+Selected-roughness original versus MC reference
+
+example                   status  local_minus_mc_peak_height_percent  local_minus_mc_peak_minutes  local_minus_mc_centroid_minutes  local_minus_mc_rising50_minutes  local_minus_mc_falling50_minutes
+     02        timing_calibrated                            8.693331                    -2.268971                        92.025203                       337.296445                               NaN
+     03        timing_calibrated                            0.242923                     0.147459                        94.062821                        92.041437                         64.800812
+     05        timing_calibrated                            0.496101                    -2.022823                       528.452103                       616.060129                        449.777509
+     13        timing_calibrated                            0.979600                    -0.508612                       239.833901                       346.423468                        122.957020
+     15        timing_calibrated                            2.148730                    -0.398981                        76.034281                       132.741693                       -246.672596
+     21        timing_calibrated                           -0.010038                    -0.451295                       164.256165                        80.472863                         88.893316
+     22 timing_target_unresolved                           -0.312591                  1390.845742                      1076.203678                      1225.030651                       1510.197390
+     37        timing_calibrated                            0.303227                    -0.324297                        80.243876                       100.572659                         51.204361
+     41        timing_calibrated                            0.770837                    -0.625346                       358.646654                       383.835013                        118.995994
+     45        timing_calibrated                           -0.066135                     0.563068                       137.326127                        88.289273                        112.801456
+     46        timing_calibrated                            8.894183                   -23.688559                      -601.291799                       509.944857                        277.458408
+     48 timing_target_unresolved                            0.086976                    52.986285                        64.562662                        61.556111                         57.185069
+     54        timing_calibrated                            1.634690                  -666.811342                       172.127715                       231.807725                               NaN
+     55        timing_calibrated                            0.606301                     0.156642                       645.329633                       443.168435                        434.726535
+     56        timing_calibrated                            0.480916                     0.007067                       290.699731                       190.861684                         49.320783
+
+Timing differences in this table are local inertia minus MC, in minutes. Both models retain their own reference parameterization; half-height crossings also reflect differences in hydrograph shape and height.
+
+
+
+Selected collapse effects versus MC
+
+example           state parent_calibration_status  peak_change_minutes  mc_peak_change_minutes  centroid_change_minutes  mc_centroid_change_minutes  rising50_change_minutes  mc_rising50_change_minutes  falling50_change_minutes  mc_falling50_change_minutes
+     02  CB004_bubble_1         timing_calibrated             0.231171               -7.950997                 0.216070                   -9.013263                 0.158332                   -7.259502                  0.312744                          NaN
+     02  CB002_bubble_2         timing_calibrated            -3.306007              -30.319300                -4.020297                  -31.961124                -3.601499                  -23.595743                 -4.858395                          NaN
+     03    S030_unit_30         timing_calibrated            -3.034324              -15.318422                -5.280366                  -15.189570                -2.701560                  -11.204309                 -7.014002                   -18.862006
+     03 CB001_bubble_14         timing_calibrated            -1.433770              -32.238658                -2.747318                  -34.889488                -1.584389                  -22.940589                 -3.289478                   -46.927955
+     05 CB001_bubble_14         timing_calibrated           -20.430891              -54.205570               -18.396725                  -46.932938               -15.480469                  -42.073224                -24.138350                   -54.514699
+     05    S025_unit_11         timing_calibrated            -5.711228              -14.360556                -5.145122                  -12.500154                -4.300227                  -11.256770                 -6.822410                   -14.390178
+     13    S045_unit_37         timing_calibrated            -9.230681              -24.062821                -9.791178                  -25.388809                -8.928146                  -23.186000                 -9.522465                   -24.097648
+     13 CB001_bubble_28         timing_calibrated           -13.066293              -48.782173               -14.114164                  -51.455156               -13.185014                  -46.987559                -13.400620                   -48.852252
+     15   S171_unit_163         timing_calibrated            -1.831339              -12.071638                -2.536159                  -12.898794                -2.122314                  -11.875763                 -2.058682                   -12.415387
+     15  CB002_bubble_3         timing_calibrated           -28.244518              -69.862168               -34.957302                  -74.601028               -30.236360                  -68.588987                -32.171262                   -72.317055
+     21    S009_unit_12         timing_calibrated            -2.253314               -6.207877                -2.451223                   -6.180009                -2.330735                   -6.083385                 -2.492769                    -6.525089
+     21 CB002_bubble_10         timing_calibrated            -1.708658               -4.009710                -1.811893                   -4.797145                -1.740585                   -3.689669                 -1.920640                    -5.831224
+     22    S288_unit_17  timing_target_unresolved            12.371644               58.077270                10.516358                   39.687521                13.831917                   30.023911                 11.014649                    53.300841
+     22 CB002_bubble_11  timing_target_unresolved          -118.271332             -119.838390              -114.074065                 -100.942959              -108.443746                 -108.399725               -132.107925                  -113.223092
+     37   S256_unit_229         timing_calibrated            18.572455              -35.097714                31.757401                  -34.255655                29.015911                  -32.702502                 33.750303                   -37.325254
+     37   S274_unit_280         timing_calibrated            21.042098              -59.114706                34.249210                  -49.467463                30.981019                  -42.464339                 36.282558                   -57.386200
+     41 CB006_bubble_22         timing_calibrated            -7.702847              -43.884305                -7.735654                  -40.353144                -6.792152                  -35.276057                 -8.513092                   -47.525741
+     41 CB001_bubble_13         timing_calibrated           -13.054926              -72.636783               -14.606859                  -67.235028               -13.875455                  -65.499821                -14.488332                   -75.457918
+     45 CB004_bubble_24         timing_calibrated            -7.647567              -39.324902                -7.573730                  -36.393997                -6.527543                  -33.211911                 -9.026105                   -42.079788
+     45 CB001_bubble_12         timing_calibrated            -6.288939              -54.549381                -6.315860                  -50.453130                -5.573119                  -45.450971                 -7.302091                   -59.104611
+     46 CB001_bubble_90         timing_calibrated          -144.270166             -156.115948              -147.005413                 -117.349393              -127.497500                 -144.640112               -183.578070                  -176.470302
+     46    S178_unit_44         timing_calibrated          -133.000685             -138.308572              -135.712678                 -105.634700              -118.461703                 -127.250879               -168.654327                  -158.157583
+     48    S052_unit_37  timing_target_unresolved            -0.966871               -2.651384                -1.052671                   -2.774667                -1.009533                   -2.665812                 -1.071505                    -2.741227
+     48 CB001_bubble_18  timing_target_unresolved            -3.992369               -9.060381                -4.273340                   -9.446686                -4.109198                   -9.090023                 -4.275669                    -9.310306
+     54    S055_unit_44         timing_calibrated            -5.086951               -2.864015                -5.654714                   -2.387896                -5.893150                   -2.511454                       NaN                          NaN
+     54  CB001_bubble_4         timing_calibrated            -2.148381               -9.513482                -2.502322                  -12.764749                -2.620756                  -12.559604                       NaN                          NaN
+     55 CB003_bubble_29         timing_calibrated           -11.596159              -71.034301               -13.658067                  -72.680856               -13.821456                  -76.158908                -13.713117                   -76.668963
+     55 CB001_bubble_38         timing_calibrated           -14.746383             -102.306943               -17.604525                 -105.344730               -17.884067                 -110.255628                -17.681270                  -111.012673
+     56     S015_unit_4         timing_calibrated            -7.096548              -36.606970                -8.506225                  -36.336736                -7.588645                  -35.472632                 -8.696736                   -41.414287
+     56  CB001_bubble_8         timing_calibrated           -12.583197              -41.731162               -15.136466                  -41.471303               -13.573355                  -40.494677                -15.230310                   -47.060404
+
+Missing half-height crossings are left undefined. Unresolved parent calibrations are diagnostic comparisons, not successful calibrated transfers.
+
+
+
+Combined merge/split junction diagnostic
+
+Original networks 15, 22 and 37 contain simultaneous merge/split nodes, absent from 56. An independent constant-width uniform-Manning test compares separate parallel middle nodes with a shared 2-in/2-out node. Both versions start with mass-balanced interface fluxes. The separate-node control preserves 2 m depth to roundoff. With the inherited pairwise min-width interfaces, the shared-node case departs from that ideal uniform equilibrium; the final maximum depth departure after 24 hours is listed below. It decreases approximately linearly with cell length. This exposes a finite-grid junction bias, not a mass-conservation failure or a proven explanation of the real-network limiter rejections. The identified capped interfaces are elsewhere. No junction rule was changed in the study.
+
+ shared_middle_node  max_length_m   cfl  maximum_final_depth_departure_m
+              False           200 0.350                     4.440892e-16
+              False           100 0.350                     2.220446e-15
+              False            50 0.350                     1.776357e-15
+              False            25 0.350                     7.105427e-15
+               True           200 0.350                     1.366925e-01
+               True           100 0.350                     7.176176e-02
+               True            50 0.350                     3.670391e-02
+               True            25 0.350                     1.855279e-02
+               True           100 0.175                     7.176176e-02
+
+
+
+Targeted 100 m versus 50 m checks at fitted roughness
+
+example           state        n  timing_error_100_minutes  timing_error_50_minutes  valid  peak_original_100_minus_50_minutes  peak_effect_100_minus_50_minutes  centroid_original_100_minus_50_minutes  centroid_effect_100_minus_50_minutes  rising50_original_100_minus_50_minutes  rising50_effect_100_minus_50_minutes  falling50_original_100_minus_50_minutes  falling50_effect_100_minus_50_minutes
+     02  CB002_bubble_2 0.057350                  0.500000                -0.500000   True                            0.669540                          0.100750                                0.353088                              0.125243                               -0.329839                              0.122164                                 3.271052                               0.104326
+     03 CB001_bubble_14 0.065969                  0.000000                 1.000000   True                           -0.410717                          0.068442                               -0.311120                              0.142847                               -0.461522                              0.090895                                -0.195016                               0.152704
+     15  CB002_bubble_3 0.016759                  0.366667                 0.366667   True                           -0.277535                          0.097264                               -0.451413                              0.099044                               -0.360742                              0.094605                                 0.308531                               0.095638
+     56  CB001_bubble_8 0.025244                 -0.500000                -0.500000   True                           -0.078692                          0.181549                               -0.424170                              0.233917                               -0.273175                              0.206852                                 0.248372                               0.224759
+     37   S274_unit_280 0.038698                  0.500000                 2.500000   True                           -2.405827                          0.522370                               -1.050583                              0.249299                               -1.303644                              0.196488                                -0.924687                               0.296168
+
+Original timing shifts and shifts in collapse effects are reported separately. The selected checks cover 02, 03, 15, 37 and 56; only completed checks appear in this table. They are not a fitted-roughness mesh study of all 15 networks.
+
+
+
+Runtime forecast
+
+example  states  estimated_serial_hours  same_original_cost_hours  original_measured_seconds
+     02      37                0.306077                  0.310832                  30.243095
+     03      42                0.543668                  0.554850                  47.558610
+     05      53                1.412055                  1.443067                  98.019615
+     13      68                2.592111                  2.575754                 136.363440
+     15     264               15.814043                 15.877403                 216.510040
+     21      32                1.391952                  1.457082                 163.921719
+     22     410              144.223319                144.564527                1269.347067
+     37     398               51.129523                 51.805574                 468.593127
+     41     184               74.888135                 74.768259                1462.857244
+     45      95                2.463404                  2.486181                  94.213163
+     46     225               61.276028                 61.445022                 983.120351
+     48      74                0.484064                  0.497162                  24.186255
+     54      83                3.964452                  4.035943                 175.052945
+     55     214               36.539674                 36.879130                 620.396587
+     56      23                0.313072                  0.333133                  52.142560
+
+Forecast scales measured full-run wall time by cell count and an initial normal-depth Courant-rate estimate for each saved network. Times include startup, steady initialization and contention from concurrent jobs. This is an approximate serial-equivalent workload, not an elapsed-time promise. Different depths, rejected regimes, time-step retries and thermal/load changes can alter costs materially. Cases without an accepted reference are omitted and must not be interpreted as zero cost.
+
+
+
+Artifacts
+
+hydrographs_plotly.html: raw observed downstream plus the frozen prior display-offset curve, MC original and selected collapses, local-inertial original at MC roughness and selected roughness, and fixed-n selected collapses. Select the example with the menu. Missing rejected runs are not plotted. Model curves use per-10-minute minima/maxima for display; metrics use full one-minute data.
+
+grid_sensitivity_plotly.html: peak, centroid and half-height rising/falling timing effects versus maximum cell length. Missing points indicate rejected or unfinished configurations.
+
+collapse_comparison_plotly.html: cross-model scatterplots of selected collapse effects for peak, centroid and half-height crossings; unresolved parent fits are shown separately.
+
+CSV tables retain timings, depths, Froude numbers, balance diagnostics, fit status, selected geometry and runtime. Per-trial result.json and wave.parquet retain numerical records.

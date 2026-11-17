@@ -1,0 +1,34 @@
+EXAMPLE 56 VERIFICATION STUDY
+
+Python orchestration environment:
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python
+Compiled array-kernel environment (NumPy/Numba):
+/opt/anaconda3/bin/python
+
+From repository root, execute in this order:
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python LISFLOOD_FP/verify_inertial56.py
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python LISFLOOD_FP/check_mc_resolution56.py
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python LISFLOOD_FP/check_inertial_benchmarks.py
+MPLCONFIGDIR=/tmp/lisflood-verification-mpl /opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python LISFLOOD_FP/summarize_verification56.py
+
+The network runner resumes cached JSON runs. Use a fresh output directory if changing the solver, forcing, geometry or test definitions. Do not treat previous caches as new executions. The two environments exchange NPZ files; no MATLAB or additional package installation is needed.
+
+Outputs:
+- hydrographs_plotly.html: self-contained interactive comparison, all valid grid families plus MC references; original and collapse lines. No external JavaScript download required.
+- hydrographs.png: static overview of key comparisons.
+- REPORT.txt: full metrics, tests, failures and interpretation limits.
+- main_comparison.csv: valid normal-flow runs selected for spatial comparison.
+- all_results.csv: all 32 hydraulic network runs, including two invalid CFL 0.7 runs.
+- hydraulic_checks.json, additional_benchmarks.json: verification evidence.
+- spatial_checks.csv, timestep_checks.csv, boundary_sensitivity.csv: separate sensitivities.
+- mc_resolution_summary.csv: 10 MC runs including exact reproduction of saved reference.
+- *_diagnostics.npz: stored profiles at initial/rising/near-peak/falling/final times, all-step depth extrema, and storage histories.
+- *_branch_splits.csv: dynamic split fractions at saved times.
+- manifest.json: setup and source provenance.
+
+Positive timing shifts mean later after collapse; negative means earlier.
+The 200m floor is applied to unsplit physical reaches, not on top of MC segmentation.
+Normal-flow friction slope equals terminal reach bed-proxy slope, except designated 0.5/2 sensitivity runs.
+Slope factor zero labels the separate fixed-stage-at-physical-face sensitivity.
+No roughness calibration was performed. MATLAB execution/equivalence remains pending.
+The existing pilot and supplied MATLAB file are unchanged.

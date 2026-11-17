@@ -1,0 +1,125 @@
+Local-inertial pilot results: executed in Python, not MATLAB. MATLAB license error -96 blocked actual MATLAB execution.
+
+{
+  "engine": "Python translation of supplied MATLAB kernel; MATLAB execution blocked by license error -96",
+  "source_sha256": "dd0a9f2ae206137256b513a8edadfd92fc12bd8b625515c0c6cc98527a639bd7",
+  "n": 0.024854130456733084,
+  "fixed_stage_m": 44.89646806515351,
+  "origin_utc": "2025-06-21 00:00:00+00:00",
+  "standard": {
+    "cfl": 0.7,
+    "max_dt_s": 300
+  },
+  "refined": {
+    "cfl": 0.35,
+    "max_dt_s": 150
+  },
+  "input_sha256": {
+    "/Users/6256481/Code/river-hierarchy/RAPID/assets/bounded_robust_slopes_20261002/child_head_reconstruction_20261003/56/c2578749d698d194b631.parquet": "984f58bb680a442e9b57b29f9d372bc3fc1fd67422c34002906d46bd532a630e",
+    "/Users/6256481/Code/river-hierarchy/RAPID/assets/bounded_robust_slopes_20261002/child_head_reconstruction_20261003/56/c3894ba4eb9cbdccfc79.parquet": "f8dee2fd917d249aee99eac1c465b0fad6e6a54e8a9233597cbd7f1380082d2e"
+  },
+  "upstream_sha256": "c140456a8aa53eea4a5d2158004cdbe7668eb2585a6d65201f63974c557119e7",
+  "forcing": "same raw upstream as diffusive; piecewise linear, midpoint integral with steps split at input knots",
+  "bed": "mean endpoint proxy elevations; one cell per physical reach",
+  "runs": [
+    {
+      "state": "base",
+      "tag": "standard",
+      "n": 0.024854130456733084,
+      "cells": 46,
+      "fixed_stage_m": 44.89646806515351,
+      "spinup_days": 4,
+      "peak_cms": 1848.075705976999,
+      "peak_seconds": 567298.2083528376,
+      "peak_utc": "2025-06-27 13:34:58.208352838+00:00",
+      "centroid_seconds": 913482.0009199617,
+      "steps": 140616,
+      "limited_face_steps": 0,
+      "clipping_volume_m3": 0.0,
+      "maximum_mass_residual_m3": 4.76837158203125e-05,
+      "maximum_depth_m": 2.8212968323942387,
+      "minimum_depth_m": 0.8787885433863462,
+      "minimum_face_discharge_cms": 31.21712020744353,
+      "min_step_s": 0.0024266832042485476,
+      "max_step_s": 22.11306480326214,
+      "final_node_imbalance_cms": 2.136869170499267e-07
+    },
+    {
+      "state": "base",
+      "tag": "refined",
+      "n": 0.024854130456733084,
+      "cells": 46,
+      "fixed_stage_m": 44.89646806515351,
+      "spinup_days": 4,
+      "peak_cms": 1848.075704632319,
+      "peak_seconds": 567294.3079627281,
+      "peak_utc": "2025-06-27 13:34:54.307962728+00:00",
+      "centroid_seconds": 913477.4484248356,
+      "steps": 278623,
+      "limited_face_steps": 0,
+      "clipping_volume_m3": 0.0,
+      "maximum_mass_residual_m3": 8.440017700195312e-05,
+      "maximum_depth_m": 2.8212968315580444,
+      "minimum_depth_m": 0.8787885448517088,
+      "minimum_face_discharge_cms": 31.21712037952211,
+      "min_step_s": 0.0020599414128810167,
+      "max_step_s": 11.0565323912113,
+      "final_node_imbalance_cms": 2.136184775736183e-07
+    },
+    {
+      "state": "S014_unit_10",
+      "tag": "standard",
+      "n": 0.024854130456733084,
+      "cells": 42,
+      "fixed_stage_m": 44.89646806515351,
+      "spinup_days": 5,
+      "peak_cms": 1847.6863233520235,
+      "peak_seconds": 567406.0363093389,
+      "peak_utc": "2025-06-27 13:36:46.036309339+00:00",
+      "centroid_seconds": 913569.3110283726,
+      "steps": 140616,
+      "limited_face_steps": 0,
+      "clipping_volume_m3": 0.0,
+      "maximum_mass_residual_m3": 2.47955322265625e-05,
+      "maximum_depth_m": 2.8209993992112774,
+      "minimum_depth_m": 0.9409674169931335,
+      "minimum_face_discharge_cms": 31.229201813612004,
+      "min_step_s": 0.008030505385249853,
+      "max_step_s": 22.1105635149086,
+      "final_node_imbalance_cms": 3.937116161978338e-07
+    },
+    {
+      "state": "S014_unit_10",
+      "tag": "refined",
+      "n": 0.024854130456733084,
+      "cells": 42,
+      "fixed_stage_m": 44.89646806515351,
+      "spinup_days": 5,
+      "peak_cms": 1847.6863219567952,
+      "peak_seconds": 567402.1403815933,
+      "peak_utc": "2025-06-27 13:36:42.140381593+00:00",
+      "centroid_seconds": 913564.757850726,
+      "steps": 278627,
+      "limited_face_steps": 0,
+      "clipping_volume_m3": 0.0,
+      "maximum_mass_residual_m3": 4.76837158203125e-05,
+      "maximum_depth_m": 2.8209993990418116,
+      "minimum_depth_m": 0.9409674195033333,
+      "minimum_face_discharge_cms": 31.2292019406008,
+      "min_step_s": 0.0004867404350079596,
+      "max_step_s": 11.055281746527266,
+      "final_node_imbalance_cms": 3.9359156289719976e-07
+    }
+  ]
+}
+
+model,state,peak_cms,peak_utc,peak_seconds,centroid_seconds,maximum_depth_m,refinement_peak_change_minutes,refinement_max_flow_difference_cms,collapse_peak_shift_min,collapse_centroid_shift_min
+Local-inertial translation,base,1848.075705976999,2025-06-27 13:34:58.208352838+00:00,567298.2083528376,913482.0009199617,2.8212968323942387,-0.06500650182521592,0.047442910407880845,0.0,0.0
+Diffusive,base,1851.459555510565,2025-06-27 14:39:50.234270161+00:00,571190.2342701608,919114.0565496756,2.9350517371504115,,,0.0,0.0
+MC saved,base,1843.1813547650913,2025-06-27 14:39:50.699968688+00:00,571190.6999686884,,,,,0.0,
+Local-inertial translation,S014_unit_10,1847.6863233520235,2025-06-27 13:36:46.036309339+00:00,567406.0363093389,913569.3110283726,2.8209993992112774,-0.06493212909360106,0.04725618979296087,1.7971326083546348,1.4551684735148835
+Diffusive,S014_unit_10,1851.716974677097,2025-06-27 14:19:28.386599396+00:00,569968.3865993962,917717.6988884124,2.935297334242977,,,-20.364127846075764,-23.27262768772004
+MC saved,S014_unit_10,1843.4539590730633,2025-06-27 14:03:00.880371368+00:00,568980.880371368,,,,,-36.83032662200664,
+
+
+Interpretation: no recalibration; 46/42 segment cells and fixed downstream stage differ from the finer diffusive normal-outlet setup. MC preprocessing differs. Small collapse timing change relies on interpolation between five-minute outputs. Spatial convergence and MATLAB/Python equivalence have not been verified. MATLAB runner and MAT inputs are prepared but unexecuted.

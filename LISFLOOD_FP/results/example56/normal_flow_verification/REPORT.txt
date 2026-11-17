@@ -1,0 +1,209 @@
+FINDINGS
+32 hydraulic network runs and 10 MC runs completed, plus eight initial verification checks and independent steady-backwater/pulse refinement benchmarks.
+The unsegmented and 200m-floor configurations produce approximately +1.8 minute collapse peak delays. Refinement instead converges toward an advance: -17.04 min at max250m, -17.38 min at max125m, -17.58 min at max62.5m. The saved MC reference gives -36.83 min.
+The 125m CFL0.7 cases are INVALID: artificial clipping water was approximately 1,047,900m3 original and 33,530m3 collapse. A smooth peak did not reveal this problem; full-series outlet changes reached 31.08 and 10.30m3/s relative to valid half-step runs. CFL0.35 eliminates clipping; further halving makes changes below 0.1 second to peak timing at this grid. The timestep coefficient is not universally safe on this network discretization.
+Valid selected normal-flow runs have depths near 2.60m; refined maximum face Froude is about 0.38. Valid event runs conserve volume with relative residual below 3.5e-13 and have no clipping or critical-flow limiting.
+The 125m-to-62.5m collapse peak/centroid changes are 0.199/0.242 minutes. This supports a working 125m grid with CFL0.35 for example56, while retaining 62.5m as a reference. This is a study-specific tolerance, not proof of accuracy on other networks.
+Outlet slope half/double and a separate fixed-stage sensitivity alter absolute depths and timing, but collapse peak advances remain between 16.82 and 17.26 minutes at max250m. These boundary choices do not explain the sign change between coarse and fine grids.
+Independent steady local-inertial backwater ODE errors decrease from 2.84mm to 0.38mm under refinement. This verifies a smooth-channel equilibrium, not every network junction configuration.
+MC further subdivision changes the collapse peak advance from 36.830 to 36.880 minutes; centroid change remains effectively 36.860 minutes. Thus the remaining MC/local-inertial discrepancy is not removed by the tested numerical refinements.
+MATLAB agreement is still untested. No calibration was performed.
+
+EXAMPLE 56 NORMAL-FLOW VERIFICATION
+
+Python CPU translation; no MATLAB numerical comparison has been run.
+Fixed n=0.020446875; measured widths and existing endpoint bed proxies; same held one-minute MC forcing and interval-mean outputs. No calibration.
+Main normal-flow boundary uses terminal-cell depth and physical terminal-reach slope (wide rectangular Manning). It is a zero depth-gradient closure, not a fixed stage.
+200 m floor is applied to unsplit physical reaches only; endpoints held fixed, so storage, distance and slope change. It is not a geometry-preserving refinement.
+Temporal acceptance: no depth clipping/limiter activation, relative mass residual <1e-9; compare peak timing and full wave. Spatial screening target: successive collapse timing changes below 1 minute for peak/centroid/50% limbs, alongside depth/flux diagnostics; this is a study choice, not a universal literature tolerance.
+50% limbs cross halfway between each run initial flow and its own peak; centroid uses common baseline and positive excess over full buffered window.
+
+HYDRAULIC CHECKS
+[
+  {
+    "test": "uniform_Manning_2",
+    "passed": true,
+    "depth_error_m": 0.0,
+    "steps": 23.0,
+    "limited_face_steps": 0.0,
+    "clipping_volume_m3": 0.0,
+    "maximum_mass_residual_m3": 0.0,
+    "maximum_depth_m": 2.0,
+    "minimum_depth_m": 2.0,
+    "minimum_face_discharge_cms": 401.58423074934575,
+    "min_step_s": 122.67418071123484,
+    "max_step_s": 158.06026451312565,
+    "final_node_imbalance_cms": 0.0,
+    "maximum_face_froude": 0.453389355261012
+  },
+  {
+    "test": "uniform_Manning_10",
+    "passed": true,
+    "depth_error_m": 8.881784197001252e-16,
+    "steps": 114.0,
+    "limited_face_steps": 0.0,
+    "clipping_volume_m3": 0.0,
+    "maximum_mass_residual_m3": 0.0,
+    "maximum_depth_m": 2.0000000000000013,
+    "minimum_depth_m": 1.999999999999999,
+    "minimum_face_discharge_cms": 401.5842307493453,
+    "min_step_s": 27.838022003351853,
+    "max_step_s": 31.61205290262513,
+    "final_node_imbalance_cms": 3.979039320256561e-13,
+    "maximum_face_froude": 0.4533893552610123
+  },
+  {
+    "test": "uniform_Manning_40",
+    "passed": true,
+    "depth_error_m": 3.1086244689504383e-15,
+    "steps": 456.0,
+    "limited_face_steps": 0.0,
+    "clipping_volume_m3": 0.0,
+    "maximum_mass_residual_m3": 0.0,
+    "maximum_depth_m": 2.0000000000000036,
+    "minimum_depth_m": 1.9999999999999953,
+    "minimum_face_discharge_cms": 401.5842307493438,
+    "min_step_s": 4.128982326418736,
+    "max_step_s": 7.903013225656283,
+    "final_node_imbalance_cms": 1.3073986337985843e-12,
+    "maximum_face_froude": 0.45338935526101354
+  },
+  {
+    "test": "lake_at_rest",
+    "passed": true,
+    "depth_error_m": 2.6645352591003757e-15,
+    "maximum_flow_cms": 7.943048272103176e-13
+  },
+  {
+    "test": "numba_vs_existing_numpy_kernel",
+    "passed": true,
+    "maximum_outlet_difference_cms": 1.5631940186722204e-13
+  },
+  {
+    "test": "raised_tailwater_backwater",
+    "passed": true,
+    "minimum_depth_increase_m": 0.28660269121991666,
+    "upstream_depth_increase_m": 0.28660269121991666
+  },
+  {
+    "test": "symmetric_split_confluence_pulse",
+    "passed": true,
+    "branch_depth_difference_m": 0.0,
+    "steps": 480.0,
+    "limited_face_steps": 0.0,
+    "clipping_volume_m3": 0.0,
+    "maximum_mass_residual_m3": 1.1641532182693481e-09,
+    "maximum_depth_m": 1.3052806481614627,
+    "minimum_depth_m": 0.8684883661098426,
+    "minimum_face_discharge_cms": 49.99999999999991,
+    "min_step_s": 12.028235247544217,
+    "max_step_s": 47.971764752455606,
+    "final_node_imbalance_cms": 5.684341886080802e-14,
+    "maximum_face_froude": 0.4312254446388294
+  },
+  {
+    "test": "width_bed_transition_pulse",
+    "passed": true,
+    "steps": 763.0,
+    "limited_face_steps": 0.0,
+    "clipping_volume_m3": 0.0,
+    "maximum_mass_residual_m3": 2.3283064365386963e-09,
+    "maximum_depth_m": 1.671273878465905,
+    "minimum_depth_m": 0.868488366109843,
+    "minimum_face_discharge_cms": 99.99999999999984,
+    "min_step_s": 0.16915606722295706,
+    "max_step_s": 20.91861184207603,
+    "final_node_imbalance_cms": 1.2789769243681803e-10,
+    "maximum_face_froude": 0.628381506799858
+  }
+]
+
+MAIN COMPARISON (negative timing shift = earlier after collapse)
+       state     grid  cells                            peak_utc    peak_cms  peak_shift_min  centroid_shift_min  rising50_shift_min  falling50_shift_min  maximum_depth_m
+   S000_base physical     46 2025-06-27 12:11:44.470523161+00:00 1850.268384        0.000000            0.000000            0.000000             0.000000         2.598338
+S014_unit_10 physical     42 2025-06-27 12:13:33.874289656+00:00 1849.972575        1.823396            1.857577            1.147120             5.625619         2.598089
+   S000_base       mc     58 2025-06-27 12:13:35.553907936+00:00 1851.984519        0.000000            0.000000            0.000000             0.000000         2.599784
+S014_unit_10       mc     53 2025-06-27 12:03:41.099950999+00:00 1852.090621       -9.907566          -10.875265          -10.137527           -11.751105         2.599873
+   S000_base floor200     46 2025-06-27 12:13:08.073558429+00:00 1850.246031        0.000000            0.000000            0.000000             0.000000         2.598319
+S014_unit_10 floor200     42 2025-06-27 12:14:57.957162655+00:00 1849.949615        1.831393            1.872386            1.156412             5.644086         2.598070
+   S000_base  max1000    183 2025-06-27 12:26:59.336044864+00:00 1853.530146        0.000000            0.000000            0.000000             0.000000         2.601097
+S014_unit_10  max1000    167 2025-06-27 12:11:50.391556348+00:00 1853.653004      -15.149075          -17.343764          -15.811530           -17.559156         2.601200
+   S000_base   max500    339 2025-06-27 12:27:37.069397828+00:00 1853.763427        0.000000            0.000000            0.000000             0.000000         2.601295
+S014_unit_10   max500    309 2025-06-27 12:11:13.345284209+00:00 1853.893347      -16.395402          -18.877997          -17.157919           -18.920922         2.601404
+   S000_base   max250    652 2025-06-27 12:27:46.617317789+00:00 1853.890555        0.000000            0.000000            0.000000             0.000000         2.601403
+S014_unit_10   max250    593 2025-06-27 12:10:43.941454492+00:00 1854.023186      -17.044598          -19.669775          -17.849263           -19.591237         2.601514
+   S000_base   max125   1284 2025-06-27 12:27:48.561980125+00:00 1853.957037        0.000000            0.000000            0.000000             0.000000         2.601459
+S014_unit_10   max125   1170 2025-06-27 12:10:25.716992243+00:00 1854.091081      -17.380750          -20.073119          -18.200236           -19.926338         2.601572
+   S000_base  max62.5   2538 2025-06-27 12:27:49.617043781+00:00 1853.990766        0.000000            0.000000            0.000000             0.000000         2.601488
+S014_unit_10  max62.5   2315 2025-06-27 12:10:14.827267956+00:00 1854.125641      -17.579830          -20.314955          -18.409489           -20.127422         2.601602
+
+SPATIAL REFINEMENT
+coarse_grid fine_grid  peak_collapse_change_min  centroid_collapse_change_min  rising50_collapse_change_min  falling50_collapse_change_min
+    max1000    max500                 -1.246327                     -1.534233                     -1.346389                      -1.361766
+     max500    max250                 -0.649196                     -0.791778                     -0.691344                      -0.670315
+     max250    max125                 -0.336152                     -0.403343                     -0.350972                      -0.335101
+     max125   max62.5                 -0.199080                     -0.241837                     -0.209253                      -0.201083
+
+TIMESTEP CHECKS
+       state    grid coarse_clock fine_clock  coarse_valid  fine_valid  peak_difference_min  max_flow_difference_cms  max_depth_difference_m
+   S000_base  max125     standard       half         False        True             0.002034                31.084933           -6.854412e-01
+   S000_base  max125         half    quarter          True        True             0.001035                 0.001066           -8.094110e-08
+   S000_base  max250     standard       half          True        True             0.002192                 0.002156           -1.885885e-07
+   S000_base max62.5         half    quarter          True        True             0.000614                 0.000510           -4.493265e-08
+   S000_base      mc     standard       half          True        True             0.003263                 0.004972           -6.961131e-07
+S014_unit_10  max125     standard       half         False        True             0.002352                10.304426           -1.390448e-01
+S014_unit_10  max125         half    quarter          True        True             0.001195                 0.001065           -8.055443e-08
+S014_unit_10  max250     standard       half          True        True             0.002437                 0.002154           -1.874461e-07
+S014_unit_10 max62.5         half    quarter          True        True             0.000732                 0.000512           -4.425419e-08
+S014_unit_10      mc     standard       half          True        True             0.003292                 0.004980           -6.943738e-07
+
+INVALID EVENT RUNS (do not use for physical inference)
+                   tag  clipping_volume_m3  limited_face_steps  maximum_depth_m
+   S000_base_max125_s1        1.047900e+06                 0.0         3.286901
+S014_unit_10_max125_s1        3.353018e+04                 6.0         2.740617
+
+BOUNDARY SENSITIVITY
+       state  slope_factor    clock                            peak_utc  peak_shift_min  centroid_shift_min  maximum_depth_m
+   S000_base           1.0     half 2025-06-27 12:27:46.748867163+00:00        0.000000            0.000000         2.601403
+   S000_base           0.5 standard 2025-06-27 12:48:26.818876651+00:00        0.000000            0.000000         3.202343
+   S000_base           2.0 standard 2025-06-27 12:17:20.493150679+00:00        0.000000            0.000000         2.536972
+   S000_base           0.0     half 2025-06-27 12:04:38.953758353+00:00        0.000000            0.000000         2.506171
+S014_unit_10           1.0     half 2025-06-27 12:10:44.087703780+00:00      -17.044353          -19.669775         2.601514
+S014_unit_10           0.5 standard 2025-06-27 12:31:37.912050826+00:00      -16.815114          -19.667165         3.202482
+S014_unit_10           2.0 standard 2025-06-27 12:00:10.724902427+00:00      -17.162804          -19.671155         2.537075
+S014_unit_10           0.0     half 2025-06-27 11:47:23.327569179+00:00      -17.260436          -19.673318         2.506268
+
+MC REFINEMENT
+                     tag        state  factor   dt  cells  saved_reproduction_error_cms    peak_cms  peak_seconds  centroid_seconds  rising50_seconds  falling50_seconds  minimum_native_flow_cms  maximum_pulse_dip_fraction  negative_current_inflow_coefficients  negative_previous_inflow_coefficients  final_outlet_cms  initial_outlet_cms  peak_shift_min  centroid_shift_min  rising50_shift_min  falling50_shift_min
+    S000_base_MC_x1_dt15    S000_base       1 15.0     58                  9.094947e-12 1843.181355 376250.699969     737517.662487     253770.215709      700448.149399                33.890269                         NaN                                     0                                     46        661.742782          761.961666        0.000000            0.000000            0.000000             0.000000
+   S000_base_MC_x1_dt7.5    S000_base       1  7.5     58                           NaN 1843.181355 376246.950561     737513.834309     253766.465616      700444.399889                33.890269                         NaN                                     0                                     46        661.742782          761.961666        0.000000            0.000000            0.000000             0.000000
+    S000_base_MC_x2_dt15    S000_base       2 15.0    116                           NaN 1843.200517 376234.369173     737517.664500     253790.523456      700431.167492                33.890266                         NaN                                     0                                     46        661.742779          761.961666        0.000000            0.000000            0.000000             0.000000
+    S000_base_MC_x4_dt15    S000_base       4 15.0    232                           NaN 1843.205417 376230.047901     737517.665005     253795.650945      700427.012925                33.890264                         NaN                                     0                                     46        661.742779          761.961666        0.000000            0.000000            0.000000             0.000000
+    S000_base_MC_x8_dt15    S000_base       8 15.0    464                           NaN 1843.206649 376228.954322     737517.665131     253796.936078      700425.980500                33.890263                         NaN                                     0                                     46        661.742778          761.961666        0.000000            0.000000            0.000000             0.000000
+ S014_unit_10_MC_x1_dt15 S014_unit_10       1 15.0     53                  9.777068e-12 1843.453959 374040.880371     735306.048131     251606.859312      698032.717704                33.890267                         NaN                                     0                                     41        661.742728          761.961666      -36.830327          -36.860239          -36.055940           -40.257195
+S014_unit_10_MC_x1_dt7.5 S014_unit_10       1  7.5     53                           NaN 1843.453959 374037.130822     735302.218839     251603.109242      698028.967306                33.890267                         NaN                                     0                                     42        661.742727          761.961666      -36.830329          -36.860258          -36.055940           -40.257210
+ S014_unit_10_MC_x2_dt15 S014_unit_10       2 15.0    106                           NaN 1843.472291 374022.303144     735306.050131     251626.623999      698016.302224                33.890263                         NaN                                     0                                     42        661.742725          761.961666      -36.867767          -36.860239          -36.064991           -40.247754
+ S014_unit_10_MC_x4_dt15 S014_unit_10       4 15.0    212                           NaN 1843.476993 374017.407340     735306.050632     251631.617753      698012.304293                33.890261                         NaN                                     0                                     42        661.742724          761.961666      -36.877343          -36.860240          -36.067220           -40.245144
+ S014_unit_10_MC_x8_dt15 S014_unit_10       8 15.0    424                           NaN 1843.478176 374016.169600     735306.050757     251632.869570      698011.312071                33.890261                         NaN                                     0                                     42        661.742724          761.961666      -36.879745          -36.860240          -36.067775           -40.244474
+
+INDEPENDENT BACKWATER ODE / CHANNEL PULSE BENCHMARKS
+{
+  "backwater_errors_m": [
+    0.0028362177384098075,
+    0.0014763721402366592,
+    0.0007527551280417377,
+    0.00038002016747240575
+  ],
+  "backwater_ODE_converges": true,
+  "pulse_time_step_peak_difference_s": -0.09376699404401734,
+  "pulse_spatial_peak_changes_s": [
+    6.70450839368732,
+    3.1108751505726104,
+    1.5445965603066725
+  ],
+  "passed": true
+}
+
+INTERPRETATION LIMITS
+Lake-at-rest, steady Manning and conservation tests verify specific properties, not the full network junction approximation. Pairwise connections and minimum interface widths are inherited from the supplied code. No independently verified network hydraulic solution is available. Spatial convergence within this formulation does not establish field accuracy. Bed elevations remain agreed proxies.
+Reduced water-surface slopes relative to bed slopes identify backwater-like profiles, not proof that backwater causes the MC timing difference. Inertia, changing depth, branch fractions, outlet closure and cross-section friction conventions all differ.

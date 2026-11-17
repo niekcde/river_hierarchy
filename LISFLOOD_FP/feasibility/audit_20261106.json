@@ -1,0 +1,188 @@
+{
+  "date": "2026-11-06",
+  "scope": "Feasibility only; no LISFLOOD-FP simulations executed",
+  "synthetic_parameters": {
+    "total_width_m": 800.0,
+    "reference_slope": 0.0002,
+    "outer_a_fraction": 0.8,
+    "inner_fraction": 0.5,
+    "total_length_m": 10000.0,
+    "internal_location": "central",
+    "length_multiplier": 1.0,
+    "branch_width_factor": 1.0
+  },
+  "synthetic_states": [
+    {
+      "state": "centerline/original",
+      "links": 1,
+      "nodes": 2,
+      "split_nodes": 0,
+      "merge_nodes": 0,
+      "undirected_cycle_rank": 0,
+      "directed_acyclic": true
+    },
+    {
+      "state": "simple/original",
+      "links": 4,
+      "nodes": 4,
+      "split_nodes": 1,
+      "merge_nodes": 1,
+      "undirected_cycle_rank": 1,
+      "directed_acyclic": true
+    },
+    {
+      "state": "nested/original",
+      "links": 7,
+      "nodes": 6,
+      "split_nodes": 2,
+      "merge_nodes": 2,
+      "undirected_cycle_rank": 2,
+      "directed_acyclic": true
+    },
+    {
+      "state": "crossover/original",
+      "links": 7,
+      "nodes": 6,
+      "split_nodes": 2,
+      "merge_nodes": 2,
+      "undirected_cycle_rank": 2,
+      "directed_acyclic": true
+    },
+    {
+      "state": "simple/full",
+      "links": 1,
+      "nodes": 2,
+      "split_nodes": 0,
+      "merge_nodes": 0,
+      "undirected_cycle_rank": 0,
+      "directed_acyclic": true
+    },
+    {
+      "state": "nested/inner_only",
+      "links": 4,
+      "nodes": 4,
+      "split_nodes": 1,
+      "merge_nodes": 1,
+      "undirected_cycle_rank": 1,
+      "directed_acyclic": true
+    },
+    {
+      "state": "nested/main_island_only",
+      "links": 4,
+      "nodes": 4,
+      "split_nodes": 1,
+      "merge_nodes": 1,
+      "undirected_cycle_rank": 1,
+      "directed_acyclic": true
+    },
+    {
+      "state": "nested/full",
+      "links": 1,
+      "nodes": 2,
+      "split_nodes": 0,
+      "merge_nodes": 0,
+      "undirected_cycle_rank": 0,
+      "directed_acyclic": true
+    },
+    {
+      "state": "crossover/upstream_only",
+      "links": 4,
+      "nodes": 4,
+      "split_nodes": 1,
+      "merge_nodes": 1,
+      "undirected_cycle_rank": 1,
+      "directed_acyclic": true
+    },
+    {
+      "state": "crossover/downstream_only",
+      "links": 4,
+      "nodes": 4,
+      "split_nodes": 1,
+      "merge_nodes": 1,
+      "undirected_cycle_rank": 1,
+      "directed_acyclic": true
+    },
+    {
+      "state": "crossover/full",
+      "links": 1,
+      "nodes": 2,
+      "split_nodes": 0,
+      "merge_nodes": 0,
+      "undirected_cycle_rank": 0,
+      "directed_acyclic": true
+    }
+  ],
+  "historical_real_cache": {
+    "path": "RAPID/outputs/cunge_calibration_alpha2/22/850604f0b090a210/frozen_grid.parquet",
+    "sha256": "fc643dba80a4f3358c4aaf10921186578bcaab27462dc408f0187f7414587e93",
+    "status": "Historical local cache, not verified active production geometry",
+    "links": 993,
+    "nodes": 662,
+    "split_nodes": 331,
+    "merge_nodes": 331,
+    "undirected_cycle_rank": 332,
+    "directed_acyclic": true,
+    "columns": [
+      "id_link",
+      "id_us_node",
+      "id_ds_node",
+      "link_length_m",
+      "slope_used",
+      "wid_adj_routing",
+      "u",
+      "v",
+      "width",
+      "head_us",
+      "head_ds",
+      "slope",
+      "count",
+      "rapid_effective_length_m",
+      "depth_m",
+      "kb_local",
+      "rapid_celerity_mps_raw",
+      "rapid_celerity_mps",
+      "rapid_k",
+      "split_fraction",
+      "reference_flow_fraction",
+      "reference_discharge_cms",
+      "celerity_times_n",
+      "cunge_alpha",
+      "grid_n_min",
+      "grid_n_max",
+      "celerity_min_mps",
+      "celerity_max_mps",
+      "rapid_length_floor_applied",
+      "rapid_effective_length_floor_m"
+    ],
+    "ranges": {
+      "width": [
+        8.947258735606908,
+        2919.497535942894
+      ],
+      "depth_m": [
+        0.28244119652964506,
+        12.155695668322283
+      ],
+      "slope": [
+        9.307605437770326e-06,
+        0.0007114752985615855
+      ],
+      "link_length_m": [
+        14.022351912219255,
+        16787.440822341185
+      ]
+    },
+    "finite_positive_geometry": true
+  },
+  "availability": {
+    "/Volumes/PhD": false,
+    "/Volumes/SyntheticResults20261027": false,
+    "network_variants/output": false,
+    "/Volumes/PhD/river_hierarchy/network_variants/output/reviewed_master_manifest.json": false
+  },
+  "official_source": {
+    "url": "https://zenodo.org/records/6912932",
+    "version": "8.1",
+    "archive_md5": "77fa78a9c074d7baf9fbb2157fac4090"
+  }
+}

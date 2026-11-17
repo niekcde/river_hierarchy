@@ -1,0 +1,209 @@
+Example 56: local-inertial runs on exact MC subdivision.
+
+       state         grid  refined  cells        n  fixed_stage_m  spinup_days    peak_cms  peak_seconds                            peak_utc  centroid_seconds  inflow_volume_error_m3    steps  limited_face_steps  clipping_volume_m3  maximum_mass_residual_m3  maximum_depth_m  minimum_depth_m  minimum_face_discharge_cms  min_step_s  max_step_s  final_node_imbalance_cms  peak_shift_min  centroid_shift_min
+   S000_base           mc    False     58 0.020447      44.693184          4.0 1852.396211 365801.660267 2025-06-27 11:45:41.660267480+00:00     742011.865707                0.000041 140655.0                 0.0                 0.0                  0.000147         2.532007         0.821831                   32.346855    0.000167   23.082995              2.387424e-11        0.000000            0.000000
+   S000_base     physical    False     46 0.020447      44.693184          4.0 1850.729176 365684.658029 2025-06-27 11:43:44.658029294+00:00     741194.141494                0.003428 140598.0                 0.0                 0.0                  0.000396         2.530848         0.800407                   32.726879    0.000376   23.100579              5.184120e-11        0.000000            0.000000
+   S000_base           mc     True     58 0.020447      44.693184          4.0 1852.396193 365801.661230 2025-06-27 11:45:41.661229996+00:00     742011.865658               -0.014264 266620.0                 0.0                 0.0                  0.019041         2.532007         0.821831                   32.346855    0.000092   11.541498              5.024958e-11        0.000000            0.000000
+   S000_base MC_reference    False     58 0.020447            NaN          NaN 1843.181355 376250.699969 2025-06-27 14:39:50.699968688+00:00     737517.662487                     NaN      NaN                 NaN                 NaN                       NaN              NaN              NaN                         NaN         NaN         NaN                       NaN        0.000000            0.000000
+S014_unit_10           mc    False     53 0.020447      44.693184          4.0 1852.500771 365205.370899 2025-06-27 11:35:45.370898964+00:00     741359.220906                0.000032 140654.0                 0.0                 0.0                  0.000135         2.532079         0.861326                   32.346855    0.000472   23.082995              2.683009e-11       -9.938156          -10.877413
+S014_unit_10     physical    False     42 0.020447      44.693184          4.0 1850.434967 365795.357682 2025-06-27 11:45:35.357681607+00:00     741305.638546                0.003266 140600.0                 0.0                 0.0                  0.000396         2.530643         0.858490                   32.726879    0.000397   23.100579              5.070433e-11        1.844994            1.858284
+S014_unit_10           mc     True     53 0.020447      44.693184          4.0 1852.500753 365205.374073 2025-06-27 11:35:45.374073178+00:00     741359.220855               -0.014221 266621.0                 0.0                 0.0                  0.018848         2.532079         0.861326                   32.346855    0.000214   11.541498              5.331913e-11       -9.938119          -10.877413
+S014_unit_10 MC_reference    False     53 0.020447            NaN          NaN 1843.453959 374040.880371 2025-06-27 14:03:00.880371368+00:00     735306.048131                     NaN      NaN                 NaN                 NaN                       NaN              NaN              NaN                         NaN         NaN         NaN                       NaN      -36.830327          -36.860239
+
+TIMESTEP CHECKS
+       state  refinement_peak_shift_minutes  max_flow_change_cms
+   S000_base                       0.000016             0.000198
+S014_unit_10                       0.000053             0.000199
+
+{
+  "engine": "Python translation, not executed in MATLAB",
+  "parameter_sources": {
+    "S000_base": {
+      "path": "/Volumes/PhD/river_hierarchy/network_variants/output/56_indep__anchored/states/S000_base/rapid/cunge/prep/parameters.parquet",
+      "sha256": "ba1671a89e648ec98998eb7d200d216051336dd65eb9a1f70bf4796ae38f9a27",
+      "physical_reaches": 46,
+      "sections": 58
+    },
+    "S014_unit_10": {
+      "path": "/Volumes/PhD/river_hierarchy/network_variants/output/56_compound_bubbles__anchored/states/CB003_bubble_5/rapid/cunge/prep/parameters.parquet",
+      "sha256": "d1cab4d0c13fba8417704164c06a548b13153c74bb3b881299a906f03835bc70",
+      "physical_reaches": 42,
+      "sections": 53
+    }
+  },
+  "forcing_path": "/Users/6256481/Code/river-hierarchy/RAPID/outputs/event_window_runs_20261013/56/tail_216h/forcing.parquet",
+  "forcing_sha256": "f5b05cc2a0baecd054b84cca93520e449e7548722e98ca75098e07959d5d4ec1",
+  "forcing": "exact held 60-second MC interval means; same buffered window; output is 60-second integrated mean",
+  "origin_utc": "2025-06-23 06:09:00+00:00",
+  "fixed_stage_m": 44.69318413171364,
+  "runs": [
+    {
+      "state": "S000_base",
+      "grid": "mc",
+      "refined": false,
+      "cells": 58,
+      "n": 0.020446875,
+      "fixed_stage_m": 44.69318413171364,
+      "spinup_days": 4,
+      "peak_cms": 1852.3962113160783,
+      "peak_seconds": 365801.66026747983,
+      "peak_utc": "2025-06-27 11:45:41.660267480+00:00",
+      "centroid_seconds": 742011.8657066846,
+      "inflow_volume_error_m3": 4.1484832763671875e-05,
+      "steps": 140655,
+      "limited_face_steps": 0,
+      "clipping_volume_m3": 0.0,
+      "maximum_mass_residual_m3": 0.00014734268188476562,
+      "maximum_depth_m": 2.532006579428975,
+      "minimum_depth_m": 0.821831217852651,
+      "minimum_face_discharge_cms": 32.346854587998436,
+      "min_step_s": 0.0001667190808802843,
+      "max_step_s": 23.0829950873843,
+      "final_node_imbalance_cms": 2.3874235921539366e-11
+    },
+    {
+      "state": "S000_base",
+      "grid": "physical",
+      "refined": false,
+      "cells": 46,
+      "n": 0.020446875,
+      "fixed_stage_m": 44.69318413171364,
+      "spinup_days": 4,
+      "peak_cms": 1850.7291763179458,
+      "peak_seconds": 365684.658029294,
+      "peak_utc": "2025-06-27 11:43:44.658029294+00:00",
+      "centroid_seconds": 741194.1414938099,
+      "inflow_volume_error_m3": 0.0034279823303222656,
+      "steps": 140598,
+      "limited_face_steps": 0,
+      "clipping_volume_m3": 0.0,
+      "maximum_mass_residual_m3": 0.00039577484130859375,
+      "maximum_depth_m": 2.530847916543162,
+      "minimum_depth_m": 0.8004065781830184,
+      "minimum_face_discharge_cms": 32.72687871650307,
+      "min_step_s": 0.00037566316314041615,
+      "max_step_s": 23.100578861981884,
+      "final_node_imbalance_cms": 5.184119800105691e-11
+    },
+    {
+      "state": "S000_base",
+      "grid": "mc",
+      "refined": true,
+      "cells": 58,
+      "n": 0.020446875,
+      "fixed_stage_m": 44.69318413171364,
+      "spinup_days": 4,
+      "peak_cms": 1852.396192618643,
+      "peak_seconds": 365801.661229996,
+      "peak_utc": "2025-06-27 11:45:41.661229996+00:00",
+      "centroid_seconds": 742011.8656581087,
+      "inflow_volume_error_m3": -0.014263629913330078,
+      "steps": 266620,
+      "limited_face_steps": 0,
+      "clipping_volume_m3": 0.0,
+      "maximum_mass_residual_m3": 0.019041061401367188,
+      "maximum_depth_m": 2.5320065679217016,
+      "minimum_depth_m": 0.8218312178527788,
+      "minimum_face_discharge_cms": 32.3468545880083,
+      "min_step_s": 9.180232882499695e-05,
+      "max_step_s": 11.541497543691099,
+      "final_node_imbalance_cms": 5.0249582272954285e-11
+    },
+    {
+      "state": "S000_base",
+      "grid": "MC_reference",
+      "refined": false,
+      "cells": 58,
+      "n": 0.020446875,
+      "peak_cms": 1843.1813547650913,
+      "peak_seconds": 376250.6999686884,
+      "peak_utc": "2025-06-27 14:39:50.699968688+00:00",
+      "centroid_seconds": 737517.6624871042
+    },
+    {
+      "state": "S014_unit_10",
+      "grid": "mc",
+      "refined": false,
+      "cells": 53,
+      "n": 0.020446875,
+      "fixed_stage_m": 44.69318413171364,
+      "spinup_days": 4,
+      "peak_cms": 1852.5007714450658,
+      "peak_seconds": 365205.3708989636,
+      "peak_utc": "2025-06-27 11:35:45.370898964+00:00",
+      "centroid_seconds": 741359.2209057192,
+      "inflow_volume_error_m3": 3.24249267578125e-05,
+      "steps": 140654,
+      "limited_face_steps": 0,
+      "clipping_volume_m3": 0.0,
+      "maximum_mass_residual_m3": 0.00013494491577148438,
+      "maximum_depth_m": 2.5320791934315694,
+      "minimum_depth_m": 0.8613255414054811,
+      "minimum_face_discharge_cms": 32.34685458799925,
+      "min_step_s": 0.00047193001955747604,
+      "max_step_s": 23.08299508738409,
+      "final_node_imbalance_cms": 2.6830093702301383e-11
+    },
+    {
+      "state": "S014_unit_10",
+      "grid": "physical",
+      "refined": false,
+      "cells": 42,
+      "n": 0.020446875,
+      "fixed_stage_m": 44.69318413171364,
+      "spinup_days": 4,
+      "peak_cms": 1850.4349673775625,
+      "peak_seconds": 365795.3576816069,
+      "peak_utc": "2025-06-27 11:45:35.357681607+00:00",
+      "centroid_seconds": 741305.638545641,
+      "inflow_volume_error_m3": 0.0032663345336914062,
+      "steps": 140600,
+      "limited_face_steps": 0,
+      "clipping_volume_m3": 0.0,
+      "maximum_mass_residual_m3": 0.00039577484130859375,
+      "maximum_depth_m": 2.5306432884134296,
+      "minimum_depth_m": 0.8584901067110413,
+      "minimum_face_discharge_cms": 32.726878716503556,
+      "min_step_s": 0.00039716088213026524,
+      "max_step_s": 23.100578861981734,
+      "final_node_imbalance_cms": 5.070432962384075e-11
+    },
+    {
+      "state": "S014_unit_10",
+      "grid": "mc",
+      "refined": true,
+      "cells": 53,
+      "n": 0.020446875,
+      "fixed_stage_m": 44.69318413171364,
+      "spinup_days": 4,
+      "peak_cms": 1852.500753041998,
+      "peak_seconds": 365205.3740731781,
+      "peak_utc": "2025-06-27 11:35:45.374073178+00:00",
+      "centroid_seconds": 741359.2208554691,
+      "inflow_volume_error_m3": -0.01422119140625,
+      "steps": 266621,
+      "limited_face_steps": 0,
+      "clipping_volume_m3": 0.0,
+      "maximum_mass_residual_m3": 0.018847942352294922,
+      "maximum_depth_m": 2.5320791819346025,
+      "minimum_depth_m": 0.8613255414056802,
+      "minimum_face_discharge_cms": 32.3468545880083,
+      "min_step_s": 0.00021379609825089574,
+      "max_step_s": 11.541497543691063,
+      "final_node_imbalance_cms": 5.331912689143792e-11
+    },
+    {
+      "state": "S014_unit_10",
+      "grid": "MC_reference",
+      "refined": false,
+      "cells": 53,
+      "n": 0.020446875,
+      "peak_cms": 1843.4539590730633,
+      "peak_seconds": 374040.88037136797,
+      "peak_utc": "2025-06-27 14:03:00.880371368+00:00",
+      "centroid_seconds": 735306.0481308847
+    }
+  ]
+}
+
+Matched: physical reaches, section counts/lengths/widths/connectivity, n, forcing/window/interval means. Bed-proxy endpoint profile is interpolated to each cell center. MC has fixed reference depths, fixed splits and no prescribed downstream stage; these remain hydraulic-model differences. Thus this is not an inertia-only experiment. Previous pilot used a different n and forcing; the unsplit controls here isolate subdivision.

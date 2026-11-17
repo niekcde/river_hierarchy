@@ -1,0 +1,29 @@
+Example 48: first negative-depth update, 50 m maximum segmentation
+
+Scope: diagnostic replay only. Production solver, calibration and accepted-run gates unchanged.
+Manning n = 0.020799605931143154; normal-flow outlet.
+Exact saved event inputs replayed with the production scalar update instrumented to stop BEFORE clipping. Geometry arrays rebuilt from current MC physical reaches agree exactly with saved inputs (bed, width, length, topology, face width and distance).
+
+CFL .35 first failure: 31.7875658741 hours after forcing origin, step 36436 (zero-based), cell 2334 (zero-based), physical reach 165 subsection 1, length 46.5262 m, width 87.0943 m.
+Pre-update depth 0.00298424 m, available storage 12.09263 m3.
+Upstream inflow 9.67762 m3/s; downstream outflow 30.82364 m3/s.
+Step 3.11512945 s removes net 65.87260 m3, producing depth -0.01327190 m.
+Clamping that depth to zero introduces 53.77997 m3 at this cell in this single step.
+At these fixed computed fluxes, drainage time is only .571863 s. This diagnostic is NOT a proposed safe timestep: changing dt also changes the momentum update.
+
+The cell sits immediately after a narrowing from width 133.6468 m in reach 164 to 87.0943 m in reach 165. Adjacent depths at the failure state are .930793 m upstream and .383122 m downstream. Bed elevations descend continuously; water-surface depressions and retained positive downstream discharge indicate an oscillatory near-dry state. This local snapshot does not establish why the oscillation originally grew, or prove that narrowing alone caused it.
+
+Half CFL: first failure 32.32734 h, reach 161 subsection 333, trial depth -.0324505 m.
+Quarter CFL: first failure 32.58983 h, reach 180 subsection 1, trial depth -.0199018 m.
+Reducing the timestep delays and relocates the first failure; it does not resolve it in these completed runs.
+
+Independent NumPy vectorized evaluation of the MATLAB-style face equations and flux accumulation agrees with the scalar production update to 4.44e-16 in unit discharge and 1.11e-16 m in trial depth. This is evidence against a scalar/vector accumulation or sign translation error at this step, NOT actual MATLAB verification.
+
+MATLAB verification COMPLETED after university VPN connection. Actual MATLAB R2025b ran both the exact failing step and the full simulation prefix. The replay harness explicitly converts loaded numeric inputs to double (the NPZ max_dt scalar otherwise arrived as int64); no production solver change was made.
+Exact step: same failing cell 2334, same trial depth -0.01327189883140224 m; maximum unit-discharge difference 8.88e-16, maximum trial-depth difference 1.11e-16 m.
+Full prefix: same first failing cell and step 36436, time 114435.23714672409 s versus Python 114435.23714672879 s. MATLAB trial minimum -0.01327188393723 m versus Python -0.01327189883140 m; maximum all-cell trial-depth difference 7.06e-8 m.
+This verifies that the failure is reproduced in both languages under the shared setup. It is strong evidence against a Python translation error as its cause. The supplied internal equations are used in a CPU adaptation with shared geometry, steady state, normal-flow outlet and corrected timestep accounting. This is not a run of the unchanged original GPU program, and does not independently validate the shared geometry or boundary adaptation. See matlab_comparison.json for numerical comparison.
+
+Conclusion: the critical-flow cap does not guarantee nonnegative cell storage. The immediate failure is outflow exceeding available water in a nearly dry cell. A conservative positivity-preserving flux treatment merits testing, together with the source of oscillation; arbitrary depth clipping is not an acceptable fix. The 100 m fit is still provisional and the failed 50 m hydrographs cannot be used as hydraulic predictions. MATLAB parity is confirmed for the failing step and complete pre-failure trajectory. The origin of the growing oscillation remains to be isolated.
+
+Control: same saved steady initial state and grid, constant initial inflow for 36 h: no negative depth over 41,040 steps; maximum final depth drift 2.85e-13 m. The event forcing activates the failure; the initial state does not spontaneously fail in this control. Spinup itself had transient clipping, so this does not validate its full history.

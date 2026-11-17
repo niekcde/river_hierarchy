@@ -1,0 +1,40 @@
+Example 48 — conservative positivity and oscillation investigation
+
+Scope: fixed Manning n=0.020799605931143154, same measured widths, bed proxies and normal-flow outlet. Diagnostic copies only; no calibration or production changes. No collapses in this focused failure investigation.
+
+Conservative treatment: compute all proposed signed face fluxes; for each cell sum its outward fluxes, regardless of orientation. Scale all its outgoing faces by min(1, available_volume/(dt*sum_outward_flux)), with a tiny roundoff safety margin when active. Available volume is pre-step water plus positive external source; incoming internal flux is not spent in this step. Each face contributes the identical flux to donor and receiver. The limited flux also becomes momentum history. Deferred-transfer volume is an accumulated change in proposed transfer, NOT water lost.
+
+Focused tests passed: split outflows, reverse flows, outgoing boundary, incoming boundary, chained flow, external inflow, exact previously failing step, analytic uniform Manning equilibrium, inactive-limiter equivalence, lake at rest.
+
+EVENT RESULTS (all three conservative 50 m results remain hydraulically unacceptable):
+100m_cfl035: clipping 0 m3; relative volume residual 8.45e-14; max depth 1.15823 m; feature height 297.328 m3/s; feature timing error -0.5 min; positivity-limited face-steps 0.
+50m_cfl035: clipping 0 m3; relative volume residual 2.74e-13; max depth 12.0663 m; feature height 3066.55 m3/s; feature timing error -384.5 min; positivity-limited face-steps 123299.
+50m_cfl0175: clipping 0 m3; relative volume residual 5.98e-14; max depth 10.8904 m; feature height 3096.67 m3/s; feature timing error -423.5 min; positivity-limited face-steps 74930.
+50m_cfl00875: clipping 0 m3; relative volume residual 2.44e-13; max depth 10.9823 m; feature height 3112.01 m3/s; feature timing error -428.5 min; positivity-limited face-steps 54058.
+
+100 m outlet hydrograph is bit-for-bit unchanged and the positivity limiter never activates. At 50 m, preventing water creation does not remove multi-metre depth excursions, large reversals and discharge spikes. The feature timing of these failed runs is not a valid calibration metric.
+
+ONSET: original 50 m run exceeds 1.2 m depth by hour 28.386 in reach 65; 1.5 m by hour 31.140 in reach 188; 2 m by hour 31.539 in reach 161; 3 m by hour 31.693 in reach 163. The first negative depth occurs later, hour 31.788 in reach 165. Therefore the first drying cell is not a unique source of the instability.
+
+CONTROLLED UNIFORM-CHANNEL TEST: periodic perturbations on a uniformly descending bed, constant width, no junctions, no physical outlet, no forcing change, no wet/dry front and no cap activation. Initial depth perturbation 1e-7 m, wavelength 4000 m, one-hour run. Normal-flow analogues use sampled depth, bed slope and n from physical reaches; they are NOT full-network replacements. A periodic seam includes the bed drop consistently. Across 27 combinations, observed growth agrees with the discrete linearized update within the required 0.1% tolerance (in fact much closer).
+
+Reach 65 analogue, 100 m: Fr=0.8830; amplitude factors 2.785877 (dt=3 s), 2.784350 (dt=.75 s).
+Reach 65 analogue, 50 m: Fr=0.8830; amplitude factors 6.038905 (dt=3 s), 6.035125 (dt=.75 s).
+Reach 65 analogue, 25 m: Fr=0.8830; amplitude factors 8.831575 (dt=3 s), 8.825744 (dt=.75 s).
+Reach 161 analogue, 100 m: Fr=0.6745; amplitude factors 0.878128 (dt=3 s), 0.877843 (dt=.75 s).
+Reach 161 analogue, 50 m: Fr=0.6745; amplitude factors 1.563227 (dt=3 s), 1.562667 (dt=.75 s).
+Reach 161 analogue, 25 m: Fr=0.6745; amplitude factors 2.075884 (dt=3 s), 2.075111 (dt=.75 s).
+
+Interpretation: the supplied update admits growing disturbances at representative hydraulics even without the network, outlet or clipping. Grid refinement reduces numerical damping; reach 161 analogue switches from decay at 100 m to growth at 50 m. Reducing timestep does not remove that spatial/model behaviour. This is strong mechanism evidence, not a unique decomposition of every full-network error. The 100 m match can mask instability and should not be treated as demonstrated convergence.
+
+LINEAR CHECK (derived here, not a universal validity threshold): for uniform positive flow, hflow=h_upstream and inactive cap, let r=g*dt*n^2*q/h^(7/3), A=(1-r)/(1+r), C=g*dt*((10/3)*S + h/dx*(1-exp(i*k)))/(1+r), D=dt/dx*(1-exp(-i*k)). The one-step [h,q] perturbation matrix is [[1-D*C,-D*A],[C,A]]. Initializing a tiny eigenmode gives measured amplitude |lambda|^steps. In the corresponding continuum uniform-flow linearization the subcharacteristic condition compares (5/3)u with sqrt(g*h); this is an idealized analytical diagnostic, not an acceptance rule for the real network.
+
+LITERATURE CONTEXT: draining-cell outgoing-flux limitation is established in finite-volume shallow-water methods; this implementation adapts that idea to our network, rather than reproducing an entire published solver: https://www.cambridge.org/core/services/aop-cambridge-core/content/view/AE2AC80D1E6E9F6BC0E68496A1C3EC52/S0962492918000028a.pdf/finitevolume_schemes_for_shallowwater_equations.pdf
+de Almeida and Bates (2013) discuss applicability and numerical diffusion needed for some low-roughness runs: https://agupubs.onlinelibrary.wiley.com/doi/full/10.1002/wrcr.20366
+de Almeida et al. (2012) specifically address improved numerical stability: https://eprints.soton.ac.uk/356385/2/WRR_2012.pdf
+
+RECOMMENDATION: retain this limiter as a diagnostic safeguard, not as a sufficient repair. Compare a documented stabilised local-inertial discretization against the original and a full shallow-water benchmark on the uniform-channel tests before promoting any revised network run. Stabilization must demonstrate grid/time convergence without tuning numerical smoothing merely to fit a gauge. Calibration should follow that verification.
+
+CLEAN INITIALIZATION CONTROL: start from the normal-depth guess and spin with the conservative solver, rather than reusing a state whose earlier spinup clipped.
+100 m: converged=True, 1 days; max depth difference from earlier steady state 2.07e-13 m; total spinup clipping 0 m3.
+50 m: converged=True, 1 days; max depth difference from earlier steady state 2.74e-13 m; total spinup clipping 0 m3.

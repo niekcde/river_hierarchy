@@ -1,0 +1,43 @@
+EXTENDED GRID / OUTLET / MATLAB COMPARISON
+
+From repository root, Python orchestration uses:
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python
+The numerical kernel uses NumPy/Numba in /opt/anaconda3/bin/python.
+
+Commands:
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python LISFLOOD_FP/extended_convergence56.py
+/opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python LISFLOOD_FP/extended_convergence56.py --extension
+MPLCONFIGDIR=/tmp/lisflood-verification-mpl /opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python LISFLOOD_FP/summarize_extended56.py
+
+MATLAB R2025b Update 4 was used. From repository root:
+addpath('LISFLOOD_FP');
+run_verification_matlab('LISFLOOD_FP/results/example56/extended_convergence/S000_base_max125_ext0_cfl0.35');
+run_verification_matlab('LISFLOOD_FP/results/example56/extended_convergence/S014_unit_10_max125_ext0_cfl0.35');
+run_verification_matlab('LISFLOOD_FP/results/example56/extended_convergence/S000_base_max125_ext10000_cfl0.35');
+Then regenerate the Python summary to compare the MATLAB result files.
+
+Tests:
+- Original S000 and collapse S014 at max1000/500/250/200/150/125/100/50/25/10m, CFL0.35.
+- CFL0.175 checks at max100/25/10m for both networks.
+- 0/5/10/20km extensions at max125 and max50m for both networks.
+- Three full-event MATLAB/Python comparisons at max125m.
+- Geometry conservation and upstream control-volume conservation at the original outlet.
+
+All cases preserve measured widths, existing bed proxies and fixed roughness n=0.020446875.
+No calibration. Outlet normal-flow slope equals the physical terminal-reach slope.
+An extension uses the terminal width, slope and roughness throughout its length.
+Discharge is measured at the ORIGINAL outlet; remote-boundary discharge is saved separately.
+MATLAB uses a CPU adaptation with corrected time accounting and normal-flow outlet, not the untouched supplied GPU script. Identical geometry and converged initial state are shared with Python.
+
+Outputs:
+- grid_convergence_plotly.html: all grid hydrographs, original/collapse and MC reference, plus convergence curves.
+- outlet_extension_plotly.html: boundary-location sensitivity at original outlet.
+- convergence.png: static scientific overview.
+- REPORT.txt: detailed setup, metrics, comparisons and limitations.
+- all_results.csv, grid_comparison.csv, spatial_changes.csv, timestep_checks.csv.
+- extension_comparison.csv, monitor_control_volume_checks.csv, geometry_checks.csv.
+- matlab_comparison.csv: actual cross-language differences.
+- Each run folder contains cells.csv, initial.npz, input.mat, wave.parquet and result.npz.
+- The three MATLAB cases also contain matlab_result.mat.
+
+Caution for reproducibility: completed JSON runs are cached. Use a new output directory when changing equations, forcing, roughness or geometry. Cached results are not new simulations. Some runs were computed concurrently; per-run wall times are not a controlled performance benchmark. The existing pilot artifacts and supplied MATLAB source are preserved.
