@@ -1,5 +1,8 @@
 # RAPID
 
+**Prediction model settings (6 November 2026):** [primary six-input ridge, retained no-ΔGₘ secondary, and selection rationale](CURRENT_GEOMETRY_PREDICTION_MODELS.md). Both models remain available in the prediction-versus-modelled notebook.
+
+
 This subproject holds the shared RAPID routing layer for this repository. It
 now serves two workflows:
 
