@@ -1,0 +1,36 @@
+{
+  "site": "Waal near Dodewaard/Druten, Netherlands",
+  "bbox": [
+    5.57,
+    51.86,
+    5.66,
+    51.91
+  ],
+  "crs": "EPSG:32631",
+  "transform": [
+    10.0,
+    0.0,
+    676770.0,
+    0.0,
+    -10.0,
+    5754380.0,
+    0.0,
+    0.0,
+    1.0
+  ],
+  "width": 640,
+  "height": 580,
+  "start": "2024-01-01",
+  "end": "2025-12-31",
+  "collection": "sentinel-2-c1-l2a",
+  "minimum_observations": 5,
+  "water_rule": "MNDWI > 0 AND NDVI < 0.3",
+  "composite_threshold": 0.75,
+  "valid_scl": [
+    4,
+    5,
+    6
+  ],
+  "cloud_shadow_snow_buffer_m": 40,
+  "original_classifier_available": false
+}

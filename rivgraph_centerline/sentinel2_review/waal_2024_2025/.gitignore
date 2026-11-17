@@ -1,0 +1,10 @@
+cache/
+review/
+__pycache__/
+.pytest_cache/
+catalog*.json
+inventory.json
+preview_inventory.json
+*.log
+preview.png
+*.zip
