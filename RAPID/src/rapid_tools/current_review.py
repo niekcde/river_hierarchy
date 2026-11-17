@@ -64,10 +64,74 @@ def build_current_analysis_frame(example_ids, *, output_root=OUTPUT_ROOT):
     return pd.DataFrame(rows)
 
 
+def add_centerline_comparisons(analysis, example_ids=None, *, output_root=OUTPUT_ROOT):
+    """Add completed reference-centerline runs to an existing current analysis.
+
+    Repeated calls replace the same centerline keys. Parent outputs and forcing
+    must match the current comparison clock; no event-rerun fallback is used.
+    """
+    examples = analysis.example_id.unique() if example_ids is None else example_ids
+    additions = []
+    for example in examples:
+        ex = str(example).zfill(2)
+        matches = analysis[analysis.example_id.astype(str).str.zfill(2).eq(ex)]
+        if matches.empty:
+            raise ValueError(f'{ex}: no current parent comparison available')
+        row = matches.iloc[0].copy()
+        root = Path(output_root)/f'{ex}_indep__anchored/reference_section'
+        run = root/'rapid/cunge/run'
+        receipt = json.loads((run/'completion.json').read_text())
+        result = json.loads((run/'result.json').read_text())
+        if not receipt.get('complete') or result.get('method') != 'cunge':
+            raise ValueError(f'{ex}: centerline is not a completed Cunge run')
+        outlet = pd.read_parquet(run/'outlet.parquet')
+        peak = outlet.iloc[int(outlet.q_outlet_cms.argmax())]
+        forcing = pd.read_parquet(run/'forcing.parquet')
+        delta = (pd.Timestamp(peak.time_utc)-pd.Timestamp(row.parent_peak_utc)).total_seconds()
+        inlet = pd.Timestamp(forcing.time_utc.iloc[int(forcing.forcing_cms.argmax())])
+        lag = (pd.Timestamp(row.parent_peak_utc)-inlet).total_seconds()
+        updates = dict(
+            mode='centerline', state_id='fully_collapsed', target_id='fully_collapsed',
+            fingerprint=result['fingerprint'], technical_alias=False,
+            hydraulic_domain_type='Whole-network centerline collapse',
+            outlet_parquet=str(run/'outlet.parquet'),
+            parameters_parquet=str(root/'rapid/cunge/prep/parameters.parquet'),
+            forcing_parquet=str(run/'forcing.parquet'),
+            registry_path=str(root/'rapid_run_registry.csv'),
+            child_peak_utc=str(peak.time_utc), child_peak_cms=float(peak.q_outlet_cms),
+            child_feature_utc=result['feature_utc'], child_feature_kind=result['feature_kind'],
+            peak_time_shift_hours=delta/3600, sampled_peak_shift_minutes=delta/60,
+            reviewed_feature_shift_minutes=(pd.Timestamp(result['feature_utc'])-pd.Timestamp(row.parent_feature_utc)).total_seconds()/60,
+            peak_total_change_pct=100*(float(peak.q_outlet_cms)/row.parent_peak_cms-1),
+            lag_to_inflow_peak_pct_shift_vs_base=100*delta/lag if lag>0 else np.nan,
+            source_policy='Completed current reference-centerline run',
+        )
+        for key, value in updates.items():
+            row[key] = value
+        row['final_scientific_acceptance'] = receipt.get('final_scientific_acceptance', False)
+        load_pair(row)
+        additions.append(row)
+    if not additions:
+        return analysis.copy()
+    added = pd.DataFrame(additions)
+    replaced = (analysis['mode'].eq('centerline') & analysis.state_id.eq('fully_collapsed')
+                & analysis.example_id.astype(str).str.zfill(2).isin(added.example_id.astype(str).str.zfill(2)))
+    return pd.concat([analysis.loc[~replaced], added], ignore_index=True)
+
+
 def load_pair(record):
     parent=pd.read_parquet(record.parent_outlet_parquet)
     child=pd.read_parquet(record.outlet_parquet)
-    if not pd.DatetimeIndex(parent.time_utc).equals(pd.DatetimeIndex(child.time_utc)):
+    parent_clock = pd.DatetimeIndex(parent.time_utc)
+    child_clock = pd.DatetimeIndex(child.time_utc)
+    if record.get('mode') == 'centerline':
+        # Completed runs may have different settling-tail lengths. Preserve both
+        # full series, but require the same start and every shared sample time.
+        shared = min(len(parent_clock), len(child_clock))
+        same_clock = shared > 0 and parent_clock[:shared].equals(child_clock[:shared])
+    else:
+        same_clock = parent_clock.equals(child_clock)
+    if not same_clock:
         raise ValueError('Current parent/child UTC clocks differ')
     forcing=pd.read_parquet(record.forcing_parquet)
     if Path(record.parent_forcing_parquet).resolve()!=Path(record.forcing_parquet).resolve():
@@ -84,7 +148,8 @@ def load_pair(record):
 def parent_child_hydrograph_figure(record, *,
     show_forcing=True, show_downstream_gauge=False,
     show_parent=True, show_children=True, show_title = True,
-    x_range=None, y_range=None):
+    x_range=None, y_range=None,
+    show_peaks=False):
     parent,child,forcing=load_pair(record);fig=go.Figure()
     if show_forcing:
         fig.add_scatter(x=forcing.time_utc.map(lambda t: pd.Timestamp(t).isoformat()),y=forcing.forcing_cms,
@@ -117,6 +182,21 @@ def parent_child_hydrograph_figure(record, *,
         for name,w,color,dash in hydros:
             fig.add_scatter(x=w.time_utc.map(lambda t: pd.Timestamp(t).isoformat()),y=w.q_outlet_cms,
                 name=name,line=dict(color=color,dash=dash))
+            if show_peaks:
+                peak = w.iloc[w.q_outlet_cms.argmax()]
+                fig.add_scatter(
+                    x=[pd.Timestamp(peak.time_utc).isoformat()],
+                    y=[peak.q_outlet_cms],
+                    mode="markers",
+                    marker=dict(size=10, color=color),
+                    name=f"{name} peak",
+                    showlegend=False,
+                    hovertemplate=(
+                        "%{x|%Y-%m-%d %H:%M} UTC"
+                        "<br>%{y:.2f} m³/s"
+                        "<extra>%{fullData.name}</extra>"
+                    ),
+                )
 
     if show_title:
         fig.update_layout(title=f'{record.example_id} / {record["mode"]} / {record.state_id}<br><sup>Current published Cunge · UTC · no peak alignment · sampled shift {record.sampled_peak_shift_minutes:+g} min</sup>',
@@ -146,7 +226,7 @@ def parent_child_hydrograph_figure(record, *,
 
     if y_range is not None:
         fig.update_yaxes(range=[y_range[0], y_range[1]])
-
+    
     return fig
 
 
@@ -207,8 +287,14 @@ def geometry_manifest_path(record, key):
     _,_,domain=load_domain_pair(record)
     frames=[]
     for key in ['parent_parameters_parquet','parameters_parquet']:
-        manifest=json.loads(geometry_manifest_path(record,key).read_text())
-        geo=gpd.read_file(manifest['input_paths']['directed_links'])
+        if record.get('mode') == 'centerline' and key == 'parameters_parquet':
+            root = Path(record.registry_path).parent
+            summary = json.loads((root/'reference_section_summary.json').read_text())
+            geometry_path = summary['paths']['directed_links_path']
+        else:
+            manifest=json.loads(geometry_manifest_path(record,key).read_text())
+            geometry_path = manifest['input_paths']['directed_links']
+        geo=gpd.read_file(geometry_path)
         params=pd.read_parquet(record[key])
         if set(geo.id_link)!=set(params.id_link): raise ValueError('Map reach IDs differ from routed physical graph')
         frames.append(geo)
@@ -265,8 +351,14 @@ def parent_child_network_figure(record, *, zoom_to_domain=True, layout='panels',
     _,_,domain=load_domain_pair(record)
     frames=[]
     for key in ['parent_parameters_parquet','parameters_parquet']:
-        manifest=json.loads(geometry_manifest_path(record,key).read_text())
-        geo=gpd.read_file(manifest['input_paths']['directed_links'])
+        if record.get('mode') == 'centerline' and key == 'parameters_parquet':
+            root = Path(record.registry_path).parent
+            summary = json.loads((root/'reference_section_summary.json').read_text())
+            geometry_path = summary['paths']['directed_links_path']
+        else:
+            manifest=json.loads(geometry_manifest_path(record,key).read_text())
+            geometry_path = manifest['input_paths']['directed_links']
+        geo=gpd.read_file(geometry_path)
         params=pd.read_parquet(record[key])
         if set(geo.id_link)!=set(params.id_link): raise ValueError('Map reach IDs differ from routed physical graph')
         frames.append(geo)
@@ -324,9 +416,9 @@ def parent_child_network_figure(record, *, zoom_to_domain=True, layout='panels',
     else:
         fig=go.Figure()
         fig.add_trace(trace(parent,'Network context','#cbd5e1',2,zorder=0))
-        fig.add_trace(trace(p,'Full complexity','#2563eb',4,zorder=1))
+        fig.add_trace(trace(p,'Full complexity','#2563eb',3,zorder=2))
         if show_children:
-            fig.add_trace(trace(c,'Simplified','#dc2626',4,dash='dash',zorder=2))
+            fig.add_trace(trace(c,'Simplified','#dc2626',3,dash='dash',zorder=1))
         fig.update_yaxes(scaleanchor='x',scaleratio=1)
         cells=[(None,None)]
 

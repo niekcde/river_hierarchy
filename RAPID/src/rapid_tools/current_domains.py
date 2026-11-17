@@ -78,6 +78,18 @@ def validate_domain(full, membership):
 
 
 def load_domain_pair(record):
+    if record.get('mode') == 'centerline' and record.state_id == 'fully_collapsed':
+        parent = pd.read_parquet(record.parent_parameters_parquet)
+        child = pd.read_parquet(record.parameters_parquet)
+        if not {'id_us_node', 'id_ds_node'}.issubset(child.columns):
+            child = child.rename(columns={'u': 'id_us_node', 'v': 'id_ds_node'})
+        parent, pbounds = validate_domain(parent, parent)
+        child, cbounds = validate_domain(child, child)
+        return parent, child, dict(
+            source=pbounds[0], sink=pbounds[1], child_source=cbounds[0], child_sink=cbounds[1],
+            domain_type='Whole-network centerline collapse',
+            parent_links=sorted(parent.id_link.astype(int)), child_links=sorted(child.id_link.astype(int)),
+            attribute_source='Current physical parameters')
     registry_root=Path(record.registry_path).parent
     canonical=Path(record.parameters_parquet).parents[3]
     candidate=registry_root/'states'/record.state_id/'equivalent_resistance'

@@ -99,8 +99,10 @@ def run():
             pathfile=Path(record.get('source_bundle') or '')/'exterior_paths.json'
             if record.get('source_bundle') and pathfile.exists():paths=readjson(pathfile)
             else:
+                groups={(u,v):g for (u,v),g in child.groupby(['u','v'])}
                 for p in ext.itertuples():
-                    candidates=child[child.u.eq(p.u)&child.v.eq(p.v)&np.isclose(child.link_length_m,p.link_length_m,rtol=1e-8,atol=1e-5)]
+                    candidates=groups.get((p.u,p.v),child.iloc[:0])
+                    candidates=candidates[np.isclose(candidates.link_length_m,p.link_length_m,rtol=1e-8,atol=1e-5)]
                     if len(candidates)>1 and p.id_link in set(candidates.id_link):candidates=candidates[candidates.id_link.eq(p.id_link)]
                     paths.append(dict(parent_link=int(p.id_link),child_links=candidates.id_link.astype(int).tolist(),path_unique=len(candidates)==1))
             lookup=child.set_index('id_link');parent_lookup=parent.set_index('id_link');outside_edges=set();extra_nodes=set();length_changes=0;path_errors=[]

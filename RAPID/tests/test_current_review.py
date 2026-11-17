@@ -57,3 +57,46 @@ def test_island_geometry_uses_recorded_rerun_manifest(tmp_path):
     assert geometry_manifest_path(record, 'parameters_parquet') == manifest
     record.state_id = 'unknown_island'
     with pytest.raises(FileNotFoundError): geometry_manifest_path(record, 'parameters_parquet')
+
+
+def test_centerline_can_be_selected_and_readded(pair, tmp_path):
+    import json
+    from rapid_tools.current_review import add_centerline_comparisons, select_network_pairs
+    root = tmp_path/'15_indep__anchored/reference_section'
+    run = root/'rapid/cunge/run'
+    run.mkdir(parents=True)
+    pd.read_parquet(pair.outlet_parquet).to_parquet(run/'outlet.parquet')
+    pd.read_parquet(pair.forcing_parquet).to_parquet(run/'forcing.parquet')
+    (run/'completion.json').write_text(json.dumps({'complete': True}))
+    (run/'result.json').write_text(json.dumps(dict(method='cunge', fingerprint='fully_collapsed',
+        feature_utc=pair.child_peak_utc, feature_kind='single_smoothed_crest')))
+    pair['parent_feature_utc'] = pair.parent_peak_utc
+    pair['child_feature_utc'] = pair.child_peak_utc
+    pair['peak_total_change_pct'] = 0.
+    analysis = pd.DataFrame([pair])
+    added = add_centerline_comparisons(analysis, ['15'], output_root=tmp_path)
+    selected, _ = select_network_pairs(added, '15', units=[('centerline', 'fully_collapsed')])
+    assert len(selected) == 1
+    assert selected.iloc[0].peak_total_change_pct == pytest.approx(100/3)
+    assert len(add_centerline_comparisons(added, ['15'], output_root=tmp_path)) == 2
+    changed = pd.read_parquet(run/'forcing.parquet')
+    changed.loc[0, 'forcing_cms'] = 99.
+    changed.to_parquet(run/'forcing.parquet')
+    with pytest.raises(AssertionError):
+        add_centerline_comparisons(analysis, ['15'], output_root=tmp_path)
+
+
+def test_centerline_allows_only_matching_prefix_clock(pair):
+    parent = pd.read_parquet(pair.parent_outlet_parquet)
+    extra = parent.iloc[[-1]].copy()
+    extra['time_utc'] += pd.Timedelta(minutes=1)
+    pd.concat([parent, extra], ignore_index=True).to_parquet(pair.parent_outlet_parquet)
+    with pytest.raises(ValueError, match='clocks differ'):
+        load_pair(pair)
+    pair['mode'] = 'centerline'
+    assert len(load_pair(pair)[0]) == 5
+    child = pd.read_parquet(pair.outlet_parquet)
+    child['time_utc'] += pd.Timedelta(seconds=1)
+    child.to_parquet(pair.outlet_parquet)
+    with pytest.raises(ValueError, match='clocks differ'):
+        load_pair(pair)
