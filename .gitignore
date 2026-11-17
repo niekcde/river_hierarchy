@@ -73,3 +73,23 @@ RAPID/notebooks/link_*_bank_targets*.png
 
 # Regenerable export produced by scripts/export_swot_reach_percentiles.py.
 /swot_reach_percentiles.csv
+
+# Generated hydraulic simulation data, logs, and rendered plots.
+# Keep source snapshots and written reports visible to Git.
+/LISFLOOD_FP/results/**/*.npz
+/LISFLOOD_FP/results/**/*.json
+/LISFLOOD_FP/results/**/*.parquet
+/LISFLOOD_FP/results/**/*.csv
+/LISFLOOD_FP/results/**/*.log
+/LISFLOOD_FP/results/**/*.mat
+/LISFLOOD_FP/results/**/*.png
+/LISFLOOD_FP/results/**/*.html
+/LISFLOOD_FP/results/**/*.svg
+
+# Generated synthetic predictor results and caches; retain scripts and reports.
+/synthetic_experiments/investigations/**/results/**/*.json
+/synthetic_experiments/investigations/**/results/**/*.csv
+/synthetic_experiments/investigations/**/results/**/*.png
+/synthetic_experiments/investigations/**/results/**/*.parquet
+/synthetic_experiments/investigations/**/results/**/*.lock
+/synthetic_experiments/investigations/**/results/**/*.log
