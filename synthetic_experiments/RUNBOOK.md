@@ -240,3 +240,35 @@ Consequently, logical-size projections understate space used by the many small
 files; 105 GiB is not a verified sufficient-space guarantee for the whole batch.
 Keep the per-group 5 GiB free-space safeguard. Terminal output can also be saved
 on the drive by piping the command through `tee -a <output-directory>/run.log`.
+
+### Storage recovery: APFS container on the PhD drive
+
+After 13,773 completed groups, the external drive's 512 KiB allocation units
+expanded 18.1 GiB of file contents into approximately 99 GiB of allocated files
+and directories. The initial 40 GiB launch threshold was insufficient for this
+layout. Recovery uses an 80 GiB maximum, expandable APFS sparsebundle physically
+stored at:
+
+`/Volumes/PhD/river_hierarchy/synthetic_experiments/synthetic_results_20261027.sparsebundle`
+
+The container mounts at `/Volumes/SyntheticResults20261027`. macOS refused
+mounting it inside the original external-drive directory. The backing sparsebundle
+and all data remain on the PhD drive; only the mounted access path changes. It grows with stored data rather than allocating 80 GiB immediately.
+The storage migration reads back and SHA256-verifies every copied file, flushes
+an audit record, then removes only that verified original. Model code, manifest,
+job identities, source hashes, cache entries and existing results are preserved.
+Migration hashes are in `storage_migration_sha256.jsonl` inside the container.
+
+Use this launcher to mount the container if needed and resume two local workers:
+
+```bash
+cd /Users/6256481/Code/river-hierarchy
+bash synthetic_experiments/resume_depth_grid_phd.sh
+```
+
+The launcher mounts the named container if needed and checks its manifest. Do not
+delete the sparsebundle: it contains the actual saved results. Keep the PhD drive
+connected during routing. The original raw command does not mount the container;
+use the launcher after reconnecting the drive or rebooting. No scientific source
+file was changed for this storage recovery, so the existing provenance remains
+valid and completed groups can resume without recalculation.

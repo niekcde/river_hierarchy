@@ -1,4 +1,73 @@
-> **Current hydraulic comparison (27 October 2026):** Three integrated methods—fixed BASED, fixed Manning and conservative variable Manning/MCT—use a 2:1 pulse. `branch_width_factor` expands only the internal test corridor; inlet and outlet retain the same reference width. Use `run_depth_comparison.py`, [the runbook](RUNBOOK.md#current-three-method-comparison-27-october-2026), and [the protocol](CUNGE_PROTOCOL.md). New executed sections in the existing notebooks display the completed comparison subsets. Historical fixed-X results and the active legacy selector are preserved; the expanded factorial is planned, not run.
+# Current completed synthetic analysis · 28 October 2026
+
+**Prediction model settings (6 November 2026):** [primary six-input ridge, retained no-ΔGₘ secondary, and selection rationale](../RAPID/CURRENT_GEOMETRY_PREDICTION_MODELS.md). Both models remain available in the prediction-versus-modelled notebook.
+
+
+Real-only check of four selected sets (2 November 2026): [whole-river-held-out results](../RAPID/outputs/synthetic_selected_sets_20261102/report.md). Fits use real data only, no synthetic coefficients. All 2,185 established cases retained. Report separates ordinary collapses from 15 full-network controls; combined scores mask poor ordinary-case centroid performance. Equivalent path-width route sums become extreme in complex real networks and cause quadratic extrapolation failure.
+
+Forward selection (2 November 2026): [nested searches up to ten inputs](investigations/forward_selection_20261102/results/report.md), with and without Manning ΔG, unconstrained versus explicit four-principle coverage. The active search pool contains 68 standalone-screen survivors plus six restored pure-topology reserves (74 total). Fixed quadratic interaction regression, not an RF search; results are conditional internal synthetic validation. [Comparison figure](investigations/forward_selection_20261102/results/nested_comparison.png).
+
+Individual predictor screen (2 November 2026): [100-candidate standalone results](investigations/individual_predictor_screen_20261102/results/report.md). Five grouped folds, fixed univariate splines, centroid and peak shift, separate hydraulic approaches; includes correlations, per-type scores and cross-method figures on common treatment support. No candidates removed and no new routing runs.
+
+Predictor inventory (2 November 2026): [staged decision log](notes/2026-11-02_predictor_selection_decision_log.md). After reopening the full 205-representation inventory, coverage/affine screening and review of 22 similarity groups produced **100 candidate classes**, plus four design constants awaiting real-network checks. The subsequent forward-search pool is 74 as described above. The earlier 19-candidate pool is a historical benchmark, not the current selection filter.
+
+Geometric concept inventory (2 November 2026): [21 concepts underlying the 205 candidate representations](notes/geometry_concept_inventory_20261102.docx), with core equations, exact derivation counts and [complete column membership](notes/geometry_concept_inventory_20261102.json). This is a conceptual classification, separate from predictor selection.
+
+
+Pre-RF candidate reduction (30 October 2026): [full scientific investigation and 19-candidate pool](notes/2026-10-30_geometry_candidate_reduction.md), with figures and decision tables in predictor validation **Section 10**. Includes mathematical validity, predictor–predictor redundancy, three hydraulic approaches and design-sensitivity checks; no new RF fits.
+
+
+Broad descriptor audit (30 October 2026): [205-candidate geometry-only inventory and findings](notes/2026-10-30_broad_descriptor_audit.md), with family-selectable matrices in predictor validation Section 8. This is an exploratory mechanistic screen, not a final model selection. Manning geometry ΔG is included; resistance and inverse-depth ΔG remain excluded. [Paired real-network addition test](notes/2026-10-30_manning_geometry_candidate.md) is shown in Section 9.
+
+Current control-to-predictor mechanism audit (29 October 2026): see [analysis note](notes/2026-10-29_control_predictor_mechanisms.md) and sections 6–7 of [predictor validation](notebooks/synthetic_predictor_validation.ipynb). It compares matched directions, standardized magnitudes and factorial signatures across the full three-method grid; it does not fit a new model.
+
+**SYN-FULL-DEPTH-GRID-2026-10-28.** All **19,683 groups / 137,781 parent–child
+comparisons** are complete: 6,561 geometries, eight three-level factors, seven
+collapse treatments and three depth methods. Fixed BASED, fixed Manning and
+conservative variable Manning/MCT are analysed separately under the 2:1 pulse.
+
+Start with these executed notebooks, in order:
+
+1. [Results synthesis](notebooks/synthetic_results_synthesis.ipynb): setup, native
+   centroid and peak shifts, response distributions and matched-method comparison.
+2. [Factor interactions](notebooks/synthetic_factor_interactions.ipynb): eight
+   factors, all **28** pair interactions, main/total effects and signed contrasts.
+3. [Physical predictor diagnostics](notebooks/synthetic_predictor_validation.ipynb):
+   geometry/allocation/slope travel-time expression, no-fit checks and residuals.
+   This is not a new fitted predictor benchmark or real-network validation.
+4. [Routing results](notebooks/synthetic_routing_results.ipynb): selectable matched
+   hydrographs across methods and multiple collapsed states, including the
+   uniform-centerline control.
+
+The input/output directory is `/Volumes/SyntheticResults20261027`, an APFS
+container physically stored on the PhD drive. Derived tables and static PNGs are
+under `analysis/full_grid_20261028/`. Notebook Run All reads saved simulations;
+it never launches routing. The loader verifies the complete factorial population
+and response provenance. Historical notebook versions and their saved outputs are
+preserved in `notebooks/legacy/pre_full_depth_grid_20261028/`.
+
+To rebuild derived tables (no routing):
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+  /opt/anaconda3/envs/river-hierarchy-rivgraph/bin/python \
+  synthetic_experiments/investigations/update_completed_depth_grid.py
+```
+
+Centroid and peak timing are the current focus. Near-constant response strata
+retain raw timing values but do not receive normalized variance/R² scores.
+Fixed-Manning centroid agreement with its own travel-time identity is an internal
+check, not independent evidence of a physical law. Peak timing, variable-depth
+residuals, and subsequent real-network transfer require separate interpretation.
+
+See [the dated analysis note](notes/2026-10-28_completed_depth_grid_analysis.md).
+
+---
+
+## Historical setup and earlier decision records
+
+The material below documents the earlier implementations; it does not override
+the completed three-method grid and notebook entry points above.
 
 # Controlled synthetic experiments
 
@@ -9,7 +78,7 @@ workflow in `../synthetic_runs/`. Copied generator/plotting provenance is in
 `COPY_PROVENANCE.json`. Shared hierarchy detection and RAPID remain dependencies;
 this package does not import the legacy synthetic package.
 
-The current analysis version is `outputs/hydraulic_alpha065_20260930/`, selected
+The historical September analysis version is `outputs/hydraulic_alpha065_20260930/`, selected
 by [active_analysis.json](configs/active_analysis.json). Original outputs in
 `outputs/full_grid_island`, `outputs/baseline_island`, `outputs/extremes_island`
 and the original extension are preserved with their original settings.
@@ -23,7 +92,7 @@ The selected depth exponent is **alpha=0.65**, anchored to the existing BASED
 reference section with local kb varying with width. The decision and controlled
 settings are recorded in [selected_hydraulic_reference.json](configs/selected_hydraulic_reference.json).
 The full 2,187-configuration grid and 140-configuration extension have now been
-rerun in the selected version. Current sensitivity, predictor and routing
+rerun in the selected version. The archived September sensitivity, predictor and routing
 notebooks use these results; earlier outputs remain separate. **The real-case choice is deferred until
 new runs using updated slopes are available.** Read the current decision in the
 [hydraulic applicability notebook](notebooks/synthetic_hydraulic_applicability.ipynb).

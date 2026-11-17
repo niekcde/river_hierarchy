@@ -1,0 +1,754 @@
+{
+  "reference": "SYN-GEOMETRIC-CONCEPT-INVENTORY-2026-11-02",
+  "date": "2026-11-02",
+  "n_concepts": 21,
+  "n_candidates": 205,
+  "n_metric_labels": 66,
+  "grouping": "Interpretive taxonomy by geometric object and weighting; exhaustive non-overlapping assignment of candidate columns, not statistical independence or a new selection.",
+  "source": "/Volumes/SyntheticResults20261027/analysis/broad_descriptors_20261030/geometry_with_manning/candidate_catalog.csv",
+  "source_sha256": "d2bd7d379b990455ce81094af36832f7f72efc3f7b302f602e58b83d2f54d5af",
+  "concepts": [
+    {
+      "id": 1,
+      "name": "Allocated route length distribution",
+      "ingredients": "L B C",
+      "count": 28,
+      "metrics": [
+        {
+          "metric": "route_length_mean",
+          "count": 4
+        },
+        {
+          "metric": "route_length_sd",
+          "count": 4
+        },
+        {
+          "metric": "route_length_cv",
+          "count": 4
+        },
+        {
+          "metric": "route_length_min",
+          "count": 4
+        },
+        {
+          "metric": "route_length_max",
+          "count": 4
+        },
+        {
+          "metric": "route_length_skew",
+          "count": 3
+        },
+        {
+          "metric": "log1p__B_ratio_route_length_mean",
+          "count": 1
+        },
+        {
+          "metric": "log1p__B_ratio_route_length_sd",
+          "count": 1
+        },
+        {
+          "metric": "length_delta_km",
+          "count": 1
+        },
+        {
+          "metric": "route_spread_change_m",
+          "count": 1
+        },
+        {
+          "metric": "route_spread_change_over_parent_mean",
+          "count": 1
+        }
+      ],
+      "equation": "Lᵣ = ∑ₑ∈ᵣ Lₑ; P(R = r) = πᵣ",
+      "latex": "L_r=\\sum_{e\\in r}L_e,\\quad P(R=r)=\\pi_r",
+      "note": "Mean, SD, CV, minimum, maximum and skewness, plus parent–child comparisons and extra scalings. Route probabilities come from width splitting. Minimum and maximum themselves do not use those weights.",
+      "candidates": [
+        "B_parent_route_length_mean",
+        "B_child_route_length_mean",
+        "B_delta_route_length_mean",
+        "B_ratio_route_length_mean",
+        "B_parent_route_length_sd",
+        "B_child_route_length_sd",
+        "B_delta_route_length_sd",
+        "B_ratio_route_length_sd",
+        "B_parent_route_length_cv",
+        "B_child_route_length_cv",
+        "B_delta_route_length_cv",
+        "B_ratio_route_length_cv",
+        "B_parent_route_length_min",
+        "B_child_route_length_min",
+        "B_delta_route_length_min",
+        "B_ratio_route_length_min",
+        "B_parent_route_length_max",
+        "B_child_route_length_max",
+        "B_delta_route_length_max",
+        "B_ratio_route_length_max",
+        "B_parent_route_length_skew",
+        "B_child_route_length_skew",
+        "B_delta_route_length_skew",
+        "log1p__B_ratio_route_length_mean",
+        "log1p__B_ratio_route_length_sd",
+        "length_delta_km",
+        "route_spread_change_m",
+        "route_spread_change_over_parent_mean"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Equally weighted route length distribution",
+      "ingredients": "L C",
+      "count": 6,
+      "metrics": [
+        {
+          "metric": "path_length_cv",
+          "count": 3
+        },
+        {
+          "metric": "path_length_range_norm",
+          "count": 3
+        }
+      ],
+      "equation": "P₀(R = r) = 1/N",
+      "latex": "P_0(R=r)=1/N",
+      "note": "Unweighted path-length CV and range divided by equivalent length. The CV uses equal path weights; the range normalisation additionally introduces width through L_eq.",
+      "candidates": [
+        "path_parent_path_length_cv",
+        "path_child_path_length_cv",
+        "path_delta_path_length_cv",
+        "path_parent_path_length_range_norm",
+        "path_child_path_length_range_norm",
+        "path_delta_path_length_range_norm"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "Reach width distribution",
+      "ingredients": "L B",
+      "count": 25,
+      "metrics": [
+        {
+          "metric": "width_mean",
+          "count": 4
+        },
+        {
+          "metric": "width_sd",
+          "count": 4
+        },
+        {
+          "metric": "width_cv",
+          "count": 4
+        },
+        {
+          "metric": "width_harmonic",
+          "count": 4
+        },
+        {
+          "metric": "width_p10",
+          "count": 4
+        },
+        {
+          "metric": "width_p90",
+          "count": 4
+        },
+        {
+          "metric": "log1p__B_ratio_width_cv",
+          "count": 1
+        }
+      ],
+      "equation": "(Bₑ, wₑ); wₑ = Lₑ / ∑ₖ Lₖ",
+      "latex": "(B_e,w_e),\\quad w_e=L_e/\\sum_kL_k",
+      "note": "Length-weighted mean, SD, CV, harmonic mean and P10/P90 widths. The transformed width-CV ratio is included here.",
+      "candidates": [
+        "B_parent_width_mean",
+        "B_child_width_mean",
+        "B_delta_width_mean",
+        "B_ratio_width_mean",
+        "B_parent_width_sd",
+        "B_child_width_sd",
+        "B_delta_width_sd",
+        "B_ratio_width_sd",
+        "B_parent_width_cv",
+        "B_child_width_cv",
+        "B_delta_width_cv",
+        "B_ratio_width_cv",
+        "B_parent_width_harmonic",
+        "B_child_width_harmonic",
+        "B_delta_width_harmonic",
+        "B_ratio_width_harmonic",
+        "B_parent_width_p10",
+        "B_child_width_p10",
+        "B_delta_width_p10",
+        "B_ratio_width_p10",
+        "B_parent_width_p90",
+        "B_child_width_p90",
+        "B_delta_width_p90",
+        "B_ratio_width_p90",
+        "log1p__B_ratio_width_cv"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "Reach slope distribution",
+      "ingredients": "L S; B C for inverse slope",
+      "count": 13,
+      "metrics": [
+        {
+          "metric": "slope_mean",
+          "count": 3
+        },
+        {
+          "metric": "slope_min",
+          "count": 3
+        },
+        {
+          "metric": "slope_max",
+          "count": 3
+        },
+        {
+          "metric": "slope_cv",
+          "count": 3
+        },
+        {
+          "metric": "parent_slope_slow",
+          "count": 1
+        }
+      ],
+      "equation": "(Sₑ, wₑ); wₑ = Lₑ / ∑ₖ Lₖ",
+      "latex": "(S_e,w_e),\\quad w_e=L_e/\\sum_kL_k",
+      "note": "Mean, extremes and CV use the saved geometric slopes. The additional inverse-slope summary uses allocated-length weights: ∑ₑ fₑLₑSₑ⁻¹ᐟ² / ∑ₑ fₑLₑ.",
+      "candidates": [
+        "path_parent_slope_mean",
+        "path_child_slope_mean",
+        "path_delta_slope_mean",
+        "path_parent_slope_min",
+        "path_child_slope_min",
+        "path_delta_slope_min",
+        "path_parent_slope_max",
+        "path_child_slope_max",
+        "path_delta_slope_max",
+        "path_parent_slope_cv",
+        "path_child_slope_cv",
+        "path_delta_slope_cv",
+        "parent_slope_slow"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "Total channel length",
+      "ingredients": "L",
+      "count": 4,
+      "metrics": [
+        {
+          "metric": "total_length",
+          "count": 4
+        }
+      ],
+      "equation": "L_tot = ∑ₑ Lₑ",
+      "latex": "L_{\\rm tot}=\\sum_eL_e",
+      "note": "Sum of unique physical reach lengths. Parallel channels contribute separately; this is not expected route length.",
+      "candidates": [
+        "B_parent_total_length",
+        "B_child_total_length",
+        "B_delta_total_length",
+        "B_ratio_total_length"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "Channel area",
+      "ingredients": "L B",
+      "count": 4,
+      "metrics": [
+        {
+          "metric": "area_proxy",
+          "count": 4
+        }
+      ],
+      "equation": "A = ∑ₑ LₑBₑ",
+      "latex": "A=\\sum_eL_eB_e",
+      "note": "Channel-area proxy, not polygon-union area and not weighted by discharge allocation.",
+      "candidates": [
+        "B_parent_area_proxy",
+        "B_child_area_proxy",
+        "B_delta_area_proxy",
+        "B_ratio_area_proxy"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "Affected domain extent",
+      "ingredients": "L B C U",
+      "count": 1,
+      "metrics": [
+        {
+          "metric": "domain_size",
+          "count": 1
+        }
+      ],
+      "equation": "Dᵤ = 10⁻³ ∑ₑ∈ᵁ fₑLₑ",
+      "latex": "D_U=10^{-3}\\sum_{e\\in U}f_eL_e",
+      "note": "Allocation-weighted selected source-unit length in kilometres. U is the selected membership, not a fifth independent geometric ingredient.",
+      "candidates": [
+        "domain_size"
+      ]
+    },
+    {
+      "id": 8,
+      "name": "Local bifurcation allocation distribution",
+      "ingredients": "B C",
+      "count": 20,
+      "metrics": [
+        {
+          "metric": "dominance_mean",
+          "count": 3
+        },
+        {
+          "metric": "dominance_sd",
+          "count": 3
+        },
+        {
+          "metric": "effective_branches_mean",
+          "count": 4
+        },
+        {
+          "metric": "effective_branches_sd",
+          "count": 4
+        },
+        {
+          "metric": "split_entropy_mean",
+          "count": 3
+        },
+        {
+          "metric": "split_entropy_sd",
+          "count": 3
+        }
+      ],
+      "equation": "aᵥⱼ = Bᵥⱼ / ∑ₖ Bᵥₖ",
+      "latex": "a_{vj}=B_{vj}/\\sum_kB_{vk}",
+      "note": "At each split: dominance maxⱼ aᵥⱼ, effective branches 1/∑ⱼaᵥⱼ², and normalised entropy −∑ⱼaᵥⱼln(aᵥⱼ)/ln(kᵥ). Visit-weighted means and SDs summarise these across bifurcations.",
+      "candidates": [
+        "B_parent_dominance_mean",
+        "B_child_dominance_mean",
+        "B_delta_dominance_mean",
+        "B_parent_dominance_sd",
+        "B_child_dominance_sd",
+        "B_delta_dominance_sd",
+        "B_parent_effective_branches_mean",
+        "B_child_effective_branches_mean",
+        "B_delta_effective_branches_mean",
+        "B_ratio_effective_branches_mean",
+        "B_parent_effective_branches_sd",
+        "B_child_effective_branches_sd",
+        "B_delta_effective_branches_sd",
+        "B_ratio_effective_branches_sd",
+        "B_parent_split_entropy_mean",
+        "B_child_split_entropy_mean",
+        "B_delta_split_entropy_mean",
+        "B_parent_split_entropy_sd",
+        "B_child_split_entropy_sd",
+        "B_delta_split_entropy_sd"
+      ]
+    },
+    {
+      "id": 9,
+      "name": "Bifurcation exposure distribution",
+      "ingredients": "B C",
+      "count": 10,
+      "metrics": [
+        {
+          "metric": "split_exposure_mean",
+          "count": 3
+        },
+        {
+          "metric": "split_exposure_sd",
+          "count": 3
+        },
+        {
+          "metric": "expected_splits",
+          "count": 4
+        }
+      ],
+      "equation": "pᵥ = ∑ₑ→ᵥ fₑ; E[N_split] = ∑ᵥ∈ℬ pᵥ",
+      "latex": "p_v=\\sum_{e\\to v}f_e,\\quad E[N_{\\rm split}]=\\sum_{v\\in\\mathcal B}p_v",
+      "note": "The inlet has p_in = 1; other node probabilities sum incoming fractions. Unweighted mean and SD over bifurcations, plus their sum, give exposure summaries and expected splits.",
+      "candidates": [
+        "B_parent_expected_splits",
+        "B_child_expected_splits",
+        "B_delta_expected_splits",
+        "B_ratio_expected_splits",
+        "B_parent_split_exposure_mean",
+        "B_child_split_exposure_mean",
+        "B_delta_split_exposure_mean",
+        "B_parent_split_exposure_sd",
+        "B_child_split_exposure_sd",
+        "B_delta_split_exposure_sd"
+      ]
+    },
+    {
+      "id": 10,
+      "name": "Exposure weighted splitting intensity",
+      "ingredients": "B C",
+      "count": 12,
+      "metrics": [
+        {
+          "metric": "split_impact_mean",
+          "count": 4
+        },
+        {
+          "metric": "split_impact_sd",
+          "count": 4
+        },
+        {
+          "metric": "split_impact_sum",
+          "count": 4
+        }
+      ],
+      "equation": "Iᵥ = pᵥ (1 − ∑ⱼ aᵥⱼ²)",
+      "latex": "I_v=p_v\\left(1-\\sum_ja_{vj}^2\\right)",
+      "note": "Mean, SD and sum of local splitting intensity. The mean/SD are unweighted across bifurcations because exposure is already in Iᵥ.",
+      "candidates": [
+        "B_parent_split_impact_mean",
+        "B_child_split_impact_mean",
+        "B_delta_split_impact_mean",
+        "B_ratio_split_impact_mean",
+        "B_parent_split_impact_sd",
+        "B_child_split_impact_sd",
+        "B_delta_split_impact_sd",
+        "B_ratio_split_impact_sd",
+        "B_parent_split_impact_sum",
+        "B_child_split_impact_sum",
+        "B_delta_split_impact_sum",
+        "B_ratio_split_impact_sum"
+      ]
+    },
+    {
+      "id": 11,
+      "name": "Allocated route diversity",
+      "ingredients": "B C",
+      "count": 6,
+      "metrics": [
+        {
+          "metric": "route_entropy",
+          "count": 4
+        },
+        {
+          "metric": "log1p__B_ratio_route_entropy",
+          "count": 1
+        },
+        {
+          "metric": "route_entropy_change",
+          "count": 1
+        }
+      ],
+      "equation": "Hπ = −∑ᵣ πᵣ ln(πᵣ)",
+      "latex": "H_\\pi=-\\sum_r\\pi_r\\ln\\pi_r",
+      "note": "Entropy of complete-route allocation. Equals accumulated visit-weighted local entropy; distinct from mean normalised local entropy.",
+      "candidates": [
+        "B_parent_route_entropy",
+        "B_child_route_entropy",
+        "B_delta_route_entropy",
+        "B_ratio_route_entropy",
+        "log1p__B_ratio_route_entropy",
+        "route_entropy_change"
+      ]
+    },
+    {
+      "id": 12,
+      "name": "Branch distance contrasts",
+      "ingredients": "L B C",
+      "count": 12,
+      "metrics": [
+        {
+          "metric": "branch_length_contrast_mean",
+          "count": 4
+        },
+        {
+          "metric": "branch_length_contrast_sd",
+          "count": 4
+        },
+        {
+          "metric": "branch_length_variance_sum",
+          "count": 4
+        }
+      ],
+      "equation": "dᵥⱼ = Lᵥⱼ + μL,ⱼ; cᵥ² = ∑ⱼ aᵥⱼ(dᵥⱼ − d̄ᵥ)²",
+      "latex": "d_{vj}=L_{vj}+\\mu_{L,j},\\quad c_v^2=\\sum_ja_{vj}(d_{vj}-\\bar d_v)^2",
+      "note": "Here μL,ⱼ is expected remaining distance from downstream node j and d̄ᵥ = ∑ⱼaᵥⱼdᵥⱼ. Visit-weighted mean and SD of cᵥ and the variance sum ∑ᵥpᵥcᵥ². The latter equals route-length variance, so this concept overlaps mathematically with allocated route spread.",
+      "candidates": [
+        "B_parent_branch_length_contrast_mean",
+        "B_child_branch_length_contrast_mean",
+        "B_delta_branch_length_contrast_mean",
+        "B_ratio_branch_length_contrast_mean",
+        "B_parent_branch_length_contrast_sd",
+        "B_child_branch_length_contrast_sd",
+        "B_delta_branch_length_contrast_sd",
+        "B_ratio_branch_length_contrast_sd",
+        "B_parent_branch_length_variance_sum",
+        "B_child_branch_length_variance_sum",
+        "B_delta_branch_length_variance_sum",
+        "B_ratio_branch_length_variance_sum"
+      ]
+    },
+    {
+      "id": 13,
+      "name": "Equivalent path width distribution",
+      "ingredients": "L B C",
+      "count": 15,
+      "metrics": [
+        {
+          "metric": "equivalent_width",
+          "count": 3
+        },
+        {
+          "metric": "dominant_width_fraction",
+          "count": 3
+        },
+        {
+          "metric": "effective_n_paths_width",
+          "count": 3
+        },
+        {
+          "metric": "width_entropy",
+          "count": 3
+        },
+        {
+          "metric": "width_evenness",
+          "count": 3
+        }
+      ],
+      "equation": "Wᵣ = Lᵣ / ∑ₑ∈ᵣ(Lₑ/Bₑ); qᵣ = Wᵣ / ∑ₛ Wₛ",
+      "latex": "W_r={L_r\\over\\sum_{e\\in r}L_e/B_e},\\quad q_r={W_r\\over\\sum_sW_s}",
+      "note": "Equivalent total width ∑ᵣWᵣ, dominance max qᵣ, entropy Hq, evenness Hq/ln N and effective count exp(Hq). qᵣ is not routed allocation πᵣ. Evenness is conventionally 1 for N = 1.",
+      "candidates": [
+        "path_parent_equivalent_width",
+        "path_child_equivalent_width",
+        "path_delta_equivalent_width",
+        "path_parent_effective_n_paths_width",
+        "path_child_effective_n_paths_width",
+        "path_delta_effective_n_paths_width",
+        "path_parent_dominant_width_fraction",
+        "path_child_dominant_width_fraction",
+        "path_delta_dominant_width_fraction",
+        "path_parent_width_entropy",
+        "path_child_width_entropy",
+        "path_delta_width_entropy",
+        "path_parent_width_evenness",
+        "path_child_width_evenness",
+        "path_delta_width_evenness"
+      ]
+    },
+    {
+      "id": 14,
+      "name": "Equivalent path length",
+      "ingredients": "L B C",
+      "count": 3,
+      "metrics": [
+        {
+          "metric": "equivalent_length",
+          "count": 3
+        }
+      ],
+      "equation": "L_eq = ∑ᵣ qᵣLᵣ",
+      "latex": "L_{eq}=\\sum_rq_rL_r",
+      "note": "Complete-path length weighted by harmonic path width. Separated from allocated route length because qᵣ and πᵣ differ.",
+      "candidates": [
+        "path_parent_equivalent_length",
+        "path_child_equivalent_length",
+        "path_delta_equivalent_length"
+      ]
+    },
+    {
+      "id": 15,
+      "name": "Length width association",
+      "ingredients": "L B C",
+      "count": 3,
+      "metrics": [
+        {
+          "metric": "signed_length_width_association",
+          "count": 3
+        }
+      ],
+      "equation": "A_LW = L_eq / [(1/N) ∑ᵣ Lᵣ] − 1",
+      "latex": "A_{LW}={L_{eq}\\over N^{-1}\\sum_rL_r}-1",
+      "note": "Positive when harmonic path width gives relatively more weight to longer routes; zero when all route lengths are equal.",
+      "candidates": [
+        "path_parent_signed_length_width_association",
+        "path_child_signed_length_width_association",
+        "path_delta_signed_length_width_association"
+      ]
+    },
+    {
+      "id": 16,
+      "name": "Network elongation",
+      "ingredients": "L B C",
+      "count": 7,
+      "metrics": [
+        {
+          "metric": "area_elongation",
+          "count": 4
+        },
+        {
+          "metric": "elongation",
+          "count": 3
+        }
+      ],
+      "equation": "E_A = μL²/A; E_eq = L_eq/W_eq",
+      "latex": "E_A=\\mu_L^2/A,\\quad E_{eq}=L_{eq}/W_{eq}",
+      "note": "Two distinct length-versus-width shape definitions. Grouped as one geometric concept, not asserted to be equivalent.",
+      "candidates": [
+        "B_parent_area_elongation",
+        "B_child_area_elongation",
+        "B_delta_area_elongation",
+        "B_ratio_area_elongation",
+        "path_parent_elongation",
+        "path_child_elongation",
+        "path_delta_elongation"
+      ]
+    },
+    {
+      "id": 17,
+      "name": "Route elongation relative to shortest route",
+      "ingredients": "L B C",
+      "count": 4,
+      "metrics": [
+        {
+          "metric": "sinuosity_proxy",
+          "count": 4
+        }
+      ],
+      "equation": "τ = μL / L_min",
+      "latex": "\\tau=\\mu_L/L_{\\min}",
+      "note": "Allocated mean route length relative to the shortest directed route. Not map-based channel sinuosity.",
+      "candidates": [
+        "B_parent_sinuosity_proxy",
+        "B_child_sinuosity_proxy",
+        "B_delta_sinuosity_proxy",
+        "B_ratio_sinuosity_proxy"
+      ]
+    },
+    {
+      "id": 18,
+      "name": "Topological architecture",
+      "ingredients": "C",
+      "count": 21,
+      "metrics": [
+        {
+          "metric": "bifurcations",
+          "count": 4
+        },
+        {
+          "metric": "cycle_rank",
+          "count": 4
+        },
+        {
+          "metric": "junction_excess",
+          "count": 4
+        },
+        {
+          "metric": "log1p_paths",
+          "count": 3
+        },
+        {
+          "metric": "n_valid_paths",
+          "count": 3
+        },
+        {
+          "metric": "topologic_complexity_score",
+          "count": 3
+        }
+      ],
+      "equation": "T = (N_b, E − V + C_w, ∑ᵥ max(kᵥ − 1, 0), N)",
+      "latex": "\\mathcal T=(N_b,\\ E-V+C_w,\\ \\sum_v(k_v-1)_+,\\ N)",
+      "note": "E, V and C_w count edges, vertices and weak components; kᵥ is outgoing degree. Includes branch count, undirected cycle rank, junction excess, path count and transformations. Historical complexity = ln(1+N)+ln(1+i_b)+ln(1+i_c), where internal bifurcations/confluences exclude the boundary source/sink.",
+      "candidates": [
+        "B_parent_bifurcations",
+        "B_child_bifurcations",
+        "B_delta_bifurcations",
+        "B_ratio_bifurcations",
+        "B_parent_cycle_rank",
+        "B_child_cycle_rank",
+        "B_delta_cycle_rank",
+        "B_ratio_cycle_rank",
+        "B_parent_junction_excess",
+        "B_child_junction_excess",
+        "B_delta_junction_excess",
+        "B_ratio_junction_excess",
+        "B_parent_log1p_paths",
+        "B_child_log1p_paths",
+        "B_delta_log1p_paths",
+        "path_parent_topologic_complexity_score",
+        "path_child_topologic_complexity_score",
+        "path_delta_topologic_complexity_score",
+        "path_parent_n_valid_paths",
+        "path_child_n_valid_paths",
+        "path_delta_n_valid_paths"
+      ]
+    },
+    {
+      "id": 19,
+      "name": "Branching density",
+      "ingredients": "L C; B for equivalent length",
+      "count": 7,
+      "metrics": [
+        {
+          "metric": "bifurcation_density",
+          "count": 4
+        },
+        {
+          "metric": "branching_density_by_length",
+          "count": 3
+        }
+      ],
+      "equation": "ρ_b = N_b/L_tot; ρ_bc = (i_b + i_c)/L_eq",
+      "latex": "\\rho_b=N_b/L_{tot},\\quad \\rho_{bc}=(i_b+i_c)/L_{eq}",
+      "note": "Two normalisations of branching architecture by length; the equivalent-length version also depends on width.",
+      "candidates": [
+        "B_parent_bifurcation_density",
+        "B_child_bifurcation_density",
+        "B_delta_bifurcation_density",
+        "B_ratio_bifurcation_density",
+        "path_parent_branching_density_by_length",
+        "path_child_branching_density_by_length",
+        "path_delta_branching_density_by_length"
+      ]
+    },
+    {
+      "id": 20,
+      "name": "Domain head loss",
+      "ingredients": "L S C",
+      "count": 3,
+      "metrics": [
+        {
+          "metric": "head_drop",
+          "count": 3
+        }
+      ],
+      "equation": "ΔH = z_in − z_out = ∑ₑ∈ᵣ SₑLₑ",
+      "latex": "\\Delta H=z_{in}-z_{out}=\\sum_{e\\in r}S_eL_e",
+      "note": "Head drop over the domain. Path-sum form assumes the common consistent node-head field used in the synthetic construction.",
+      "candidates": [
+        "path_parent_head_drop",
+        "path_child_head_drop",
+        "path_delta_head_drop"
+      ]
+    },
+    {
+      "id": 21,
+      "name": "Manning geometric accumulation",
+      "ingredients": "L B S C",
+      "count": 1,
+      "metrics": [
+        {
+          "metric": "delta_G_manning",
+          "count": 1
+        }
+      ],
+      "equation": "G_M = ∑ₑ Lₑ Bₑ²ᐟ⁵ fₑ³ᐟ⁵ Sₑ⁻³ᐟ¹⁰",
+      "latex": "G_M=\\sum_eL_eB_e^{2/5}f_e^{3/5}S_e^{-3/10}",
+      "note": "Only child-minus-parent ΔG_M is in this 205-column inventory. Sums cover whole networks, with allocation recomputed per state; no depth, n or simulated discharge is an input.",
+      "candidates": [
+        "delta_G_manning"
+      ]
+    }
+  ]
+}
